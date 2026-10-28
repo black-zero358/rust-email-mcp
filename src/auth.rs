@@ -190,18 +190,25 @@ pub struct RequestId(pub String);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aws_lc_rs::{
+        encoding::{AsDer, Pkcs8V1Der},
+        rsa::{KeyPair, KeySize},
+        signature::KeyPair as _,
+    };
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use jsonwebtoken::{EncodingKey, Header, encode};
-    use rsa::{RsaPrivateKey, pkcs8::EncodePrivateKey, traits::PublicKeyParts};
     use serde_json::json;
     #[tokio::test]
     async fn jwt_trust_boundaries() {
-        let key = RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
-        let public = key.to_public_key();
-        let jwks:JwkSet=serde_json::from_value(json!({"keys":[{"kty":"RSA","kid":"test","alg":"RS256","use":"sig","n":URL_SAFE_NO_PAD.encode(public.n().to_bytes_be()),"e":URL_SAFE_NO_PAD.encode(public.e().to_bytes_be())}]})).unwrap();
-        let signing =
-            EncodingKey::from_rsa_pem(key.to_pkcs8_pem(Default::default()).unwrap().as_bytes())
-                .unwrap();
+        let key = KeyPair::generate(KeySize::Rsa2048).unwrap();
+        let public = key.public_key();
+        let jwks:JwkSet=serde_json::from_value(json!({"keys":[{"kty":"RSA","kid":"test","alg":"RS256","use":"sig","n":URL_SAFE_NO_PAD.encode(public.modulus().big_endian_without_leading_zero()),"e":URL_SAFE_NO_PAD.encode(public.exponent().big_endian_without_leading_zero())}]})).unwrap();
+        let der = AsDer::<Pkcs8V1Der>::as_der(&key).unwrap();
+        let pem = format!(
+            "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----",
+            base64::engine::general_purpose::STANDARD.encode(der.as_ref())
+        );
+        let signing = EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap();
         let auth = Auth {
             config: crate::config::fixture(),
             client: reqwest::Client::new(),

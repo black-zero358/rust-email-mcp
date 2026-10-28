@@ -8,5 +8,5 @@
 - Authenticate each HTTP request; validate issuer, audience, expiry, scope and subject allowlist.
 - Test OAuth with isolated clients/users. Keep deployment and rollback separate from source publishing.
 - Completed: core, 16 regression tests, fmt/clippy, isolated OAuth + QQ read acceptance, SQLite WAL/FULL benchmark.
-- Lessons: Rauthy WebAuthn origin requires explicit :443; allow early token refresh; preserve independent sessions. Bound IMAP literals before parser allocation.
+- Lessons: Rauthy WebAuthn origin requires explicit :443; allow early token refresh; preserve independent sessions. Bound IMAP literals before parser allocation. JWT uses AWS-LC to keep known vulnerable RustCrypto transitive dependencies out of the lockfile.
 - TODO: restart acceptance, publish deployment templates and GitHub release, switch production, record rollback and client reconnection.

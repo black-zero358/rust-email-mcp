@@ -7,6 +7,7 @@
 - `cargo test --locked`：16 项通过。
 - `cargo fmt --check`、`cargo clippy --locked --all-targets -- -D warnings`：通过。
 - Linux amd64 musl 静态 release 构建：通过。
+- `cargo audit`：0 项漏洞、0 项警告；JWT 使用 AWS-LC 后端，审计包含测试依赖。
 - 本地模拟 SMTP 验证接受后审计失败、响应丢失、重复操作键；合成草稿验证 BCC 和 MIME 附件保留。
 - JWT 测试覆盖签名算法、issuer、audience、subject、scope、有效期与 nbf。
 

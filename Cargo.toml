@@ -11,7 +11,7 @@ async-imap = { version = "0.12", default-features = false, features = ["runtime-
 axum = "0.8"
 base64 = "0.22"
 futures = "0.3"
-jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls", "ring", "webpki-roots"] }
 mailparse = "0.18"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -33,8 +33,7 @@ webpki-roots = "1"
 
 [dev-dependencies]
 tempfile = "3"
-rsa = "0.9"
-rand = "0.8"
+aws-lc-rs = "1"
 
 [profile.release]
 lto = "thin"
