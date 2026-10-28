@@ -161,7 +161,15 @@ impl Part<'_> {
             })
         };
         let disposition = self.get_content_disposition();
-        disposition.disposition == mailparse::DispositionType::Attachment
+        // RFC 2183 section 2.8: types we do not support as inline are
+        // attachments. mailparse represents an absent/empty type as
+        // Extension("") rather than Inline; preserve that empty case.
+        let attached_disposition = match &disposition.disposition {
+            mailparse::DispositionType::Inline => false,
+            mailparse::DispositionType::Extension(value) => !value.trim().is_empty(),
+            _ => true,
+        };
+        attached_disposition
             || has_name(&disposition.params, "filename")
             || has_name(&self.ctype.params, "name")
     }
@@ -357,6 +365,32 @@ impl Part<'_> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn disposition_classification_preserves_empty_inline_and_filename_rules() {
+        for (header, expected) in [
+            ("", false),
+            ("Content-Disposition:", false),
+            ("Content-Disposition: \t", false),
+            ("Content-Disposition: inline", false),
+            ("Content-Disposition: INLINE", false),
+            ("Content-Disposition: inline; size=1", false),
+            ("Content-Disposition: attachment", true),
+            ("Content-Disposition: x-test", true),
+            ("Content-Disposition: X-Test; size=1", true),
+            ("Content-Disposition: form-data", true),
+            ("Content-Disposition: ; filename=notes.txt", true),
+            ("Content-Disposition: inline; filename=notes.txt", true),
+            ("Content-Disposition: x-test; filename=notes.txt", true),
+            ("Content-Type: text/plain; name=notes.txt", true),
+        ] {
+            let raw = format!("{header}\r\n\r\n");
+            assert_eq!(
+                parse(raw.as_bytes()).unwrap().is_attachment(),
+                expected,
+                "{header}"
+            );
+        }
+    }
     #[test]
     fn alternative_and_related_select_one_representation() {
         let alternative = b"Content-Type: multipart/alternative; boundary=a\n\n--a\n\nolder\n--a\nContent-Type: text/html\n\n<p>HTML</p>\n--a\n\nnewer\n--a--\n";
