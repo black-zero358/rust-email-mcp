@@ -13,6 +13,8 @@ MCP 客户端 ── HTTPS ── Nginx ── Rust Email MCP ── IMAP / SMTP
 
 邮件服务使用 rmcp、async-imap、lettre、rustls、rusqlite 和 tracing。认证交给 Rauthy，登录、刷新和邮件工具共享清晰的权限边界。运行时只需两个服务容器。
 
+开发与维护从 [工程纲领与贡献指南](CONTRIBUTING.md) 开始；模块与设计约束见 [架构](docs/architecture.md)，版本、发布和依赖复核见 [维护规程](docs/maintenance.md)。
+
 ## 功能
 
 | 类别 | 工具 |
@@ -55,7 +57,7 @@ HTML 在本地提取纯文本，保留实体、Unicode、段落换行和图片 a
 | `rejected` | SMTP 服务器明确拒绝。检查配置或收件人，确认后使用新的操作键。 |
 | `unknown` | 连接中断、超时或进程重启使最终结果无法确认。先检查邮箱和服务商记录。 |
 
-进行中的操作显示 `sending`。相同账户下的同一个操作键只会获得一次发送执行权；参数变化会返回 `IDEMPOTENCY_CONFLICT`。操作记录默认持续保留，便于查询历史结果与阻止重复提交。
+进行中的操作显示 `sending`。同一服务实例的操作数据库内，相同 OIDC subject 下的同一个 `operation_key` 只会获得一次发送执行权；参数变化会返回 `IDEMPOTENCY_CONFLICT`。不同 subject 的操作键和状态彼此隔离，即使它们使用同一个邮箱。操作记录默认持续保留，便于查询历史结果与阻止重复提交；删除记录、更换主体或恢复旧备份后的去重边界见 [维护规程](docs/maintenance.md)。
 
 SMTP 已接受后，操作记录更新失败会返回 `journal_update_failed`，同时保留本次 `accepted` 结果。草稿发送保留原草稿，并返回 `draft_retained`。BCC 参与 SMTP 信封投递，发送内容中的 BCC 头会被移除。
 
@@ -63,7 +65,7 @@ SMTP 连接与事务共用发送期限。DATA 最终返回 250 后先记录 `acc
 
 ## 编译和测试
 
-需要 Rust 1.99.1。仓库包含工具链版本与 Cargo.lock。
+需要 Rust 1.99.1。仓库包含工具链版本与 Cargo.lock。当前承诺使用这一固定工具链构建；其他 Rust 版本需另行验证。完整验证要求见 [贡献指南](CONTRIBUTING.md#验证与完成标准)。
 
 ```sh
 cargo build --release --locked
@@ -131,6 +133,8 @@ Rauthy 使用嵌入式 Hiqlite/SQLite，省去独立数据库容器。建议配�
 ## 部署与运维
 
 完整步骤、Compose、Nginx 和 Rauthy 配置见 [单节点部署](docs/deployment.md)。
+
+升级前先按 [维护规程](docs/maintenance.md)核对版本、产物来源、数据兼容和发送记录连续性。
 
 使用 Dockerfile 构建邮件服务，在反向代理后监听内网地址。数据目录由容器用户独占，根文件系统设为只读，移除 Linux capabilities，设置 `no-new-privileges`、内存限额和容器重启策略。
 
