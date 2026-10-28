@@ -37,4 +37,5 @@
 ## Before handing off
 
 - Follow the applicable validation and PR checklist in CONTRIBUTING.md; preserve the [invariant-to-verification mapping](docs/architecture.md#invariants-and-verification) when behavior changes.
+- For a coordinated issue repair campaign, keep per-issue assessment, PR, independent review and merge evidence in [ISSUE_PROGRESS.md](ISSUE_PROGRESS.md). Review the final PR head and its required checks after integration updates; source merges do not authorize deployment.
 - Keep current contracts in README/architecture, maintenance procedures in their designated guides, and dated results in [validation](docs/validation.md) with a commit or release reference. Track remaining work through [open follow-ups](CONTRIBUTING.md#待闭环事项) and issues, not Completed/TODO entries in this file.
