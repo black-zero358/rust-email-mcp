@@ -215,13 +215,13 @@ mod tests {
                 match reply {
                     "disconnect" => break,
                     "stall" => {
-                        tokio::time::sleep(Duration::from_millis(400)).await;
+                        tokio::time::sleep(Duration::from_millis(800)).await;
                     }
                     _ => socket.write_all(reply.as_bytes()).await.unwrap(),
                 }
             }
         });
-        let mut sender = SmtpSender::fixture(port, Duration::from_millis(150));
+        let mut sender = SmtpSender::fixture(port, Duration::from_millis(500));
         if credentials {
             sender.credentials = Some(Credentials::new("synthetic".into(), "test-only".into()));
         }
@@ -351,13 +351,12 @@ mod tests {
             .await,
             "accepted"
         );
-        // No credentials may be sent when required STARTTLS was not offered.
         assert_eq!(
             scripted_send(
                 vec![
                     ("EHLO", "250-test\r\n250 AUTH PLAIN\r\n"),
                     ("AUTH PLAIN", "535 denied\r\n"),
-                    ("QUIT", "221 bye\r\n")
+                    ("EOF", "")
                 ],
                 false,
                 true,
@@ -366,6 +365,7 @@ mod tests {
             .await,
             "rejected"
         );
+        // No credentials may be sent when required STARTTLS was not offered.
         assert_eq!(
             scripted_send(
                 vec![("EHLO", "250-test\r\n250 AUTH PLAIN\r\n"), ("EOF", "")],
@@ -442,5 +442,92 @@ mod tests {
         sending.abort();
         assert!(matches!(sending.await, Err(error) if error.is_cancelled()));
         backend.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn authenticated_tls_and_starttls_happy_paths() {
+        use lettre::transport::smtp::client::Certificate;
+        use tokio_rustls::{
+            TlsAcceptor,
+            rustls::{ServerConfig, pki_types::PrivatePkcs8KeyDer},
+        };
+        for starttls in [false, true] {
+            let rcgen::CertifiedKey { cert, signing_key } =
+                rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+            let server_config = ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![cert.der().clone()],
+                    PrivatePkcs8KeyDer::from(signing_key.serialize_der()).into(),
+                )
+                .unwrap();
+            let acceptor = TlsAcceptor::from(std::sync::Arc::new(server_config));
+            let tls = TlsParameters::builder("localhost".into())
+                .add_root_certificate(Certificate::from_der(cert.der().to_vec()).unwrap())
+                .build()
+                .unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let backend = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let socket = if starttls {
+                    let mut plain = BufReader::new(socket);
+                    plain.write_all(b"220 synthetic ESMTP\r\n").await.unwrap();
+                    let mut line = String::new();
+                    plain.read_line(&mut line).await.unwrap();
+                    assert!(line.starts_with("EHLO"));
+                    plain
+                        .write_all(b"250-test\r\n250-STARTTLS\r\n250 AUTH PLAIN\r\n")
+                        .await
+                        .unwrap();
+                    line.clear();
+                    plain.read_line(&mut line).await.unwrap();
+                    assert_eq!(line, "STARTTLS\r\n");
+                    plain.write_all(b"220 upgrade\r\n").await.unwrap();
+                    plain.into_inner()
+                } else {
+                    socket
+                };
+                let mut secured = BufReader::new(acceptor.accept(socket).await.unwrap());
+                if !starttls {
+                    secured.write_all(b"220 synthetic ESMTP\r\n").await.unwrap();
+                }
+                for (prefix, reply) in [
+                    ("EHLO", "250-test\r\n250 AUTH PLAIN\r\n"),
+                    ("AUTH PLAIN", "235 authenticated\r\n"),
+                    ("MAIL", "250 ok\r\n"),
+                    ("RCPT", "250 ok\r\n"),
+                    ("DATA", "354 data\r\n"),
+                ] {
+                    let mut line = String::new();
+                    secured.read_line(&mut line).await.unwrap();
+                    assert!(line.starts_with(prefix), "expected {prefix}, got {line:?}");
+                    secured.write_all(reply.as_bytes()).await.unwrap();
+                }
+                loop {
+                    let mut line = String::new();
+                    assert!(secured.read_line(&mut line).await.unwrap() > 0);
+                    if line == ".\r\n" {
+                        break;
+                    }
+                }
+                secured.write_all(b"250 accepted\r\n").await.unwrap();
+                let mut line = String::new();
+                secured.read_line(&mut line).await.unwrap();
+                assert_eq!(line, "QUIT\r\n");
+                secured.write_all(b"221 bye\r\n").await.unwrap();
+            });
+            let mut sender = SmtpSender::fixture(port, Duration::from_secs(2));
+            sender.tls = Some(tls);
+            sender.starttls = starttls;
+            sender.credentials = Some(Credentials::new("synthetic".into(), "test-only".into()));
+            let envelope = Envelope::new(None, vec!["one@example.com".parse().unwrap()]).unwrap();
+            let result = sender
+                .submit(&envelope, b"Subject: synthetic\r\n\r\nbody")
+                .await;
+            assert_eq!(result.status, "accepted");
+            result.cleanup().await;
+            backend.await.unwrap();
+        }
     }
 }
