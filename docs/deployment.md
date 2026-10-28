@@ -49,11 +49,29 @@ docker compose -f deploy/compose.yaml up -d auth
 | --- | --- |
 | 类型 | Public，PKCE S256 |
 | Flows | authorization_code、refresh_token |
-| Redirect URI | `https://chatgpt.com/connector_platform/oauth/callback` |
+| Redirect URI | `https://chatgpt.com/connector_platform_oauth_redirect` |
 | Scopes / default scopes | openid、email:mcp |
 | Access token algorithm | RS256 |
 | Access token lifetime | 300 秒 |
 | Allowed resources / default audience | `https://mail.example.com/email/mcp` |
+
+回调地址以 ChatGPT 当前创建页面显示的值为准，精确复制。Rauthy 0.37.2 支持公共 PKCE 客户端，但默认发现文档遗漏 `none`。创建连接前导出修正后的发现文档：
+
+```sh
+uv run deploy/prepare_discovery.py https://mail.example.com/auth/v1/.well-known/openid-configuration /opt/rust-email-mcp/oidc-discovery.json
+```
+
+在 HTTPS Nginx server 块添加精确路由并 reload：
+
+```nginx
+location = /auth/v1/.well-known/openid-configuration {
+    alias /opt/rust-email-mcp/oidc-discovery.json;
+    default_type application/json;
+    add_header Cache-Control "no-store";
+}
+```
+
+保证 Nginx 可以读取该文件。升级 Rauthy 或修改域名、端点、scope 后，从原服务重新导出发现文档。ChatGPT 的 Token 端点认证方式选择 `none`，客户端密钥与注册 URL 留空；默认 scope 为 `email:mcp`，基础 scope 为 `openid`。此连接可关闭可选的 OIDC 邮箱身份功能。
 
 Rauthy 0.37.2 的 bootstrap client JSON 未包含资源受众字段。通过管理界面，或管理 API 的 `GET /auth/v1/clients/email-mcp` 和 `PUT /auth/v1/clients/email-mcp` 设置 `allowed_resources`、`default_aud` 数组，PUT 时保留其他客户端配置。创建短期 API Key 时仅授予 Clients read/update 权限。
 

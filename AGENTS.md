@@ -11,3 +11,4 @@
 - Lessons: Rauthy WebAuthn origin requires explicit :443; allow early token refresh; preserve independent sessions. Bound IMAP literals before parser allocation. JWT uses AWS-LC to keep known vulnerable RustCrypto transitive dependencies out of the lockfile.
 - Completed: restart recovery, public deployment templates, GitHub publication, production cutover and rollback documentation. Acceptance mailbox authorization removed after testing.
 - TODO: user-side ChatGPT reconnection/natural refresh; authorized real-mail writes in a dedicated test mailbox; sustained load/attachment memory observations.
+- ChatGPT callback must exactly match its setup UI. Rauthy 0.37.2 discovery omits supported public-client `none`; see deployment guide for the metadata correction and refresh it when upgrading.
