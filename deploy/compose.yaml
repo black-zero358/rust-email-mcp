@@ -1,0 +1,38 @@
+name: rust-email-mcp
+services:
+  auth:
+    image: ghcr.io/sebadob/rauthy:0.37.2@sha256:666e9f54b4deb99d710448b32eb2c18214160744dd3f68f8f7cee140a6cd80ef
+    platform: linux/amd64
+    command: [serve, --config-file, /app/config.toml]
+    user: "10001:10001"
+    volumes:
+      - ../secrets/rauthy.toml:/app/config.toml:ro
+      - ../secrets/bootstrap:/app/bootstrap:ro
+      - ../data/auth:/app/data
+    ports: ["127.0.0.1:19556:8080"]
+    networks: [auth]
+    restart: unless-stopped
+    read_only: true
+    tmpfs: ["/tmp:size=16m,mode=1777"]
+    mem_limit: 256m
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    logging: {driver: json-file, options: {max-size: 5m, max-file: "2"}}
+  mail:
+    build: ..
+    env_file: ../secrets/mail.env
+    user: "1000:1000"
+    ports: ["127.0.0.1:19580:8080"]
+    volumes: ["../data/mail:/data"]
+    restart: unless-stopped
+    stop_grace_period: 45s
+    read_only: true
+    tmpfs: ["/tmp:size=16m,mode=1777"]
+    mem_limit: 128m
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    logging: {driver: json-file, options: {max-size: 5m, max-file: "2"}}
+networks:
+  auth:
+    ipam:
+      config: [{subnet: 172.30.91.0/24}]

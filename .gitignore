@@ -1,0 +1,6 @@
+/target/
+/.env
+/secrets/
+/data/
+*.sqlite*
+*.log

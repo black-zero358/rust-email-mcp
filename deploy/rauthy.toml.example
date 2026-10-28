@@ -1,0 +1,46 @@
+[access]
+disable_refresh_token_nbf = true
+[bootstrap]
+admin_email = 'admin@example.com'
+password_argon2id = 'REPLACE_WITH_ARGON2ID_HASH'
+bootstrap_dir = '/app/bootstrap'
+[cluster]
+node_id = 1
+nodes = ['1 localhost:8100 localhost:8200']
+data_dir = '/app/data'
+log_sync = 'immediate'
+log_statements = false
+read_pool_size = 1
+secret_raft = 'REPLACE_WITH_RANDOM_SECRET'
+secret_api = 'REPLACE_WITH_ANOTHER_RANDOM_SECRET'
+[database]
+hiqlite = true
+[encryption]
+keys = ['key01/REPLACE_WITH_BASE64_32_RANDOM_BYTES']
+key_active = 'key01'
+[hashing]
+argon2_m_cost = 32768
+argon2_t_cost = 3
+argon2_p_cost = 2
+max_hash_threads = 1
+[logging]
+level = 'warn'
+level_database = 'warn'
+level_access = 'off'
+log_fmt = 'json'
+[server]
+scheme = 'http'
+pub_url = 'mail.example.com'
+proxy_mode = true
+trusted_proxies = ['172.30.91.1/32']
+http_workers = 1
+metrics_enable = false
+swagger_ui_enable = false
+[user_registration]
+enable = false
+[webauthn]
+rp_id = 'mail.example.com'
+rp_origin = 'https://mail.example.com:443'
+[lifetimes]
+refresh_token_grace_time = '5s'
+refresh_token_lifetime = '30d'
