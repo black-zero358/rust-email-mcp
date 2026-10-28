@@ -58,6 +58,8 @@ Content-Transfer-Encoding 缺省为 7bit，叶子解码支持 7bit、8bit、bina
 
 发送前由客户端向用户展示收件人和内容，并获得明确授权。所有发送工具必须提供 `operation_key`，同一发送意图重试时复用该值。
 
+SMTPUTF8 需求同时检查信封地址和保留的原始邮件头（含 MIME 子头和未转码封装的邮件头），不将 RFC 2047 编码词解码后的 Unicode 或普通 8 位正文误判为国际化头。只需 8BITMIME 的邮件仍可使用不提供 SMTPUTF8 的服务器；需要 SMTPUTF8 但服务端不支持时，在 MAIL 前拒绝，操作记录为 `rejected`，不提交 DATA。头部检查沿用有界 MIME 结构/头部预算，不解码或渲染正文；非 ASCII 邮件无法在预算内确定头部需求时，连接前确定拒绝。原始草稿正文保持不变。
+
 服务先将操作键、参数摘要和 Message-ID 写入 SQLite，再提交 SMTP。结果有三种：
 
 | 状态 | 含义与后续操作 |

@@ -2615,6 +2615,70 @@ mod tests {
         smtp_fixture(true, false, false).await;
     }
     #[tokio::test]
+    async fn smtp_utf8_refusal_is_recorded_as_rejected_without_mail() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let backend = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                socket.write_all(b"220 synthetic ESMTP\r\n").await.unwrap();
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                assert!(line.starts_with("EHLO"));
+                socket
+                    .write_all(b"250-synthetic\r\n250 8BITMIME\r\n")
+                    .await
+                    .unwrap();
+                line.clear();
+                socket.read_line(&mut line).await.unwrap();
+                assert_eq!(line, "QUIT\r\n");
+                socket.write_all(b"221 bye\r\n").await.unwrap();
+            });
+            let journal = Journal::open(std::path::Path::new(":memory:")).unwrap();
+            let id = "<synthetic@example.test>";
+            let (raw, envelope) = prepare_draft(
+                "To: recipient@example.test\r\nSubject: 中文\r\n\r\nASCII body\r\n".as_bytes(),
+                "sender@example.test",
+                id,
+            )
+            .unwrap();
+            journal.claim("owner", "utf8-refusal", "hash", id).unwrap();
+            let sender = crate::smtp::SmtpSender::fixture(port, std::time::Duration::from_secs(2));
+            let submission = sender.submit(&envelope, &raw).await;
+            let operation = record_send(
+                &journal,
+                "owner",
+                "utf8-refusal",
+                submission.status,
+                id.into(),
+                true,
+            );
+            assert_eq!(operation.status, "rejected");
+            assert_eq!(
+                journal
+                    .get("owner", "utf8-refusal")
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                "rejected"
+            );
+            assert_eq!(
+                journal
+                    .claim("owner", "utf8-refusal", "hash", id)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                "rejected"
+            );
+            submission.cleanup().await;
+            backend.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
     async fn smtp_accepted_send_is_deduplicated() {
         smtp_fixture(false, false, false).await;
     }

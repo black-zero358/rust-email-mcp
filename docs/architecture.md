@@ -83,6 +83,10 @@ SMTP 使用 lettre 的低层 connection/command/message API，保留 TLS、AUTH�
 
 已知 SMTP 接受结果不得因后续日志/数据库更新或清理失败而改为失败。操作记录更新失败时，本次响应保留 `accepted` 并附 `journal_update_failed`；这不等于数据库已经成功保存该结果，后续必须检查操作状态及服务商记录。
 
+SMTPUTF8 需求为信封中非 ASCII 地址或 `mime::requires_smtputf8` 检出的原始国际化头。按 [RFC 6531 §3.2、§3.6](https://www.rfc-editor.org/rfc/rfc6531#section-3.6) 检查所有 MIME 子头，附件子树也不排除；只检查原始字节，RFC 2047 编码词和叶子正文不展开。identity 编码的 message/rfc822、message/global 递归共用结构/头部预算；编码封装的 message/global 保持不透明，符合 [RFC 6532 §3.5](https://www.rfc-editor.org/rfc/rfc6532#section-3.5) 对 7bit 封装的支持。此检查不调用正文选择、HTML 渲染或 transfer/charset 解码；非 ASCII 输入无法在结构/头部预算内确定需求时，连接前返回确定 `rejected`。
+
+缺少 SMTPUTF8 能力通过私有拒绝类型在 MAIL 前返回并持久化为 `rejected`，清理继续有界 QUIT；网络/事务的不确定结果保持 `unknown`，已知接受仍为 `accepted`。8BITMIME 对原始非 ASCII 数据的既有要求、TLS/AUTH 和状态恢复规则不变。
+
 草稿发送使用同一个有界规范化头部缓冲区做收件人解释和隐私过滤，在 claim/SMTP 前验证字段名、续行及头/体分隔符，并明确拒绝不支持的 `Resent-*` 语义。BCC 参与信封投递但不进入发送头部；正文原始字节（包括二进制附件）保持不变，源草稿保留并返回 `draft_retained`。
 
 ## Authentication
@@ -123,6 +127,8 @@ JSON 日志使用固定事件名和受控字段，记录服务端生成的 reque
 vendored 构建依赖必须由 `.dockerignore` 明确允许并复制进 Docker builder；允许范围不能扩大到 vendor 同级目录、秘密或部署数据。Docker context 检查使用合成哨兵与真实构建器。普通 `cargo audit` 会跳过 path package，因此本地与 CI 统一运行专用审计脚本，同时独立审阅本地补丁代码；升级时同步更新来源、脚本和回归测试。
 
 CTE 支持性对应 D3/D5：`mime::Part::transfer_encoding/encoded/select_text` 与 `parse_part` 的验证入口为 `transfer_encodings_require_known_decoders_before_interpretation`、`unknown_transfer_encoding_cannot_be_read_forwarded_or_downloaded_as_decoded`；覆盖不透明 multipart、完整 alternative 回退与下载拒绝，不替代真实邮箱验收。
+
+SMTPUTF8 需求与确定拒绝对应 D3/D4：`mime::requires_smtputf8`、`smtp::submit/transaction` 和 `mail::record_send` 由 `smtp_utf8_inspection_uses_raw_headers_and_shared_budgets`、`smtp_utf8_covers_preserved_draft_headers_but_not_body_bytes`、`smtp_utf8_refusal_is_recorded_as_rejected_without_mail` 验证；原发送故障/QUIT 回归继续验证 accepted/unknown 边界。
 
 ## Decision records
 

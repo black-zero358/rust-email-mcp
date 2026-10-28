@@ -57,6 +57,49 @@ pub(crate) fn parse(raw: &[u8]) -> Result<Part<'_>> {
     parse_part(raw, &mut Budget::default(), 0, false)
 }
 
+/// Inspect wire headers, never decoded RFC 2047 values or body text. Embedded
+/// identity-encoded messages share the same structural/header budgets.
+pub(crate) fn requires_smtputf8(raw: &[u8]) -> Result<bool> {
+    if raw.is_ascii() {
+        return Ok(false);
+    }
+    fn inspect(part: &Part<'_>, budget: &mut Budget, depth: usize) -> Result<bool> {
+        if part
+            .headers
+            .iter()
+            .any(|header| !header.get_key_raw().is_ascii() || !header.get_value_raw().is_ascii())
+        {
+            return Ok(true);
+        }
+        for child in &part.subparts {
+            if inspect(child, budget, depth + 1)? {
+                return Ok(true);
+            }
+        }
+        if matches!(
+            part.ctype.mimetype.as_str(),
+            "message/rfc822" | "message/global"
+        ) && !part.body.is_empty()
+            && part
+                .headers
+                .get_first_value("Content-Transfer-Encoding")
+                .is_none_or(|value| {
+                    matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "7bit" | "8bit" | "binary"
+                    )
+                })
+        {
+            let nested = parse_part(part.body, budget, depth + 1, false)?;
+            return inspect(&nested, budget, depth + 1);
+        }
+        Ok(false)
+    }
+    let mut budget = Budget::default();
+    let part = parse_part(raw, &mut budget, 0, false)?;
+    inspect(&part, &mut budget, 0)
+}
+
 fn parse_part<'a>(
     raw: &'a [u8],
     budget: &mut Budget,
@@ -380,6 +423,31 @@ impl Part<'_> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn smtp_utf8_inspection_uses_raw_headers_and_shared_budgets() {
+        for (raw, expected) in [
+            (&b"Subject: =?UTF-8?B?5Lit5paH?=\r\n\r\nbody"[..], false),
+            ("Subject: 中文\r\n\r\nbody".as_bytes(), true),
+            ("Subject: ASCII\r\n\r\nSubject: 中文".as_bytes(), false),
+            (&b"Content-Type: application/octet-stream\r\n\r\n\xff\xfe"[..], false),
+            ("Content-Type: message/global\r\nContent-Transfer-Encoding: base64\r\n\r\nU3ViamVjdDog5Lit5paHDQoNCmJvZHk=".as_bytes(), false),
+        ] {
+            assert_eq!(requires_smtputf8(raw).unwrap(), expected);
+        }
+        let deep = format!(
+            "{}Subject: ASCII\r\n\r\n中文 body\r\n",
+            "Content-Type: message/rfc822\r\n\r\n".repeat(MAX_DEPTH + 1)
+        );
+        assert_eq!(
+            requires_smtputf8(deep.as_bytes()).unwrap_err().code,
+            "LIMIT_EXCEEDED"
+        );
+        let raw = format!("Subject: {}\r\n\r\n中文", "x".repeat(MAX_HEADER_BLOCK));
+        assert_eq!(
+            requires_smtputf8(raw.as_bytes()).unwrap_err().code,
+            "LIMIT_EXCEEDED"
+        );
+    }
     #[test]
     fn disposition_classification_preserves_empty_inline_and_filename_rules() {
         for (header, expected) in [
