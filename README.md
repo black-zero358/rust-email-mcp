@@ -31,7 +31,7 @@ MCP 客户端 ── HTTPS ── Nginx ── Rust Email MCP ── IMAP / SMTP
 
 读取使用 IMAP `EXAMINE` 和 `BODY.PEEK`，保持邮件标记。每个邮件引用由文件夹、UID 和 UIDVALIDITY 组成，避免文件夹重建后误操作旧 UID。
 
-列表和搜索每次扫描最多 500 个 UID，返回最多 50 条摘要。继续查询时传入 `next_before_uid`；空页也可能带有下一页游标。批量读取最多 10 封，结果包含逐项状态；完整获取后的本地 MIME 错误仅影响该项，继续读取后续 UID。原始获取失败（包括协议、连接或字节预算失败）仍停止，后续项标为 `unprocessed`，不自动重试。`completed` 计已尝试项数，包含单项失败，不表示成功数量。
+列表和搜索每次扫描最多 500 个 UID，返回最多 50 条摘要且不超过请求 limit。同 UID 的 FETCH 属性合并成一条摘要，异步 FLAGS 更新不会生成空摘要；后到的显式空 FLAGS 可以清空标记，缺失 HEADER 的 UID 不生成摘要。继续查询时传入 `next_before_uid`；空页也可能带有下一页游标。批量读取最多 10 封，结果包含逐项状态；完整获取后的本地 MIME 错误仅影响该项，继续读取后续 UID。原始获取失败（包括协议、连接或字节预算失败）仍停止，后续项标为 `unprocessed`，不自动重试。`completed` 计已尝试项数，包含单项失败，不表示成功数量。
 
 正文返回纯文本，并标记截断状态。单封 MIME 邮件上限 8 MiB。单次工具响应的序列化 JSON 上限 256 KiB，包括 JSON-RPC 外层及实际 id、request_id、structuredContent 和供文本客户端读取的转义副本；不包括 HTTP 头及 SSE 帧。超限返回小型 `LIMIT_EXCEEDED` 工具错误。小附件以 Base64 返回，解码后最多 128 KiB，仍受完整响应预算限制；接近该大小的附件可能因双份输出超限而无法返回。新邮件支持文本；现有草稿发送保留原 MIME 附件。转发工具发送原邮件的纯文本内容。
 
@@ -50,9 +50,11 @@ MIME 在构建结构时限制为 256 个节点、20 层嵌套，头部每段最�
 
 发送已有草稿时，收件人解释与隐私头清理共用规范化后的字段名，支持大小写、折行与旧格式字段名尾部空白。缺少冒号、非法字段名、控制字符、孤立续行或缺少头部结束空行的草稿会在发送意图记录和 SMTP 前拒绝。`Resent-*` 块的投递语义暂不支持，返回 `UNSUPPORTED_DRAFT_HEADERS`；请先保存为普通草稿。MIME 正文和二进制附件保留原始字节。
 
-正文选择会排除标为 attachment 的部件及其整个子树，也将带 `filename` 或 Content-Type `name` 的部件视为附件。`multipart/alternative` 优先选最后一个完整纯文本表示（包括真正为空的纯文本），没有时再选一个允许 HTML 转换的表示；候选中的 HTML 主体不能被跳过后只留下 plain 签名。`multipart/related` 只选 `start` 指定的主部件，缺省选首部件；mixed 内联内容按顺序读取。附件列表与下载共用识别规则，multipart 附件作为整体提供下载。读取正文和转发使用同一选择逻辑，转发不包含原附件内容。
+正文选择会排除标为 attachment 的部件及其整个子树；显式但不支持的 Content-Disposition 类型也按附件处理，缺省或空类型保持原有内联语义。带 `filename` 或 Content-Type `name` 的部件同样视为附件。`multipart/alternative` 优先选最后一个完整纯文本表示（包括真正为空的纯文本），没有时再选一个允许 HTML 转换的表示；候选中的 HTML 主体不能被跳过后只留下 plain 签名。`multipart/related` 只选 `start` 指定的主部件，缺省选首部件；mixed 内联内容按顺序读取。附件列表与下载共用识别规则，multipart 附件作为整体提供下载。读取正文和转发使用同一选择逻辑，转发不包含原附件内容。
 
 HTML 在本地提取纯文本，保留实体、Unicode、段落换行和图片 alt 文本，忽略文档元数据、脚本、样式、模板及内嵌框架；不执行脚本、不加载资源，也不保留 CSS 可见性和表格排版。转换前限制解码后的 HTML 为 128 KiB、ASCII 空白、单/双引号、斜杠和等号合计最多 8192 个，以保守限制标记属性复杂度；流式处理最多 4096 个 token、256 KiB 输出，并受共享 MIME 解码预算约束。超限返回 `LIMIT_EXCEEDED`；SVG/MathML 外来命名空间与非空但无法完整解释的内联正文（包括未知或替换型字符集）整段返回 `UNSUPPORTED_BODY`，转发在记录发送意图与 SMTP 前拒绝不完整原文。真正为空的正文仍可读取和转发。所有新构建的纯文本邮件（包括转发）显式声明 `text/plain; charset=utf-8`。
+
+Content-Transfer-Encoding 缺省为 7bit，叶子解码支持 7bit、8bit、binary、Base64 和 quoted-printable，名称不区分大小写。未知或显式空编码的非空内联实体返回 `UNSUPPORTED_BODY`，alternative 可改选其他完整受支持表示；未知编码的 multipart 保持不透明，不按原始字节解释子树。显式附件仍可发现，但未知编码无法按已解码附件下载：内联下载拒绝，二进制 GET 沿既有后端失败路径返回 HTTP 502；不提供未标明的原始编码数据。
 
 发送前由客户端向用户展示收件人和内容，并获得明确授权。所有发送工具必须提供 `operation_key`，同一发送意图重试时复用该值。
 

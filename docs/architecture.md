@@ -45,7 +45,7 @@
 
 服务使用官方 Rust MCP SDK rmcp 3.8.0 与 Streamable HTTP。IMAP 使用 async-imap 和证书校验的 TLS；SMTP 使用 lettre 的隐式 TLS 或必须成功的 STARTTLS。每个需要邮箱后端的操作获取两个执行槽位之一，连接归单次操作所有，在完成、超时或解析失败后关闭。只读的本地账户/发送状态查询不需要邮箱连接。
 
-读取必须使用 `EXAMINE` 和 `BODY.PEEK`。状态 FETCH 只接受所请求 UID 的结果，忽略其他 UID 或无 UID 的非请求更新；目标不存在返回 `NOT_FOUND`，目标存在但 `FLAGS ()` 为空应成功，后出现的同 UID flags 覆盖先前值。不得以关闭会话为由引入 `CLOSE/EXPUNGE` 等额外副作用。
+读取必须使用 `EXAMINE` 和 `BODY.PEEK`。状态 FETCH 只接受所请求 UID 的结果，忽略其他 UID 或无 UID 的非请求更新；目标不存在返回 `NOT_FOUND`，目标存在但 `FLAGS ()` 为空应成功，后出现的同 UID flags 覆盖先前值。整封读取按目标 UID 及所需 SIZE/BODY 属性筛选，异步 FLAGS 不代替所需属性；缺失所需属性仍返回 `MAIL_BACKEND`。列表/搜索按请求 UID 归并 HEADER、SIZE 与最后实际出现的 FLAGS；用 vendored `Fetch::has_flags` 区分未提供 FLAGS 与显式空集合，不让后到的无 FLAGS 响应清空标记。只有明确返回 HEADER（包括真实空头部）才生成摘要，每个 UID 一条、按 UID 降序且数量不超过 limit，忽略其他 UID/无 UID 响应；缺失 HEADER 不从缓存伪造摘要。所有结果均等待匹配 tag 的 OK，不以已收到部分数据代替成功终结。依据 [RFC 3501 §5.2](https://www.rfc-editor.org/rfc/rfc3501#section-5.2) 与 [§7.4.2](https://www.rfc-editor.org/rfc/rfc3501#section-7.4.2)。不得以关闭会话为由引入 `CLOSE/EXPUNGE` 等额外副作用。
 
 连接、原始响应和单封邮件都必须有预算；`BudgetStream` 对连接累计读取字节计量；`Client::with_buffer_limit` 在真实 parser 的 `decode_needs`、扩容及剩余数据重置前执行同一个应用字节上限（`max_message + 2 MiB`，另保留上游 512 MiB 硬上限）。已用字节与 parser 所需追加字节采用 checked arithmetic；初始化、分块取整和替换缓冲区同样不超过该上限。移除独立的行尾 literal 猜测扫描，合法响应文本中的花括号不会被当作 literal。预算约束每个 parser 缓冲块，非进程 RSS；增长时新旧块、已交付响应及协议对象可能同时存活。列表和搜索最多扫描 500 个 UID、返回 50 条摘要，批量读取最多 10 封并保留逐项结果。具体字节、结构及输出限额见 README；调整数值仍须满足 D3 并评估客户端兼容性。
 
@@ -63,7 +63,11 @@ async-imap 0.12 的 APPEND flags 原样序列化，必须传入 `(\Draft)` 这�
 
 邮件正文、主题、头部和附件均按不可信输入处理。构建 MIME 结构前检查共享的节点、深度和头部预算；transfer/charset 解码前预留预算。不得恢复对不可信输入调用 `mailparse::parse_mail`；回复和草稿发送只需要有界头部。boundary 按完整分隔符匹配，接受允许的尾部空白，不能把相同前缀当作分隔符。
 
+依据 [RFC 2045 §6.1、§6.4](https://www.rfc-editor.org/rfc/rfc2045#section-6.4)，缺省 transfer encoding 为 7bit，编码名不区分大小写；未知编码实体不按声明的 MIME 类型解释。解析时对未知编码停止 multipart 递归，选择时把非空内联实体视为不支持，允许 alternative 回滚并选另一完整候选；没有候选时返回既有 `UNSUPPORTED_BODY`。`encoded()` 在调用 mailparse `Body::new` 前显式验证编码，不能依赖该库把未知值默认为 SevenBit 的行为。`body_raw` 同样拒绝未知编码，不把原始编码字节作为已解码附件交付，认证下载保留原 HTTP 502 后端失败映射。显式附件分类和共享索引不变，真正空实体不被当作非空正文错误，原有结构、头部和解码分配前预算继续适用。
+
 正文选择排除显式 attachment 或带文件名的部件及其整个子树；`multipart/alternative` 选一个受支持表示并优先纯文本，`multipart/related` 只选主部件。读取和转发共用选择逻辑，附件列表和下载共用分类规则，multipart 附件可整体下载。真实空正文与“不支持或无法完整解释的正文”必须区分。
+
+`mime::Part::is_attachment` 按 [RFC 2183 §2.8–2.9](https://www.rfc-editor.org/rfc/rfc2183#section-2.8) 将显式但服务不支持的 disposition 类型（含 form-data）按附件处理；multipart 分类作用于整个子树。锁定的 mailparse 0.18.0 将缺省/空类型解析为 `Extension("")`，因此不能机械地把全部 Extension 判为附件；缺省、空或仅空白类型保持原有语义，inline 仍可内联，filename/name 的既有附件判断独立生效。正文、转发、附件发现和下载统一调用该分类，不新增索引或解码路径。
 
 依据 [RFC 2046 §5.1.4](https://www.rfc-editor.org/rfc/rfc2046#section-5.1.4)，alternative 每个候选表示同一份信息，选择必须覆盖候选的完整内联正文。纯文本探测遇到非空 HTML 时判定该候选不完整，回滚其中已收集的所有片段（如 plain 签名），继续寻找完整纯文本表示；不存在时才允许 HTML 转换。此规则沿 mixed、嵌套 alternative 和 related 主部件递归传播，附件仍排除；真正空的 HTML 不引入待转换内容，真正空的 plain 仍是有效完整表示。探测不解码、不分配正文，最终选中叶子继续共用既有解码预算。
 
@@ -108,13 +112,15 @@ JSON 日志使用固定事件名和受控字段，记录服务端生成的 reque
 | 原则 | 实现入口 | 现有验证与审阅入口 |
 | --- | --- | --- |
 | D1 身份与授权 | `auth`、`server::allowed/call_tool`、`main` 接线 | `jwt_trust_boundaries`、`failed_refresh_is_shared_and_expired_keys_fail_closed`、`cached_key_does_not_wait_for_rotation_and_refresh_updates_snapshot`、`schemas_match_policy`；另做隔离 OAuth/登录资产验收 |
-| D2 读取无副作用与 UIDVALIDITY | `mail`、`imap_text`、vendored completion boundary | `status_uses_only_target_uid_and_distinguishes_missing_from_empty_flags`、`rev1_mailbox_names_round_trip_through_tools`、`statistics_status_requires_complete_matching_snapshot_and_tag`、`refused_imap_tools_return_backend_error_and_stop_delete`、`batch_read_continues_after_local_content_errors`、`batch_read_stops_after_protocol_failure_or_transport_exhaustion`、`tests/imap_completion.rs`；只读邮箱验收核对读前后 flags |
+| D2 读取无副作用与 UIDVALIDITY | `mail`、`imap_text`、vendored completion boundary | `status_uses_only_target_uid_and_distinguishes_missing_from_empty_flags`、`raw_fetch_ignores_interleaved_flags_and_requires_target_attributes`、`list_fetch_merges_uid_attributes_and_only_actual_flag_updates`、`list_fetch_requires_header_and_successful_tagged_completion`、`list_fetch_split_attributes_keep_unique_requested_uids_and_order`、`rev1_mailbox_names_round_trip_through_tools`、`statistics_status_requires_complete_matching_snapshot_and_tag`、`refused_imap_tools_return_backend_error_and_stop_delete`、`batch_read_continues_after_local_content_errors`、`batch_read_stops_after_protocol_failure_or_transport_exhaustion`、`tests/imap_completion.rs`；只读邮箱验收核对读前后 flags |
 | D3 资源有界 | `BudgetStream`、vendored `ImapStream::Buffer`、`mime`、`html`、`server` | `bounded_parser_rejects_incomplete_response_at_application_limit`、`bounded_parser_accepts_fragmented_text_and_normal_literal`、`bounded_parser_handles_exact_text_budget_and_unknown_need`、vendored `application_limit_rejects_growth_before_allocation`、`headers_and_decode_are_bounded_before_allocation`、`attributes_are_bounded_before_tokenization_without_whitespace`、`final_wire_budget_covers_duplicates_escaping_unicode_and_attachments`、`email_body_prefix_fits_real_wire_budget_and_preserves_metadata`、`long_parsed_email_returns_a_wire_bounded_readable_prefix`、`oversized_rpc_id_is_rejected_before_execution` |
 | D4 发送结果与幂等 | `journal`、`mail::send`、`smtp` | `durable_dedup_and_principal_isolation`、`concurrent_claim_has_single_winner`、`smtp_lost_reply_does_not_resend`、`smtp_accepted_is_persisted_before_unresponsive_quit`、`smtp_accepted_survives_quit_timeout_and_journal_failure` |
-| D5 隐私与不可信内容 | `mail`、`mime`、`html`、`main` 日志 | `discovery_matches_message_indices_and_multipart_attachment_trees`、`http_download_authorization_binary_headers_and_transfer_capacity`、`draft_envelope_and_privacy_filter_share_canonical_fields`、`ambiguous_draft_headers_are_rejected`、`text_attachments_stay_downloadable_but_leave_body_and_forward`、`html_read_and_forward_preserve_original_content`、`alternative_read_and_forward_require_complete_representations`、`plain_probes_require_all_inline_parts_and_prune_only_attachments`；日志字段和 panic 脱敏仍需代码审阅 |
+| D5 隐私与不可信内容 | `mail`、`mime`、`html`、`main` 日志 | `discovery_matches_message_indices_and_multipart_attachment_trees`、`http_download_authorization_binary_headers_and_transfer_capacity`、`draft_envelope_and_privacy_filter_share_canonical_fields`、`ambiguous_draft_headers_are_rejected`、`text_attachments_stay_downloadable_but_leave_body_and_forward`、`html_read_and_forward_preserve_original_content`、`disposition_classification_preserves_empty_inline_and_filename_rules`、`alternative_read_and_forward_require_complete_representations`、`plain_probes_require_all_inline_parts_and_prune_only_attachments`；日志字段和 panic 脱敏仍需代码审阅 |
 | D6 简单可维护与明确范围 | 模块边界、工具链、补丁来源、部署模板 | CI 的 fmt/test/clippy/build；`scripts/audit-dependencies.sh`；`scripts/test-docker-context.sh` 和生产 Dockerfile 构建；升级/恢复证据见维护与部署指南 |
 
 vendored 构建依赖必须由 `.dockerignore` 明确允许并复制进 Docker builder；允许范围不能扩大到 vendor 同级目录、秘密或部署数据。Docker context 检查使用合成哨兵与真实构建器。普通 `cargo audit` 会跳过 path package，因此本地与 CI 统一运行专用审计脚本，同时独立审阅本地补丁代码；升级时同步更新来源、脚本和回归测试。
+
+CTE 支持性对应 D3/D5：`mime::Part::transfer_encoding/encoded/select_text` 与 `parse_part` 的验证入口为 `transfer_encodings_require_known_decoders_before_interpretation`、`unknown_transfer_encoding_cannot_be_read_forwarded_or_downloaded_as_decoded`；覆盖不透明 multipart、完整 alternative 回退与下载拒绝，不替代真实邮箱验收。
 
 ## Decision records
 
