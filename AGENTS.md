@@ -1,28 +1,24 @@
-# Development
+# Agent working guide
 
-- Rust: Cargo, pinned Cargo.lock; temporary Python scripts: uv; Node tooling: pnpm.
-- Keep secrets and deployment identities out of Git and logs.
-- Never send or modify real email for tests without explicit user authorization.
-- Status FETCH results must match the requested UID. Ignore unsolicited other/no-UID updates; a missing target is NOT_FOUND, while an existing target with FLAGS () succeeds. Later matching flags replace earlier ones.
-- IMAP text mode is rev1: encode every mailbox argument with modified UTF-7 and decode LIST names to Unicode with canonical round-trip validation. Never send UTF-8 quoted search octets; use CHARSET UTF-8 and a synchronizing literal, waiting for continuation and matching tagged OK. BADCHARSET is UNSUPPORTED_CHARSET.
-- Read with EXAMINE/PEEK. Bound connection count, response bytes, message size and tool output.
-- Tool output budget counts the complete serialized JSON-RPC response with actual id, request_id, structuredContent and escaped text copy. HTTP rejects ids over 1024 serialized JSON bytes before execution; keep this guard wired ahead of rmcp. Limit fallback remains bounded and preserves known send status; use get_operation with the original operation_key before retrying writes.
-- Persist send intent before SMTP. Preserve accepted/unknown outcomes across audit or cleanup failures; never retry unknown sends automatically.
-- Draft sending uses one bounded canonical header buffer for destination extraction and privacy filtering. Validate field names, continuations and the header/body separator before claim/SMTP; reject unsupported Resent blocks explicitly. Preserve body bytes, including binary payloads, exactly.
-- SMTP uses lettre's low-level connection/command/message API: persist the final transaction result before a separate one-second QUIT bound. Unknown/cancelled transactions close without QUIT or pooling. Preserve TLS/AUTH and SMTPUTF8/8BITMIME policy and hold execution slots through cleanup.
-- Authenticate each HTTP request; validate issuer, audience, expiry, scope and subject allowlist.
-- JWKS keys have a hard 300-second TTL with no stale-on-error extension. Refresh I/O uses a separate coordinator; cached fresh keys bypass it. Refresh results share a 10-second cooldown (also after failure); unavailable JWKS returns HTTP 503 with Retry-After, while invalid tokens return 401.
-- Test OAuth with isolated clients/users. Keep deployment and rollback separate from source publishing.
-- Completed: core, 16 regression tests, fmt/clippy, isolated OAuth + QQ read acceptance, SQLite WAL/FULL benchmark.
-- MIME body selection excludes explicit/filename attachments and their complete subtrees; alternative chooses one supported plain representation, related only its root. Keep read/forward selection and attachment listing/download classification consistent; multipart attachments are downloadable as a whole.
-- HTML fallback uses a bounded tokenizer-only sink, never a DOM/layout engine. Keep pre-tokenizer input/attribute-complexity bounds and token/output budgets; unsupported nonempty inline content must fail read/forward explicitly before send claim. Compose text as explicit UTF-8 so conversion preserves Unicode in forwarded MIME.
-- A tokenizer-only sink cannot interpret foreign SVG/MathML CDATA: reject the whole body even after visible text. Pre-tokenizer attribute accounting must include adjacent quoted attributes and slash recovery, not only whitespace; keep those regressions.
-- Lessons: Rauthy WebAuthn origin requires explicit :443; allow early token refresh; preserve independent sessions. Bound IMAP literals before parser allocation. JWT uses AWS-LC to keep known vulnerable RustCrypto transitive dependencies out of the lockfile.
-- Completed: restart recovery, public deployment templates, GitHub publication, production cutover and rollback documentation. Acceptance mailbox authorization removed after testing.
-- TODO: user-side ChatGPT reconnection/natural refresh; authorized real-mail writes in a dedicated test mailbox; sustained load/attachment memory observations.
-- ChatGPT callback must exactly match its setup UI. Rauthy 0.37.2 discovery omits supported public-client `none`; see deployment guide for the metadata correction and refresh it when upgrading.
-- Keep Rauthy static asset/theme requests outside login rate limits. Test every login-page script/style, including burst loads; HTML 200 alone misses frontend initialization failures.
-- APPEND flags passed to async-imap 0.12 are serialized verbatim: use a parenthesized list such as `(\Draft)`. The synthetic duplex regression covers literal continuation, OK and rejected NO/BAD outcomes without contacting a mailbox.
-- Issue #3: parse MIME structure with shared node/depth/header budgets before allocation; reserve transfer/charset decoding budgets before decoding. Do not restore mailparse::parse_mail on untrusted input. Reply/draft paths need bounded headers only. Limits and strict delimiter matching are documented in README; regressions use synthetic data only.
-- async-imap 0.12 is vendored with a completion-status patch; see vendor/async-imap/PATCHES.md. Only matching tagged OK completes streams; NO/BAD, missing completion and wrong tags fail. Run scripts/audit-dependencies.sh so RustSec also checks the vendored upstream version (plain cargo audit skips path packages).
-- Vendored build dependencies must be explicitly allowed by .dockerignore and copied into the Docker builder stage. CI builds the production Dockerfile; keep its allowlist narrow so secrets and deployment data never enter the build context.
+[CONTRIBUTING.md](CONTRIBUTING.md) is the engineering entry point for design, development and maintenance. This file is an execution summary; it does not replace or relax that policy. Read the relevant [architecture constraints](docs/architecture.md) before changing behavior and the [maintenance policy](docs/maintenance.md) before changing dependencies, delivery or operations.
+
+## Working rules
+
+- Rust: Cargo with the pinned toolchain and Cargo.lock; temporary Python scripts: uv; Node tooling: pnpm. Python and Node are not runtime dependencies.
+- Keep secrets and deployment identities out of Git and logs. Use synthetic data for regressions. Never send or modify real email for tests without explicit user authorization.
+- Test OAuth with isolated clients and users. Source publishing does not authorize production deployment, cutover or rollback; follow the separate deployment procedure.
+- Preserve the module boundaries and public contracts in [architecture](docs/architecture.md#module-boundaries). Record material design changes there and follow the compatibility rules in CONTRIBUTING.md.
+
+## Constraints to preserve
+
+- Read with EXAMINE/PEEK and retain UIDVALIDITY checks. Keep target-UID FETCH handling, IMAP4rev1 text encoding, APPEND flag syntax and tagged completion checks as specified in [MCP and mail](docs/architecture.md#mcp-and-mail).
+- Bound connections, response bytes and parser allocation. MIME structure, header and decoding budgets apply before allocation; do not restore `mailparse::parse_mail` on untrusted input. Preserve shared read/forward body selection and bounded tokenizer-only HTML handling, including foreign-content rejection and adjacent-attribute regressions. See [MIME and HTML](docs/architecture.md#mime-and-html).
+- Persist intent before SMTP. Preserve accepted/unknown outcomes across journal or cleanup failures; never automatically retry unknown sends. Keep the documented principal-scoped operation keys, bounded QUIT cleanup, TLS/AUTH and SMTPUTF8/8BITMIME policy. Preserve the canonical draft-header privacy boundary and body bytes. See [send lifecycle](docs/architecture.md#send-lifecycle).
+- Authenticate every HTTP request entering MCP. Preserve issuer, audience, expiry, nbf, scope and subject validation, the hard JWKS TTL and shared refresh cooldown. Keep deployment-specific OAuth and login-asset checks in [authentication](docs/architecture.md#authentication).
+- Count the complete serialized JSON-RPC tool response, including the actual id, request_id, structuredContent and escaped text copy. Keep the 1024-byte serialized-id guard ahead of rmcp; bounded fallback must retain known send status and direct clients to `get_operation` with the original key. See [stable contracts](docs/architecture.md#stable-contracts).
+- Keep the vendored dependency provenance, completion-status regressions and `scripts/audit-dependencies.sh` aligned. Plain `cargo audit` skips path packages. Keep the Docker context allowlist narrow and include only the required vendored crate in the builder. See [dependency maintenance](docs/maintenance.md) and [PATCHES.md](vendor/async-imap/PATCHES.md).
+
+## Before handing off
+
+- Follow the applicable validation and PR checklist in CONTRIBUTING.md; preserve the [invariant-to-verification mapping](docs/architecture.md#invariants-and-verification) when behavior changes.
+- Keep current contracts in README/architecture, maintenance procedures in their designated guides, and dated results in [validation](docs/validation.md) with a commit or release reference. Track remaining work through [open follow-ups](CONTRIBUTING.md#待闭环事项) and issues, not Completed/TODO entries in this file.

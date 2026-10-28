@@ -1,9 +1,27 @@
-# Security
+# 安全政策
 
-Report a vulnerability through GitHub's private vulnerability reporting when enabled, or contact the repository owner through their public GitHub profile. Include the affected commit, expected behavior and a minimal reproduction using synthetic data.
+本政策与 [开发总纲](CONTRIBUTING.md)、[维护与发布规范](docs/maintenance.md) 一起适用。
 
-Never attach credentials, tokens, mail contents, private keys or production databases. Keep exploit details private until a fix is available.
+## 支持范围
 
-The service validates OIDC access tokens on every request and binds mailbox access to configured subjects, audiences and scopes. Keep access-token lifetimes short. Rotate mailbox credentials and OIDC signing keys through their owning services.
+| 版本 | 处理方式 |
+| --- | --- |
+| `main` 开发分支 | 用于修复开发和回归验证，不作为正式发布稳定性承诺 |
+| 最新正式发布版本 | 提供安全修复发布；按影响说明必要的升级与迁移 |
+| 更早的发布版本 | 建议升级至包含修复的版本，不承诺独立维护分支或回补 |
 
-Run behind HTTPS, bind container ports to loopback, restrict file permissions and keep data backups encrypted. Deploy one process per operation database. Retain operation keys for as long as duplicate-send protection is required.
+维护者按影响范围和可维护性尽力处理报告，不承诺固定响应或修复时限。安全修复仍须说明对已支持行为、配置和数据的兼容影响。
+
+## 私密报告
+
+如仓库已启用 GitHub 私密漏洞报告，优先使用仓库 **Security → Report a vulnerability** 入口。本文件不代表该功能已经启用。
+
+若入口不可用，可创建一个仅请求私密安全联系渠道的 issue；不要在其中描述漏洞细节、攻击步骤或附复现代码。待维护者提供私密渠道后再提交完整报告。不要通过公开 issue 或 PR 披露未修复的漏洞细节。
+
+私密报告应包含受影响的 tag/commit、预期行为与实际结果，以及使用合成数据的最小复现。不得附带凭据、令牌、邮件内容、私钥或生产数据库。报告与验证优先使用隔离环境；真实邮件发送或修改测试仍须事先取得明确授权。
+
+## 部署与数据
+
+服务在每个请求上校验 OIDC 访问令牌，并按配置的 subject、audience 和 scope 限定邮箱访问。保持访问令牌较短有效期，通过所属服务轮换邮箱凭据和 OIDC 签名密钥。
+
+使用 HTTPS 反向代理，将容器端口绑定 loopback，限制文件权限并加密备份。一个操作数据库只允许一个服务进程拥有。只要仍需要重复发送保护，就必须保留操作键与结果；恢复旧备份不能证明备份之后的邮件未发送。升级、回滚与恢复要求见 [部署指南](docs/deployment.md#验收与回滚)。
