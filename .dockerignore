@@ -3,3 +3,6 @@
 !Cargo.lock
 !src/
 !src/**
+!vendor/
+!vendor/async-imap/
+!vendor/async-imap/**

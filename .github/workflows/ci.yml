@@ -24,3 +24,8 @@ jobs:
           toolchain: 1.99.1
       - run: cargo install cargo-audit --version 0.22.2 --locked
       - run: bash scripts/audit-dependencies.sh
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - run: docker build --tag rust-email-mcp:ci .
