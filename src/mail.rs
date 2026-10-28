@@ -3,12 +3,10 @@ use crate::{
     error::{MailError, Result},
     journal::{Journal, Operation},
     mime,
+    smtp::SmtpSender,
 };
 use futures::TryStreamExt;
-use lettre::{
-    AsyncSmtpTransport, AsyncTransport, Tokio1Executor, address::Envelope, message::Mailbox,
-    transport::smtp::authentication::Credentials,
-};
+use lettre::{address::Envelope, message::Mailbox};
 use mailparse::MailHeaderMap;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -132,23 +130,11 @@ pub struct MailService {
     pub config: Arc<Config>,
     pub journal: Arc<Journal>,
     slots: Semaphore,
-    smtp: AsyncSmtpTransport<Tokio1Executor>,
+    smtp: SmtpSender,
 }
 impl MailService {
     pub fn new(config: Arc<Config>, journal: Arc<Journal>) -> anyhow::Result<Self> {
-        let builder = if config.smtp_starttls {
-            AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&config.smtp_host)?
-        } else {
-            AsyncSmtpTransport::<Tokio1Executor>::relay(&config.smtp_host)?
-        };
-        let smtp = builder
-            .port(config.smtp_port)
-            .credentials(Credentials::new(
-                config.address.clone(),
-                config.password.clone(),
-            ))
-            .timeout(Some(config.timeout))
-            .build();
+        let smtp = SmtpSender::new(&config)?;
         Ok(Self {
             config,
             journal,
@@ -574,21 +560,16 @@ impl MailService {
         {
             return Ok(json!({"operation":old}));
         }
-        let result =
-            tokio::time::timeout(self.config.timeout, self.smtp.send_raw(&envelope, &raw)).await;
-        let status = match result {
-            Ok(Ok(_)) => "accepted",
-            Ok(Err(ref e)) if e.is_permanent() || e.is_transient() => "rejected",
-            _ => "unknown",
-        };
+        let submission = self.smtp.submit(&envelope, &raw).await;
         let operation = record_send(
             &self.journal,
             principal,
             key,
-            status,
+            submission.status,
             message_id,
             name == "send_draft",
         );
+        submission.cleanup().await;
         Ok(json!({"operation":operation,"retry_allowed":false}))
     }
 }
@@ -1216,7 +1197,7 @@ mod tests {
         );
         assert_eq!(attachment(b"\r\nhello", 0, 5).unwrap()["size"], 5);
     }
-    async fn smtp_fixture(disconnect_after_data: bool, fail_journal: bool) {
+    async fn smtp_fixture(disconnect_after_data: bool, fail_journal: bool, slow_quit: bool) {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let dir = tempfile::tempdir().unwrap();
         let journal = Arc::new(Journal::open(&dir.path().join("db")).unwrap());
@@ -1269,6 +1250,22 @@ mod tests {
                         .unwrap();
                     data = true;
                 } else if line.starts_with("QUIT") {
+                    if !fail_journal {
+                        assert_eq!(
+                            backend_journal
+                                .get("owner", "test-send")
+                                .unwrap()
+                                .unwrap()
+                                .status,
+                            "accepted"
+                        );
+                    }
+                    if slow_quit {
+                        // Longer than the transaction deadline: acceptance was
+                        // already journaled and must survive bounded cleanup.
+                        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+                        break;
+                    }
                     socket.get_mut().write_all(b"221 bye\r\n").await.unwrap();
                     break;
                 } else {
@@ -1279,9 +1276,7 @@ mod tests {
             assert!(!payload.contains("hidden@example.com"));
         });
         let mut service = MailService::new(crate::config::fixture(), journal.clone()).unwrap();
-        service.smtp = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous("127.0.0.1")
-            .port(port)
-            .build();
+        service.smtp = SmtpSender::fixture(port, std::time::Duration::from_millis(300));
         let args = json!({"to":["receiver@example.com"],"bcc":["hidden@example.com"],"subject":"synthetic","body":"test","operation_key":"test-send"});
         let result = service.send("send_email", &args, "owner").await.unwrap();
         assert_eq!(
@@ -1311,15 +1306,23 @@ mod tests {
     }
     #[tokio::test]
     async fn smtp_acceptance_then_storage_failure() {
-        smtp_fixture(false, true).await;
+        smtp_fixture(false, true, false).await;
     }
     #[tokio::test]
     async fn smtp_lost_reply_does_not_resend() {
-        smtp_fixture(true, false).await;
+        smtp_fixture(true, false, false).await;
     }
     #[tokio::test]
     async fn smtp_accepted_send_is_deduplicated() {
-        smtp_fixture(false, false).await;
+        smtp_fixture(false, false, false).await;
+    }
+    #[tokio::test]
+    async fn smtp_accepted_is_persisted_before_unresponsive_quit() {
+        smtp_fixture(false, false, true).await;
+    }
+    #[tokio::test]
+    async fn smtp_accepted_survives_quit_timeout_and_journal_failure() {
+        smtp_fixture(false, true, true).await;
     }
     #[test]
     fn smtp_success_survives_journal_failure() {

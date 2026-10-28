@@ -5,3 +5,4 @@ pub mod journal;
 pub mod mail;
 mod mime;
 pub mod server;
+mod smtp;
