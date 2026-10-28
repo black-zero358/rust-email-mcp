@@ -653,13 +653,7 @@ impl MailService {
         } else {
             compose(a, &self.config.address, Some(&message_id))?
         };
-        if raw.len() > self.config.max_message {
-            return Err(MailError::limit());
-        }
-        if let Some(old) = self
-            .journal
-            .claim(principal, key, &fingerprint, &message_id)?
-        {
+        if let Some(old) = self.claim_send(principal, key, &fingerprint, &message_id, &raw)? {
             return Ok(json!({"operation":old}));
         }
         let submission = self.smtp.submit(&envelope, &raw).await;
@@ -673,6 +667,21 @@ impl MailService {
         );
         submission.cleanup().await;
         Ok(json!({"operation":operation,"retry_allowed":false}))
+    }
+
+    fn claim_send(
+        &self,
+        principal: &str,
+        key: &str,
+        fingerprint: &str,
+        message_id: &str,
+        raw: &[u8],
+    ) -> Result<Option<Operation>> {
+        if raw.len() > self.config.max_message {
+            return Err(MailError::limit());
+        }
+        crate::smtp::validate_data(raw)?;
+        self.journal.claim(principal, key, fingerprint, message_id)
     }
 }
 
@@ -1168,6 +1177,7 @@ pub fn prepare_draft(raw: &[u8], from: &str, id: &str) -> Result<(Vec<u8>, Envel
     }
     clean.extend_from_slice(format!("From: {from}\r\nMessage-ID: {id}\r\n\r\n").as_bytes());
     clean.extend_from_slice(&raw[body_start..]);
+    crate::smtp::validate_data(&clean)?;
     Ok((clean, envelope))
 }
 fn forward_body(raw: &[u8], note: &str) -> Result<String> {
@@ -1226,6 +1236,57 @@ fn attachment(raw: &[u8], index: usize, max: usize) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unsupported_data_is_rejected_before_journal_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = MailService::new(
+            crate::config::fixture(),
+            Arc::new(Journal::open(&dir.path().join("db")).unwrap()),
+        )
+        .unwrap();
+        for body in [
+            b"ordinary\nsecond line".to_vec(),
+            b"ordinary\rsecond line".to_vec(),
+            b"ordinary\0binary".to_vec(),
+            vec![b'a'; 999],
+        ] {
+            let error = service
+                .claim_send("owner", "key", "hash", "id", &body)
+                .unwrap_err();
+            assert_eq!(error.code, "UNSUPPORTED_DATA_FORMAT");
+            assert!(service.journal.get("owner", "key").unwrap().is_none());
+        }
+        assert!(
+            service
+                .claim_send("owner", "key", "hash", "id", b"ordinary\r\nsecond line")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            service.journal.get("owner", "key").unwrap().unwrap().status,
+            "sending"
+        );
+    }
+
+    #[test]
+    fn supported_draft_data_preserves_body_and_encoded_attachment() {
+        for body in [
+            b"ordinary\r\n.second line".as_slice(),
+            b"--x\r\nContent-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\nAP8NCg==\r\n--x--".as_slice(),
+        ] {
+            let ctype = if body.starts_with(b"--x") { "multipart/mixed; boundary=x" } else { "text/plain" };
+            let mut raw = format!("To: recipient@example.test\nSubject: synthetic\nContent-Type: {ctype}\n\n").into_bytes();
+            raw.extend_from_slice(body);
+            let (clean, _) = prepare_draft(&raw, "sender@example.test", "<synthetic@example.test>").unwrap();
+            assert!(clean.ends_with(body));
+            assert!(crate::smtp::validate_data(&clean).is_ok());
+            if body.starts_with(b"--x") {
+                let parsed = mime::parse(&clean).unwrap();
+                assert_eq!(parsed.subparts[0].body_raw(1024).unwrap(), b"\0\xff\r\n");
+            }
+        }
+    }
+
     #[test]
     fn long_parsed_email_returns_a_wire_bounded_readable_prefix() {
         let body = "a".repeat(150000);
@@ -1599,6 +1660,22 @@ mod tests {
     }
     use super::*;
     #[test]
+    fn draft_data_format_rejects_noncanonical_body_without_rewriting() {
+        for body in [
+            b"ordinary\nsecond line".to_vec(),
+            b"ordinary\rsecond line".to_vec(),
+            b"ordinary\0binary".to_vec(),
+            vec![b'a'; 999],
+        ] {
+            let mut raw = b"To: recipient@example.test\r\nSubject: synthetic\r\n\r\n".to_vec();
+            raw.extend_from_slice(&body);
+            let error =
+                prepare_draft(&raw, "sender@example.test", "<synthetic@example.test>").unwrap_err();
+            assert_eq!(error.code, "UNSUPPORTED_DATA_FORMAT");
+            assert!(!error.retryable);
+        }
+    }
+    #[test]
     fn draft_header_names_are_canonical_before_interpretation() {
         let (canonical, body_start) =
             canonical_draft_headers(b"X-Example \t: value\n\tfolded\n\nbody").unwrap();
@@ -1618,8 +1695,8 @@ mod tests {
 
     #[test]
     fn draft_envelope_and_privacy_filter_share_canonical_fields() {
-        let mut raw = b"From: old@example.com\nSender: old@example.com\nMessage-ID: <old@example.com>\nReturn-Path: <old@example.com>\nTo: visible@example.com\nCc: copy@example.com\nBcc: hidden@example.com,\n second@example.com\nbCc: third@example.com\nSubject: preserved\nContent-Type: application/octet-stream\n\n".to_vec();
-        let body = b"binary\0\xff\n\r\n\r\n--unchanged";
+        let mut raw = b"From: old@example.com\nSender: old@example.com\nMessage-ID: <old@example.com>\nReturn-Path: <old@example.com>\nTo: visible@example.com\nCc: copy@example.com\nBcc: hidden@example.com,\n second@example.com\nbCc: third@example.com\nSubject: preserved\nContent-Type: application/octet-stream\nContent-Transfer-Encoding: quoted-printable\n\n".to_vec();
+        let body = b"binary=00=FF\r\n\r\n--unchanged";
         raw.extend_from_slice(body);
         let (clean, envelope) = prepare_draft(&raw, "me@example.com", "<new@example.com>").unwrap();
         assert_eq!(envelope.to().len(), 5);

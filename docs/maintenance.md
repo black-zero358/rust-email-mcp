@@ -52,3 +52,11 @@
 维护者负责在 `main` 启用保护规则，将 `check`、`audit`、`container` 设为必需检查，并核对允许绕过的范围。持续审计应有每周定时触发；自动化启用前按上述周期手动运行并留存结果。未来的 musl 发布自动化必须覆盖同样的目标构建和产物验收。
 
 这些要求的实际配置状态及后续项统一记录在 [待闭环事项](../CONTRIBUTING.md#待闭环事项)，不在多份文档重复维护状态。只有取得配置、运行或发布证据后，才能标记为已落实。
+
+## 0.2.0 DATA 格式兼容性
+
+0.2.0 按本规范提升次版本，因为此前显式接受的 LF/原始二进制正文现在可能以 `UNSUPPORTED_DATA_FORMAT` 拒绝。这是有意的契约收紧，不能仅以安全修复省略版本说明。Cargo.toml 与 Cargo.lock 同步，仅源码版本改变，不代表创建 Release、发布产物或部署生产。
+
+升级前由客户端将不规范草稿按 MIME 语义修复：规范 CRLF 行，二进制使用 Base64 或 quoted-printable，避免超过 998 原始字节的行。服务不盲目修改正文。支持范围内的 CRLF MIME/编码附件保持原字节，末行无 CRLF 可继续发送。新拒绝发生于 claim 前，不预留操作键；无数据库迁移，已有 accepted/unknown 记录保留。回滚旧程序会重新接受这些非规范格式，不应把该行为当作可靠发送支持；未知发送结果仍先核验，禁止自动重试。
+
+依据：[RFC 5321 §2.3.8](https://www.rfc-editor.org/rfc/rfc5321#section-2.3.8)、[§4.5.2](https://www.rfc-editor.org/rfc/rfc5321#section-4.5.2)、[§4.5.3.1.6](https://www.rfc-editor.org/rfc/rfc5321#section-4.5.3.1.6) 和 [RFC 6152](https://www.rfc-editor.org/rfc/rfc6152)。
