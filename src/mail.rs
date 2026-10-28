@@ -1226,6 +1226,54 @@ fn attachment(raw: &[u8], index: usize, max: usize) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn long_parsed_email_returns_a_wire_bounded_readable_prefix() {
+        let body = "a".repeat(150000);
+        let raw = format!(
+            "From: sender@example.invalid\r\nSubject: synthetic\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{body}"
+        );
+        let parsed = super::insights::parsed_with_options(
+            raw.as_bytes(),
+            7,
+            Some(42),
+            128 * 1024,
+            &serde_json::json!({}),
+        )
+        .unwrap();
+        assert_eq!(parsed["body"].as_str().unwrap().len(), 128 * 1024);
+        assert_eq!(parsed["body_truncated"], true);
+        let id = rmcp::model::RequestId::String("x".repeat(1022).into());
+        let unbounded = rmcp::model::JsonRpcResponse {
+            jsonrpc: rmcp::model::JsonRpcVersion2_0,
+            id: id.clone(),
+            result: rmcp::model::ServerResult::CallToolResult(
+                rmcp::model::CallToolResult::structured(serde_json::json!({
+                    "data":parsed,"request_id":"00000000-0000-0000-0000-000000000000"
+                })),
+            ),
+        };
+        assert!(serde_json::to_vec(&unbounded).unwrap().len() > 256 * 1024);
+        let result = crate::server::bounded_email_result(
+            Ok(parsed),
+            "00000000-0000-0000-0000-000000000000",
+            &id,
+            256 * 1024,
+        )
+        .unwrap();
+        assert_ne!(result.is_error, Some(true));
+        let data = &result.structured_content.as_ref().unwrap()["data"];
+        let prefix = data["body"].as_str().unwrap();
+        assert!(!prefix.is_empty() && prefix.len() < 128 * 1024);
+        assert!(body.starts_with(prefix));
+        assert_eq!(data["body_truncated"], true);
+        let wire = rmcp::model::JsonRpcResponse {
+            jsonrpc: rmcp::model::JsonRpcVersion2_0,
+            id,
+            result: rmcp::model::ServerResult::CallToolResult(result),
+        };
+        assert!(serde_json::to_vec(&wire).unwrap().len() <= 256 * 1024);
+    }
+
     #[tokio::test]
     async fn advanced_search_intersects_filters_and_sync_literal_fields() {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};

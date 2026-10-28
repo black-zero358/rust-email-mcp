@@ -14,6 +14,16 @@
 - 兼容性：工具参数、结果、稳定错误码、配置及数据库不变，无迁移。实际 parser 缓冲块上限收敛到已有传输预算；移除不具协议语法状态的 literal 猜测和其 64 KiB 行扫描限制，允许预算内合法响应文本。预算为每个缓冲块上限，增长时新旧块及已交付响应可能同时存活，不构成进程 RSS 上限。
 - 未覆盖：真实 IMAP、生产部署、持续负载和 musl 发布产物；本记录不代表这些验收已完成。
 
+## 2026-10-29 get_email 完整响应正文预算（Asia/Shanghai）
+
+- 代码提交：`a97b0f585bef946080743cc7dd8764af2419f8f9`（含 `f8257cda138b9a211ce6e4ecdcb3c610a0ed0fe6`）；基线 main `36177076aae667cd72ba3ca81556b94575ab0fc6`，修复 [#27](https://github.com/black-zero358/rust-email-mcp/issues/27)。
+- 环境：Windows 独立工作树、WSL Ubuntu、固定 Rust/Cargo 1.99.1，独立 `CARGO_TARGET_DIR=/home/oeic_fe/issue-output-target`；仅合成数据与本地模拟后端。
+- `cargo fmt --check`、`cargo test --locked`（81 项单元测试、1 项 IMAP 集成测试）、`cargo clippy --locked --all-targets -- -D warnings`、`cargo build --locked --release`、`git diff --check` 全部通过。专用 `bash scripts/audit-dependencies.sh` 通过，覆盖 307 项依赖；依赖及 vendored 补丁未变。vendored async-imap 的既有 deprecated macro 警告仍存在。
+- 回归先验证 150000 字符合成 MIME 经真实 `parsed_with_options` 产生的 128 KiB 正文完整封装超限，再验证新路径返回前缀与真实 `body_truncated`。另覆盖 ASCII、转义密集正文、多字节字符、最大合法 1024 序列化字节 id、text/structuredContent 相同及下一字符超限；短正文与已有截断标记保持，元数据独立超限仍拒绝。边界回归要求把 false 改为 true 所节省的字节不能造成“未省略字符却标记截断”。
+- 依据：[MCP structured content](https://modelcontextprotocol.io/specification/2025-11-25/server/tools#structured-content) 建议同时保留序列化文本副本；[Rust floor_char_boundary](https://doc.rust-lang.org/std/primitive.str.html#method.floor_char_boundary) 保证字符边界，不保证 grapheme cluster 不拆分。
+- 兼容性：仅修正 get_email 已承诺的前缀返回；工具参数、字段类型、配置、依赖和操作库不变，无迁移。`body_byte_limit` 保持配置上限含义；实际返回可进一步缩短。非正文元数据不裁剪，其余工具及发送状态恢复路径不变。
+- 未进行真实邮箱读取/写入、生产部署、持续负载或 musl 发布验收；生产 Docker 构建由最终 PR `container` 检查补足。合并前需核对最终提交的 `check`、`audit`、`container`，本地记录不代替最终 CI。
+
 ## 2026-10-29 完整 alternative 正文选择（Asia/Shanghai，issue #25）
 
 - 代码提交：`287074887dbcc8e970855cf900571432ac22fd6e`；基于 main `36177076aae667cd72ba3ca81556b94575ab0fc6`，独立分支 `codex/fix-25-complete-alternative`。
