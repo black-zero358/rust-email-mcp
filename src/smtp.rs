@@ -256,7 +256,11 @@ mod tests {
             "ordinary\r\n.second line",
             "--x\r\nContent-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\nAP8NCg==\r\n--x--",
         ] {
-            let ctype = if body.starts_with("--x") { "multipart/mixed; boundary=x" } else { "text/plain" };
+            let ctype = if body.starts_with("--x") {
+                "multipart/mixed; boundary=x"
+            } else {
+                "text/plain"
+            };
             let raw = format!("From: sender@example.test\r\nTo: recipient@example.test\r\nSubject: synthetic\r\nContent-Type: {ctype}\r\n\r\n{body}").into_bytes();
             let expected = raw.clone();
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

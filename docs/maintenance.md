@@ -60,3 +60,4 @@
 升级前由客户端将不规范草稿按 MIME 语义修复：规范 CRLF 行，二进制使用 Base64 或 quoted-printable，避免超过 998 原始字节的行。服务不盲目修改正文。支持范围内的 CRLF MIME/编码附件保持原字节，末行无 CRLF 可继续发送。新拒绝发生于 claim 前，不预留操作键；无数据库迁移，已有 accepted/unknown 记录保留。回滚旧程序会重新接受这些非规范格式，不应把该行为当作可靠发送支持；未知发送结果仍先核验，禁止自动重试。
 
 依据：[RFC 5321 §2.3.8](https://www.rfc-editor.org/rfc/rfc5321#section-2.3.8)、[§4.5.2](https://www.rfc-editor.org/rfc/rfc5321#section-4.5.2)、[§4.5.3.1.6](https://www.rfc-editor.org/rfc/rfc5321#section-4.5.3.1.6) 和 [RFC 6152](https://www.rfc-editor.org/rfc/rfc6152)。
+本轮 0.2.0 发送规范还配套 [issue #32](https://github.com/black-zero358/rust-email-mcp/issues/32) 的 SMTPUTF8 原始头检测和有界检查：非 ASCII 顶层/子 MIME 及 message 嵌套头需要正确的能力要求，超出相应结构/头部预算可在连接前确定拒绝。其失败语义与 DATA 的 claim 前输入拒绝分别核验；相关实现和验证以 #32 修复 PR 为准，最终发布需同时包含并验收这些收紧。不能只因字段/Schema 未变而声明完全兼容。
