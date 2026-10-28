@@ -291,16 +291,7 @@ impl MailService {
                 }
                 Ok(json!({"items":items,"requested":ids.len(),"completed":items.len()}))
             }
-            "save_draft" => {
-                let (raw, _) = compose(a, &self.config.address, None)?;
-                if raw.len() > self.config.max_message {
-                    return Err(MailError::limit());
-                }
-                s.append(&self.config.drafts, Some("\\Draft"), None, &raw)
-                    .await
-                    .map_err(|_| MailError::backend())?;
-                Ok(json!({"status":"saved","mailbox":self.config.drafts}))
-            }
+            "save_draft" => save_draft(s, &self.config, a).await,
             "create_mailbox" => {
                 s.create(text(a, "name")?)
                     .await
@@ -687,6 +678,21 @@ fn addresses(a: &Value, key: &str) -> Result<Vec<Mailbox>> {
         }
     }
 }
+async fn save_draft<S>(s: &mut async_imap::Session<S>, config: &Config, a: &Value) -> Result<Value>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
+{
+    let (raw, _) = compose(a, &config.address, None)?;
+    if raw.len() > config.max_message {
+        return Err(MailError::limit());
+    }
+    // async-imap serializes flags verbatim; RFC 3501 APPEND requires a flag list.
+    s.append(&config.drafts, Some("(\\Draft)"), None, &raw)
+        .await
+        .map_err(|_| MailError::backend())?;
+    Ok(json!({"status":"saved","mailbox":config.drafts}))
+}
+
 pub fn compose(a: &Value, from: &str, id: Option<&str>) -> Result<(Vec<u8>, Envelope)> {
     if a.get("attachments").is_some() {
         return Err(MailError::input());
@@ -848,6 +854,81 @@ fn attachment(raw: &[u8], index: usize, max: usize) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn save_draft_append_protocol() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        // Exercise the same operation as the tool, using only synthetic mailbox data.
+        for (status, continuation) in [
+            ("OK", true),
+            ("NO", true),
+            ("BAD", true),
+            ("NO", false),
+            ("BAD", false),
+        ] {
+            let (client, server) = tokio::io::duplex(8192);
+            let server = tokio::spawn(async move {
+                let mut server = BufReader::new(server);
+                let mut line = String::new();
+                server.read_line(&mut line).await.unwrap();
+                assert!(line.ends_with(" LOGIN \"synthetic\" \"test-only\"\r\n"));
+                let tag = line.split_whitespace().next().unwrap().to_owned();
+                server
+                    .write_all(format!("{tag} OK logged in\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                line.clear();
+                server.read_line(&mut line).await.unwrap();
+                let (tag, command) = line.split_once(' ').unwrap();
+                let prefix = "APPEND \"Drafts\" (\\Draft) {";
+                assert!(command.starts_with(prefix), "invalid APPEND: {command:?}");
+                let size: usize = command
+                    .strip_prefix(prefix)
+                    .unwrap()
+                    .strip_suffix("}\r\n")
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                let tag = tag.to_owned();
+                if continuation {
+                    server.write_all(b"+ ready for literal\r\n").await.unwrap();
+                    let mut literal = vec![0; size];
+                    server.read_exact(&mut literal).await.unwrap();
+                    let parsed = mailparse::parse_mail(&literal).unwrap();
+                    assert_eq!(
+                        parsed.headers.get_first_value("Subject").as_deref(),
+                        Some("synthetic draft")
+                    );
+                    assert_eq!(
+                        parsed.headers.get_first_value("Bcc").as_deref(),
+                        Some("hidden@example.com")
+                    );
+                    assert_eq!(parsed.get_body().unwrap().trim(), "synthetic body");
+                    let mut end = [0; 2];
+                    server.read_exact(&mut end).await.unwrap();
+                    assert_eq!(&end, b"\r\n");
+                }
+                server
+                    .write_all(format!("{tag} {status} append result\r\n").as_bytes())
+                    .await
+                    .unwrap();
+            });
+            let client = async_imap::Client::new(client);
+            let mut session = client.login("synthetic", "test-only").await.unwrap();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(2), save_draft(
+                &mut session, &crate::config::fixture(),
+                &json!({"to":["recipient@example.com"],"bcc":["hidden@example.com"],"subject":"synthetic draft","body":"synthetic body"}),
+            )).await.unwrap();
+            server.await.unwrap();
+            if status == "OK" {
+                assert_eq!(
+                    result.unwrap(),
+                    json!({"status":"saved","mailbox":"Drafts"})
+                );
+            } else {
+                assert_eq!(result.unwrap_err().code, "MAIL_BACKEND");
+            }
+        }
+    }
     use super::*;
     async fn smtp_fixture(disconnect_after_data: bool, fail_journal: bool) {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
