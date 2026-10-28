@@ -37,6 +37,28 @@ unexpected source/checksum or changed pinned version. Upgrade the provenance,
 script and tests together when changing this dependency; verify audit coverage
 against RustSec again. There is no fallback that suppresses an audit failure.
 
+## SELECT/EXAMINE and STATUS completion (issue #28)
+
+`src/parse.rs` also routes `parse_mailbox` and `parse_status` through one
+`checked_responses` instance per command. SELECT, SELECT (CONDSTORE), EXAMINE
+and STATUS now require matching tagged OK; empty or partial response EOF,
+wrong tags and matching NO/BAD all fail before returning a Mailbox. Mailbox
+field extraction, unsolicited handling and typed NO/BAD errors are preserved.
+The shared helper is unchanged; this closes two omitted callers rather than
+introducing a second completion state machine. Upstream version, checksum,
+licenses and locked dependencies remain unchanged.
+
+`mailbox_commands_require_matching_tagged_completion` tests all four command
+entry points with both empty and partial data followed by OK/NO/BAD/EOF/wrong
+tag. `empty_mailbox_pages_require_completed_examine` exercises application
+list/search empty-page behavior, structured backend errors and absence of any
+follow-up command. No real service is contacted.
+
+This requirement follows [RFC 3501 section 2.2.2](https://www.rfc-editor.org/rfc/rfc3501#section-2.2.2)
+and [EXAMINE](https://www.rfc-editor.org/rfc/rfc3501#section-6.3.2).
+The advisory audit must still be paired with local completion-code review and
+these regressions; changing the official upstream release requires both.
+
 ## APPEND continuation notifications (issue #30)
 
 `src/client.rs::Session::append` loops while waiting for synchronous literal

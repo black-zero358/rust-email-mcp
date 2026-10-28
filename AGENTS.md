@@ -11,7 +11,8 @@
 
 ## Constraints to preserve
 
-- Read with EXAMINE/PEEK and retain UIDVALIDITY checks. Keep target-UID FETCH handling, IMAP4rev1 text encoding, APPEND flag syntax and tagged completion checks as specified in [MCP and mail](docs/architecture.md#mcp-and-mail).
+- Read with EXAMINE/PEEK and retain UIDVALIDITY checks. Keep target-UID FETCH handling, IMAP4rev1 text encoding, APPEND flag syntax and tagged completion checks for SELECT/EXAMINE (including empty mailboxes) and STATUS as specified in [MCP and mail](docs/architecture.md#mcp-and-mail).
+
 - APPEND waits through legitimate untagged notifications for literal continuation; tagged results, BYE and EOF before continuation must fail without sending literal bytes.
 
 

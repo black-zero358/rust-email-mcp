@@ -4,6 +4,9 @@ cd "$(dirname "$0")/.."
 
 # RustSec skips path packages. Audit this local fork using its upstream release
 # identity too; never alter Cargo's actual lockfile or dependency sources.
+# Review local completion patches separately, including SELECT/EXAMINE/STATUS;
+# advisory matching cannot verify protocol completion behavior.
+
 # APPEND continuation-state patches also require local code/protocol review;
 # advisory matching cannot validate notification and literal ordering.
 
