@@ -186,3 +186,9 @@ Rauthy 使用嵌入式 Hiqlite/SQLite，省去独立数据库容器。建议配�
 async-imap 0.12.0 的流式命令终结状态补丁位于 vendor/async-imap，来源、许可证和维护说明见 [PATCHES.md](vendor/async-imap/PATCHES.md)。仅匹配命令 tag 的 OK 表示成功，NO/BAD 或缺失终结响应返回错误。
 
 本地和 CI 统一运行 bash scripts/audit-dependencies.sh。普通 cargo audit 会跳过 path 依赖；脚本在临时锁文件中恢复上游版本的注册表身份，使审计覆盖本地补丁对应的上游版本及全部锁定依赖。实际 Cargo.lock 不变，补丁代码仍需独立审核。升级依赖时必须同步核对脚本和回归测试。
+
+## 0.2.0 的 SMTP DATA 格式约束
+
+源码 0.2.0 收紧此前被接受的非规范发送输入；源码版本不代表已发布产物或生产已部署。发送前、记录操作意图前校验 DATA：行分隔必须为 CRLF、每行最多 998 原始字节（不计透明传输新增的点），不接受 NUL。不符合时返回 `UNSUPPORTED_DATA_FORMAT`，`retryable=false`，不创建操作记录或建立 SMTP 连接。末行可不含 CRLF，由现有 SMTP codec 补终结。
+
+规范 CRLF 草稿、7bit/8bit 内容及 Base64/quoted-printable 附件保持原字节；8bit 与 SMTPUTF8 仍须现有能力协商。不会盲目转换 MIME 正文。旧草稿若包含裸 LF/CR、NUL 或超长行，应由邮件客户端按 MIME 语义修复或编码后再发送。头部原有 LF 规范化仍支持，正文不自动重写。无数据库迁移；已有 accepted/unknown 去重记录继续保留，未知发送不能自动重试。

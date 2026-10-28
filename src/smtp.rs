@@ -13,6 +13,37 @@ use lettre::{
 };
 use std::time::Duration;
 
+/// Validate DATA representability without rewriting MIME bytes. The codec adds
+/// the final CRLF, so a nonempty last line need not already end in CRLF.
+pub(crate) fn validate_data(raw: &[u8]) -> crate::error::Result<()> {
+    let invalid = || crate::error::MailError {
+        code: "UNSUPPORTED_DATA_FORMAT",
+        message: "SMTP DATA requires CRLF lines of at most 998 bytes without NUL; encode binary attachments before sending.",
+        retryable: false,
+    };
+    let mut bytes = raw.iter();
+    let mut line_bytes = 0;
+    while let Some(&byte) = bytes.next() {
+        match byte {
+            0 | b'\n' => return Err(invalid()),
+            b'\r' => {
+                if bytes.next() != Some(&b'\n') {
+                    return Err(invalid());
+                }
+                line_bytes = 0;
+            }
+            _ => {
+                line_bytes += 1;
+                // Count source bytes, before transparency adds a leading dot.
+                if line_bytes > 998 {
+                    return Err(invalid());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("SMTPUTF8 unavailable before MAIL")]
 struct SmtpUtf8Unavailable;
@@ -88,6 +119,15 @@ impl SmtpSender {
         Ok(connection)
     }
     pub async fn submit(&self, envelope: &Envelope, raw: &[u8]) -> Submission {
+        // Defense in depth for direct callers. The service validates before
+        // claiming a send; this path must not connect or report uncertainty.
+        if validate_data(raw).is_err() {
+            return Submission {
+                status: "rejected",
+                connection: None,
+            };
+        }
+
         let utf8_headers = match crate::mime::requires_smtputf8(raw) {
             Ok(required) => required,
             Err(_) => {
@@ -197,6 +237,108 @@ async fn transaction(
 mod tests {
     use super::*;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    #[test]
+    fn data_line_validation_uses_source_octets_and_allows_final_line() {
+        let mut dotted = vec![b'.'];
+        dotted.extend(std::iter::repeat_n(b'a', 997));
+        assert!(validate_data(&dotted).is_ok());
+        dotted.push(b'a');
+        assert!(validate_data(&dotted).is_err());
+        assert!(validate_data(&[0xff, 0xfe, b'\r', b'\n', b'a']).is_ok());
+        assert!(validate_data(b"ordinary\r\nsecond line").is_ok());
+        assert!(validate_data(b"ordinary\r").is_err());
+        assert!(validate_data(b"ordinary\n").is_err());
+    }
+
+    #[tokio::test]
+    async fn unsupported_data_never_opens_smtp_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sender = SmtpSender::fixture(
+            listener.local_addr().unwrap().port(),
+            Duration::from_secs(1),
+        );
+        let envelope = Envelope::new(
+            Some("sender@example.test".parse().unwrap()),
+            vec!["recipient@example.test".parse().unwrap()],
+        )
+        .unwrap();
+        let submission = sender.submit(&envelope, b"ordinary\nsecond line").await;
+        assert_eq!(submission.status, "rejected");
+        submission.cleanup().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_data_preserves_content_and_codec_final_crlf() {
+        for body in [
+            "ordinary\r\n.second line",
+            "--x\r\nContent-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\nAP8NCg==\r\n--x--",
+        ] {
+            let ctype = if body.starts_with("--x") {
+                "multipart/mixed; boundary=x"
+            } else {
+                "text/plain"
+            };
+            let raw = format!("From: sender@example.test\r\nTo: recipient@example.test\r\nSubject: synthetic\r\nContent-Type: {ctype}\r\n\r\n{body}").into_bytes();
+            let expected = raw.clone();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let sender = SmtpSender::fixture(
+                listener.local_addr().unwrap().port(),
+                Duration::from_secs(1),
+            );
+            let backend = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                socket.write_all(b"220 synthetic ESMTP\r\n").await.unwrap();
+                for (command, reply) in [
+                    ("EHLO", "250 synthetic\r\n"),
+                    ("MAIL FROM:", "250 ok\r\n"),
+                    ("RCPT TO:", "250 ok\r\n"),
+                    ("DATA", "354 ready\r\n"),
+                ] {
+                    let mut line = String::new();
+                    socket.read_line(&mut line).await.unwrap();
+                    assert!(line.starts_with(command));
+                    socket.write_all(reply.as_bytes()).await.unwrap();
+                }
+                let mut actual = Vec::new();
+                loop {
+                    let mut line = Vec::new();
+                    assert!(socket.read_until(b'\n', &mut line).await.unwrap() > 0);
+                    assert!(line.ends_with(b"\r\n"));
+                    if line == b".\r\n" {
+                        break;
+                    }
+                    if line.starts_with(b"..") {
+                        line.remove(0);
+                    }
+                    actual.extend_from_slice(&line);
+                }
+                let mut expected = expected;
+                expected.extend_from_slice(b"\r\n");
+                assert_eq!(actual, expected);
+                socket.write_all(b"250 accepted\r\n").await.unwrap();
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                assert_eq!(line, "QUIT\r\n");
+                socket.write_all(b"221 bye\r\n").await.unwrap();
+            });
+            let envelope = Envelope::new(
+                Some("sender@example.test".parse().unwrap()),
+                vec!["recipient@example.test".parse().unwrap()],
+            )
+            .unwrap();
+            let submission = sender.submit(&envelope, &raw).await;
+            assert_eq!(submission.status, "accepted");
+            submission.cleanup().await;
+            backend.await.unwrap();
+        }
+    }
 
     async fn scripted_send(
         steps: Vec<(&'static str, &'static str)>,
