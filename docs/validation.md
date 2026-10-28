@@ -2,6 +2,30 @@
 
 本文件保存带版本与环境边界的证据。每次新增记录注明提交/tag、日期与时区、环境、命令、结果、CI 链接及未覆盖项；保留历史结果，不把其测试数量或部署状态当作当前版本的证明。验证要求见 [贡献指南](../CONTRIBUTING.md#验证与完成标准)。
 
+## 2026-10-29 disposition 兼容分类（Asia/Shanghai，issue #26）
+
+- 代码提交：`2d279eb948fba69ffaf7ae50e99521cbb8bcdda6`；基线 main `36177076aae667cd72ba3ca81556b94575ab0fc6`，独立分支 `codex/fix-26-disposition-extensions`。
+- 整合提交：`5a3940319a05f8d114f523ea5189d1949e274f7a` 合并 main `18b26dd`，保留 #25 完整正文选择及 #26 分类规则；仅文档冲突人工整合，源码自动合并。整合后独立 target 重跑 fmt、81 单元 + 1 集成、Clippy、release 全部通过；以下 79 项记录对应原分类代码提交。
+- 环境：Windows 隔离工作树、WSL Ubuntu、固定 Rust/Cargo 1.99.1；独立 `CARGO_TARGET_DIR=/home/oeic_fe/issue-disposition-target`，复制依赖缓存后清除本项目及 vendored async-imap 构建结果，明确重编。分类测试命名执行为 1 项通过；`--lib -- --list` 确认分类测试存在且共 79 项。
+- 修复前分类回归在显式扩展类型处失败，修复后通过；公开测试只包含分类头值，覆盖缺省、空/空白、inline 大小写、未知类型、form-data 及 filename/name。依据 [RFC 2183 §2.8–2.9](https://www.rfc-editor.org/rfc/rfc2183#section-2.8) 和锁定 mailparse 0.18.0 源码，区分空 Extension 与显式不支持类型。
+- 本地临时扩展既有 `text_attachments_stay_downloadable_but_leave_body_and_forward` 与 `discovery_matches_message_indices_and_multipart_attachment_trees` 各执行 1 项通过，验证分类在读取/转发、附件发现、整体 multipart 下载与索引间一致；测试后恢复原文件。依照 issue #26 和 SECURITY 的公开范围，完整触发邮件未提交，公开仓库保留最小分类回归和既有普通附件集成回归。
+- 最终公开源码的 `cargo fmt --check`、`cargo test --locked`（79 单元 + 1 IMAP 完成状态集成测试）、`cargo clippy --locked --all-targets -- -D warnings`、`cargo build --locked --release` 与 `git diff --check` 全部通过；cargo-audit 0.22.2 的专用 `bash scripts/audit-dependencies.sh` 覆盖 307 项依赖并通过。vendored 既有 deprecated 宏警告保留。
+- 兼容性：显式但不支持的 disposition 按附件处理，正文排除，仍可发现和下载；缺省/空类型、inline、文件名规则与 multipart 子树边界保持。工具 Schema、配置、依赖、权限和操作库不变，无迁移。最终 PR 的 `check`、`audit`、`container` 须在合并前核对。
+- 未使用真实邮箱、未发布产物或部署、未验收持续负载或 musl 目标；本地 release 构建使用 Linux GNU 默认目标。
+
+## 2026-10-29 IMAP parser 分配预算（Asia/Shanghai）
+
+- 修复代码：`b52e7dfa09c745d644b88a441161cb9d52cf7aa7`，基于 `36177076aae667cd72ba3ca81556b94575ab0fc6`；对应 issue #24。
+- 环境：Windows 隔离工作树、WSL Ubuntu、固定 Rust 1.99.1；合成小响应、本地 duplex，无真实邮箱、发送或部署。
+- `cargo fmt --check`、vendored 两个修改文件的 `rustfmt --edition 2024 --check`、`cargo test --locked`（79 单元、1 集成）、`cargo clippy --locked --all-targets -- -D warnings`、`cargo build --locked --release` 均通过。
+- 独立临时 vendor 副本以根 Cargo.lock 为解析种子运行 `cargo test --no-default-features --features runtime-tokio --lib imap_stream::tests`，13 项通过；该临时锁文件另解析了上游测试专用依赖，不改变项目锁文件或运行依赖。根 CI 的锁定测试覆盖应用接线；底层单元测试的容量断言另行本地执行。
+- 容量回归直接断言超预算请求及 checked arithmetic 拒绝后容量不增长；覆盖非 4 KiB 整数倍上限、重置剩余数据、已知/未知 incomplete、逐字节分片、包含花括号的合法响应文本和 literal 正文、恰好 1 KiB 合法响应。所有输入均为小型合成数据，没有 OOM 或压力实验。
+- `bash scripts/audit-dependencies.sh`（cargo-audit 0.22.2，307 项依赖）和 `bash scripts/test-docker-context.sh` 通过。上游版本/checksum、运行依赖和 Cargo.lock 不变，审计不能替代本地 parser 补丁审阅。保留上游现有 `unsafe_pinned` 弃用警告，本次没有新增警告。
+- 原始修复候选的生产 Dockerfile 本地构建 `docker build --tag rust-email-mcp:fix-24 .` 通过（镜像 manifest `sha256:937f082ab849ff030262c9a3aa834ba3187c14fdeb82d807c3a5c37d7b7bcb20`）。随后合入 main 的 issue #25 修复；合入后的本地重测遇到 WSL/Service/WSAETIMEDOUT，不能算作通过，最终候选的 `check`、`audit`、`container` 以 PR #39 检查为合并门禁。
+- WSL 恢复后，合入 main `717a302e3ca955a084c3a0cca78d38dcb0fc141a` 的提交 `8b8967b4548e9219e9832ea4595cb0d3808695af` 重新通过 fmt、84 单元+1 集成和 Clippy；最终 release/audit/container 仍按最终提交 CI 核验。
+- 兼容性：工具参数、结果、稳定错误码、配置及数据库不变，无迁移。实际 parser 缓冲块上限收敛到已有传输预算；移除不具协议语法状态的 literal 猜测和其 64 KiB 行扫描限制，允许预算内合法响应文本。预算为每个缓冲块上限，增长时新旧块及已交付响应可能同时存活，不构成进程 RSS 上限。
+- 未覆盖：真实 IMAP、生产部署、持续负载和 musl 发布产物；本记录不代表这些验收已完成。
+
 ## 2026-10-29 get_email 完整响应正文预算（Asia/Shanghai）
 
 - 代码提交：`a97b0f585bef946080743cc7dd8764af2419f8f9`（含 `f8257cda138b9a211ce6e4ecdcb3c610a0ed0fe6`）；基线 main `36177076aae667cd72ba3ca81556b94575ab0fc6`，修复 [#27](https://github.com/black-zero358/rust-email-mcp/issues/27)。
