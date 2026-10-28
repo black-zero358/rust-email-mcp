@@ -131,7 +131,9 @@ pub(crate) fn bounded_email_result(
         value["body_truncated"] = json!(true);
         // Each prefix is measured with the real envelope and escaped text copy.
         // Byte offsets keep the search logarithmic; floor to a UTF-8 boundary.
-        let (mut low, mut high) = (0, body.len());
+        // Changing false to true saves one JSON byte; still omit a character
+        // before claiming truncation when that alone would make the result fit.
+        let (mut low, mut high) = (0, body.len() - 1);
         while low < high {
             let mid = low + (high - low).div_ceil(2);
             let cut = body.floor_char_boundary(mid);
@@ -575,6 +577,19 @@ mod tests {
     #[test]
     fn email_budget_preserves_existing_truncation_short_bodies_and_metadata_errors() {
         let id = RequestId::Number(1);
+        let value = json!({"body":"hello中","body_truncated":false});
+        let full = CallToolResult::structured(json!({"data":value,"request_id":TRACE_ID}));
+        let limit = wire_bytes(full, id.clone()).len() - 1;
+        let response = bounded_email_result(Ok(value), TRACE_ID, &id, limit).unwrap();
+        assert_eq!(
+            response.structured_content.as_ref().unwrap()["data"]["body"],
+            "hello"
+        );
+        assert_eq!(
+            response.structured_content.as_ref().unwrap()["data"]["body_truncated"],
+            true
+        );
+        assert!(wire_bytes(response, id.clone()).len() <= limit);
         for truncated in [false, true] {
             let value = json!({"body":"x".repeat(90000),"body_truncated":truncated});
             let response =
