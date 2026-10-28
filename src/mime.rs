@@ -149,10 +149,21 @@ impl Part<'_> {
     }
 
     pub fn is_attachment(&self) -> bool {
+        // mailparse leaves RFC 2231 keys encoded when the charset is unknown
+        // or a continuation cannot be assembled. A failed filename decode is
+        // still attachment intent, never permission to include it in the body.
+        let has_name = |params: &std::collections::BTreeMap<String, String>, base: &str| {
+            params.keys().any(|key| {
+                key == base
+                    || key
+                        .strip_prefix(base)
+                        .is_some_and(|tail| tail.starts_with('*'))
+            })
+        };
         let disposition = self.get_content_disposition();
         disposition.disposition == mailparse::DispositionType::Attachment
-            || disposition.params.contains_key("filename")
-            || self.ctype.params.contains_key("name")
+            || has_name(&disposition.params, "filename")
+            || has_name(&self.ctype.params, "name")
     }
 
     pub fn get_content_disposition(&self) -> mailparse::ParsedContentDisposition {

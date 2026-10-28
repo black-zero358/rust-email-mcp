@@ -1203,6 +1203,10 @@ mod tests {
             "Content-Type: text/plain\r\nContent-Disposition: attachment; filename=notes.txt",
             "Content-Type: text/plain; name=notes.txt",
             "Content-Type: text/plain\r\nContent-Disposition: inline; filename=notes.txt",
+            "Content-Type: text/plain\r\nContent-Disposition: inline; filename*=x-unknown''notes.txt",
+            "Content-Type: text/plain; name*=x-unknown''notes.txt",
+            "Content-Type: text/plain\r\nContent-Disposition: inline; filename*1*=utf-8''notes.txt",
+            "Content-Type: text/plain; name*1=notes.txt",
             "Content-Type: multipart/mixed; boundary=inside\r\nContent-Disposition: attachment; filename=bundle.mime",
         ] {
             let attached = if headers.starts_with("Content-Type: multipart/") {
