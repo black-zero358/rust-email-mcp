@@ -9,4 +9,5 @@
 - Test OAuth with isolated clients/users. Keep deployment and rollback separate from source publishing.
 - Completed: core, 16 regression tests, fmt/clippy, isolated OAuth + QQ read acceptance, SQLite WAL/FULL benchmark.
 - Lessons: Rauthy WebAuthn origin requires explicit :443; allow early token refresh; preserve independent sessions. Bound IMAP literals before parser allocation. JWT uses AWS-LC to keep known vulnerable RustCrypto transitive dependencies out of the lockfile.
-- TODO: restart acceptance, publish deployment templates and GitHub release, switch production, record rollback and client reconnection.
+- Completed: restart recovery, public deployment templates, GitHub publication, production cutover and rollback documentation. Acceptance mailbox authorization removed after testing.
+- TODO: user-side ChatGPT reconnection/natural refresh; authorized real-mail writes in a dedicated test mailbox; sustained load/attachment memory observations.
