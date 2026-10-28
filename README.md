@@ -50,7 +50,7 @@ MIME 在构建结构时限制为 256 个节点、20 层嵌套，头部每段最�
 
 发送已有草稿时，收件人解释与隐私头清理共用规范化后的字段名，支持大小写、折行与旧格式字段名尾部空白。缺少冒号、非法字段名、控制字符、孤立续行或缺少头部结束空行的草稿会在发送意图记录和 SMTP 前拒绝。`Resent-*` 块的投递语义暂不支持，返回 `UNSUPPORTED_DRAFT_HEADERS`；请先保存为普通草稿。MIME 正文和二进制附件保留原始字节。
 
-正文选择会排除标为 attachment 的部件及其整个子树；显式但不支持的 Content-Disposition 类型也按附件处理，缺省或空类型保持原有内联语义。带 `filename` 或 Content-Type `name` 的部件同样视为附件。`multipart/alternative` 优先选最后一个纯文本表示（包括真正为空的纯文本），没有时再选一个 HTML 表示；`multipart/related` 只选 `start` 指定的主部件，缺省选首部件；mixed 内联内容按顺序读取。附件列表与下载共用识别规则，multipart 附件作为整体提供下载。读取正文和转发使用同一选择逻辑，转发不包含原附件内容。
+正文选择会排除标为 attachment 的部件及其整个子树；显式但不支持的 Content-Disposition 类型也按附件处理，缺省或空类型保持原有内联语义。带 `filename` 或 Content-Type `name` 的部件同样视为附件。`multipart/alternative` 优先选最后一个完整纯文本表示（包括真正为空的纯文本），没有时再选一个允许 HTML 转换的表示；候选中的 HTML 主体不能被跳过后只留下 plain 签名。`multipart/related` 只选 `start` 指定的主部件，缺省选首部件；mixed 内联内容按顺序读取。附件列表与下载共用识别规则，multipart 附件作为整体提供下载。读取正文和转发使用同一选择逻辑，转发不包含原附件内容。
 
 HTML 在本地提取纯文本，保留实体、Unicode、段落换行和图片 alt 文本，忽略文档元数据、脚本、样式、模板及内嵌框架；不执行脚本、不加载资源，也不保留 CSS 可见性和表格排版。转换前限制解码后的 HTML 为 128 KiB、ASCII 空白、单/双引号、斜杠和等号合计最多 8192 个，以保守限制标记属性复杂度；流式处理最多 4096 个 token、256 KiB 输出，并受共享 MIME 解码预算约束。超限返回 `LIMIT_EXCEEDED`；SVG/MathML 外来命名空间与非空但无法完整解释的内联正文（包括未知或替换型字符集）整段返回 `UNSUPPORTED_BODY`，转发在记录发送意图与 SMTP 前拒绝不完整原文。真正为空的正文仍可读取和转发。所有新构建的纯文本邮件（包括转发）显式声明 `text/plain; charset=utf-8`。
 
