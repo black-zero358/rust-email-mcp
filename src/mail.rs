@@ -941,6 +941,7 @@ mod tests {
                     ("SELECT \"&mHl27g-&-\"", "* 1 EXISTS\r\n* OK [UIDVALIDITY 9] valid\r\n"),
                     ("CAPABILITY", "* CAPABILITY IMAP4rev1 MOVE\r\n"),
                     ("UID MOVE 7 \"&mHl27g-&-\"", ""),
+                    ("EXAMINE \"&mHl27g-&-\"", "* 1 EXISTS\r\n* OK [UIDVALIDITY 9] valid\r\n* OK [UIDNEXT 8] next\r\n"),
                 ] {
                     let mut line = String::new();
                     server.read_line(&mut line).await.unwrap();
@@ -949,6 +950,16 @@ mod tests {
                     server.write_all(format!("{rows}{tag} OK completed\r\n").as_bytes()).await.unwrap();
                 }
                 let mut line = String::new();
+                server.read_line(&mut line).await.unwrap();
+                let (tag, command) = line.trim_end_matches("\r\n").split_once(' ').unwrap();
+                assert_eq!(command, "UID SEARCH CHARSET UTF-8 UID 1:7 TEXT {6}");
+                let tag = tag.to_owned();
+                server.write_all(b"+ ready\r\n").await.unwrap();
+                let mut query = [0; 8];
+                server.read_exact(&mut query).await.unwrap();
+                assert_eq!(&query, "发票\r\n".as_bytes());
+                server.write_all(format!("* SEARCH\r\n{tag} OK searched\r\n").as_bytes()).await.unwrap();
+                line.clear();
                 server.read_line(&mut line).await.unwrap();
                 let (tag, command) = line.trim_end_matches("\r\n").split_once(' ').unwrap();
                 assert!(command.starts_with("APPEND \"&mHl27g-&-\" (\\Draft) {"));
@@ -969,12 +980,14 @@ mod tests {
             let names = service.with_session(&mut session, "list_mailboxes", &json!({})).await.unwrap();
             let name = names["mailboxes"][0]["name"].as_str().unwrap();
             assert_eq!(name, "项目&");
-            service.with_session(&mut session, "get_email_status", &json!({"folder":name,"uid":7})).await.unwrap();
+            service.with_session(&mut session, "get_email_status", &json!({"mailbox":name,"uid":7})).await.unwrap();
             service.with_session(&mut session, "rename_mailbox", &json!({"name":name,"new_name":"日本語"})).await.unwrap();
             service.with_session(&mut session, "create_mailbox", &json!({"name":name})).await.unwrap();
             service.with_session(&mut session, "delete_mailbox", &json!({"name":name,"confirm":true})).await.unwrap();
-            service.with_session(&mut session, "move_email", &json!({"folder":name,"uid":7,"destination":"日本語"})).await.unwrap();
-            service.with_session(&mut session, "delete_email", &json!({"folder":name,"uid":7})).await.unwrap();
+            service.with_session(&mut session, "move_email", &json!({"mailbox":name,"uid":7,"destination":"日本語"})).await.unwrap();
+            service.with_session(&mut session, "delete_email", &json!({"mailbox":name,"uid":7})).await.unwrap();
+            let found = service.with_session(&mut session, "search_emails", &json!({"mailbox":name,"query":"发票"})).await.unwrap();
+            assert_eq!(found["emails"], json!([]));
             service.with_session(&mut session, "save_draft", &json!({"to":["recipient@example.com"],"subject":"synthetic","body":"synthetic"})).await.unwrap();
             backend.await.unwrap();
         }).await.unwrap();

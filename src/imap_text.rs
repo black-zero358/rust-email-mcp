@@ -62,8 +62,10 @@ pub(crate) fn display_name(wire: &str) -> Result<String> {
                 return Err(MailError::backend());
             }
             let units = bytes
-                .chunks_exact(2)
-                .map(|p| u16::from_be_bytes([p[0], p[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|p| u16::from_be_bytes(*p))
                 .collect::<Vec<_>>();
             decoded.push_str(&String::from_utf16(&units).map_err(|_| MailError::backend())?);
         }
@@ -301,6 +303,10 @@ mod tests {
                                 assert_eq!(literal, format!("{text}\r\n").as_bytes());
                             }
                         }
+                        // Partial result must never turn a terminal failure into success.
+                        if !early {
+                            server.write_all(b"* SEARCH 7 9 501\r\n").await.unwrap();
+                        }
                         if status != "EOF" {
                             let response = match status {
                                 "BADCHARSET" => {
@@ -309,10 +315,6 @@ mod tests {
                                 "WRONG_TAG" => "OTHER OK unrelated\r\n".to_owned(),
                                 _ => format!("{tag} {status} done\r\n"),
                             };
-                            // Partial result must never turn a terminal failure into success.
-                            if !early {
-                                server.write_all(b"* SEARCH 7 9 501\r\n").await.unwrap();
-                            }
                             server.write_all(response.as_bytes()).await.unwrap();
                         }
                         if early {
