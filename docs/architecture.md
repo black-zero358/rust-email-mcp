@@ -59,6 +59,8 @@ async-imap 0.12 的 APPEND flags 原样序列化，必须传入 `(\Draft)` 这�
 
 ## MIME and HTML
 
+`get_emails` 按阶段区分失败：`raw()` 成功表示 SIZE/BODY 获取已消费并通过匹配 tagged OK，此后 `parsed_with_options` 的本地 MIME/正文错误只记录单项失败并继续；不依据错误码猜测连接状态（本地头部解析同样可能返回 `MAIL_BACKEND`）。`raw()` 失败则保留既有保守停止边界，后续 UID 明确 `unprocessed`，避免在未消费完响应、失效连接或耗尽预算上继续。`completed` 保持已尝试项数的既有含义。依据 [RFC 3501 §2.2.2](https://www.rfc-editor.org/rfc/rfc3501#section-2.2.2) 的命令终结语义；MIME 失败不能代替协议状态判断。
+
 邮件正文、主题、头部和附件均按不可信输入处理。构建 MIME 结构前检查共享的节点、深度和头部预算；transfer/charset 解码前预留预算。不得恢复对不可信输入调用 `mailparse::parse_mail`；回复和草稿发送只需要有界头部。boundary 按完整分隔符匹配，接受允许的尾部空白，不能把相同前缀当作分隔符。
 
 正文选择排除显式 attachment 或带文件名的部件及其整个子树；`multipart/alternative` 选一个受支持表示并优先纯文本，`multipart/related` 只选主部件。读取和转发共用选择逻辑，附件列表和下载共用分类规则，multipart 附件可整体下载。真实空正文与“不支持或无法完整解释的正文”必须区分。
@@ -106,7 +108,7 @@ JSON 日志使用固定事件名和受控字段，记录服务端生成的 reque
 | 原则 | 实现入口 | 现有验证与审阅入口 |
 | --- | --- | --- |
 | D1 身份与授权 | `auth`、`server::allowed/call_tool`、`main` 接线 | `jwt_trust_boundaries`、`failed_refresh_is_shared_and_expired_keys_fail_closed`、`cached_key_does_not_wait_for_rotation_and_refresh_updates_snapshot`、`schemas_match_policy`；另做隔离 OAuth/登录资产验收 |
-| D2 读取无副作用与 UIDVALIDITY | `mail`、`imap_text`、vendored completion boundary | `status_uses_only_target_uid_and_distinguishes_missing_from_empty_flags`、`rev1_mailbox_names_round_trip_through_tools`、`statistics_status_requires_complete_matching_snapshot_and_tag`、`refused_imap_tools_return_backend_error_and_stop_delete`、`tests/imap_completion.rs`；只读邮箱验收核对读前后 flags |
+| D2 读取无副作用与 UIDVALIDITY | `mail`、`imap_text`、vendored completion boundary | `status_uses_only_target_uid_and_distinguishes_missing_from_empty_flags`、`rev1_mailbox_names_round_trip_through_tools`、`statistics_status_requires_complete_matching_snapshot_and_tag`、`refused_imap_tools_return_backend_error_and_stop_delete`、`batch_read_continues_after_local_content_errors`、`batch_read_stops_after_protocol_failure_or_transport_exhaustion`、`tests/imap_completion.rs`；只读邮箱验收核对读前后 flags |
 | D3 资源有界 | `BudgetStream`、vendored `ImapStream::Buffer`、`mime`、`html`、`server` | `bounded_parser_rejects_incomplete_response_at_application_limit`、`bounded_parser_accepts_fragmented_text_and_normal_literal`、`bounded_parser_handles_exact_text_budget_and_unknown_need`、vendored `application_limit_rejects_growth_before_allocation`、`headers_and_decode_are_bounded_before_allocation`、`attributes_are_bounded_before_tokenization_without_whitespace`、`final_wire_budget_covers_duplicates_escaping_unicode_and_attachments`、`email_body_prefix_fits_real_wire_budget_and_preserves_metadata`、`long_parsed_email_returns_a_wire_bounded_readable_prefix`、`oversized_rpc_id_is_rejected_before_execution` |
 | D4 发送结果与幂等 | `journal`、`mail::send`、`smtp` | `durable_dedup_and_principal_isolation`、`concurrent_claim_has_single_winner`、`smtp_lost_reply_does_not_resend`、`smtp_accepted_is_persisted_before_unresponsive_quit`、`smtp_accepted_survives_quit_timeout_and_journal_failure` |
 | D5 隐私与不可信内容 | `mail`、`mime`、`html`、`main` 日志 | `discovery_matches_message_indices_and_multipart_attachment_trees`、`http_download_authorization_binary_headers_and_transfer_capacity`、`draft_envelope_and_privacy_filter_share_canonical_fields`、`ambiguous_draft_headers_are_rejected`、`text_attachments_stay_downloadable_but_leave_body_and_forward`、`html_read_and_forward_preserve_original_content`、`alternative_read_and_forward_require_complete_representations`、`plain_probes_require_all_inline_parts_and_prune_only_attachments`；日志字段和 panic 脱敏仍需代码审阅 |

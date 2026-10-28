@@ -22,6 +22,7 @@
 
 - Mail workflow extensions live in `mail/attachments.rs` and `mail/insights.rs`; reuse bounded MIME and rev1 text handling. Keep attachment indices consistent and preserve inline Base64 downloads; authenticated binary handles use a separate tool.
 - Statistics require all requested STATUS fields and matching tagged completion. Batches preserve per-item unknown/unprocessed outcomes and never retry automatically; document bounded search coverage and omissions.
+- In `get_emails`, continue after local MIME errors only after raw FETCH completed successfully. Keep the conservative stop on raw fetch/transport/protocol failures; later items remain unprocessed, never automatically retried.
 
 ## Before handing off
 
