@@ -37,6 +37,27 @@ unexpected source/checksum or changed pinned version. Upgrade the provenance,
 script and tests together when changing this dependency; verify audit coverage
 against RustSec again. There is no fallback that suppresses an audit failure.
 
+## APPEND continuation notifications (issue #30)
+
+`src/client.rs::Session::append` loops while waiting for synchronous literal
+continuation and routes legitimate untagged notifications through the existing
+bounded unsolicited-response queue. Only Continue authorizes literal bytes.
+Any tagged response, BYE or EOF before continuation fails with the existing
+Error::Append, so neither a rejection nor a queued later continuation sends
+message content. Read errors retain the existing propagation. Final completion
+still uses the existing matching-tag check. Flags and MIME bytes are unchanged.
+
+`save_draft_waits_for_continuation_after_notifications` uses the application
+save_draft path with zero, one and multiple notifications, successful literal
+and tagged OK, and pre-literal NO/BAD/BYE/EOF/wrong-tag/premature-OK rejection;
+it asserts no bytes are sent after rejection and checks notification delivery.
+The previous APPEND flags and post-literal NO/BAD regressions remain in place.
+No real mail service is used. Upstream version, archive checksum, licenses and
+Cargo.lock remain unchanged; review this local state-machine change separately
+from the advisory mapping in scripts/audit-dependencies.sh.
+
+Protocol basis: [RFC 3501 section 2.2.1](https://www.rfc-editor.org/rfc/rfc3501#section-2.2.1).
+
 ## FETCH attribute presence (issue #29)
 
 `src/types/fetch.rs` adds the read-only `Fetch::has_flags()` accessor, including

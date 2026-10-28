@@ -44,6 +44,10 @@ pub(crate) fn validate_data(raw: &[u8]) -> crate::error::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("SMTPUTF8 unavailable before MAIL")]
+struct SmtpUtf8Unavailable;
+
 pub(crate) struct SmtpSender {
     host: String,
     port: u16,
@@ -123,14 +127,31 @@ impl SmtpSender {
                 connection: None,
             };
         }
+
+        let utf8_headers = match crate::mime::requires_smtputf8(raw) {
+            Ok(required) => required,
+            Err(_) => {
+                return Submission {
+                    status: "rejected",
+                    connection: None,
+                };
+            }
+        };
         let mut connection = None;
         let result = tokio::time::timeout(self.timeout, async {
             connection = Some(self.connect().await?);
-            transaction(connection.as_mut().expect("connected"), envelope, raw).await
+            transaction(
+                connection.as_mut().expect("connected"),
+                envelope,
+                raw,
+                utf8_headers,
+            )
+            .await
         })
         .await;
         let status = match &result {
             Ok(Ok(())) => "accepted",
+            Ok(Err(error)) if error.is::<SmtpUtf8Unavailable>() => "rejected",
             Ok(Err(error))
                 if error
                     .downcast_ref::<Error>()
@@ -153,23 +174,25 @@ async fn transaction(
     connection: &mut AsyncSmtpConnection,
     envelope: &Envelope,
     raw: &[u8],
+    utf8_headers: bool,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(!envelope.to().is_empty(), "SMTP envelope has no recipients");
     // Match lettre's send() extension policy, but keep cleanup outside the
     // transaction: its send() aborts internally before returning an error.
     let mut options = Vec::new();
-    if envelope
-        .from()
-        .into_iter()
-        .chain(envelope.to())
-        .any(|address| !AsRef::<str>::as_ref(address).is_ascii())
+    if utf8_headers
+        || envelope
+            .from()
+            .into_iter()
+            .chain(envelope.to())
+            .any(|address| !AsRef::<str>::as_ref(address).is_ascii())
     {
-        anyhow::ensure!(
-            connection
-                .server_info()
-                .supports_feature(Extension::SmtpUtfEight),
-            "SMTPUTF8 unavailable"
-        );
+        if !connection
+            .server_info()
+            .supports_feature(Extension::SmtpUtfEight)
+        {
+            return Err(SmtpUtf8Unavailable.into());
+        }
         options.push(MailParameter::SmtpUtfEight);
     }
     if !raw.is_ascii() {
@@ -396,6 +419,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn smtp_utf8_covers_preserved_draft_headers_but_not_body_bytes() {
+        for (draft, needs_utf8) in [
+            (
+                "To: recipient@example.test\r\nSubject: 中文\r\n\r\nASCII body\r\n",
+                true,
+            ),
+            (
+                "To: 收件人 <recipient@example.test>\r\nSubject: synthetic\r\n\r\nASCII body\r\n",
+                true,
+            ),
+            (
+                "To: recipient@example.test\r\nContent-Type: multipart/mixed; boundary=m\r\n\r\n--m\r\nContent-Type: text/plain\r\nContent-Disposition: attachment; filename=note.txt\r\nContent-Description: 中文\r\n\r\nASCII body\r\n--m--\r\n",
+                true,
+            ),
+            (
+                "To: recipient@example.test\r\nSubject: =?UTF-8?B?5Lit5paH?=\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n中文 body\r\n",
+                false,
+            ),
+            (
+                "To: recipient@example.test\r\nContent-Type: multipart/mixed; boundary=m\r\n\r\n--m\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n中文 body\r\n--m--\r\n",
+                false,
+            ),
+            (
+                "To: recipient@example.test\r\nContent-Type: message/rfc822\r\n\r\nSubject: 中文\r\n\r\nASCII body\r\n",
+                true,
+            ),
+            (
+                "To: recipient@example.test\r\nContent-Type: message/global\r\n\r\nSubject: ASCII\r\n\r\n中文 body\r\n",
+                false,
+            ),
+        ] {
+            for advertised in [true, false] {
+                let (raw, envelope) = crate::mail::prepare_draft(
+                    draft.as_bytes(),
+                    "sender@example.test",
+                    "<synthetic@example.test>",
+                )
+                .unwrap();
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let port = listener.local_addr().unwrap().port();
+                let expected_raw = raw.clone();
+                let backend = tokio::spawn(async move {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    let mut socket = BufReader::new(socket);
+                    socket.write_all(b"220 synthetic ESMTP\r\n").await.unwrap();
+                    let mut line = String::new();
+                    socket.read_line(&mut line).await.unwrap();
+                    assert!(line.starts_with("EHLO"));
+                    let capabilities = if advertised {
+                        "250-synthetic\r\n250-8BITMIME\r\n250 SMTPUTF8\r\n"
+                    } else {
+                        "250-synthetic\r\n250 8BITMIME\r\n"
+                    };
+                    socket.write_all(capabilities.as_bytes()).await.unwrap();
+                    line.clear();
+                    let read = socket.read_line(&mut line).await.unwrap();
+                    if needs_utf8 && !advertised {
+                        assert!(
+                            read == 0 || line == "QUIT\r\n",
+                            "unsupported SMTPUTF8 must stop before MAIL: {line:?}"
+                        );
+                        if read > 0 {
+                            socket.write_all(b"221 bye\r\n").await.unwrap();
+                        }
+                        return;
+                    }
+                    assert!(line.starts_with("MAIL FROM:<sender@example.test>"));
+                    assert_eq!(line.contains(" SMTPUTF8"), needs_utf8);
+                    assert_eq!(line.contains(" BODY=8BITMIME"), !expected_raw.is_ascii());
+                    socket.write_all(b"250 ok\r\n").await.unwrap();
+                    line.clear();
+                    socket.read_line(&mut line).await.unwrap();
+                    assert_eq!(line, "RCPT TO:<recipient@example.test>\r\n");
+                    socket.write_all(b"250 ok\r\n").await.unwrap();
+                    line.clear();
+                    socket.read_line(&mut line).await.unwrap();
+                    assert_eq!(line, "DATA\r\n");
+                    socket.write_all(b"354 data\r\n").await.unwrap();
+                    let mut data = Vec::new();
+                    loop {
+                        let mut bytes = Vec::new();
+                        assert!(socket.read_until(b'\n', &mut bytes).await.unwrap() > 0);
+                        if bytes == b".\r\n" {
+                            break;
+                        }
+                        data.extend_from_slice(&bytes);
+                    }
+                    // lettre appends the DATA terminator's leading CRLF even
+                    // when the supplied message already ends in CRLF.
+                    assert_eq!(data, [expected_raw.as_slice(), b"\r\n"].concat());
+                    socket.write_all(b"250 accepted\r\n").await.unwrap();
+                    line.clear();
+                    socket.read_line(&mut line).await.unwrap();
+                    assert_eq!(line, "QUIT\r\n");
+                    socket.write_all(b"221 bye\r\n").await.unwrap();
+                });
+                let sender = SmtpSender::fixture(port, Duration::from_secs(2));
+                let result = sender.submit(&envelope, &raw).await;
+                let expected = if needs_utf8 && !advertised {
+                    "rejected"
+                } else {
+                    "accepted"
+                };
+                assert_eq!(result.status, expected);
+                result.cleanup().await;
+                backend.await.unwrap();
+            }
+        }
+    }
+    #[tokio::test]
     async fn smtp_final_outcome_survives_quit_and_negative_responses() {
         for (final_reply, cleanup, expected) in [
             ("250 accepted\r\n", "disconnect", "accepted"),
@@ -467,10 +600,26 @@ mod tests {
             .await,
             "accepted"
         );
-        for greeting in ["250 test\r\n", "250-test\r\n250 SMTPUTF8\r\n"] {
+        for (greeting, expected) in [
+            ("250 test\r\n", "rejected"),
+            ("250-test\r\n250 SMTPUTF8\r\n", "unknown"),
+        ] {
             assert_eq!(
-                scripted_send(vec![("EHLO", greeting), ("EOF", "")], true, false, false).await,
-                "unknown"
+                scripted_send(
+                    vec![
+                        ("EHLO", greeting),
+                        if expected == "rejected" {
+                            ("QUIT", "221 bye\r\n")
+                        } else {
+                            ("EOF", "")
+                        }
+                    ],
+                    true,
+                    false,
+                    false
+                )
+                .await,
+                expected
             );
         }
         assert_eq!(

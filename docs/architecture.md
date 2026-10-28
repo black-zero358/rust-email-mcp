@@ -53,6 +53,8 @@ IMAP 文本模式固定为 rev1：所有邮箱参数编码为 modified UTF-7，L
 
 async-imap 0.12 的 APPEND flags 原样序列化，必须传入 `(\Draft)` 这样的带括号列表。合成 duplex 回归覆盖 literal continuation 及 OK/NO/BAD。vendored completion-status 补丁只允许匹配 tag 的 OK 成功；NO/BAD、缺失终结响应和错误 tag 均失败。来源、退出条件与审计方式见 [PATCHES.md](../vendor/async-imap/PATCHES.md)。
 
+APPEND 等待同步 literal continuation 时，先将合法 untagged 通知交给现有有界 unsolicited 队列，再继续读取；只有 `Continue` 才发送正文。continuation 前任何 tagged 结果（包括提前 OK 和错误 tag）、BYE、EOF 或读取错误均失败且不发送 literal，拒绝后排队的 continuation 不能恢复命令。完整 literal 后仍等待匹配 tag 的 OK。`save_draft_waits_for_continuation_after_notifications` 和 `save_draft_append_protocol` 覆盖这一 D2 协议边界；不改变草稿 flags/MIME 或发送策略。
+
 `mail/attachments.rs` 使用现有有界整封邮件与 MIME 解析发现附件，统一 `get_email`、列表、内联 Base64 和二进制下载的索引与附件子树边界。`download_attachment` 保持原契约；新增 `prepare_attachment_download` 保存最多 16 个主体绑定、300 秒有效的元数据句柄。GET 再核对 UIDVALIDITY 并重新读取整封邮件；不引入 BODYSTRUCTURE 或单部分 FETCH。两份二进制传输许可持有至响应消费或丢弃，邮箱连接仍共用原槽位与预算。
 
 `mail/insights.rs` 提供有界标识符图会话、精确 Message-ID 定位、严格 STATUS 统计、脱敏诊断与正文展示。头部缓存最多 128 项/2 MiB、30 秒，只保存不可变头部并以新 UIDVALIDITY 失效；正文共用 `mime`/`html` 选择器。统计用 `imap_text::status_counts` 验证完整字段和命令完成。批量修改使用明确 UID、总体期限和逐项结果，失败项保守为 unknown、后续 unprocessed；没有持久化修改日志，重试前必须检查邮箱。范围与限制见 [能力说明](capabilities.md)。
@@ -82,6 +84,11 @@ SMTP 使用 lettre 的低层 connection/command/message API，保留 TLS、AUTH�
 已知 SMTP 接受结果不得因后续日志/数据库更新或清理失败而改为失败。操作记录更新失败时，本次响应保留 `accepted` 并附 `journal_update_failed`；这不等于数据库已经成功保存该结果，后续必须检查操作状态及服务商记录。
 
 草稿发送使用同一个有界规范化头部缓冲区做收件人解释和隐私过滤，在 claim/SMTP 前验证字段名、续行及头/体分隔符，并明确拒绝不支持的 `Resent-*` 语义。BCC 参与信封投递但不进入发送头部；可用于 DATA 的正文原始字节（包括 Base64/quoted-printable 编码附件）保持不变，源草稿保留并返回 `draft_retained`。在 `prepare_draft` 和共同 `claim_send` 边界验证 CRLF、无 NUL、每行最多 998 原始字节（dot-stuffing 新增点不计）；不合规返回固定 `UNSUPPORTED_DATA_FORMAT`，不 claim、不连接，不盲目规范化二进制/MIME 正文。末行无 CRLF 仍允许，由现有 lettre DATA codec 补终结。`SmtpSender::submit` 同样在连接前做防御检查，不将确定未提交的非法格式标为 unknown。该限制不代表协商 BINARYMIME/BDAT，8bit 数据仍需能力协商。`unsupported_data_is_rejected_before_journal_claim`、`canonical_data_preserves_content_and_codec_final_crlf` 和 `data_line_validation_uses_source_octets_and_allows_final_line` 对应 D3/D4/D5 的发送前验证边界。
+
+SMTPUTF8 需求为信封中非 ASCII 地址或 `mime::requires_smtputf8` 检出的原始国际化头。按 [RFC 6531 §3.2、§3.6](https://www.rfc-editor.org/rfc/rfc6531#section-3.6) 检查所有 MIME 子头，附件子树也不排除；只检查原始字节，RFC 2047 编码词和叶子正文不展开。identity 编码的 message/rfc822、message/global 递归共用结构/头部预算；编码封装的 message/global 保持不透明，符合 [RFC 6532 §3.5](https://www.rfc-editor.org/rfc/rfc6532#section-3.5) 对 7bit 封装的支持。此检查不调用正文选择、HTML 渲染或 transfer/charset 解码；非 ASCII 输入无法在结构/头部预算内确定需求时，连接前返回确定 `rejected`。
+
+缺少 SMTPUTF8 能力通过私有拒绝类型在 MAIL 前返回并持久化为 `rejected`，清理继续有界 QUIT；网络/事务的不确定结果保持 `unknown`，已知接受仍为 `accepted`。8BITMIME 对原始非 ASCII 数据的既有要求、TLS/AUTH 和状态恢复规则不变。
+
 
 ## Authentication
 
@@ -121,6 +128,8 @@ JSON 日志使用固定事件名和受控字段，记录服务端生成的 reque
 vendored 构建依赖必须由 `.dockerignore` 明确允许并复制进 Docker builder；允许范围不能扩大到 vendor 同级目录、秘密或部署数据。Docker context 检查使用合成哨兵与真实构建器。普通 `cargo audit` 会跳过 path package，因此本地与 CI 统一运行专用审计脚本，同时独立审阅本地补丁代码；升级时同步更新来源、脚本和回归测试。
 
 CTE 支持性对应 D3/D5：`mime::Part::transfer_encoding/encoded/select_text` 与 `parse_part` 的验证入口为 `transfer_encodings_require_known_decoders_before_interpretation`、`unknown_transfer_encoding_cannot_be_read_forwarded_or_downloaded_as_decoded`；覆盖不透明 multipart、完整 alternative 回退与下载拒绝，不替代真实邮箱验收。
+
+SMTPUTF8 需求与确定拒绝对应 D3/D4：`mime::requires_smtputf8`、`smtp::submit/transaction` 和 `mail::record_send` 由 `smtp_utf8_inspection_uses_raw_headers_and_shared_budgets`、`smtp_utf8_covers_preserved_draft_headers_but_not_body_bytes`、`smtp_utf8_refusal_is_recorded_as_rejected_without_mail` 验证；原发送故障/QUIT 回归继续验证 accepted/unknown 边界。
 
 ## Decision records
 
