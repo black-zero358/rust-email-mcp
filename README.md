@@ -35,6 +35,8 @@ JSON-RPC id 的序列化 JSON（包括引号、转义和 UTF-8 字节）最多 1
 
 MIME 在构建结构时限制为 256 个节点、20 层嵌套，头部每段最多 32 KiB，累计最多 256 KiB、2048 行（含折行）。正文解码前按编码字节数的四倍预留共享的 8 MiB 预算，覆盖字符集转为 UTF-8 的放大；附件解码也先限制编码输入。超限返回 `LIMIT_EXCEEDED`，因此部分原始大小合规的复杂邮件或长正文仍会被拒绝。回复和草稿发送只解析有界头部，保留草稿正文原始字节。边界分隔行按完整 boundary 匹配，接受尾部空格和制表符；不再把仅具有相同前缀的行当作分隔符。
 
+文件夹名称在工具参数、LIST 返回值和 DRAFTS_MAILBOX/TRASH_MAILBOX 配置中使用 Unicode；返回的 name 可直接传给读取、移动或重命名工具。连接采用 IMAP4rev1，线路上的名称使用 modified UTF-7，包含 & 的名称也会正确转换。非规范或无法安全往返的服务端名称返回 MAIL_BACKEND，避免误引用其他文件夹。ASCII 搜索继续使用 US-ASCII；中文等非 ASCII 查询使用 CHARSET UTF-8 和同步 literal。服务器返回 BADCHARSET 时报告 UNSUPPORTED_CHARSET，不降级为含义不同的查询；未协商 UTF8=ACCEPT 或 IMAP4rev2。
+
 ## 发送行为
 
 发送已有草稿时，收件人解释与隐私头清理共用规范化后的字段名，支持大小写、折行与旧格式字段名尾部空白。缺少冒号、非法字段名、控制字符、孤立续行或缺少头部结束空行的草稿会在发送意图记录和 SMTP 前拒绝。`Resent-*` 块的投递语义暂不支持，返回 `UNSUPPORTED_DRAFT_HEADERS`；请先保存为普通草稿。MIME 正文和二进制附件保留原始字节。

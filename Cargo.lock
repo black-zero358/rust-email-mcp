@@ -1763,6 +1763,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "futures",
+ "imap-proto",
  "jsonwebtoken",
  "lettre",
  "mailparse",
