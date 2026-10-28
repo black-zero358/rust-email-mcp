@@ -31,7 +31,7 @@ MCP 客户端 ── HTTPS ── Nginx ── Rust Email MCP ── IMAP / SMTP
 
 读取使用 IMAP `EXAMINE` 和 `BODY.PEEK`，保持邮件标记。每个邮件引用由文件夹、UID 和 UIDVALIDITY 组成，避免文件夹重建后误操作旧 UID。
 
-列表和搜索每次扫描最多 500 个 UID，返回最多 50 条摘要且不超过请求 limit。同 UID 的 FETCH 属性合并成一条摘要，异步 FLAGS 更新不会生成空摘要；后到的显式空 FLAGS 可以清空标记，缺失 HEADER 的 UID 不生成摘要。继续查询时传入 `next_before_uid`；空页也可能带有下一页游标。批量读取最多 10 封，结果包含逐项状态。
+列表和搜索每次扫描最多 500 个 UID，返回最多 50 条摘要且不超过请求 limit。同 UID 的 FETCH 属性合并成一条摘要，异步 FLAGS 更新不会生成空摘要；后到的显式空 FLAGS 可以清空标记，缺失 HEADER 的 UID 不生成摘要。继续查询时传入 `next_before_uid`；空页也可能带有下一页游标。批量读取最多 10 封，结果包含逐项状态；完整获取后的本地 MIME 错误仅影响该项，继续读取后续 UID。原始获取失败（包括协议、连接或字节预算失败）仍停止，后续项标为 `unprocessed`，不自动重试。`completed` 计已尝试项数，包含单项失败，不表示成功数量。
 
 正文返回纯文本，并标记截断状态。单封 MIME 邮件上限 8 MiB。单次工具响应的序列化 JSON 上限 256 KiB，包括 JSON-RPC 外层及实际 id、request_id、structuredContent 和供文本客户端读取的转义副本；不包括 HTTP 头及 SSE 帧。超限返回小型 `LIMIT_EXCEEDED` 工具错误。小附件以 Base64 返回，解码后最多 128 KiB，仍受完整响应预算限制；接近该大小的附件可能因双份输出超限而无法返回。新邮件支持文本；现有草稿发送保留原 MIME 附件。转发工具发送原邮件的纯文本内容。
 
