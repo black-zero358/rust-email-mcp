@@ -140,6 +140,21 @@ fn parse_part<'a>(
 }
 
 impl Part<'_> {
+    pub fn filename(&self) -> Option<String> {
+        self.get_content_disposition()
+            .params
+            .get("filename")
+            .cloned()
+            .or_else(|| self.ctype.params.get("name").cloned())
+    }
+
+    pub fn is_attachment(&self) -> bool {
+        let disposition = self.get_content_disposition();
+        disposition.disposition == mailparse::DispositionType::Attachment
+            || disposition.params.contains_key("filename")
+            || self.ctype.params.contains_key("name")
+    }
+
     pub fn get_content_disposition(&self) -> mailparse::ParsedContentDisposition {
         mailparse::parse_content_disposition(
             &self
@@ -191,7 +206,62 @@ impl Part<'_> {
     }
 
     fn append_plain(&self, out: &mut String, remaining: &mut usize) -> Result<()> {
-        if self.subparts.is_empty() && self.ctype.mimetype == "text/plain" {
+        let mut selected = Vec::new();
+        self.select_plain(&mut selected);
+        for part in selected {
+            part.append_plain_leaf(out, remaining)?;
+        }
+        Ok(())
+    }
+
+    fn select_plain<'a>(&'a self, out: &mut Vec<&'a Self>) {
+        if self.is_attachment() {
+            return;
+        }
+        if self.subparts.is_empty() {
+            if self.ctype.mimetype == "text/plain" {
+                out.push(self);
+            }
+            return;
+        }
+        match self.ctype.mimetype.as_str() {
+            "multipart/alternative" => {
+                // Representations are alternatives, not consecutive body text.
+                // Prefer the last supported plain representation, including a
+                // genuinely empty plain body.
+                for child in self.subparts.iter().rev() {
+                    let before = out.len();
+                    child.select_plain(out);
+                    if out.len() != before {
+                        break;
+                    }
+                }
+            }
+            "multipart/related" => {
+                let root = match self.ctype.params.get("start") {
+                    Some(start) => self.subparts.iter().find(|p| {
+                        p.headers
+                            .get_first_value("Content-ID")
+                            .is_some_and(|id| id.trim() == start.trim())
+                    }),
+                    None => self.subparts.first(),
+                };
+                if let Some(root) = root {
+                    root.select_plain(out);
+                }
+            }
+            _ => {
+                // Mixed inline parts remain consecutive body content. An
+                // attachment at any level prunes its entire subtree above.
+                for child in &self.subparts {
+                    child.select_plain(out);
+                }
+            }
+        }
+    }
+
+    fn append_plain_leaf(&self, out: &mut String, remaining: &mut usize) -> Result<()> {
+        if self.ctype.mimetype == "text/plain" {
             // Reserve conservatively before decoding: transfer output <= input,
             // and charset-to-UTF8 conversion needs at most four bytes per input
             // byte. All leaves share one budget, including temporary strings.
@@ -214,9 +284,6 @@ impl Part<'_> {
             }
             out.push_str(&text);
         }
-        for child in &self.subparts {
-            child.append_plain(out, remaining)?;
-        }
         Ok(())
     }
 }
@@ -224,6 +291,22 @@ impl Part<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alternative_and_related_select_one_representation() {
+        let alternative = b"Content-Type: multipart/alternative; boundary=a\n\n--a\n\nolder\n--a\nContent-Type: text/html\n\n<p>HTML</p>\n--a\n\nnewer\n--a--\n";
+        assert_eq!(parse(alternative).unwrap().plain_body().unwrap(), "newer");
+        let related = b"Content-Type: multipart/related; boundary=a; start=\"<root>\"\n\n--a\nContent-ID: <resource>\n\nRESOURCE_ONLY\n--a\nContent-ID: <root>\n\nVisible body\n--a--\n";
+        assert_eq!(
+            parse(related).unwrap().plain_body().unwrap(),
+            "Visible body"
+        );
+        let related_default = b"Content-Type: multipart/related; boundary=a\n\n--a\n\nVisible body\n--a\n\nRESOURCE_ONLY\n--a--\n";
+        assert_eq!(
+            parse(related_default).unwrap().plain_body().unwrap(),
+            "Visible body"
+        );
+    }
 
     const NORMAL: &[u8] = b"Subject: example\r\nContent-Type: multipart/mixed; boundary=outer\r\n\r\n--outer\r\nContent-Type: multipart/alternative; boundary=inner\r\n\r\n--inner\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nhello =E2=82=AC\r\n--inner\r\nContent-Type: text/html\r\n\r\n<p>hello</p>\r\n--inner--\r\n--outer\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=example.txt\r\nContent-Transfer-Encoding: base64\r\n\r\nYWJj\r\n--outer--\r\n";
 

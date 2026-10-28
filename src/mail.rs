@@ -555,11 +555,7 @@ impl MailService {
                     json!(headers.get_first_value("Message-ID").unwrap_or_default());
             }
             if name == "forward_email" {
-                args["body"] = json!(format!(
-                    "{}\n\n---------- Forwarded message ----------\n{}",
-                    text(a, "body")?,
-                    mime::parse(&original)?.plain_body()?
-                ));
+                args["body"] = json!(forward_body(&original, text(a, "body")?)?);
             }
             compose(&args, &self.config.address, Some(&message_id))?
         } else {
@@ -874,6 +870,13 @@ pub fn prepare_draft(raw: &[u8], from: &str, id: &str) -> Result<(Vec<u8>, Envel
     clean.extend_from_slice(&raw[body_start..]);
     Ok((clean, envelope))
 }
+fn forward_body(raw: &[u8], note: &str) -> Result<String> {
+    Ok(format!(
+        "{note}\n\n---------- Forwarded message ----------\n{}",
+        mime::parse(raw)?.plain_body()?
+    ))
+}
+
 fn leaves<'a, 'b>(
     p: &'a mime::Part<'b>,
     out: &mut Vec<&'a mime::Part<'b>>,
@@ -882,7 +885,7 @@ fn leaves<'a, 'b>(
     if depth > 20 || out.len() > 1000 {
         return Err(MailError::limit());
     }
-    if p.subparts.is_empty() {
+    if p.subparts.is_empty() || p.is_attachment() {
         out.push(p);
     } else {
         for part in &p.subparts {
@@ -904,7 +907,7 @@ fn parsed(raw: &[u8], uid: u32, validity: Option<u32>, max: usize) -> Result<Val
     }
     let mut parts = Vec::new();
     leaves(&p, &mut parts, 0)?;
-    let attachments=parts.iter().enumerate().filter(|(_,p)|p.get_content_disposition().disposition==mailparse::DispositionType::Attachment).map(|(i,p)|json!({"attachment_index":i,"content_type":p.ctype.mimetype,"filename":p.get_content_disposition().params.get("filename")})).collect::<Vec<_>>();
+    let attachments=parts.iter().enumerate().filter(|(_,p)|p.is_attachment()).map(|(i,p)|json!({"attachment_index":i,"content_type":p.ctype.mimetype,"filename":p.filename()})).collect::<Vec<_>>();
     Ok(
         json!({"uid":uid,"uid_validity":validity,"subject":p.headers.get_first_value("Subject"),"from":p.headers.get_first_value("From"),"to":p.headers.get_first_value("To"),"body":body,"body_truncated":truncated,"attachments":attachments,"content_trust":"untrusted"}),
     )
@@ -1192,6 +1195,44 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code, "UNSUPPORTED_DRAFT_HEADERS");
         assert!(!error.retryable);
+    }
+    #[test]
+    fn text_attachments_stay_downloadable_but_leave_body_and_forward() {
+        use base64::Engine;
+        for headers in [
+            "Content-Type: text/plain\r\nContent-Disposition: attachment; filename=notes.txt",
+            "Content-Type: text/plain; name=notes.txt",
+            "Content-Type: text/plain\r\nContent-Disposition: inline; filename=notes.txt",
+            "Content-Type: multipart/mixed; boundary=inside\r\nContent-Disposition: attachment; filename=bundle.mime",
+        ] {
+            let attached = if headers.starts_with("Content-Type: multipart/") {
+                "--inside\r\nContent-Type: text/plain\r\n\r\nATTACHMENT_ONLY_MARKER\r\n--inside--"
+            } else {
+                "ATTACHMENT_ONLY_MARKER"
+            };
+            let raw = format!(
+                "Content-Type: multipart/mixed; boundary=outside\r\n\r\n--outside\r\nContent-Type: text/plain\r\n\r\nVisible body\r\n--outside\r\n{headers}\r\n\r\n{attached}\r\n--outside--\r\n"
+            );
+            let read = parsed(raw.as_bytes(), 1, None, 16000).unwrap();
+            assert_eq!(read["body"], "Visible body");
+            assert_eq!(read["attachments"].as_array().unwrap().len(), 1);
+            let index = read["attachments"][0]["attachment_index"].as_u64().unwrap() as usize;
+            let downloaded = attachment(raw.as_bytes(), index, 1024).unwrap();
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(downloaded["base64"].as_str().unwrap())
+                .unwrap();
+            assert!(String::from_utf8_lossy(&data).contains("ATTACHMENT_ONLY_MARKER"));
+            let body = forward_body(raw.as_bytes(), "FYI").unwrap();
+            let (forward, _) = compose(
+                &json!({"to":["recipient@example.com"],"subject":"forward","body":body}),
+                "me@example.com",
+                Some("<id@example.com>"),
+            )
+            .unwrap();
+            let forwarded = mailparse::parse_mail(&forward).unwrap().get_body().unwrap();
+            assert!(forwarded.contains("Visible body"));
+            assert!(!forwarded.contains("ATTACHMENT_ONLY_MARKER"));
+        }
     }
     #[test]
     fn mail_consumers_enforce_mime_limits_and_recover() {
