@@ -134,7 +134,14 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Client<T> {
     /// This method primarily exists for writing tests that mock the underlying transport, but can
     /// also be used to support IMAP over custom tunnels.
     pub fn new(stream: T) -> Client<T> {
-        let stream = ImapStream::new(stream);
+        Self::with_buffer_limit(stream, 512 * 1024 * 1024)
+    }
+
+    /// Creates a client with a per-response parser buffer limit in bytes.
+    /// The limit is clamped to 1..=512 MiB and applies before allocation.
+    /// Transport byte accounting remains the caller's responsibility.
+    pub fn with_buffer_limit(stream: T, max_buffer: usize) -> Client<T> {
+        let stream = ImapStream::with_buffer_limit(stream, max_buffer);
 
         Client {
             conn: Connection {
