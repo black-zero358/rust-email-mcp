@@ -39,6 +39,8 @@ sudo chmod 600 secrets/rauthy.toml secrets/mail.env
 
 将 `deploy/nginx.conf.example` 放入自己的 HTTPS server 块，执行 `nginx -t` 后 reload。公网只开放 Nginx 的 HTTPS 端口，容器端口绑定 loopback。按部署环境对登录和 API 路径配置速率限制。
 
+登录限流只应用于认证接口。为 `/auth/v1/_app/`、`/auth/v1/assets/`、`/auth/v1/theme/` 设置更具体的代理 location，保持静态资源独立于登录限流。登录页一次会加载数十个 JavaScript/CSS 文件；上线验收需检查这些资源全部返回成功，防止资源 429 导致前端显示 500。
+
 ```sh
 docker compose -f deploy/compose.yaml up -d auth
 ```
