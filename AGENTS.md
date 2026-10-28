@@ -3,6 +3,7 @@
 - Rust: Cargo, pinned Cargo.lock; temporary Python scripts: uv; Node tooling: pnpm.
 - Keep secrets and deployment identities out of Git and logs.
 - Never send or modify real email for tests without explicit user authorization.
+- Status FETCH results must match the requested UID. Ignore unsolicited other/no-UID updates; a missing target is NOT_FOUND, while an existing target with FLAGS () succeeds. Later matching flags replace earlier ones.
 - Read with EXAMINE/PEEK. Bound connection count, response bytes, message size and tool output.
 - Tool output budget counts the complete serialized JSON-RPC response with actual id, request_id, structuredContent and escaped text copy. HTTP rejects ids over 1024 serialized JSON bytes before execution; keep this guard wired ahead of rmcp. Limit fallback remains bounded and preserves known send status; use get_operation with the original operation_key before retrying writes.
 - Persist send intent before SMTP. Preserve accepted/unknown outcomes across audit or cleanup failures; never retry unknown sends automatically.

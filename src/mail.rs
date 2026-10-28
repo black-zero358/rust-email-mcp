@@ -246,16 +246,7 @@ impl MailService {
                 let state = s.examine(folder).await.map_err(|_| MailError::backend())?;
                 check_validity(a, state.uid_validity)?;
                 if name == "get_email_status" {
-                    let f = s
-                        .uid_fetch(uid.to_string(), "(UID FLAGS)")
-                        .await
-                        .map_err(|_| MailError::backend())?
-                        .try_collect::<Vec<_>>()
-                        .await
-                        .map_err(|_| MailError::backend())?;
-                    return Ok(
-                        json!({"uid":uid,"uid_validity":state.uid_validity,"flags":f.iter().flat_map(|x|x.flags().map(|f|format!("{f:?}"))).collect::<Vec<_>>()}),
-                    );
+                    return email_status(s, uid, state.uid_validity).await;
                 }
                 let raw = self.raw(s, uid).await?;
                 if name == "download_attachment" {
@@ -696,6 +687,37 @@ fn addresses(a: &Value, key: &str) -> Result<Vec<Mailbox>> {
         }
     }
 }
+async fn email_status<S>(
+    s: &mut async_imap::Session<S>,
+    uid: u32,
+    validity: Option<u32>,
+) -> Result<Value>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
+{
+    let fetched = s
+        .uid_fetch(uid.to_string(), "(UID FLAGS)")
+        .await
+        .map_err(|_| MailError::backend())?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|_| MailError::backend())?;
+    // FETCH may also contain unsolicited updates for other messages. A target
+    // update replaces its previous flags, so use the last matching response.
+    let target = fetched
+        .iter()
+        .rev()
+        .find(|f| f.uid == Some(uid))
+        .ok_or(MailError {
+            code: "NOT_FOUND",
+            message: "The requested email UID was not returned by the mailbox.",
+            retryable: false,
+        })?;
+    Ok(
+        json!({"uid":uid,"uid_validity":validity,"flags":target.flags().map(|f|format!("{f:?}")).collect::<Vec<_>>()}),
+    )
+}
+
 async fn save_draft<S>(s: &mut async_imap::Session<S>, config: &Config, a: &Value) -> Result<Value>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
@@ -853,6 +875,70 @@ fn attachment(raw: &[u8], index: usize, max: usize) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn status_uses_only_target_uid_and_distinguishes_missing_from_empty_flags() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        for (rows, expected) in [
+            (
+                "* 2 FETCH (UID 99 FLAGS (\\Seen))\r\n* 1 FETCH (UID 7 FLAGS (\\Flagged))\r\n* 3 FETCH (UID 100 FLAGS (\\Answered))\r\n",
+                Some(json!(["Flagged"])),
+            ),
+            (
+                "* 2 FETCH (FLAGS (\\Seen))\r\n* 1 FETCH (UID 7 FLAGS (\\Flagged))\r\n* 3 FETCH (FLAGS (\\Answered))\r\n",
+                Some(json!(["Flagged"])),
+            ),
+            (
+                "* 2 FETCH (UID 99 FLAGS (\\Seen))\r\n* 3 FETCH (FLAGS (\\Answered))\r\n",
+                None,
+            ),
+            ("", None),
+            (
+                "* 1 FETCH (UID 7 FLAGS (\\Seen))\r\n* 1 FETCH (UID 7 FLAGS (\\Flagged))\r\n",
+                Some(json!(["Flagged"])),
+            ),
+            (
+                "* 2 FETCH (UID 99 FLAGS (\\Seen))\r\n* 1 FETCH (UID 7 FLAGS ())\r\n",
+                Some(json!([])),
+            ),
+        ] {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let (client, server) = tokio::io::duplex(8192);
+                let backend = tokio::spawn(async move {
+                    let mut server = BufReader::new(server);
+                    let mut line = String::new();
+                    server.read_line(&mut line).await.unwrap();
+                    let tag = line.split_whitespace().next().unwrap();
+                    server
+                        .write_all(format!("{tag} OK login\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                    line.clear();
+                    server.read_line(&mut line).await.unwrap();
+                    let (tag, command) = line.split_once(' ').unwrap();
+                    assert_eq!(command, "UID FETCH 7 (UID FLAGS)\r\n");
+                    server
+                        .write_all(format!("{rows}{tag} OK fetched\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                });
+                let mut session = async_imap::Client::new(client)
+                    .login("synthetic", "test-only")
+                    .await
+                    .unwrap();
+                let result = email_status(&mut session, 7, Some(9)).await;
+                backend.await.unwrap();
+                match expected {
+                    Some(flags) => assert_eq!(
+                        result.unwrap(),
+                        json!({"uid":7,"uid_validity":9,"flags":flags})
+                    ),
+                    None => assert_eq!(result.unwrap_err().code, "NOT_FOUND"),
+                }
+            })
+            .await
+            .unwrap();
+        }
+    }
     #[tokio::test]
     async fn refused_imap_tools_return_backend_error_and_stop_delete() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
