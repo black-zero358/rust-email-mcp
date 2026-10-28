@@ -1,5 +1,5 @@
 use crate::{
-    auth::{Principal, RequestId},
+    auth::{Principal, RequestId as HttpRequestId},
     error::MailError,
     mail::MailService,
 };
@@ -10,6 +10,103 @@ use rmcp::{
 };
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Instant};
+
+pub const MAX_RPC_ID_BYTES: usize = 1024;
+
+/// Enforce the id bound before rmcp can execute a write or echo an oversized id.
+pub async fn limit_rpc_id(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if req.method() != axum::http::Method::POST {
+        return next.run(req).await;
+    }
+    let (parts, body) = req.into_parts();
+    let Ok(body) = axum::body::to_bytes(body, 256 * 1024).await else {
+        return axum::http::StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    };
+    if let Ok(value) = serde_json::from_slice::<Value>(&body)
+        && let Some(id) = value.get("id")
+        && !serialized_fits(id, MAX_RPC_ID_BYTES)
+    {
+        return (
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            "JSON-RPC id exceeds 1024 serialized bytes",
+        )
+            .into_response();
+    }
+    next.run(axum::extract::Request::from_parts(parts, body.into()))
+        .await
+}
+
+/// Count actual serde JSON bytes without allocating a second full wire buffer.
+fn serialized_fits(value: &impl serde::Serialize, limit: usize) -> bool {
+    struct Budget(usize);
+    impl std::io::Write for Budget {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.0 {
+                return Err(std::io::Error::other("JSON output budget exceeded"));
+            }
+            self.0 -= bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer(Budget(limit), value).is_ok()
+}
+
+fn response_fits(response: &CallToolResult, id: &RequestId, limit: usize) -> bool {
+    // rmcp's ServerResult is untagged. Legacy adaptation only removes resultType.
+    serialized_fits(
+        &JsonRpcResponse {
+            jsonrpc: JsonRpcVersion2_0,
+            id: id.clone(),
+            result: response,
+        },
+        limit,
+    )
+}
+
+fn bounded_tool_result(
+    result: crate::error::Result<Value>,
+    request_id: &str,
+    id: &RequestId,
+    limit: usize,
+) -> std::result::Result<CallToolResult, ErrorData> {
+    let status = result
+        .as_ref()
+        .ok()
+        .and_then(|v| v["operation"]["status"].as_str())
+        .filter(|s| ["sending", "accepted", "rejected", "unknown"].contains(s))
+        .map(str::to_owned);
+    let response = match result {
+        Ok(value) => CallToolResult::structured(json!({"data":value,"request_id":request_id})),
+        Err(error) => {
+            CallToolResult::structured_error(json!({"error":error,"request_id":request_id}))
+        }
+    };
+    if response_fits(&response, id, limit) {
+        return Ok(response);
+    }
+    let mut fallback = json!({"error":MailError::limit(),"request_id":request_id,
+        "recovery":"Inspect get_operation with the original operation_key before retrying a write.",
+        "retry_allowed":false});
+    if let Some(status) = status {
+        fallback["operation"] = json!({"status":status});
+    }
+    let fallback = CallToolResult::structured_error(fallback);
+    if response_fits(&fallback, id, limit) {
+        Ok(fallback)
+    } else {
+        Err(ErrorData::internal_error(
+            "Output budget cannot fit the limit response",
+            None,
+        ))
+    }
+}
 
 #[derive(Clone)]
 pub struct EmailServer(pub Arc<MailService>);
@@ -240,6 +337,12 @@ impl ServerHandler for EmailServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResponse, ErrorData> {
+        if !serialized_fits(&context.id, MAX_RPC_ID_BYTES) {
+            return Err(ErrorData::invalid_request(
+                "JSON-RPC id exceeds 1024 serialized bytes",
+                None,
+            ));
+        }
         let parts = context
             .extensions
             .get::<axum::http::request::Parts>()
@@ -254,7 +357,7 @@ impl ServerHandler for EmailServer {
             .clone();
         let request_id = parts
             .extensions
-            .get::<RequestId>()
+            .get::<HttpRequestId>()
             .map(|r| r.0.clone())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let name = request.name.to_string();
@@ -266,10 +369,13 @@ impl ServerHandler for EmailServer {
         let schema = serde_json::to_value(&tool.input_schema)
             .map_err(|_| ErrorData::internal_error("Tool schema unavailable", None))?;
         if !validate(&args, &schema) {
-            return Ok(CallToolResult::structured_error(
-                json!({"error":MailError::input(),"request_id":request_id}),
+            return bounded_tool_result(
+                Err(MailError::input()),
+                &request_id,
+                &context.id,
+                self.0.config.max_output,
             )
-            .into());
+            .map(Into::into);
         }
         let service = self.0.clone();
         let started = Instant::now();
@@ -301,26 +407,165 @@ impl ServerHandler for EmailServer {
                 retryable: false,
             })
         });
-        let response = match result {
-            Ok(value) => {
-                if value.to_string().len() > self.0.config.max_output {
-                    CallToolResult::structured_error(
-                        json!({"error":MailError::limit(),"request_id":request_id}),
-                    )
-                } else {
-                    CallToolResult::structured(json!({"data":value,"request_id":request_id}))
-                }
-            }
-            Err(error) => {
-                CallToolResult::structured_error(json!({"error":error,"request_id":request_id}))
-            }
-        };
-        Ok(response.into())
+        bounded_tool_result(result, &request_id, &context.id, self.0.config.max_output)
+            .map(Into::into)
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    const OUTPUT_LIMIT: usize = 256 * 1024;
+    const TRACE_ID: &str = "00000000-0000-0000-0000-000000000000";
+
+    fn wire_bytes(result: CallToolResult, id: RequestId) -> Vec<u8> {
+        serde_json::to_vec(&JsonRpcResponse {
+            jsonrpc: JsonRpcVersion2_0,
+            id,
+            result: ServerResult::CallToolResult(result),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn final_wire_budget_covers_duplicates_escaping_unicode_and_attachments() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let id = RequestId::String("\\\"\n中".repeat(40).into());
+        for value in [
+            json!({"body":"x".repeat(140_000)}),
+            json!({"body":"中😀".repeat(30_000)}),
+            json!({"body":"\"\\\n".repeat(30_000)}),
+            json!({"size":128*1024,"base64":STANDARD.encode(vec![b'x';128*1024])}),
+            json!({"items":(0..10).map(|_| json!({"body":"x".repeat(14000)})).collect::<Vec<_>>()}),
+        ] {
+            let unbounded = CallToolResult::structured(json!({"data":value,"request_id":TRACE_ID}));
+            assert!(wire_bytes(unbounded, id.clone()).len() > OUTPUT_LIMIT);
+            let bounded = bounded_tool_result(Ok(value), TRACE_ID, &id, OUTPUT_LIMIT).unwrap();
+            assert_eq!(
+                bounded.structured_content.as_ref().unwrap()["error"]["code"],
+                "LIMIT_EXCEEDED"
+            );
+            assert_eq!(bounded.is_error, Some(true));
+            assert!(wire_bytes(bounded, id.clone()).len() <= OUTPUT_LIMIT);
+        }
+    }
+
+    #[test]
+    fn exact_wire_boundary_and_error_responses_are_bounded() {
+        for id in [
+            RequestId::Number(i64::MIN),
+            RequestId::String("x".repeat(1022).into()),
+            RequestId::String("\n\"\\中".repeat(60).into()),
+        ] {
+            let value = json!({"items":[{"body":"hello 中\n\"\\"}]});
+            let candidate = CallToolResult::structured(json!({"data":value,"request_id":TRACE_ID}));
+            let length = wire_bytes(candidate.clone(), id.clone()).len();
+            assert!(response_fits(&candidate, &id, length));
+            assert!(!response_fits(&candidate, &id, length - 1));
+            assert_eq!(
+                bounded_tool_result(Ok(value), TRACE_ID, &id, length).unwrap(),
+                candidate
+            );
+            let error =
+                bounded_tool_result(Err(MailError::input()), TRACE_ID, &id, OUTPUT_LIMIT).unwrap();
+            assert!(wire_bytes(error, id.clone()).len() <= OUTPUT_LIMIT);
+            let error = bounded_tool_result(Ok(json!({"operation":{"status":"accepted","warnings":["x".repeat(OUTPUT_LIMIT)]}})), TRACE_ID, &id, OUTPUT_LIMIT).unwrap();
+            let content = error.structured_content.as_ref().unwrap();
+            assert_eq!(content["operation"]["status"], "accepted");
+            assert_eq!(content["retry_allowed"], false);
+            assert!(wire_bytes(error, id).len() <= OUTPUT_LIMIT);
+        }
+        assert!(serialized_fits(&json!("hello"), 7));
+        assert!(!serialized_fits(&json!("hello"), 6));
+    }
+
+    #[test]
+    fn multi_item_results_at_the_256k_boundary() {
+        let id = RequestId::String("\"\\中".repeat(70).into());
+        let make_value =
+            |n| json!({"items":(0..10).map(|_| json!({"body":"x".repeat(n)})).collect::<Vec<_>>()});
+        let mut low = 0;
+        let mut high = OUTPUT_LIMIT;
+        while low + 1 < high {
+            let mid = (low + high) / 2;
+            let response =
+                CallToolResult::structured(json!({"data":make_value(mid),"request_id":TRACE_ID}));
+            if response_fits(&response, &id, OUTPUT_LIMIT) {
+                low = mid;
+            } else {
+                high = mid;
+            }
+        }
+        let exact = bounded_tool_result(Ok(make_value(low)), TRACE_ID, &id, OUTPUT_LIMIT).unwrap();
+        assert!(
+            exact
+                .structured_content
+                .as_ref()
+                .unwrap()
+                .get("data")
+                .is_some()
+        );
+        assert!(wire_bytes(exact, id.clone()).len() <= OUTPUT_LIMIT);
+        let over = bounded_tool_result(Ok(make_value(high)), TRACE_ID, &id, OUTPUT_LIMIT).unwrap();
+        assert_eq!(
+            over.structured_content.as_ref().unwrap()["error"]["code"],
+            "LIMIT_EXCEEDED"
+        );
+        assert!(wire_bytes(over, id).len() <= OUTPUT_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn oversized_rpc_id_is_rejected_before_execution() {
+        use axum::{
+            Router,
+            body::Body,
+            http::{Request, StatusCode},
+            middleware,
+            routing::post,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tower::ServiceExt;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let app = Router::new()
+            .route(
+                "/mcp",
+                post(move || {
+                    let counter = counter.clone();
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        "executed"
+                    }
+                }),
+            )
+            .layer(middleware::from_fn(limit_rpc_id));
+        for (id, expected) in [
+            (json!("x".repeat(1022)), StatusCode::OK),
+            (json!(i64::MIN), StatusCode::OK),
+            (json!("x".repeat(1023)), StatusCode::PAYLOAD_TOO_LARGE),
+            (json!("\"\\\n".repeat(200)), StatusCode::PAYLOAD_TOO_LARGE),
+            (json!("中".repeat(400)), StatusCode::PAYLOAD_TOO_LARGE),
+            (json!("x".repeat(255 * 1024)), StatusCode::PAYLOAD_TOO_LARGE),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/mcp")
+                        .body(Body::from(
+                            json!({"jsonrpc":"2.0","id":id,"method":"tools/call"}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            assert!(
+                axum::body::to_bytes(response.into_body(), OUTPUT_LIMIT)
+                    .await
+                    .is_ok()
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
     #[test]
     fn schemas_match_policy() {
         assert_eq!(tools("full").len(), 20);

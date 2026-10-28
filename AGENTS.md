@@ -4,6 +4,7 @@
 - Keep secrets and deployment identities out of Git and logs.
 - Never send or modify real email for tests without explicit user authorization.
 - Read with EXAMINE/PEEK. Bound connection count, response bytes, message size and tool output.
+- Tool output budget counts the complete serialized JSON-RPC response with actual id, request_id, structuredContent and escaped text copy. HTTP rejects ids over 1024 serialized JSON bytes before execution; keep this guard wired ahead of rmcp. Limit fallback remains bounded and preserves known send status; use get_operation with the original operation_key before retrying writes.
 - Persist send intent before SMTP. Preserve accepted/unknown outcomes across audit or cleanup failures; never retry unknown sends automatically.
 - Authenticate each HTTP request; validate issuer, audience, expiry, scope and subject allowlist.
 - Test OAuth with isolated clients/users. Keep deployment and rollback separate from source publishing.
