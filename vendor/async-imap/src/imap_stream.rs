@@ -38,10 +38,16 @@ pub struct ImapStream<R: Read + Write> {
 
 impl<R: Read + Write + Unpin> ImapStream<R> {
     /// Creates a new `ImapStream` based on the given `Read`er.
+    #[cfg(any(test, feature = "compress"))]
     pub fn new(inner: R) -> Self {
+        Self::with_buffer_limit(inner, Buffer::MAX_CAPACITY)
+    }
+
+    /// Creates a stream with a parser allocation limit.
+    pub fn with_buffer_limit(inner: R, max_buffer: usize) -> Self {
         ImapStream {
             inner,
-            buffer: Buffer::new(),
+            buffer: Buffer::with_limit(max_buffer),
             decode_needs: 0,
             read_closed: false,
         }
@@ -113,7 +119,13 @@ impl<R: Read + Write + Unpin> ImapStream<R> {
                 }
                 Err(nom::Err::Incomplete(Needed::Size(min))) => {
                     log::trace!("decode: incomplete data, need minimum {min} bytes");
-                    self.decode_needs = self.buffer.used() + usize::from(min);
+                    let needed = self.buffer.used().checked_add(usize::from(min));
+                    match needed {
+                        Some(needed) if needed <= self.buffer.max_capacity => {
+                            self.decode_needs = needed;
+                        }
+                        _ => return Err(Some(io::Error::other("IMAP parser buffer limit"))),
+                    }
                     Err(None)
                 }
                 Err(nom::Err::Incomplete(_)) => {
@@ -196,16 +208,24 @@ struct Buffer {
     block: BytesMut,
     /// Offset where used bytes range ends.
     offset: usize,
+    max_capacity: usize,
 }
 
 impl Buffer {
     const BLOCK_SIZE: usize = 1024 * 4;
     const MAX_CAPACITY: usize = 512 * 1024 * 1024; // 512 MiB
 
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_limit(Self::MAX_CAPACITY)
+    }
+
+    fn with_limit(limit: usize) -> Self {
+        let max_capacity = limit.clamp(1, Self::MAX_CAPACITY);
         Self {
-            block: BytesMut::zeroed(Self::BLOCK_SIZE),
+            block: BytesMut::zeroed(Self::BLOCK_SIZE.min(max_capacity)),
             offset: 0,
+            max_capacity,
         }
     }
 
@@ -238,44 +258,37 @@ impl Buffer {
 
     /// Ensure the buffer has free capacity, optionally ensuring minimum buffer size.
     fn ensure_capacity(&mut self, required: usize) -> io::Result<()> {
-        let free_bytes: usize = self.block.len() - self.offset;
-        let extra_bytes_needed: usize = required.saturating_sub(self.block.len());
-        if free_bytes == 0 || extra_bytes_needed > 0 {
-            let increase = std::cmp::max(Buffer::BLOCK_SIZE, extra_bytes_needed);
-            self.grow(increase)?;
+        let required = required.max(self.offset.saturating_add(1));
+        if required > self.max_capacity {
+            return Err(io::Error::other("IMAP parser buffer limit"));
         }
-
-        // Assert that the buffer at least one free byte.
+        if required > self.block.len() {
+            self.grow(required - self.block.len())?;
+        }
         debug_assert!(self.offset < self.block.len());
-
-        // Assert that the buffer has at least the required capacity.
         debug_assert!(self.block.len() >= required);
         Ok(())
     }
 
-    /// Grows the buffer, ensuring there are free bytes in the tail.
-    ///
-    /// The specified number of bytes is only a minimum.  The buffer could grow by more as
-    /// it will always grow in multiples of [`BLOCK_SIZE`].
-    ///
-    /// If the size would be larger than [`MAX_CAPACITY`] an error is returned.
-    ///
-    /// [`BLOCK_SIZE`]: Self::BLOCK_SIZE
-    /// [`MAX_CAPACITY`]: Self::MAX_CAPACITY
+    /// Grow only after checked arithmetic and budget validation. Allocate a fresh
+    /// exact-size block so BytesMut's geometric resize cannot exceed the limit.
     fn grow(&mut self, num_bytes: usize) -> io::Result<()> {
-        let min_size = self.block.len() + num_bytes;
-        let new_size = match min_size % Self::BLOCK_SIZE {
-            0 => min_size,
-            n => min_size + (Self::BLOCK_SIZE - n),
-        };
-        if new_size > Self::MAX_CAPACITY {
-            Err(io::Error::other("incoming data too large"))
-        } else {
-            self.block.resize(new_size, 0);
-            Ok(())
-        }
+        let min_size = self
+            .block
+            .len()
+            .checked_add(num_bytes)
+            .filter(|size| *size <= self.max_capacity)
+            .ok_or_else(|| io::Error::other("IMAP parser buffer limit"))?;
+        let new_size = Self::rounded_size(min_size, self.max_capacity);
+        let mut block = BytesMut::zeroed(new_size);
+        block[..self.offset].copy_from_slice(&self.block[..self.offset]);
+        self.block = block;
+        Ok(())
     }
 
+    fn rounded_size(size: usize, limit: usize) -> usize {
+        (size.saturating_add(Self::BLOCK_SIZE - 1) / Self::BLOCK_SIZE * Self::BLOCK_SIZE).min(limit)
+    }
     /// Return the block backing the buffer.
     ///
     /// Next you *must* either return this block using [`return_block`] or call
@@ -285,7 +298,7 @@ impl Buffer {
     /// [`reset_with_data`]: Self::reset_with_data
     // TODO: Enforce this with typestate.
     fn take_block(&mut self) -> BytesMut {
-        std::mem::replace(&mut self.block, BytesMut::zeroed(Self::BLOCK_SIZE))
+        std::mem::take(&mut self.block)
     }
 
     /// Reset the buffer to be a new allocation with given data copied in.
@@ -293,17 +306,10 @@ impl Buffer {
     /// This allows the previously returned block from `get_block` to be used in and owned
     /// by the [ResponseData].
     ///
-    /// This does not do any bounds checking to see if the new buffer would exceed the
-    /// maximum size.  It will however ensure that there is at least some free space at the
-    /// end of the buffer so that the next reading operation won't need to realloc right
-    /// away.  This could be wasteful if the next action on the buffer is another decode
-    /// rather than a read, but we don't know.
+    /// Remaining bytes are already within the current bounded block. The new
+    /// allocation is rounded without exceeding the same limit.
     fn reset_with_data(&mut self, data: &[u8]) {
-        let min_size = data.len();
-        let new_size = match min_size % Self::BLOCK_SIZE {
-            0 => min_size + Self::BLOCK_SIZE,
-            n => min_size + (Self::BLOCK_SIZE - n),
-        };
+        let new_size = Self::rounded_size(data.len().saturating_add(1), self.max_capacity);
         self.block = BytesMut::zeroed(new_size);
         self.block[..data.len()].copy_from_slice(data);
 
@@ -474,6 +480,48 @@ mod tests {
 
         // IMAP stream should end even though underlying stream fails only once.
         assert!(imap_stream.next().await.is_none());
+    }
+
+    #[test]
+    fn application_limit_rejects_growth_before_allocation() {
+        let mut buf = Buffer::with_limit(1024);
+        assert_eq!(buf.block.len(), 1024);
+        let capacity = buf.block.capacity();
+        assert!(buf.ensure_capacity(1025).is_err());
+        assert_eq!(buf.block.capacity(), capacity);
+        assert!(buf.grow(usize::MAX).is_err());
+        assert_eq!(buf.block.capacity(), capacity);
+        buf.extend_used(1024);
+        assert!(buf.ensure_capacity(0).is_err());
+        assert_eq!(buf.block.capacity(), capacity);
+    }
+
+    #[test]
+    fn rounding_and_reset_stay_within_non_block_limit() {
+        let mut buf = Buffer::with_limit(5000);
+        buf.ensure_capacity(4999).unwrap();
+        assert_eq!(buf.block.capacity(), 5000);
+        buf.reset_with_data(&vec![b'a'; 4999]);
+        assert_eq!(buf.block.capacity(), 5000);
+        assert_eq!(buf.used(), 4999);
+        buf.ensure_capacity(5000).unwrap();
+        assert!(buf.ensure_capacity(5001).is_err());
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    async fn decode_need_rejected_before_growth_or_further_read() {
+        use futures_util::StreamExt;
+        let mut stream = ImapStream::with_buffer_limit(
+            FailingStream {
+                inner: b"* 1 FETCH (BODY[] {2048}\r\n",
+                has_failed: true,
+            },
+            1024,
+        );
+        assert!(stream.next().await.unwrap().is_err());
+        assert_eq!(stream.buffer.block.capacity(), 1024);
+        assert!(stream.next().await.is_none());
     }
 
     #[test]
