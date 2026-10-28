@@ -42,7 +42,7 @@ MIME 在构建结构时限制为 256 个节点、20 层嵌套，头部每段最�
 文件夹名称在工具参数、LIST 返回值和 DRAFTS_MAILBOX/TRASH_MAILBOX 配置中使用 Unicode；返回的 name 可直接传给读取、移动或重命名工具。连接采用 IMAP4rev1，线路上的名称使用 modified UTF-7，包含 & 的名称也会正确转换。非规范或无法安全往返的服务端名称返回 MAIL_BACKEND，避免误引用其他文件夹。ASCII 搜索继续使用 US-ASCII；中文等非 ASCII 查询使用 CHARSET UTF-8 和同步 literal。服务器返回 BADCHARSET 时报告 UNSUPPORTED_CHARSET，不降级为含义不同的查询；未协商 UTF8=ACCEPT 或 IMAP4rev2。
 搜索支持日期、发件人、收件人、主题、已读、星标、已回复、附件和大小组合。会话根据关联头组织；跨文件夹定位使用精确 Message-ID。批量整理最多 50 个明确 UID，保留逐项结果，批量删除必须确认。
 
-正文支持完整或去引用模式、长度设置及省略提示。单封 MIME 邮件上限 8 MiB，单次工具输出上限 256 KiB。附件发现、准备下载及二进制 GET 均通过现有有界整封 MIME 读取，保持统一索引和整体 multipart 附件语义；每封原始邮件和解码后的附件分别受 8 MiB 限制。新邮件支持文本；现有草稿发送保留原 MIME 附件。转发工具发送原邮件的纯文本内容。
+正文支持完整或去引用模式、长度设置及省略提示。`get_email` 在正文长度上限内，按完整 JSON-RPC 响应预算返回可容纳的最长 UTF-8 正文前缀；额外截断设置 `body_truncated=true`。`body_byte_limit` 表示正文配置上限，实际正文可能因 JSON 转义、元数据和调用 id 而更短；元数据本身超限仍返回 `LIMIT_EXCEEDED`。单封 MIME 邮件上限 8 MiB，单次工具输出上限 256 KiB。附件发现、准备下载及二进制 GET 均通过现有有界整封 MIME 读取，保持统一索引和整体 multipart 附件语义；每封原始邮件和解码后的附件分别受 8 MiB 限制。新邮件支持文本；现有草稿发送保留原 MIME 附件。转发工具发送原邮件的纯文本内容。
 
 `download_attachment` 保留原有内联 Base64 返回格式及输出预算。新增 `prepare_attachment_download` 返回短期下载 URL；客户端需携带同一用户的 OAuth Bearer 令牌。普通链接点击和 ChatGPT 自动文件解析尚未验收。参数与范围限制见 [邮件能力扩展](docs/capabilities.md)。
 

@@ -41,6 +41,8 @@
 
 ## MCP and mail
 
+`get_email` 的正文先受 MIME 解码和正文长度选项约束，再由 `server::bounded_email_result` 按实际 JSON-RPC 响应二分选择可容纳的最长 UTF-8 前缀。计量包含真实 id、request_id、全部元数据及两份 JSON 内容；需要额外截断时设置 `body_truncated=true`，保留已有截断标记。`body_byte_limit` 仍表示正文选项与解析硬上限的交集，实际前缀可能更短。非正文元数据不裁剪，空正文仍超限时保留有界 `LIMIT_EXCEEDED`。其他工具和发送结果继续使用原有预算及状态降级路径。
+
 服务使用官方 Rust MCP SDK rmcp 3.8.0 与 Streamable HTTP。IMAP 使用 async-imap 和证书校验的 TLS；SMTP 使用 lettre 的隐式 TLS 或必须成功的 STARTTLS。每个需要邮箱后端的操作获取两个执行槽位之一，连接归单次操作所有，在完成、超时或解析失败后关闭。只读的本地账户/发送状态查询不需要邮箱连接。
 
 读取必须使用 `EXAMINE` 和 `BODY.PEEK`。状态 FETCH 只接受所请求 UID 的结果，忽略其他 UID 或无 UID 的非请求更新；目标不存在返回 `NOT_FOUND`，目标存在但 `FLAGS ()` 为空应成功，后出现的同 UID flags 覆盖先前值。不得以关闭会话为由引入 `CLOSE/EXPUNGE` 等额外副作用。
@@ -107,7 +109,7 @@ JSON 日志使用固定事件名和受控字段，记录服务端生成的 reque
 | --- | --- | --- |
 | D1 身份与授权 | `auth`、`server::allowed/call_tool`、`main` 接线 | `jwt_trust_boundaries`、`failed_refresh_is_shared_and_expired_keys_fail_closed`、`cached_key_does_not_wait_for_rotation_and_refresh_updates_snapshot`、`schemas_match_policy`；另做隔离 OAuth/登录资产验收 |
 | D2 读取无副作用与 UIDVALIDITY | `mail`、`imap_text`、vendored completion boundary | `status_uses_only_target_uid_and_distinguishes_missing_from_empty_flags`、`rev1_mailbox_names_round_trip_through_tools`、`statistics_status_requires_complete_matching_snapshot_and_tag`、`refused_imap_tools_return_backend_error_and_stop_delete`、`tests/imap_completion.rs`；只读邮箱验收核对读前后 flags |
-| D3 资源有界 | `BudgetStream`、`mime`、`html`、`server` | `rejects_split_oversized_literal_before_parser`、`headers_and_decode_are_bounded_before_allocation`、`attributes_are_bounded_before_tokenization_without_whitespace`、`final_wire_budget_covers_duplicates_escaping_unicode_and_attachments`、`oversized_rpc_id_is_rejected_before_execution` |
+| D3 资源有界 | `BudgetStream`、`mime`、`html`、`server` | `rejects_split_oversized_literal_before_parser`、`headers_and_decode_are_bounded_before_allocation`、`attributes_are_bounded_before_tokenization_without_whitespace`、`final_wire_budget_covers_duplicates_escaping_unicode_and_attachments`、`email_body_prefix_fits_real_wire_budget_and_preserves_metadata`、`long_parsed_email_returns_a_wire_bounded_readable_prefix`、`oversized_rpc_id_is_rejected_before_execution` |
 | D4 发送结果与幂等 | `journal`、`mail::send`、`smtp` | `durable_dedup_and_principal_isolation`、`concurrent_claim_has_single_winner`、`smtp_lost_reply_does_not_resend`、`smtp_accepted_is_persisted_before_unresponsive_quit`、`smtp_accepted_survives_quit_timeout_and_journal_failure` |
 | D5 隐私与不可信内容 | `mail`、`mime`、`html`、`main` 日志 | `discovery_matches_message_indices_and_multipart_attachment_trees`、`http_download_authorization_binary_headers_and_transfer_capacity`、`draft_envelope_and_privacy_filter_share_canonical_fields`、`ambiguous_draft_headers_are_rejected`、`text_attachments_stay_downloadable_but_leave_body_and_forward`、`html_read_and_forward_preserve_original_content`、`alternative_read_and_forward_require_complete_representations`、`plain_probes_require_all_inline_parts_and_prune_only_attachments`；日志字段和 panic 脱敏仍需代码审阅 |
 | D6 简单可维护与明确范围 | 模块边界、工具链、补丁来源、部署模板 | CI 的 fmt/test/clippy/build；`scripts/audit-dependencies.sh`；`scripts/test-docker-context.sh` 和生产 Dockerfile 构建；升级/恢复证据见维护与部署指南 |
