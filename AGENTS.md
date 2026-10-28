@@ -14,6 +14,7 @@
 - JWKS keys have a hard 300-second TTL with no stale-on-error extension. Refresh I/O uses a separate coordinator; cached fresh keys bypass it. Refresh results share a 10-second cooldown (also after failure); unavailable JWKS returns HTTP 503 with Retry-After, while invalid tokens return 401.
 - Test OAuth with isolated clients/users. Keep deployment and rollback separate from source publishing.
 - Completed: core, 16 regression tests, fmt/clippy, isolated OAuth + QQ read acceptance, SQLite WAL/FULL benchmark.
+- MIME body selection excludes explicit/filename attachments and their complete subtrees; alternative chooses one supported plain representation, related only its root. Keep read/forward selection and attachment listing/download classification consistent; multipart attachments are downloadable as a whole.
 - Lessons: Rauthy WebAuthn origin requires explicit :443; allow early token refresh; preserve independent sessions. Bound IMAP literals before parser allocation. JWT uses AWS-LC to keep known vulnerable RustCrypto transitive dependencies out of the lockfile.
 - Completed: restart recovery, public deployment templates, GitHub publication, production cutover and rollback documentation. Acceptance mailbox authorization removed after testing.
 - TODO: user-side ChatGPT reconnection/natural refresh; authorized real-mail writes in a dedicated test mailbox; sustained load/attachment memory observations.
