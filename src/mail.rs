@@ -214,7 +214,15 @@ impl MailService {
         // Dropping the connection avoids CLOSE/EXPUNGE side effects and bounds logout latency.
         result
     }
-    async fn with_session(&self, s: &mut Session, name: &str, a: &Value) -> Result<Value> {
+    async fn with_session<S>(
+        &self,
+        s: &mut async_imap::Session<S>,
+        name: &str,
+        a: &Value,
+    ) -> Result<Value>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
+    {
         match name {
             "list_mailboxes" => {
                 let list = s
@@ -390,7 +398,10 @@ impl MailService {
             _ => Err(MailError::input()),
         }
     }
-    async fn raw(&self, s: &mut Session, uid: u32) -> Result<Vec<u8>> {
+    async fn raw<S>(&self, s: &mut async_imap::Session<S>, uid: u32) -> Result<Vec<u8>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
+    {
         let metadata = s
             .uid_fetch(uid.to_string(), "(UID RFC822.SIZE)")
             .await
@@ -426,7 +437,15 @@ impl MailService {
         }
         Ok(body.to_vec())
     }
-    async fn list(&self, s: &mut Session, a: &Value, search: bool) -> Result<Value> {
+    async fn list<S>(
+        &self,
+        s: &mut async_imap::Session<S>,
+        a: &Value,
+        search: bool,
+    ) -> Result<Value>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
+    {
         let m = s
             .examine(folder(a)?)
             .await
@@ -834,6 +853,79 @@ fn attachment(raw: &[u8], index: usize, max: usize) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn refused_imap_tools_return_backend_error_and_stop_delete() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = tempfile::tempdir().unwrap();
+        let service = MailService::new(
+            crate::config::fixture(),
+            Arc::new(Journal::open(&dir.path().join("db")).unwrap()),
+        )
+        .unwrap();
+        for (tool, target, row) in [
+            (
+                "mark_email",
+                "UID STORE",
+                "* 1 FETCH (UID 7 FLAGS (\\Seen))\r\n",
+            ),
+            (
+                "delete_email",
+                "UID STORE",
+                "* 1 FETCH (UID 7 FLAGS (\\Deleted))\r\n",
+            ),
+            ("delete_email", "UID EXPUNGE", "* 1 EXPUNGE\r\n"),
+            ("list_mailboxes", "LIST", "* LIST () \"/\" \"INBOX\"\r\n"),
+            ("search_emails", "UID SEARCH", "* SEARCH 7\r\n"),
+            (
+                "get_email_status",
+                "UID FETCH",
+                "* 1 FETCH (UID 7 FLAGS (\\Seen))\r\n",
+            ),
+        ] {
+            for status in ["NO", "BAD", "EOF"] {
+                for partial in [false, true] {
+                    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                        let (client, server) = tokio::io::duplex(8192);
+                        let backend = tokio::spawn(async move {
+                            let mut server = BufReader::new(server);
+                            let mut rejected = false;
+                            loop {
+                                let mut line = String::new();
+                                if server.read_line(&mut line).await.unwrap() == 0 {
+                                    assert!(rejected);
+                                    break;
+                                }
+                                assert!(!rejected, "command after rejection: {line}");
+                                let (tag, command) = line.split_once(' ').unwrap();
+                                let mut response = String::new();
+                                if command.starts_with(target) {
+                                    rejected = true;
+                                    if partial { response.push_str(row); }
+                                    if status != "EOF" {
+                                        response.push_str(&format!("{tag} {status} refused\r\n"));
+                                    }
+                                } else if command.starts_with("SELECT") || command.starts_with("EXAMINE") {
+                                    response.push_str("* 1 EXISTS\r\n* OK [UIDVALIDITY 9] valid\r\n* OK [UIDNEXT 8] next\r\n");
+                                } else if command.starts_with("CAPABILITY") {
+                                    response.push_str("* CAPABILITY IMAP4rev1 UIDPLUS\r\n");
+                                } else {
+                                    assert!(command.starts_with("LOGIN") || (target == "UID EXPUNGE" && command.starts_with("UID STORE")), "unexpected: {command}");
+                                }
+                                if !rejected { response.push_str(&format!("{tag} OK completed\r\n")); }
+                                server.write_all(response.as_bytes()).await.unwrap();
+                                if rejected && status == "EOF" { break; }
+                            }
+                        });
+                        let mut session = async_imap::Client::new(client).login("synthetic", "test-only").await.unwrap();
+                        let result = service.with_session(&mut session, tool, &json!({"folder":"INBOX","uid":7,"uid_validity":9,"flag":"seen","value":true,"permanent":true,"confirm":true,"query":"synthetic"})).await;
+                        assert_eq!(result.unwrap_err().code, "MAIL_BACKEND", "{tool}/{target}/{status}/{partial}");
+                        drop(session);
+                        backend.await.unwrap();
+                    }).await.unwrap();
+                }
+            }
+        }
+    }
     #[tokio::test]
     async fn save_draft_append_protocol() {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
