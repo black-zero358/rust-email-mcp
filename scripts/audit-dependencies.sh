@@ -7,6 +7,9 @@ cd "$(dirname "$0")/.."
 # Review local completion patches separately, including SELECT/EXAMINE/STATUS;
 # advisory matching cannot verify protocol completion behavior.
 
+# APPEND continuation-state patches also require local code/protocol review;
+# advisory matching cannot validate notification and literal ordering.
+
 # Local FETCH attribute-presence accessors require root behavioral regressions
 # and code review; upstream advisory matching does not validate local changes.
 

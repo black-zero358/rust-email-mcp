@@ -13,6 +13,8 @@
 
 - Read with EXAMINE/PEEK and retain UIDVALIDITY checks. Keep target-UID FETCH handling, IMAP4rev1 text encoding, APPEND flag syntax and tagged completion checks for SELECT/EXAMINE (including empty mailboxes) and STATUS as specified in [MCP and mail](docs/architecture.md#mcp-and-mail).
 
+- APPEND waits through legitimate untagged notifications for literal continuation; tagged results, BYE and EOF before continuation must fail without sending literal bytes.
+
 
 - Match raw FETCH results by UID plus required attribute; merge listing attributes per requested UID. Only actual FLAGS attributes replace flags, including empty FLAGS; missing headers must not create blank summaries.
 - Bound connections, response bytes and parser allocation. Supply the same application limit to `BudgetStream` and `Client::with_buffer_limit`; transport scanning is not a parser allocation boundary. MIME structure, header and decoding budgets apply before allocation; do not restore `mailparse::parse_mail` on untrusted input. Preserve shared read/forward body selection and bounded tokenizer-only HTML handling, including foreign-content rejection and adjacent-attribute regressions. See [MIME and HTML](docs/architecture.md#mime-and-html).
@@ -20,6 +22,7 @@
 - Plain-only alternative probes must cover the complete inline representation: non-empty HTML makes the candidate incomplete, and all collected fragments must be rolled back before trying another candidate.
 - Validate transfer-encoding support before interpreting an entity or decoding a leaf; unknown encoded multipart content stays opaque, and downloads must not label raw encoded bytes as decoded content.
 - Persist intent before SMTP. Preserve accepted/unknown outcomes across journal or cleanup failures; never automatically retry unknown sends. Keep the documented principal-scoped operation keys, bounded QUIT cleanup, TLS/AUTH and SMTPUTF8/8BITMIME policy. Preserve the canonical draft-header privacy boundary and body bytes. See [send lifecycle](docs/architecture.md#send-lifecycle).
+- SMTPUTF8 requirements include raw internationalized headers at every MIME level, including attachments; encoded-words and 8-bit bodies alone do not require it. Refuse missing SMTPUTF8 before MAIL and persist that definite refusal as rejected.
 - Authenticate every HTTP request entering MCP. Preserve issuer, audience, expiry, nbf, scope and subject validation, the hard JWKS TTL and shared refresh cooldown. Keep deployment-specific OAuth and login-asset checks in [authentication](docs/architecture.md#authentication).
 - Count the complete serialized JSON-RPC tool response, including the actual id, request_id, structuredContent and escaped text copy. Keep the 1024-byte serialized-id guard ahead of rmcp; bounded fallback must retain known send status and direct clients to `get_operation` with the original key. See [stable contracts](docs/architecture.md#stable-contracts).
 - Fit `get_email` display-body prefixes against that complete wire budget at UTF-8 boundaries; preserve existing truncation flags and metadata, and retain LIMIT_EXCEEDED when metadata alone cannot fit.
