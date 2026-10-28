@@ -1786,6 +1786,61 @@ mod tests {
         }
     }
     #[test]
+    fn unknown_transfer_encoding_cannot_be_read_forwarded_or_downloaded_as_decoded() {
+        for content_type in ["text/plain", "text/html", "multipart/mixed; boundary=m"] {
+            for encoding in ["x-example", "X-Example", "", " \t"] {
+                let raw = format!(
+                    "Content-Type: {content_type}\r\nContent-Transfer-Encoding: {encoding}\r\n\r\nRAW_ENCODED"
+                );
+                assert_eq!(
+                    parsed(raw.as_bytes(), 1, None, 16000).unwrap_err().code,
+                    "UNSUPPORTED_BODY"
+                );
+                assert_eq!(
+                    forward_body(raw.as_bytes(), "FYI").unwrap_err().code,
+                    "UNSUPPORTED_BODY"
+                );
+            }
+        }
+        let unknown =
+            "Content-Type: text/plain\r\nContent-Transfer-Encoding: x-example\r\n\r\nRAW_ENCODED";
+        let mixed = format!(
+            "Content-Type: multipart/mixed; boundary=m\r\n\r\n--m\r\nContent-Type: text/plain\r\n\r\nVisible intro\r\n--m\r\n{unknown}\r\n--m--\r\n"
+        );
+        assert_eq!(
+            parsed(mixed.as_bytes(), 1, None, 16000).unwrap_err().code,
+            "UNSUPPORTED_BODY"
+        );
+        assert_eq!(
+            forward_body(mixed.as_bytes(), "FYI").unwrap_err().code,
+            "UNSUPPORTED_BODY"
+        );
+        let alternative = format!(
+            "Content-Type: multipart/alternative; boundary=a\r\n\r\n--a\r\nContent-Type: text/plain\r\n\r\nComplete fallback\r\n--a\r\n{unknown}\r\n--a--\r\n"
+        );
+        assert_eq!(
+            parsed(alternative.as_bytes(), 1, None, 16000).unwrap()["body"],
+            "Complete fallback"
+        );
+        assert_eq!(
+            forward_body(alternative.as_bytes(), "FYI").unwrap(),
+            "FYI\n\n---------- Forwarded message ----------\nComplete fallback"
+        );
+        let attached = b"Content-Type: text/plain\r\nContent-Disposition: attachment\r\nContent-Transfer-Encoding: x-example\r\n\r\nRAW_ENCODED";
+        let read = parsed(attached, 1, None, 16000).unwrap();
+        assert_eq!(read["body"], "");
+        assert_eq!(read["attachments"][0]["attachment_index"], 0);
+        assert!(
+            !forward_body(attached, "FYI")
+                .unwrap()
+                .contains("RAW_ENCODED")
+        );
+        assert_eq!(
+            attachment(attached, 0, 1024).unwrap_err().code,
+            "UNSUPPORTED_BODY"
+        );
+    }
+    #[test]
     fn composed_unicode_subject_address_and_body_keep_utf8_semantics() {
         let args = json!({"to":["用户@example.test"],"subject":"中文主题","body":"中 café 😀"});
         let (raw, envelope) = compose(&args, "me@example.test", Some("<id@example.test>")).unwrap();

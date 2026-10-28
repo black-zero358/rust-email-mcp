@@ -61,6 +61,8 @@ async-imap 0.12 的 APPEND flags 原样序列化，必须传入 `(\Draft)` 这�
 
 邮件正文、主题、头部和附件均按不可信输入处理。构建 MIME 结构前检查共享的节点、深度和头部预算；transfer/charset 解码前预留预算。不得恢复对不可信输入调用 `mailparse::parse_mail`；回复和草稿发送只需要有界头部。boundary 按完整分隔符匹配，接受允许的尾部空白，不能把相同前缀当作分隔符。
 
+依据 [RFC 2045 §6.1、§6.4](https://www.rfc-editor.org/rfc/rfc2045#section-6.4)，缺省 transfer encoding 为 7bit，编码名不区分大小写；未知编码实体不按声明的 MIME 类型解释。解析时对未知编码停止 multipart 递归，选择时把非空内联实体视为不支持，允许 alternative 回滚并选另一完整候选；没有候选时返回既有 `UNSUPPORTED_BODY`。`encoded()` 在调用 mailparse `Body::new` 前显式验证编码，不能依赖该库把未知值默认为 SevenBit 的行为。`body_raw` 同样拒绝未知编码，不把原始编码字节作为已解码附件交付，认证下载保留原 HTTP 502 后端失败映射。显式附件分类和共享索引不变，真正空实体不被当作非空正文错误，原有结构、头部和解码分配前预算继续适用。
+
 正文选择排除显式 attachment 或带文件名的部件及其整个子树；`multipart/alternative` 选一个受支持表示并优先纯文本，`multipart/related` 只选主部件。读取和转发共用选择逻辑，附件列表和下载共用分类规则，multipart 附件可整体下载。真实空正文与“不支持或无法完整解释的正文”必须区分。
 
 `mime::Part::is_attachment` 按 [RFC 2183 §2.8–2.9](https://www.rfc-editor.org/rfc/rfc2183#section-2.8) 将显式但服务不支持的 disposition 类型（含 form-data）按附件处理；multipart 分类作用于整个子树。锁定的 mailparse 0.18.0 将缺省/空类型解析为 `Extension("")`，因此不能机械地把全部 Extension 判为附件；缺省、空或仅空白类型保持原有语义，inline 仍可内联，filename/name 的既有附件判断独立生效。正文、转发、附件发现和下载统一调用该分类，不新增索引或解码路径。
@@ -115,6 +117,8 @@ JSON 日志使用固定事件名和受控字段，记录服务端生成的 reque
 | D6 简单可维护与明确范围 | 模块边界、工具链、补丁来源、部署模板 | CI 的 fmt/test/clippy/build；`scripts/audit-dependencies.sh`；`scripts/test-docker-context.sh` 和生产 Dockerfile 构建；升级/恢复证据见维护与部署指南 |
 
 vendored 构建依赖必须由 `.dockerignore` 明确允许并复制进 Docker builder；允许范围不能扩大到 vendor 同级目录、秘密或部署数据。Docker context 检查使用合成哨兵与真实构建器。普通 `cargo audit` 会跳过 path package，因此本地与 CI 统一运行专用审计脚本，同时独立审阅本地补丁代码；升级时同步更新来源、脚本和回归测试。
+
+CTE 支持性对应 D3/D5：`mime::Part::transfer_encoding/encoded/select_text` 与 `parse_part` 的验证入口为 `transfer_encodings_require_known_decoders_before_interpretation`、`unknown_transfer_encoding_cannot_be_read_forwarded_or_downloaded_as_decoded`；覆盖不透明 multipart、完整 alternative 回退与下载拒绝，不替代真实邮箱验收。
 
 ## Decision records
 

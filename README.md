@@ -54,6 +54,8 @@ MIME 在构建结构时限制为 256 个节点、20 层嵌套，头部每段最�
 
 HTML 在本地提取纯文本，保留实体、Unicode、段落换行和图片 alt 文本，忽略文档元数据、脚本、样式、模板及内嵌框架；不执行脚本、不加载资源，也不保留 CSS 可见性和表格排版。转换前限制解码后的 HTML 为 128 KiB、ASCII 空白、单/双引号、斜杠和等号合计最多 8192 个，以保守限制标记属性复杂度；流式处理最多 4096 个 token、256 KiB 输出，并受共享 MIME 解码预算约束。超限返回 `LIMIT_EXCEEDED`；SVG/MathML 外来命名空间与非空但无法完整解释的内联正文（包括未知或替换型字符集）整段返回 `UNSUPPORTED_BODY`，转发在记录发送意图与 SMTP 前拒绝不完整原文。真正为空的正文仍可读取和转发。所有新构建的纯文本邮件（包括转发）显式声明 `text/plain; charset=utf-8`。
 
+Content-Transfer-Encoding 缺省为 7bit，叶子解码支持 7bit、8bit、binary、Base64 和 quoted-printable，名称不区分大小写。未知或显式空编码的非空内联实体返回 `UNSUPPORTED_BODY`，alternative 可改选其他完整受支持表示；未知编码的 multipart 保持不透明，不按原始字节解释子树。显式附件仍可发现，但未知编码无法按已解码附件下载：内联下载拒绝，二进制 GET 沿既有后端失败路径返回 HTTP 502；不提供未标明的原始编码数据。
+
 发送前由客户端向用户展示收件人和内容，并获得明确授权。所有发送工具必须提供 `operation_key`，同一发送意图重试时复用该值。
 
 服务先将操作键、参数摘要和 Message-ID 写入 SQLite，再提交 SMTP。结果有三种：
