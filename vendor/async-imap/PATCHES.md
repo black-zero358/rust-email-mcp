@@ -1,4 +1,4 @@
-# Local completion-status patch
+# Local protocol and allocation patches
 
 Source: crates.io `async-imap` 0.12.0, upstream commit
 `31fde98fceb5b9bde726807419992f8d84b1f193`.
@@ -36,3 +36,32 @@ The script fails on a changed upstream checksum, missing/duplicate package,
 unexpected source/checksum or changed pinned version. Upgrade the provenance,
 script and tests together when changing this dependency; verify audit coverage
 against RustSec again. There is no fallback that suppresses an audit failure.
+
+## Application parser allocation limit (issue #24)
+
+The upstream archive, version, licenses and checksum above remain unchanged.
+Local changes in `src/client.rs` and `src/imap_stream.rs` add
+`Client::with_buffer_limit(stream, bytes)`; `Client::new` retains the upstream
+512 MiB ceiling. The application supplies its transport budget to this new
+constructor before greeting/login. Limits clamp to 1..=512 MiB.
+
+`nom::Needed::Size` counts additional bytes: checked addition of buffered and
+needed bytes must fit the application limit before any growth. Unknown needs,
+block rounding, initial allocations and copied response tails obey the same
+limit. Fresh exact-size BytesMut blocks avoid geometric resize exceeding it;
+new and old blocks can coexist during copying, so this is not an RSS promise.
+Parser errors close the stream. Transport accounting remains independent.
+
+Small synthetic regressions in application tests exercise fragmented legal text,
+normal literals, known and unknown incomplete sizes, and an exact boundary.
+Vendored unit regressions additionally assert unchanged allocation capacity after
+rejected growth and cover arithmetic overflow, non-block limits and tail reset.
+Run those tests from a temporary standalone copy of this crate with the root
+Cargo.lock as the resolution seed, using `cargo test --no-default-features
+--features runtime-tokio --lib imap_stream::tests`; Cargo may add upstream-only
+dev dependencies to that temporary lockfile. Root tests run under `--locked`.
+
+Review these local parser changes separately from advisory matching in
+`scripts/audit-dependencies.sh`. An upstream replacement must pass both the
+completion-status and allocation regressions before removing either patch.
+Protocol semantics reference: [nom streaming take](https://docs.rs/nom/8.0.0/nom/bytes/streaming/fn.take.html).
