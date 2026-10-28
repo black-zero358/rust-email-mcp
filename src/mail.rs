@@ -1,6 +1,7 @@
 use crate::{
     config::Config,
     error::{MailError, Result},
+    imap_text::{display_name, mailbox_name, uid_text_search},
     journal::{Journal, Operation},
     mime,
 };
@@ -235,15 +236,17 @@ impl MailService {
                 if list.len() > 200 {
                     return Err(MailError::limit());
                 }
-                Ok(
-                    json!({"mailboxes":list.iter().map(|m|json!({"name":m.name(),"attributes":format!("{:?}",m.attributes())})).collect::<Vec<_>>()}),
-                )
+                let mailboxes = list.iter().map(|m| Ok(json!({"name":display_name(m.name())?,"attributes":format!("{:?}",m.attributes())}))).collect::<Result<Vec<_>>>()?;
+                Ok(json!({"mailboxes":mailboxes}))
             }
             "list_emails" | "search_emails" => self.list(s, a, name == "search_emails").await,
             "get_email" | "get_email_status" | "download_attachment" => {
                 let folder = folder(a)?;
                 let uid = uid(a)?;
-                let state = s.examine(folder).await.map_err(|_| MailError::backend())?;
+                let state = s
+                    .examine(mailbox_name(folder)?)
+                    .await
+                    .map_err(|_| MailError::backend())?;
                 check_validity(a, state.uid_validity)?;
                 if name == "get_email_status" {
                     return email_status(s, uid, state.uid_validity).await;
@@ -267,7 +270,7 @@ impl MailService {
                     return Err(MailError::input());
                 }
                 let state = s
-                    .examine(folder(a)?)
+                    .examine(mailbox_name(folder(a)?)?)
                     .await
                     .map_err(|_| MailError::backend())?;
                 check_validity(a, state.uid_validity)?;
@@ -293,29 +296,32 @@ impl MailService {
             }
             "save_draft" => save_draft(s, &self.config, a).await,
             "create_mailbox" => {
-                s.create(text(a, "name")?)
+                s.create(mailbox_name(text(a, "name")?)?)
                     .await
                     .map_err(|_| MailError::backend())?;
                 Ok(json!({"status":"created"}))
             }
             "rename_mailbox" => {
-                s.rename(text(a, "name")?, text(a, "new_name")?)
-                    .await
-                    .map_err(|_| MailError::backend())?;
+                s.rename(
+                    mailbox_name(text(a, "name")?)?,
+                    mailbox_name(text(a, "new_name")?)?,
+                )
+                .await
+                .map_err(|_| MailError::backend())?;
                 Ok(json!({"status":"renamed"}))
             }
             "delete_mailbox" => {
                 if a["confirm"] != true {
                     return Err(MailError::input());
                 }
-                s.delete(text(a, "name")?)
+                s.delete(mailbox_name(text(a, "name")?)?)
                     .await
                     .map_err(|_| MailError::backend())?;
                 Ok(json!({"status":"deleted"}))
             }
             "move_email" | "delete_email" | "mark_email" => {
                 let state = s
-                    .select(folder(a)?)
+                    .select(mailbox_name(folder(a)?)?)
                     .await
                     .map_err(|_| MailError::backend())?;
                 check_validity(a, state.uid_validity)?;
@@ -379,7 +385,7 @@ impl MailService {
                                 retryable: false,
                             });
                         }
-                        s.uid_mv(&uid, dest)
+                        s.uid_mv(&uid, mailbox_name(dest)?)
                             .await
                             .map_err(|_| MailError::backend())?;
                     }
@@ -438,7 +444,7 @@ impl MailService {
         S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
     {
         let m = s
-            .examine(folder(a)?)
+            .examine(mailbox_name(folder(a)?)?)
             .await
             .map_err(|_| MailError::backend())?;
         check_validity(a, m.uid_validity)?;
@@ -456,15 +462,14 @@ impl MailService {
         // Scan a finite UID window; callers explicitly advance the cursor even for sparse results.
         let end = before - 1;
         let start = end.saturating_sub(499).max(1);
-        let query = if search {
-            format!("UID {start}:{end} TEXT {}", quote(text(a, "query")?)?)
+        let found = if search {
+            uid_text_search(s, start, end, text(a, "query")?).await?
         } else {
-            format!("UID {start}:{end}")
+            s.uid_search(format!("UID {start}:{end}"))
+                .await
+                .map_err(|_| MailError::backend())?
         };
-        let mut ids = s
-            .uid_search(query)
-            .await
-            .map_err(|_| MailError::backend())?
+        let mut ids = found
             .into_iter()
             .filter(|u| *u >= start && *u <= end)
             .collect::<Vec<_>>();
@@ -522,7 +527,7 @@ impl MailService {
             let raw = tokio::time::timeout(self.config.timeout, async {
                 let mut s = self.connect().await?;
                 let state = s
-                    .examine(&self.config.drafts)
+                    .examine(mailbox_name(&self.config.drafts)?)
                     .await
                     .map_err(|_| MailError::backend())?;
                 check_validity(a, state.uid_validity)?;
@@ -535,7 +540,7 @@ impl MailService {
             let original = tokio::time::timeout(self.config.timeout, async {
                 let mut s = self.connect().await?;
                 let state = s
-                    .examine(folder(a)?)
+                    .examine(mailbox_name(folder(a)?)?)
                     .await
                     .map_err(|_| MailError::backend())?;
                 check_validity(a, state.uid_validity)?;
@@ -659,15 +664,6 @@ fn check_validity(a: &Value, current: Option<u32>) -> Result<()> {
     }
     Ok(())
 }
-fn quote(s: &str) -> Result<String> {
-    if s.len() > 512 || s.contains(['\r', '\n', '\0']) {
-        return Err(MailError::input());
-    }
-    Ok(format!(
-        "\"{}\"",
-        s.replace('\\', "\\\\").replace('"', "\\\"")
-    ))
-}
 fn addresses(a: &Value, key: &str) -> Result<Vec<Mailbox>> {
     match a.get(key) {
         None => Ok(vec![]),
@@ -727,7 +723,7 @@ where
         return Err(MailError::limit());
     }
     // async-imap serializes flags verbatim; RFC 3501 APPEND requires a flag list.
-    s.append(&config.drafts, Some("(\\Draft)"), None, &raw)
+    s.append(mailbox_name(&config.drafts)?, Some("(\\Draft)"), None, &raw)
         .await
         .map_err(|_| MailError::backend())?;
     Ok(json!({"status":"saved","mailbox":config.drafts}))
@@ -923,6 +919,66 @@ fn attachment(raw: &[u8], index: usize, max: usize) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn rev1_mailbox_names_round_trip_through_tools() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let (client, server) = tokio::io::duplex(8192);
+            let backend = tokio::spawn(async move {
+                let mut server = BufReader::new(server);
+                // Every mailbox argument must be the rev1 ASCII wire name.
+                for (expected, rows) in [
+                    ("LOGIN \"synthetic\" \"test-only\"", ""),
+                    ("LIST \"\" *", "* LIST () \"/\" \"&mHl27g-&-\"\r\n"),
+                    ("EXAMINE \"&mHl27g-&-\"", "* 1 EXISTS\r\n* OK [UIDVALIDITY 9] valid\r\n"),
+                    ("UID FETCH 7 (UID FLAGS)", "* 1 FETCH (UID 7 FLAGS ())\r\n"),
+                    ("RENAME \"&mHl27g-&-\" \"&ZeVnLIqe-\"", ""),
+                    ("CREATE \"&mHl27g-&-\"", ""),
+                    ("DELETE \"&mHl27g-&-\"", ""),
+                    ("SELECT \"&mHl27g-&-\"", "* 1 EXISTS\r\n* OK [UIDVALIDITY 9] valid\r\n"),
+                    ("CAPABILITY", "* CAPABILITY IMAP4rev1 MOVE\r\n"),
+                    ("UID MOVE 7 \"&ZeVnLIqe-\"", ""),
+                    ("SELECT \"&mHl27g-&-\"", "* 1 EXISTS\r\n* OK [UIDVALIDITY 9] valid\r\n"),
+                    ("CAPABILITY", "* CAPABILITY IMAP4rev1 MOVE\r\n"),
+                    ("UID MOVE 7 \"&mHl27g-&-\"", ""),
+                ] {
+                    let mut line = String::new();
+                    server.read_line(&mut line).await.unwrap();
+                    let (tag, command) = line.trim_end_matches("\r\n").split_once(' ').unwrap();
+                    assert_eq!(command, expected);
+                    server.write_all(format!("{rows}{tag} OK completed\r\n").as_bytes()).await.unwrap();
+                }
+                let mut line = String::new();
+                server.read_line(&mut line).await.unwrap();
+                let (tag, command) = line.trim_end_matches("\r\n").split_once(' ').unwrap();
+                assert!(command.starts_with("APPEND \"&mHl27g-&-\" (\\Draft) {"));
+                let size = command.rsplit_once('{').unwrap().1.strip_suffix('}').unwrap().parse::<usize>().unwrap();
+                let tag = tag.to_owned();
+                server.write_all(b"+ ready\r\n").await.unwrap();
+                let mut literal = vec![0; size + 2];
+                server.read_exact(&mut literal).await.unwrap();
+                assert!(literal.ends_with(b"\r\n"));
+                server.write_all(format!("{tag} OK appended\r\n").as_bytes()).await.unwrap();
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = (*crate::config::fixture()).clone();
+            config.drafts = "项目&".into();
+            config.trash = "项目&".into();
+            let service = MailService::new(Arc::new(config), Arc::new(Journal::open(&dir.path().join("db")).unwrap())).unwrap();
+            let mut session = async_imap::Client::new(client).login("synthetic", "test-only").await.unwrap();
+            let names = service.with_session(&mut session, "list_mailboxes", &json!({})).await.unwrap();
+            let name = names["mailboxes"][0]["name"].as_str().unwrap();
+            assert_eq!(name, "项目&");
+            service.with_session(&mut session, "get_email_status", &json!({"folder":name,"uid":7})).await.unwrap();
+            service.with_session(&mut session, "rename_mailbox", &json!({"name":name,"new_name":"日本語"})).await.unwrap();
+            service.with_session(&mut session, "create_mailbox", &json!({"name":name})).await.unwrap();
+            service.with_session(&mut session, "delete_mailbox", &json!({"name":name,"confirm":true})).await.unwrap();
+            service.with_session(&mut session, "move_email", &json!({"folder":name,"uid":7,"destination":"日本語"})).await.unwrap();
+            service.with_session(&mut session, "delete_email", &json!({"folder":name,"uid":7})).await.unwrap();
+            service.with_session(&mut session, "save_draft", &json!({"to":["recipient@example.com"],"subject":"synthetic","body":"synthetic"})).await.unwrap();
+            backend.await.unwrap();
+        }).await.unwrap();
+    }
     #[tokio::test]
     async fn status_uses_only_target_uid_and_distinguishes_missing_from_empty_flags() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -1385,7 +1441,7 @@ mod tests {
     }
     #[test]
     fn reject_injection_and_local_attachments() {
-        assert!(quote("x\r\nDELETE INBOX").is_err());
+        assert!(mailbox_name("x\r\nDELETE INBOX").is_err());
         assert!(compose(&json!({"to":["a@example.com"],"subject":"x","body":"x","attachments":["/etc/passwd"]}),"me@example.com",None).is_err());
     }
     #[tokio::test]
