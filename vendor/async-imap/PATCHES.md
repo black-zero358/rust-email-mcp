@@ -59,6 +59,21 @@ and [EXAMINE](https://www.rfc-editor.org/rfc/rfc3501#section-6.3.2).
 The advisory audit must still be paired with local completion-code review and
 these regressions; changing the official upstream release requires both.
 
+## FETCH attribute presence (issue #29)
+
+`src/types/fetch.rs` adds the read-only `Fetch::has_flags()` accessor, including
+explicit `FLAGS ()`. The existing `flags()` iterator returns no elements for
+both an absent attribute and an empty flag set; applications merging FETCH
+fragments must distinguish them. No parsing or iterator semantics change.
+Upstream archive, version, checksum and licenses above remain unchanged.
+
+Application-level synthetic regressions exercise the accessor through the real
+parser: late empty FLAGS clears a previous set, while later UID/SIZE/HEADER
+fragments without FLAGS retain it. They also cover raw SIZE/BODY selection,
+UID filtering, unique list limits and tagged completion. These regressions run
+in the root locked test suite; audit advisory matching does not validate this
+local accessor. Preserve or replace this API when upgrading the vendored crate.
+
 ## Application parser allocation limit (issue #24)
 
 The upstream archive, version, licenses and checksum above remain unchanged.
