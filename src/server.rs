@@ -108,6 +108,46 @@ fn bounded_tool_result(
     }
 }
 
+/// Fit only get_email's display body; metadata and other tool results stay intact.
+pub(crate) fn bounded_email_result(
+    result: crate::error::Result<Value>,
+    request_id: &str,
+    id: &RequestId,
+    limit: usize,
+) -> std::result::Result<CallToolResult, ErrorData> {
+    let result = result.map(|mut value| {
+        let candidate = |value: &Value| {
+            CallToolResult::structured(json!({"data":value,"request_id":request_id}))
+        };
+        if response_fits(&candidate(&value), id, limit) {
+            return value;
+        }
+        let Some(body) = value.get("body").and_then(Value::as_str).map(str::to_owned) else {
+            return value;
+        };
+        if body.is_empty() {
+            return value;
+        }
+        value["body_truncated"] = json!(true);
+        // Each prefix is measured with the real envelope and escaped text copy.
+        // Byte offsets keep the search logarithmic; floor to a UTF-8 boundary.
+        let (mut low, mut high) = (0, body.len());
+        while low < high {
+            let mid = low + (high - low).div_ceil(2);
+            let cut = body.floor_char_boundary(mid);
+            value["body"] = json!(&body[..cut]);
+            if response_fits(&candidate(&value), id, limit) {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        value["body"] = json!(&body[..body.floor_char_boundary(low)]);
+        value
+    });
+    bounded_tool_result(result, request_id, id, limit)
+}
+
 #[derive(Clone)]
 pub struct EmailServer(pub Arc<MailService>);
 pub fn is_send(name: &str) -> bool {
@@ -429,6 +469,7 @@ impl ServerHandler for EmailServer {
             .map(Into::into);
         }
         let service = self.0.clone();
+        let truncate_email = name == "get_email";
         let started = Instant::now();
         let log_name = name.clone();
         let log_id = request_id.clone();
@@ -458,8 +499,12 @@ impl ServerHandler for EmailServer {
                 retryable: false,
             })
         });
-        bounded_tool_result(result, &request_id, &context.id, self.0.config.max_output)
-            .map(Into::into)
+        let bound = if truncate_email {
+            bounded_email_result
+        } else {
+            bounded_tool_result
+        };
+        bound(result, &request_id, &context.id, self.0.config.max_output).map(Into::into)
     }
 }
 #[cfg(test)]
@@ -475,6 +520,77 @@ mod tests {
             result: ServerResult::CallToolResult(result),
         })
         .unwrap()
+    }
+
+    #[test]
+    fn email_body_prefix_fits_real_wire_budget_and_preserves_metadata() {
+        for id in [
+            RequestId::Number(1),
+            RequestId::String("x".repeat(1022).into()),
+            RequestId::String("\n\"\\中".repeat(60).into()),
+        ] {
+            assert!(serialized_fits(&id, MAX_RPC_ID_BYTES));
+            for body in [
+                "x".repeat(131072),
+                "\"\\\n\t\r\u{0001}".repeat(20000),
+                "中😀".repeat(20000),
+            ] {
+                let value = json!({"uid":7,"uid_validity":42,"subject":"synthetic",
+                    "body":body,"body_truncated":false,"attachments":[],
+                    "body_byte_limit":131072,"body_original_bytes":150000});
+                let response =
+                    bounded_email_result(Ok(value.clone()), TRACE_ID, &id, OUTPUT_LIMIT).unwrap();
+                assert_ne!(response.is_error, Some(true));
+                let content = response.structured_content.as_ref().unwrap();
+                assert_eq!(content["request_id"], TRACE_ID);
+                let data = &content["data"];
+                let prefix = data["body"].as_str().unwrap();
+                assert!(!prefix.is_empty() && prefix.len() < body.len());
+                assert!(body.starts_with(prefix));
+                assert_eq!(data["body_truncated"], true);
+                let mut restored = data.clone();
+                restored["body"] = value["body"].clone();
+                restored["body_truncated"] = value["body_truncated"].clone();
+                assert_eq!(restored, value);
+                let next = body[prefix.len()..].chars().next().unwrap();
+                let mut longer = data.clone();
+                longer["body"] = json!(format!("{prefix}{next}"));
+                assert!(!response_fits(
+                    &CallToolResult::structured(json!({"data":longer,"request_id":TRACE_ID})),
+                    &id,
+                    OUTPUT_LIMIT
+                ));
+                // The text fallback must contain exactly the structured JSON.
+                let wire: Value =
+                    serde_json::from_slice(&wire_bytes(response.clone(), id.clone())).unwrap();
+                let text: Value =
+                    serde_json::from_str(wire["result"]["content"][0]["text"].as_str().unwrap())
+                        .unwrap();
+                assert_eq!(&text, content);
+                assert!(wire_bytes(response, id.clone()).len() <= OUTPUT_LIMIT);
+            }
+        }
+    }
+
+    #[test]
+    fn email_budget_preserves_existing_truncation_short_bodies_and_metadata_errors() {
+        let id = RequestId::Number(1);
+        for truncated in [false, true] {
+            let value = json!({"body":"x".repeat(90000),"body_truncated":truncated});
+            let response =
+                bounded_email_result(Ok(value.clone()), TRACE_ID, &id, OUTPUT_LIMIT).unwrap();
+            assert_eq!(response.structured_content.unwrap()["data"], value);
+        }
+        for body in ["", "hello"] {
+            let value =
+                json!({"body":body,"body_truncated":false,"subject":"x".repeat(OUTPUT_LIMIT)});
+            let response = bounded_email_result(Ok(value), TRACE_ID, &id, OUTPUT_LIMIT).unwrap();
+            assert_eq!(
+                response.structured_content.as_ref().unwrap()["error"]["code"],
+                "LIMIT_EXCEEDED"
+            );
+            assert!(wire_bytes(response, id.clone()).len() <= OUTPUT_LIMIT);
+        }
     }
 
     #[test]
