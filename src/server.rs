@@ -233,7 +233,7 @@ pub fn tools(mode: &str) -> Vec<Tool> {
         ),
         (
             "get_emails",
-            "Read up to ten messages with individual outcomes; unprocessed items follow a connection failure.",
+            "Read up to ten messages with individual outcomes. Local MIME errors affect only that item; fetch failures leave later items unprocessed.",
             json!({"mailbox":mailbox,"uids":{"type":"array","items":uid,"minItems":1,"maxItems":10},"uid_validity":uid,"body_mode":{"enum":["full","trimmed"]},"max_body_length":{"type":"integer","minimum":0,"maximum":65536}}),
             vec!["uids", "uid_validity"],
         ),
