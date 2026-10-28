@@ -324,13 +324,22 @@ impl MailService {
                         continue;
                     }
                     attempted += 1;
-                    match self.raw(s, id).await.and_then(|raw| {
-                        insights::parsed_with_options(&raw, id, state.uid_validity, 16000, a)
-                    }) {
+                    let raw = match self.raw(s, id).await {
+                        Ok(raw) => raw,
+                        Err(error) => {
+                            // The FETCH may be incomplete or its transport budget
+                            // exhausted. Preserve the conservative stop boundary.
+                            items.push(json!({"uid":id,"ok":false,"error":error}));
+                            stopped = true;
+                            continue;
+                        }
+                    };
+                    // Both FETCH commands completed successfully. Local MIME
+                    // failures affect this message, not the synchronized session.
+                    match insights::parsed_with_options(&raw, id, state.uid_validity, 16000, a) {
                         Ok(value) => items.push(json!({"uid":id,"ok":true,"email":value})),
                         Err(error) => {
                             items.push(json!({"uid":id,"ok":false,"error":error}));
-                            stopped = true;
                         }
                     }
                 }
@@ -1265,6 +1274,164 @@ fn attachment(raw: &[u8], index: usize, max: usize) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    async fn batch_read_result(
+        messages: Vec<(u32, String)>,
+        failure: Option<&'static str>,
+        budget: usize,
+    ) -> Value {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = tempfile::tempdir().unwrap();
+        let service = MailService::new(
+            crate::config::fixture(),
+            Arc::new(Journal::open(&dir.path().join("db")).unwrap()),
+        )
+        .unwrap();
+        let uids = messages.iter().map(|(uid, _)| *uid).collect::<Vec<_>>();
+        let body_limit = service.config.max_message + 1;
+        let (client, server) = tokio::io::duplex(131072);
+        let backend = tokio::spawn(async move {
+            let mut script = vec![
+                (
+                    "LOGIN \"synthetic\" \"test-only\"".to_owned(),
+                    String::new(),
+                    "OK",
+                ),
+                (
+                    "EXAMINE \"INBOX\"".to_owned(),
+                    "* 3 EXISTS\r\n* OK [UIDVALIDITY 9] valid\r\n".to_owned(),
+                    "OK",
+                ),
+            ];
+            for (uid, raw) in messages {
+                script.push((
+                    format!("UID FETCH {uid} (UID RFC822.SIZE)"),
+                    format!("* 1 FETCH (UID {uid} RFC822.SIZE {})\r\n", raw.len()),
+                    "OK",
+                ));
+                script.push((
+                    format!("UID FETCH {uid} (UID BODY.PEEK[]<0.{body_limit}>)"),
+                    format!(
+                        "* 1 FETCH (UID {uid} BODY[] {{{}}}\r\n{raw})\r\n",
+                        raw.len()
+                    ),
+                    failure.unwrap_or("OK"),
+                ));
+                if failure.is_some() {
+                    break;
+                }
+            }
+            let mut server = BufReader::new(server);
+            for (expected, rows, status) in script {
+                let mut line = String::new();
+                if server.read_line(&mut line).await.unwrap() == 0 {
+                    return;
+                }
+                let (tag, command) = line.trim_end_matches("\r\n").split_once(' ').unwrap();
+                assert_eq!(command, expected);
+                let completion = match status {
+                    "EOF" => String::new(),
+                    "WRONG_TAG" => "other OK completed\r\n".into(),
+                    status => format!("{tag} {status} completed\r\n"),
+                };
+                server
+                    .write_all(format!("{rows}{completion}").as_bytes())
+                    .await
+                    .unwrap();
+                if ["EOF", "WRONG_TAG"].contains(&status) {
+                    return;
+                }
+            }
+            // After an unsafe FETCH failure the client must not issue another UID.
+            let mut extra = String::new();
+            assert_eq!(
+                server.read_line(&mut extra).await.unwrap(),
+                0,
+                "unexpected command: {extra}"
+            );
+        });
+        let (stream, remaining) = BudgetStream::new(client, 200000);
+        let mut session = async_imap::Client::new(stream)
+            .login("synthetic", "test-only")
+            .await
+            .unwrap();
+        remaining.store(budget, Ordering::Relaxed);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            service.with_session(
+                &mut session,
+                "get_emails",
+                &json!({"uids":uids,"uid_validity":9}),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(session);
+        backend.await.unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn batch_read_continues_after_local_content_errors() {
+        for (raw, code) in [
+            (
+                "Content-Type: application/octet-stream\r\n\r\nopaque".to_owned(),
+                "UNSUPPORTED_BODY",
+            ),
+            (
+                format!("Subject: {}\r\n\r\nbody", "x".repeat(33000)),
+                "LIMIT_EXCEEDED",
+            ),
+            (" orphaned-fold\r\n\r\nbody".to_owned(), "MAIL_BACKEND"),
+        ] {
+            assert_eq!(
+                insights::parsed_with_options(raw.as_bytes(), 7, Some(9), 16000, &json!({}))
+                    .unwrap_err()
+                    .code,
+                code
+            );
+            let result = batch_read_result(
+                vec![(7, raw), (8, "Subject: valid\r\n\r\nbody".into())],
+                None,
+                200000,
+            )
+            .await;
+            assert_eq!(result["requested"], 2);
+            assert_eq!(result["completed"], 2);
+            assert_eq!(result["items"][0]["ok"], false);
+            assert_eq!(result["items"][0]["error"]["code"], code);
+            assert_eq!(result["items"][1]["uid"], 8);
+            assert_eq!(result["items"][1]["ok"], true);
+            assert_eq!(result["items"][1]["email"]["body"], "body");
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_read_stops_after_protocol_failure_or_transport_exhaustion() {
+        for (status, budget) in [
+            (Some("NO"), 200000),
+            (Some("BAD"), 200000),
+            (Some("EOF"), 200000),
+            (Some("WRONG_TAG"), 200000),
+            (None, 300),
+        ] {
+            let raw = format!("Subject: valid\r\n\r\n{}", "x".repeat(2000));
+            let result = batch_read_result(
+                vec![(7, raw), (8, "Subject: untouched\r\n\r\nbody".into())],
+                status,
+                budget,
+            )
+            .await;
+            assert_eq!(result["requested"], 2);
+            assert_eq!(result["completed"], 1);
+            assert_eq!(result["items"][0]["error"]["code"], "MAIL_BACKEND");
+            assert_eq!(
+                result["items"][1],
+                json!({"uid":8,"ok":false,"status":"unprocessed"})
+            );
+        }
+    }
+
     #[test]
     fn long_parsed_email_returns_a_wire_bounded_readable_prefix() {
         let body = "a".repeat(150000);
