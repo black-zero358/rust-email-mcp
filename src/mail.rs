@@ -765,8 +765,61 @@ pub fn compose(a: &Value, from: &str, id: Option<&str>) -> Result<(Vec<u8>, Enve
         .map_err(|_| MailError::input())?;
     Ok((message.formatted(), message.envelope().clone()))
 }
+// Both envelope extraction and outbound filtering must see identical field names.
+// Normalize supported obsolete whitespace syntax; reject ambiguous/malformed
+// fields before constructing an envelope or claiming a send operation.
+fn canonical_draft_headers(raw: &[u8]) -> Result<(Vec<u8>, usize)> {
+    mime::headers(raw)?;
+    let mut canonical = Vec::new();
+    let mut offset = 0;
+    let mut have_field = false;
+    for line in raw.split_inclusive(|b| *b == b'\n') {
+        offset += line.len();
+        let line = line.strip_suffix(b"\n").ok_or_else(MailError::input)?;
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            canonical.extend_from_slice(b"\r\n");
+            return Ok((canonical, offset));
+        }
+        if line.iter().any(|b| (*b < 32 && *b != b'\t') || *b == 127) {
+            return Err(MailError::input());
+        }
+        if line.starts_with(b" ") || line.starts_with(b"\t") {
+            if !have_field {
+                return Err(MailError::input());
+            }
+            canonical.extend_from_slice(line);
+        } else {
+            let colon = line
+                .iter()
+                .position(|b| *b == b':')
+                .ok_or_else(MailError::input)?;
+            let name = line[..colon].trim_ascii_end();
+            if name.is_empty() || name.iter().any(|b| !(33..=126).contains(b) || *b == b':') {
+                return Err(MailError::input());
+            }
+            // Resent blocks have distinct destination semantics. Refuse them
+            // until that model is supported rather than silently dropping a
+            // hidden recipient or choosing the wrong delivery envelope.
+            if name.len() >= 7 && name[..7].eq_ignore_ascii_case(b"resent-") {
+                return Err(MailError {
+                    code: "UNSUPPORTED_DRAFT_HEADERS",
+                    message: "Resent header blocks are not supported for draft sending.",
+                    retryable: false,
+                });
+            }
+            canonical.extend(name.iter().map(u8::to_ascii_lowercase));
+            canonical.extend_from_slice(&line[colon..]);
+            have_field = true;
+        }
+        canonical.extend_from_slice(b"\r\n");
+    }
+    Err(MailError::input())
+}
+
 pub fn prepare_draft(raw: &[u8], from: &str, id: &str) -> Result<(Vec<u8>, Envelope)> {
-    let headers = mime::headers(raw)?;
+    let (canonical, body_start) = canonical_draft_headers(raw)?;
+    let headers = mime::headers(&canonical)?;
     let mut recipients = Vec::new();
     for key in ["To", "Cc", "Bcc"] {
         for val in headers.get_all_values(key) {
@@ -794,13 +847,8 @@ pub fn prepare_draft(raw: &[u8], from: &str, id: &str) -> Result<(Vec<u8>, Envel
     )
     .map_err(|_| MailError::input())?;
     // Preserve MIME body byte-for-byte; strip Bcc and old identity headers including folded continuations.
-    let header_end = raw
-        .windows(4)
-        .position(|x| x == b"\r\n\r\n")
-        .map(|p| (p, 4))
-        .or_else(|| raw.windows(2).position(|x| x == b"\n\n").map(|p| (p, 2)))
-        .ok_or_else(MailError::input)?;
-    let headers = std::str::from_utf8(&raw[..header_end.0]).map_err(|_| MailError::input())?;
+    let headers =
+        std::str::from_utf8(&canonical[..canonical.len() - 2]).map_err(|_| MailError::input())?;
     let mut clean = Vec::new();
     let mut skip = false;
     for line in headers.lines() {
@@ -823,7 +871,7 @@ pub fn prepare_draft(raw: &[u8], from: &str, id: &str) -> Result<(Vec<u8>, Envel
         }
     }
     clean.extend_from_slice(format!("From: {from}\r\nMessage-ID: {id}\r\n\r\n").as_bytes());
-    clean.extend_from_slice(&raw[header_end.0 + header_end.1..]);
+    clean.extend_from_slice(&raw[body_start..]);
     Ok((clean, envelope))
 }
 fn leaves<'a, 'b>(
@@ -1088,6 +1136,63 @@ mod tests {
         }
     }
     use super::*;
+    #[test]
+    fn draft_header_names_are_canonical_before_interpretation() {
+        let (canonical, body_start) =
+            canonical_draft_headers(b"X-Example \t: value\n\tfolded\n\nbody").unwrap();
+        assert_eq!(canonical, b"x-example: value\r\n\tfolded\r\n\r\n");
+        assert_eq!(
+            &b"X-Example \t: value\n\tfolded\n\nbody"[body_start..],
+            b"body"
+        );
+        assert_eq!(
+            mime::headers(&canonical)
+                .unwrap()
+                .get_first_value("X-Example")
+                .unwrap(),
+            "value folded"
+        );
+    }
+
+    #[test]
+    fn draft_envelope_and_privacy_filter_share_canonical_fields() {
+        let mut raw = b"From: old@example.com\nSender: old@example.com\nMessage-ID: <old@example.com>\nReturn-Path: <old@example.com>\nTo: visible@example.com\nCc: copy@example.com\nBcc: hidden@example.com,\n second@example.com\nbCc: third@example.com\nSubject: preserved\nContent-Type: application/octet-stream\n\n".to_vec();
+        let body = b"binary\0\xff\n\r\n\r\n--unchanged";
+        raw.extend_from_slice(body);
+        let (clean, envelope) = prepare_draft(&raw, "me@example.com", "<new@example.com>").unwrap();
+        assert_eq!(envelope.to().len(), 5);
+        let (headers, body_start) = mailparse::parse_headers(&clean).unwrap();
+        assert!(headers.get_all_values("Bcc").is_empty());
+        assert!(headers.get_all_values("Sender").is_empty());
+        assert!(headers.get_all_values("Return-Path").is_empty());
+        assert_eq!(headers.get_all_values("From"), ["me@example.com"]);
+        assert_eq!(headers.get_all_values("Message-ID"), ["<new@example.com>"]);
+        assert_eq!(&clean[body_start..], body);
+        assert!(!String::from_utf8_lossy(&clean).contains("hidden@example.com"));
+        assert!(!String::from_utf8_lossy(&clean).contains("second@example.com"));
+        assert!(!String::from_utf8_lossy(&clean).contains("third@example.com"));
+    }
+
+    #[test]
+    fn ambiguous_draft_headers_are_rejected() {
+        for raw in [
+            &b"To: a@example.com\nNo-Colon\n\nbody"[..],
+            &b"To: a@example.com\nBad Name: value\n\nbody"[..],
+            &b"To: a@example.com\nX: bad\0value\n\nbody"[..],
+            &b"\tOrphan: value\nTo: a@example.com\n\nbody"[..],
+            &b"To: a@example.com\n"[..],
+        ] {
+            assert!(prepare_draft(raw, "me@example.com", "<id@example.com>").is_err());
+        }
+        let error = prepare_draft(
+            b"To: a@example.com\nResent-To: b@example.com\n\nbody",
+            "me@example.com",
+            "<id@example.com>",
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "UNSUPPORTED_DRAFT_HEADERS");
+        assert!(!error.retryable);
+    }
     #[test]
     fn mail_consumers_enforce_mime_limits_and_recover() {
         let oversized_header = vec![b'x'; 33 * 1024];

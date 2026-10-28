@@ -7,6 +7,7 @@
 - Read with EXAMINE/PEEK. Bound connection count, response bytes, message size and tool output.
 - Tool output budget counts the complete serialized JSON-RPC response with actual id, request_id, structuredContent and escaped text copy. HTTP rejects ids over 1024 serialized JSON bytes before execution; keep this guard wired ahead of rmcp. Limit fallback remains bounded and preserves known send status; use get_operation with the original operation_key before retrying writes.
 - Persist send intent before SMTP. Preserve accepted/unknown outcomes across audit or cleanup failures; never retry unknown sends automatically.
+- Draft sending uses one bounded canonical header buffer for destination extraction and privacy filtering. Validate field names, continuations and the header/body separator before claim/SMTP; reject unsupported Resent blocks explicitly. Preserve body bytes, including binary payloads, exactly.
 - Authenticate each HTTP request; validate issuer, audience, expiry, scope and subject allowlist.
 - JWKS keys have a hard 300-second TTL with no stale-on-error extension. Refresh I/O uses a separate coordinator; cached fresh keys bypass it. Refresh results share a 10-second cooldown (also after failure); unavailable JWKS returns HTTP 503 with Retry-After, while invalid tokens return 401.
 - Test OAuth with isolated clients/users. Keep deployment and rollback separate from source publishing.
