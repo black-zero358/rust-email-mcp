@@ -84,6 +84,11 @@ fn parse_part<'a>(
         subparts: Vec::new(),
         body: &raw[body_start..],
     };
+    // An unknown transfer encoding makes the entire entity opaque (RFC 2045
+    // section 6.4), even when its declared type looks like a multipart tree.
+    if part.transfer_encoding().is_err() {
+        return Ok(part);
+    }
     if part.ctype.mimetype.starts_with("multipart/")
         && let Some(boundary) = part.ctype.params.get("boundary")
     {
@@ -175,15 +180,22 @@ impl Part<'_> {
         )
     }
 
-    fn encoded(&self) -> Body<'_> {
-        Body::new(
-            self.body,
-            &self.ctype,
-            &self
-                .headers
-                .get_first_value("Content-Transfer-Encoding")
-                .map(|v| v.to_lowercase()),
-        )
+    fn transfer_encoding(&self) -> Result<Option<String>> {
+        let encoding = self
+            .headers
+            .get_first_value("Content-Transfer-Encoding")
+            .map(|value| value.trim().to_ascii_lowercase());
+        match encoding.as_deref() {
+            None | Some("7bit" | "8bit" | "binary" | "base64" | "quoted-printable") => Ok(encoding),
+            _ => Err(crate::html::unsupported()),
+        }
+    }
+
+    fn encoded(&self) -> Result<Body<'_>> {
+        let encoding = self.transfer_encoding()?;
+        // Body::new silently defaults unknown labels to SevenBit; never pass
+        // those labels through or claim their bytes have been decoded.
+        Ok(Body::new(self.body, &self.ctype, &encoding))
     }
 
     pub fn encoded_len(&self) -> usize {
@@ -201,7 +213,7 @@ impl Part<'_> {
         {
             return Err(MailError::limit());
         }
-        let decoded = match self.encoded() {
+        let decoded = match self.encoded()? {
             Body::Base64(b) | Body::QuotedPrintable(b) => b.get_decoded(),
             Body::SevenBit(b) | Body::EightBit(b) => Ok(b.get_raw().to_vec()),
             Body::Binary(b) => Ok(b.get_raw().to_vec()),
@@ -237,6 +249,9 @@ impl Part<'_> {
     fn select_text<'a>(&'a self, out: &mut Vec<&'a Self>, html: bool) -> bool {
         if self.is_attachment() {
             return false;
+        }
+        if self.transfer_encoding().is_err() {
+            return !self.body.is_empty();
         }
         if self.subparts.is_empty() {
             match self.ctype.mimetype.as_str() {
@@ -330,7 +345,7 @@ impl Part<'_> {
             *remaining = remaining
                 .checked_sub(reserve)
                 .ok_or_else(MailError::limit)?;
-            let text = match self.encoded() {
+            let text = match self.encoded()? {
                 Body::Base64(b) | Body::QuotedPrintable(b) => b.get_decoded_as_string(),
                 Body::SevenBit(b) | Body::EightBit(b) => b.get_as_string(),
                 Body::Binary(b) => b.get_as_string(),
@@ -382,6 +397,39 @@ mod tests {
         assert_eq!(parse(raw).unwrap().plain_body().unwrap(), "HTML original");
         let raw = b"Content-Type: multipart/mixed; boundary=a\n\n--a\nContent-Type: text/html\n\n<p>HTML original</p>\n--a\nContent-Type: text/html; name=attachment.html\n\n<p>ATTACHMENT_ONLY</p>\n--a--\n";
         assert_eq!(parse(raw).unwrap().plain_body().unwrap(), "HTML original");
+    }
+
+    #[test]
+    fn transfer_encodings_require_known_decoders_before_interpretation() {
+        for (encoding, body) in [
+            (None, "hello"),
+            (Some("7bit"), "hello"),
+            (Some("8BIT"), "hello"),
+            (Some("binary"), "hello"),
+            (Some("BaSe64"), "aGVsbG8="),
+            (Some("Quoted-Printable"), "hel=6Co"),
+        ] {
+            let header = encoding.map_or_else(String::new, |value| {
+                format!("Content-Transfer-Encoding: {value}\r\n")
+            });
+            let raw = format!("Content-Type: text/plain; charset=utf-8\r\n{header}\r\n{body}");
+            let part = parse(raw.as_bytes()).unwrap();
+            assert_eq!(part.plain_body().unwrap(), "hello");
+            assert_eq!(part.body_raw(1024).unwrap(), b"hello");
+        }
+        let raw = b"Content-Type: text/plain\nContent-Transfer-Encoding: x-example\n\nencoded";
+        let part = parse(raw).unwrap();
+        assert_eq!(part.plain_body().unwrap_err().code, "UNSUPPORTED_BODY");
+        assert_eq!(part.body_raw(1024).unwrap_err().code, "UNSUPPORTED_BODY");
+        let raw = b"Content-Type: multipart/mixed; boundary=m\nContent-Transfer-Encoding: x-example\n\n--m\nContent-Type: text/plain\n\nnot decoded\n--m--\n";
+        let opaque = parse(raw).unwrap();
+        assert!(opaque.subparts.is_empty());
+        assert_eq!(opaque.plain_body().unwrap_err().code, "UNSUPPORTED_BODY");
+        let raw = b"Content-Type: multipart/alternative; boundary=a\n\n--a\nContent-Type: text/plain\n\nComplete fallback\n--a\nContent-Type: multipart/mixed; boundary=m\n\n--m\nContent-Type: text/plain\n\nSignature\n--m\nContent-Type: text/plain\nContent-Transfer-Encoding: x-example\n\nencoded\n--m--\n--a--\n";
+        assert_eq!(
+            parse(raw).unwrap().plain_body().unwrap(),
+            "Complete fallback"
+        );
     }
 
     const NORMAL: &[u8] = b"Subject: example\r\nContent-Type: multipart/mixed; boundary=outer\r\n\r\n--outer\r\nContent-Type: multipart/alternative; boundary=inner\r\n\r\n--inner\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nhello =E2=82=AC\r\n--inner\r\nContent-Type: text/html\r\n\r\n<p>hello</p>\r\n--inner--\r\n--outer\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=example.txt\r\nContent-Transfer-Encoding: base64\r\n\r\nYWJj\r\n--outer--\r\n";

@@ -59,6 +59,8 @@ async-imap 0.12 的 APPEND flags 原样序列化，必须传入 `(\Draft)` 这�
 
 邮件正文、主题、头部和附件均按不可信输入处理。构建 MIME 结构前检查共享的节点、深度和头部预算；transfer/charset 解码前预留预算。不得恢复对不可信输入调用 `mailparse::parse_mail`；回复和草稿发送只需要有界头部。boundary 按完整分隔符匹配，接受允许的尾部空白，不能把相同前缀当作分隔符。
 
+依据 [RFC 2045 §6.1、§6.4](https://www.rfc-editor.org/rfc/rfc2045#section-6.4)，缺省 transfer encoding 为 7bit，编码名不区分大小写；未知编码实体不按声明的 MIME 类型解释。解析时对未知编码停止 multipart 递归，选择时把非空内联实体视为不支持，允许 alternative 回滚并选另一完整候选；没有候选时返回既有 `UNSUPPORTED_BODY`。`encoded()` 在调用 mailparse `Body::new` 前显式验证编码，不能依赖该库把未知值默认为 SevenBit 的行为。`body_raw` 同样拒绝未知编码，不把原始编码字节作为已解码附件交付，认证下载保留原 HTTP 502 后端失败映射。显式附件分类和共享索引不变，真正空实体不被当作非空正文错误，原有结构、头部和解码分配前预算继续适用。
+
 正文选择排除显式 attachment 或带文件名的部件及其整个子树；`multipart/alternative` 选一个受支持表示并优先纯文本，`multipart/related` 只选主部件。读取和转发共用选择逻辑，附件列表和下载共用分类规则，multipart 附件可整体下载。真实空正文与“不支持或无法完整解释的正文”必须区分。
 
 依据 [RFC 2046 §5.1.4](https://www.rfc-editor.org/rfc/rfc2046#section-5.1.4)，alternative 每个候选表示同一份信息，选择必须覆盖候选的完整内联正文。纯文本探测遇到非空 HTML 时判定该候选不完整，回滚其中已收集的所有片段（如 plain 签名），继续寻找完整纯文本表示；不存在时才允许 HTML 转换。此规则沿 mixed、嵌套 alternative 和 related 主部件递归传播，附件仍排除；真正空的 HTML 不引入待转换内容，真正空的 plain 仍是有效完整表示。探测不解码、不分配正文，最终选中叶子继续共用既有解码预算。
