@@ -218,35 +218,68 @@ impl Part<'_> {
 
     fn append_plain(&self, out: &mut String, remaining: &mut usize) -> Result<()> {
         let mut selected = Vec::new();
-        self.select_plain(&mut selected);
+        if self.select_text(&mut selected, true) {
+            return Err(crate::html::unsupported());
+        }
         for part in selected {
             part.append_plain_leaf(out, remaining)?;
         }
         Ok(())
     }
 
-    fn select_plain<'a>(&'a self, out: &mut Vec<&'a Self>) {
+    // The bool reports non-empty unsupported inline content. Selection probes
+    // do not decode; one shared budget still covers all selected leaf codecs.
+    fn select_text<'a>(&'a self, out: &mut Vec<&'a Self>, html: bool) -> bool {
         if self.is_attachment() {
-            return;
+            return false;
         }
         if self.subparts.is_empty() {
-            if self.ctype.mimetype == "text/plain" {
-                out.push(self);
+            match self.ctype.mimetype.as_str() {
+                "text/plain" => out.push(self),
+                "text/html" => {
+                    if html {
+                        out.push(self);
+                    }
+                }
+                _ => return !self.body.is_empty(),
             }
-            return;
+            return false;
         }
         match self.ctype.mimetype.as_str() {
             "multipart/alternative" => {
                 // Representations are alternatives, not consecutive body text.
-                // Prefer the last supported plain representation, including a
-                // genuinely empty plain body.
+                // Prefer plain, including a genuinely empty plain body; fall
+                // back to one HTML representation only when plain is absent.
+                let mut unsupported = false;
                 for child in self.subparts.iter().rev() {
                     let before = out.len();
-                    child.select_plain(out);
+                    let failed = child.select_text(out, false);
+                    if failed {
+                        out.truncate(before);
+                        unsupported = true;
+                        continue;
+                    }
                     if out.len() != before {
-                        break;
+                        return failed;
+                    }
+                    unsupported |= failed;
+                }
+                if html {
+                    for child in self.subparts.iter().rev() {
+                        let before = out.len();
+                        let failed = child.select_text(out, true);
+                        if failed {
+                            out.truncate(before);
+                            unsupported = true;
+                            continue;
+                        }
+                        if out.len() != before {
+                            return failed;
+                        }
+                        unsupported |= failed;
                     }
                 }
+                unsupported
             }
             "multipart/related" => {
                 let root = match self.ctype.params.get("start") {
@@ -258,21 +291,25 @@ impl Part<'_> {
                     None => self.subparts.first(),
                 };
                 if let Some(root) = root {
-                    root.select_plain(out);
+                    root.select_text(out, html)
+                } else {
+                    !self.body.is_empty()
                 }
             }
             _ => {
                 // Mixed inline parts remain consecutive body content. An
                 // attachment at any level prunes its entire subtree above.
+                let mut unsupported = false;
                 for child in &self.subparts {
-                    child.select_plain(out);
+                    unsupported |= child.select_text(out, html);
                 }
+                unsupported
             }
         }
     }
 
     fn append_plain_leaf(&self, out: &mut String, remaining: &mut usize) -> Result<()> {
-        if self.ctype.mimetype == "text/plain" {
+        if matches!(self.ctype.mimetype.as_str(), "text/plain" | "text/html") {
             // Reserve conservatively before decoding: transfer output <= input,
             // and charset-to-UTF8 conversion needs at most four bytes per input
             // byte. All leaves share one budget, including temporary strings.
@@ -290,6 +327,14 @@ impl Part<'_> {
                 Body::Binary(b) => b.get_as_string(),
             }
             .map_err(|_| MailError::backend())?;
+            if text.len() > reserve {
+                return Err(MailError::limit());
+            }
+            let text = if self.ctype.mimetype == "text/html" {
+                crate::html::to_text(&text)?
+            } else {
+                text
+            };
             if text.len() > reserve {
                 return Err(MailError::limit());
             }
@@ -317,6 +362,17 @@ mod tests {
             parse(related_default).unwrap().plain_body().unwrap(),
             "Visible body"
         );
+    }
+    #[test]
+    fn html_fallback_keeps_plain_preference_and_ignores_resources() {
+        let raw = b"Content-Type: multipart/alternative; boundary=a\n\n--a\n\nPlain original\n--a\nContent-Type: text/html\n\n<p>HTML alternative</p>\n--a--\n";
+        assert_eq!(parse(raw).unwrap().plain_body().unwrap(), "Plain original");
+        let raw = b"Content-Type: multipart/alternative; boundary=a\n\n--a\n\n\n--a\nContent-Type: text/html\n\n<p>HTML alternative</p>\n--a--\n";
+        assert_eq!(parse(raw).unwrap().plain_body().unwrap(), "");
+        let raw = b"Content-Type: multipart/related; boundary=a\n\n--a\nContent-Type: text/html\n\n<p>HTML original</p>\n--a\n\nRESOURCE_ONLY\n--a--\n";
+        assert_eq!(parse(raw).unwrap().plain_body().unwrap(), "HTML original");
+        let raw = b"Content-Type: multipart/mixed; boundary=a\n\n--a\nContent-Type: text/html\n\n<p>HTML original</p>\n--a\nContent-Type: text/html; name=attachment.html\n\n<p>ATTACHMENT_ONLY</p>\n--a--\n";
+        assert_eq!(parse(raw).unwrap().plain_body().unwrap(), "HTML original");
     }
 
     const NORMAL: &[u8] = b"Subject: example\r\nContent-Type: multipart/mixed; boundary=outer\r\n\r\n--outer\r\nContent-Type: multipart/alternative; boundary=inner\r\n\r\n--inner\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nhello =E2=82=AC\r\n--inner\r\nContent-Type: text/html\r\n\r\n<p>hello</p>\r\n--inner--\r\n--outer\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=example.txt\r\nContent-Transfer-Encoding: base64\r\n\r\nYWJj\r\n--outer--\r\n";

@@ -734,6 +734,7 @@ pub fn compose(a: &Value, from: &str, id: Option<&str>) -> Result<(Vec<u8>, Enve
         b = b.bcc(m);
     }
     let message = b
+        .header(lettre::message::header::ContentType::TEXT_PLAIN)
         .body(text(a, "body")?.to_owned())
         .map_err(|_| MailError::input())?;
     Ok((message.formatted(), message.envelope().clone()))
@@ -1287,6 +1288,88 @@ mod tests {
             assert!(forwarded.contains("Visible body"));
             assert!(!forwarded.contains("ATTACHMENT_ONLY_MARKER"));
         }
+    }
+    #[test]
+    fn html_read_and_forward_preserve_original_content() {
+        use base64::Engine;
+        for (headers, encoded, expected) in [
+            (
+                "Content-Type: text/html; charset=utf-8",
+                "<html><body>Invoice 123 due Friday</body></html>".to_owned(),
+                "Invoice 123 due Friday",
+            ),
+            (
+                "Content-Type: text/html; charset=utf-8\r\nContent-Transfer-Encoding: base64",
+                base64::engine::general_purpose::STANDARD.encode("<p>中 &amp; Friday</p>"),
+                "中 & Friday",
+            ),
+            (
+                "Content-Type: text/html; charset=iso-8859-1\r\nContent-Transfer-Encoding: quoted-printable",
+                "<p>caf=E9 invoice</p>".to_owned(),
+                "café invoice",
+            ),
+        ] {
+            let raw = format!("Subject: HTML original\r\n{headers}\r\n\r\n{encoded}");
+            let read = parsed(raw.as_bytes(), 1, None, 16000).unwrap();
+            assert_eq!(read["body"], expected);
+            assert_eq!(read["body_truncated"], false);
+            let body = forward_body(raw.as_bytes(), "FYI").unwrap();
+            let (forward, _) = compose(
+                &json!({"to":["recipient@example.com"],"subject":"forward","body":body}),
+                "me@example.com",
+                Some("<id@example.com>"),
+            )
+            .unwrap();
+            assert!(
+                mailparse::parse_mail(&forward)
+                    .unwrap()
+                    .get_body()
+                    .unwrap()
+                    .contains(expected)
+            );
+        }
+    }
+    #[test]
+    fn composed_unicode_subject_address_and_body_keep_utf8_semantics() {
+        let args = json!({"to":["用户@example.test"],"subject":"中文主题","body":"中 café 😀"});
+        let (raw, envelope) = compose(&args, "me@example.test", Some("<id@example.test>")).unwrap();
+        let parsed = mailparse::parse_mail(&raw).unwrap();
+        assert_eq!(
+            parsed.headers.get_first_value("Subject").unwrap(),
+            "中文主题"
+        );
+        assert_eq!(parsed.ctype.charset, "utf-8");
+        assert_eq!(parsed.get_body().unwrap().trim_end(), "中 café 😀");
+        let recipient: &str = envelope.to()[0].as_ref();
+        assert_eq!(recipient, "用户@example.test");
+    }
+    #[test]
+    fn empty_bodies_are_distinct_from_unsupported_or_over_budget() {
+        for raw in [
+            &b"Content-Type: text/plain\n\n"[..],
+            &b"Content-Type: text/html\n\n<html><body></body></html>"[..],
+        ] {
+            assert_eq!(parsed(raw, 1, None, 1024).unwrap()["body"], "");
+            assert!(forward_body(raw, "FYI").is_ok());
+        }
+        let raw = b"Content-Type: application/x-unknown\n\nnonempty original content";
+        assert_eq!(
+            parsed(raw, 1, None, 1024).unwrap_err().code,
+            "UNSUPPORTED_BODY"
+        );
+        assert_eq!(
+            forward_body(raw, "FYI").unwrap_err().code,
+            "UNSUPPORTED_BODY"
+        );
+        let raw = format!("Content-Type: text/html\n\n{}", "x".repeat(128 * 1024 + 1));
+        assert_eq!(
+            parsed(raw.as_bytes(), 1, None, 1024).unwrap_err().code,
+            "LIMIT_EXCEEDED"
+        );
+        assert_eq!(
+            forward_body(raw.as_bytes(), "FYI").unwrap_err().code,
+            "LIMIT_EXCEEDED"
+        );
     }
     #[test]
     fn mail_consumers_enforce_mime_limits_and_recover() {
