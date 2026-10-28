@@ -2,6 +2,7 @@ FROM rust:1.99.1-bookworm AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY vendor/async-imap ./vendor/async-imap
 RUN cargo build --locked --release
 
 FROM debian:bookworm-slim
