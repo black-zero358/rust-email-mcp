@@ -6,7 +6,7 @@ use rust_email_mcp::{
     auth::{Auth, require_auth},
     config::Config,
     journal::Journal,
-    mail::MailService,
+    mail::{MailService, attachments},
     server::{EmailServer, limit_rpc_id},
 };
 use std::{path::Path, sync::Arc};
@@ -46,12 +46,15 @@ async fn main() -> anyhow::Result<()> {
         .with_allowed_hosts([host, "127.0.0.1".into(), "localhost".into()])
         .with_allowed_origins(["https://chatgpt.com:443".to_string()])
         .with_cancellation_token(ct.child_token());
+    let download_mail = mail.clone();
     let service = StreamableHttpService::new(
         move || Ok(EmailServer(mail.clone())),
         Arc::new(LocalSessionManager::default()),
         transport,
     );
     let secured = Router::new()
+        .route("/mcp/attachments/{token}", get(attachments::download))
+        .with_state(download_mail)
         .nest_service("/mcp", service)
         .layer(middleware::from_fn(limit_rpc_id))
         .layer(middleware::from_fn_with_state(auth, require_auth))

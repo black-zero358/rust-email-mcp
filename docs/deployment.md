@@ -53,7 +53,7 @@ docker compose -f deploy/compose.yaml up -d auth
 | --- | --- |
 | 类型 | Public，PKCE S256 |
 | Flows | authorization_code、refresh_token |
-| Redirect URI | `https://chatgpt.com/connector_platform_oauth_redirect` |
+| Redirect URI | 当前 ChatGPT 设置界面显示的精确回调 URL |
 | Scopes / default scopes | openid、email:mcp |
 | Access token algorithm | RS256 |
 | Access token lifetime | 300 秒 |
@@ -90,6 +90,14 @@ docker compose -f deploy/compose.yaml up -d --build mail
 
 ## 验收与回滚
 
+依次记录以下验收结果：
+
+1. 公网健康检查、资源发现、OIDC 发现及 JWKS 可访问，发现文档中的 URL、scope 和认证方式正确。
+2. 在浏览器打开授权流程，确认登录界面实际渲染；检查 JavaScript、CSS 和主题资源的突发加载均成功。
+3. 检查 Nginx 限流日志与 Fail2ban 状态。修正静态资源限流后，已有封禁仍需单独核实和处理，见[接入排障](troubleshooting.md)。
+4. 用隔离测试身份完成授权、换令牌、刷新及重启恢复，再检查邮件只读工具。
+5. 用户在 ChatGPT 完成授权和工具调用，随后确认访问令牌到期后的自然刷新。分别记录服务端测试与 ChatGPT 实测结果。
+
 用独立测试用户和客户端检查两次登录各自刷新、提前刷新、重启后刷新、工具发现、列表、正文和读前后标记。真实写操作通过专用测试邮箱验收，收件人与操作范围提前确认。
 
 将新服务先部署到独立端口，使用隔离数据库或按下述方法取得的备份副本，以 `MAIL_MODE=read` 验收。不要让新旧邮件进程同时打开同一操作数据库。保留旧镜像、配置和数据；正式切换时先停止旧邮件进程，再让新版本接管最新的操作数据库并切换 Nginx。旧服务停止后再记录总内存。
@@ -105,3 +113,5 @@ docker compose -f deploy/compose.yaml up -d --build mail
 应用版本回滚与操作数据库回退必须分别处理。恢复旧操作库会丢失备份之后的发送记录，原 `operation_key` 查不到记录不代表邮件未发送，也不能继续保证这段时间的重复发送保护。
 
 若必须从旧备份恢复，先暂停邮件写操作，保留可用的最新数据库及故障现场副本，核对备份后可能执行的发送与邮件服务商记录。无法确认的结果按 `unknown` 处理，不自动重试，也不通过换用新操作键绕过检查。只有在受影响操作已核验、操作记录恢复方案明确后，才恢复已获授权的写模式；当前项目没有自动重建丢失发送记录的工具。
+
+附件扩展路由：公开 `MCP_RESOURCE/attachments/{token}` 应转发至内部 `/mcp/attachments/{token}`。示例 `/email/` 前缀代理覆盖此后缀；自定义仅匹配 MCP 根路径的代理需同步覆盖，保留 Bearer 头、认证中间件，并对含句柄路径关闭访问日志。此说明不代表实际客户端下载验收已完成。

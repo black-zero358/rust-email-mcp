@@ -90,6 +90,7 @@ fn completion_error(code: Option<&ResponseCode<'_>>) -> MailError {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn uid_text_search<S>(
     session: &mut async_imap::Session<S>,
     start: u32,
@@ -99,13 +100,29 @@ pub(crate) async fn uid_text_search<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + Debug,
 {
+    uid_field_search(session, start, end, "TEXT", text).await
+}
+
+pub(crate) async fn uid_field_search<S>(
+    session: &mut async_imap::Session<S>,
+    start: u32,
+    end: u32,
+    key: &str,
+    text: &str,
+) -> Result<HashSet<u32>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + Debug,
+{
+    if !["TEXT", "FROM", "TO", "SUBJECT"].contains(&key) {
+        return Err(MailError::input());
+    }
     if text.len() > 512 || text.contains(['\r', '\n', '\0']) {
         return Err(MailError::input());
     }
     if text.is_ascii() {
         return session
             .uid_search(format!(
-                "UID {start}:{end} TEXT \"{}\"",
+                "UID {start}:{end} {key} \"{}\"",
                 text.replace('\\', "\\\\").replace('"', "\\\"")
             ))
             .await
@@ -120,7 +137,7 @@ where
     // literal, and send its bytes only after the server requests continuation.
     let tag = session
         .run_command(format!(
-            "UID SEARCH CHARSET UTF-8 UID {start}:{end} TEXT {{{}}}",
+            "UID SEARCH CHARSET UTF-8 UID {start}:{end} {key} {{{}}}",
             text.len()
         ))
         .await
@@ -206,8 +223,153 @@ where
     }
 }
 
+/// STATUS for the statistics tool: require all requested fields and matching completion.
+pub(crate) async fn status_counts<S>(
+    session: &mut async_imap::Session<S>,
+    mailbox: &str,
+) -> Result<async_imap::types::Mailbox>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + Debug,
+{
+    use imap_proto::StatusAttribute;
+    let encoded = mailbox_name(mailbox)?;
+    let quoted = encoded.replace('\\', "\\\\").replace('"', "\\\"");
+    let tag = session
+        .run_command(format!(
+            "STATUS \"{quoted}\" (MESSAGES UNSEEN RECENT UIDNEXT UIDVALIDITY)"
+        ))
+        .await
+        .map_err(|_| MailError::backend())?;
+    let mut value = async_imap::types::Mailbox::default();
+    let mut present = 0_u8;
+    loop {
+        let response = session
+            .read_response()
+            .await
+            .map_err(|_| MailError::backend())?
+            .ok_or_else(MailError::backend)?;
+        match response.parsed() {
+            Response::MailboxData(MailboxDatum::Status {
+                mailbox: got,
+                status,
+            }) if got == &encoded
+                || (encoded.eq_ignore_ascii_case("INBOX") && got.eq_ignore_ascii_case("INBOX")) =>
+            {
+                // Each matching STATUS is a snapshot; do not combine partial snapshots.
+                present = 0;
+                value = async_imap::types::Mailbox::default();
+                for attribute in status {
+                    match attribute {
+                        StatusAttribute::Messages(n) => {
+                            value.exists = *n;
+                            present |= 1;
+                        }
+                        StatusAttribute::Unseen(n) => {
+                            value.unseen = Some(*n);
+                            present |= 2;
+                        }
+                        StatusAttribute::Recent(n) => {
+                            value.recent = *n;
+                            present |= 4;
+                        }
+                        StatusAttribute::UidNext(n) => {
+                            value.uid_next = Some(*n);
+                            present |= 8;
+                        }
+                        StatusAttribute::UidValidity(n) => {
+                            value.uid_validity = Some(*n);
+                            present |= 16;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Response::Done {
+                tag: got, status, ..
+            } => {
+                return if got == &tag
+                    && *status == Status::Ok
+                    && present == 31
+                    && value.uid_next.is_some_and(|n| n > 0)
+                    && value.uid_validity.is_some_and(|n| n > 0)
+                {
+                    Ok(value)
+                } else {
+                    Err(MailError::backend())
+                };
+            }
+            Response::Continue(_)
+            | Response::Data {
+                status: Status::Bye,
+                ..
+            } => return Err(MailError::backend()),
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn statistics_status_requires_complete_matching_snapshot_and_tag() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let cases = [
+            (
+                "* STATUS inbox (MESSAGES 0 UNSEEN 0 RECENT 0 UIDNEXT 1 UIDVALIDITY 2)\r\n{tag} OK done\r\n",
+                true,
+            ),
+            (
+                "* STATUS INBOX (MESSAGES 1 UNSEEN 0 RECENT 0 UIDNEXT 2 UIDVALIDITY 2)\r\n",
+                false,
+            ),
+            ("{tag} OK done\r\n", false),
+            (
+                "* STATUS Other (MESSAGES 0 UNSEEN 0 RECENT 0 UIDNEXT 1 UIDVALIDITY 2)\r\n{tag} OK done\r\n",
+                false,
+            ),
+            (
+                "* STATUS INBOX (UNSEEN 0 RECENT 0 UIDNEXT 1 UIDVALIDITY 2)\r\n{tag} OK done\r\n",
+                false,
+            ),
+            (
+                "* STATUS INBOX (MESSAGES 0 UNSEEN 0 RECENT 0 UIDNEXT 1 UIDVALIDITY 2)\r\nwrong OK done\r\n",
+                false,
+            ),
+            ("{tag} NO unavailable\r\n", false),
+            ("{tag} BAD invalid\r\n", false),
+        ];
+        for (reply, success) in cases {
+            let (client, server) = tokio::io::duplex(2048);
+            let backend = tokio::spawn(async move {
+                let mut server = BufReader::new(server);
+                let mut command = String::new();
+                server.read_line(&mut command).await.unwrap();
+                let tag = command.split_whitespace().next().unwrap();
+                server
+                    .get_mut()
+                    .write_all(format!("{tag} OK login\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                command.clear();
+                server.read_line(&mut command).await.unwrap();
+                assert!(command.contains("STATUS \"INBOX\""));
+                let tag = command.split_whitespace().next().unwrap();
+                server
+                    .get_mut()
+                    .write_all(reply.replace("{tag}", tag).as_bytes())
+                    .await
+                    .unwrap();
+            });
+            let mut session = async_imap::Client::new(client)
+                .login("synthetic", "test-only")
+                .await
+                .unwrap();
+            let result = super::status_counts(&mut session, "INBOX").await;
+            assert_eq!(result.is_ok(), success, "{reply}");
+            backend.await.unwrap();
+        }
+    }
+
     use super::*;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 

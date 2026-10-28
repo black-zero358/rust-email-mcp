@@ -1,11 +1,13 @@
 use crate::{
     config::Config,
     error::{MailError, Result},
-    imap_text::{display_name, mailbox_name, uid_text_search},
+    imap_text::{display_name, mailbox_name, uid_field_search},
     journal::{Journal, Operation},
     mime,
     smtp::SmtpSender,
 };
+pub mod attachments;
+pub mod insights;
 use futures::TryStreamExt;
 use lettre::{address::Envelope, message::Mailbox};
 use mailparse::MailHeaderMap;
@@ -132,11 +134,15 @@ pub struct MailService {
     pub journal: Arc<Journal>,
     slots: Semaphore,
     smtp: SmtpSender,
+    pub attachments: attachments::AttachmentStore,
+    metadata_cache: std::sync::Mutex<insights::MetadataCache>,
 }
 impl MailService {
     pub fn new(config: Arc<Config>, journal: Arc<Journal>) -> anyhow::Result<Self> {
         let smtp = SmtpSender::new(&config)?;
         Ok(Self {
+            attachments: attachments::AttachmentStore::new(config.clone()),
+            metadata_cache: Default::default(),
             config,
             journal,
             slots: Semaphore::new(2),
@@ -191,6 +197,42 @@ impl MailService {
         if ["send_email", "send_draft", "reply_email", "forward_email"].contains(&name) {
             return self.send(name, args, principal).await;
         }
+        if ["prepare_attachment_download", "list_attachments"].contains(&name) {
+            return tokio::time::timeout(
+                self.config.timeout,
+                self.prepare_attachment(name, args, principal),
+            )
+            .await
+            .map_err(|_| MailError::timeout())?;
+        }
+        if name == "diagnose_connectivity" {
+            return self.diagnose_connectivity().await;
+        }
+        if ["mark_emails", "move_emails", "delete_emails"].contains(&name) {
+            let ids = batch_ids(args)?;
+            folder(args)?;
+            if name == "mark_emails"
+                && (!["seen", "flagged", "answered"].contains(&text(args, "flag")?)
+                    || !args["value"].is_boolean())
+            {
+                return Err(MailError::input());
+            }
+            if name == "move_emails" {
+                quote(text(args, "destination")?)?;
+            }
+            if args.get("permanent").is_some_and(|v| !v.is_boolean()) {
+                return Err(MailError::input());
+            }
+            if name == "delete_emails" && args["confirm"] != true {
+                return Err(MailError::input());
+            }
+            let deadline = tokio::time::Instant::now() + self.config.timeout;
+            let connection = tokio::time::timeout_at(deadline, self.connect()).await;
+            return match connection {
+                Ok(Ok(mut s)) => self.batch(&mut s, name, args, deadline).await,
+                _ => Ok(batch_unprocessed(&ids)),
+            };
+        }
         tokio::time::timeout(self.config.timeout, self.imap_operation(name, args))
             .await
             .map_err(|_| MailError::timeout())?
@@ -211,6 +253,9 @@ impl MailService {
         S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
     {
         match name {
+            "read_conversation" | "locate_message" | "get_mailbox_statistics" => {
+                self.insight_operation(s, name, a).await
+            }
             "list_mailboxes" => {
                 let list = s
                     .list(Some(""), Some("*"))
@@ -245,7 +290,13 @@ impl MailService {
                         self.config.max_output / 2,
                     );
                 }
-                parsed(&raw, uid, state.uid_validity, self.config.max_output / 2)
+                insights::parsed_with_options(
+                    &raw,
+                    uid,
+                    state.uid_validity,
+                    self.config.max_output / 2,
+                    a,
+                )
             }
             "get_emails" => {
                 let ids = a
@@ -261,24 +312,29 @@ impl MailService {
                     .map_err(|_| MailError::backend())?;
                 check_validity(a, state.uid_validity)?;
                 let mut items = Vec::new();
+                let mut stopped = false;
+                let mut attempted = 0;
                 for id in ids {
                     let id = id
                         .as_u64()
                         .filter(|n| *n > 0 && *n <= u32::MAX as u64)
                         .ok_or_else(MailError::input)? as u32;
-                    match self
-                        .raw(s, id)
-                        .await
-                        .and_then(|raw| parsed(&raw, id, state.uid_validity, 16000))
-                    {
+                    if stopped {
+                        items.push(json!({"uid":id,"ok":false,"status":"unprocessed"}));
+                        continue;
+                    }
+                    attempted += 1;
+                    match self.raw(s, id).await.and_then(|raw| {
+                        insights::parsed_with_options(&raw, id, state.uid_validity, 16000, a)
+                    }) {
                         Ok(value) => items.push(json!({"uid":id,"ok":true,"email":value})),
                         Err(error) => {
                             items.push(json!({"uid":id,"ok":false,"error":error}));
-                            break;
+                            stopped = true;
                         }
                     }
                 }
-                Ok(json!({"items":items,"requested":ids.len(),"completed":items.len()}))
+                Ok(json!({"items":items,"requested":ids.len(),"completed":attempted}))
             }
             "save_draft" => save_draft(s, &self.config, a).await,
             "create_mailbox" => {
@@ -381,6 +437,29 @@ impl MailService {
             _ => Err(MailError::input()),
         }
     }
+    async fn batch(
+        &self,
+        s: &mut Session,
+        name: &str,
+        a: &Value,
+        deadline: tokio::time::Instant,
+    ) -> Result<Value> {
+        let ids = batch_ids(a)?;
+        let single = match name {
+            "mark_emails" => "mark_email",
+            "move_emails" => "move_email",
+            "delete_emails" => "delete_email",
+            _ => return Err(MailError::input()),
+        };
+        let mut executor = SessionBatch {
+            service: self,
+            session: s,
+            name: single,
+            args: a,
+        };
+        Ok(run_batch(&mut executor, &ids, deadline).await)
+    }
+
     async fn raw<S>(&self, s: &mut async_imap::Session<S>, uid: u32) -> Result<Vec<u8>>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
@@ -448,27 +527,78 @@ impl MailService {
         // Scan a finite UID window; callers explicitly advance the cursor even for sparse results.
         let end = before - 1;
         let start = end.saturating_sub(499).max(1);
-        let found = if search {
-            uid_text_search(s, start, end, text(a, "query")?).await?
+        let mut filters = a.clone();
+        for field in ["query", "from", "to", "subject"] {
+            filters
+                .as_object_mut()
+                .ok_or_else(MailError::input)?
+                .remove(field);
+        }
+        let query = search_query(&filters, start, end, search)?;
+        let has_text = search
+            && ["query", "from", "to", "subject"]
+                .iter()
+                .any(|key| a.get(key).is_some());
+        let mut found = if has_text && query == format!("UID {start}:{end}") {
+            None
         } else {
-            s.uid_search(format!("UID {start}:{end}"))
-                .await
-                .map_err(|_| MailError::backend())?
+            Some(
+                s.uid_search(query)
+                    .await
+                    .map_err(|_| MailError::backend())?,
+            )
         };
+        if search {
+            for (field, key) in [
+                ("query", "TEXT"),
+                ("from", "FROM"),
+                ("to", "TO"),
+                ("subject", "SUBJECT"),
+            ] {
+                if a.get(field).is_some() {
+                    let matching = uid_field_search(s, start, end, key, text(a, field)?).await?;
+                    if let Some(ids) = &mut found {
+                        ids.retain(|uid| matching.contains(uid));
+                    } else {
+                        found = Some(matching);
+                    }
+                }
+            }
+        }
+        let found = found.unwrap_or_default();
         let mut ids = found
             .into_iter()
             .filter(|u| *u >= start && *u <= end)
             .collect::<Vec<_>>();
         ids.sort_unstable_by(|a, b| b.cmp(a));
+        let mut last_examined = None;
+        if let Some(wanted) = a.get("has_attachment") {
+            let wanted = wanted.as_bool().ok_or_else(MailError::input)?;
+            let mut matches = Vec::new();
+            for id in &ids {
+                last_examined = Some(*id);
+                let raw = self.raw(s, *id).await?;
+                if attachments::has_attachment(&raw)? == wanted {
+                    matches.push(*id);
+                }
+                if matches.len() == limit {
+                    break;
+                }
+            }
+            // Retain the last examined UID, not the last server match: rejected
+            // BODYSTRUCTURE candidates must not be revisited or skipped incorrectly.
+            ids = matches;
+        }
         let more = ids.len() > limit;
         ids.truncate(limit);
-        let next = if more {
-            ids.last().copied()
-        } else if start > 1 {
-            Some(start)
-        } else {
-            None
-        };
+        let next = page_cursor(
+            start,
+            &ids,
+            limit,
+            more,
+            a.get("has_attachment").is_some(),
+            last_examined,
+        );
         if ids.is_empty() {
             return Ok(json!({"emails":[],"next_before_uid":next,"uid_validity":m.uid_validity}));
         }
@@ -484,6 +614,16 @@ impl MailService {
         for f in fetched {
             if !f.uid.is_some_and(|id| ids.contains(&id)) {
                 continue;
+            }
+            if let Some(id) = f.uid
+                && f.header().is_some_and(|header| header.len() < 8192)
+            {
+                self.remember_headers(
+                    folder(a)?,
+                    m.uid_validity,
+                    id,
+                    f.header().unwrap_or_default(),
+                );
             }
             let headers = mime::headers(f.header().unwrap_or_default())?;
             out.push(json!({"uid":f.uid,"subject":headers.get_first_value("Subject"),"from":headers.get_first_value("From"),"date":headers.get_first_value("Date"),"size":f.size,"flags":f.flags().map(|f|format!("{f:?}")).collect::<Vec<_>>()}));
@@ -575,6 +715,227 @@ impl MailService {
     }
 }
 
+trait BatchExecutor {
+    fn apply(&mut self, uid: u32) -> impl std::future::Future<Output = Result<Value>> + Send;
+}
+struct SessionBatch<'a> {
+    service: &'a MailService,
+    session: &'a mut Session,
+    name: &'a str,
+    args: &'a Value,
+}
+impl BatchExecutor for SessionBatch<'_> {
+    async fn apply(&mut self, id: u32) -> Result<Value> {
+        let mut args = self.args.clone();
+        args["uid"] = json!(id);
+        args.as_object_mut().unwrap().remove("uids");
+        let state = self
+            .session
+            .select(mailbox_name(folder(&args)?)?)
+            .await
+            .map_err(|_| MailError::backend())?;
+        check_validity(&args, state.uid_validity)?;
+        let found = self
+            .session
+            .uid_fetch(id.to_string(), "(UID)")
+            .await
+            .map_err(|_| MailError::backend())?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|_| MailError::backend())?;
+        if !found.iter().any(|f| f.uid == Some(id)) {
+            return Ok(json!({"uid":id,"status":"not_found"}));
+        }
+        self.service
+            .with_session(self.session, self.name, &args)
+            .await?;
+        Ok(json!({"uid":id,"status":"updated"}))
+    }
+}
+async fn run_batch(
+    executor: &mut impl BatchExecutor,
+    ids: &[u32],
+    deadline: tokio::time::Instant,
+) -> Value {
+    let mut items = Vec::new();
+    let mut stopped = false;
+    for id in ids {
+        if tokio::time::Instant::now() >= deadline {
+            stopped = true;
+        }
+        if stopped {
+            items.push(json!({"uid":id,"status":"unprocessed","retry_allowed":false}));
+            continue;
+        }
+        match tokio::time::timeout_at(deadline, executor.apply(*id)).await {
+            Ok(Ok(item)) => items.push(item),
+            Ok(Err(error)) => {
+                items
+                    .push(json!({"uid":id,"status":"unknown","error":error,"retry_allowed":false}));
+                stopped = true;
+            }
+            Err(_) => {
+                items.push(json!({"uid":id,"status":"unknown","error":MailError::timeout(),"retry_allowed":false}));
+                stopped = true;
+            }
+        }
+    }
+    json!({"items":items,"requested":ids.len(),"retry_allowed":false})
+}
+
+fn page_cursor(
+    start: u32,
+    ids: &[u32],
+    limit: usize,
+    more: bool,
+    postfilter: bool,
+    last_examined: Option<u32>,
+) -> Option<u32> {
+    if postfilter && ids.len() == limit {
+        last_examined
+    } else if more {
+        ids.last().copied()
+    } else if start > 1 {
+        Some(start)
+    } else {
+        None
+    }
+}
+fn quote(value: &str) -> Result<String> {
+    if value.len() > 998 || value.contains(['\r', '\n', '\0']) {
+        return Err(MailError::input());
+    }
+    Ok(format!(
+        "\"{}\"",
+        value.replace('\\', "\\\\").replace('"', "\\\"")
+    ))
+}
+fn imap_date(value: &str) -> Result<String> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || !bytes
+            .iter()
+            .enumerate()
+            .all(|(i, b)| i == 4 || i == 7 || b.is_ascii_digit())
+    {
+        return Err(MailError::input());
+    }
+    let year: u32 = value[..4].parse().map_err(|_| MailError::input())?;
+    let month: usize = value[5..7].parse().map_err(|_| MailError::input())?;
+    let day: u32 = value[8..].parse().map_err(|_| MailError::input())?;
+    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let days = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    if year == 0 || !(1..=12).contains(&month) || day == 0 || day > days[month - 1] {
+        return Err(MailError::input());
+    }
+    Ok(format!(
+        "{day}-{}-{year:04}",
+        [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+        ][month - 1]
+    ))
+}
+fn search_query(a: &Value, start: u32, end: u32, search: bool) -> Result<String> {
+    let mut keys = Vec::new();
+    keys.push(format!("UID {start}:{end}"));
+    if search {
+        for (field, key) in [
+            ("query", "TEXT"),
+            ("from", "FROM"),
+            ("to", "TO"),
+            ("subject", "SUBJECT"),
+        ] {
+            if a.get(field).is_some() {
+                keys.push(format!("{key} {}", quote(text(a, field)?)?));
+            }
+        }
+        for (field, key) in [("since", "SINCE"), ("before", "BEFORE")] {
+            if a.get(field).is_some() {
+                keys.push(format!("{key} {}", imap_date(text(a, field)?)?));
+            }
+        }
+        if let (Some(since), Some(before)) = (a["since"].as_str(), a["before"].as_str())
+            && since >= before
+        {
+            return Err(MailError::input());
+        }
+        for (field, yes, no) in [
+            ("seen", "SEEN", "UNSEEN"),
+            ("flagged", "FLAGGED", "UNFLAGGED"),
+            ("answered", "ANSWERED", "UNANSWERED"),
+        ] {
+            if let Some(v) = a.get(field) {
+                keys.push(
+                    if v.as_bool().ok_or_else(MailError::input)? {
+                        yes
+                    } else {
+                        no
+                    }
+                    .into(),
+                );
+            }
+        }
+        let min = a
+            .get("min_size")
+            .map(|_| number(a, "min_size", 0, 0, u32::MAX as u64))
+            .transpose()?;
+        let max = a
+            .get("max_size")
+            .map(|_| number(a, "max_size", 0, 0, u32::MAX as u64))
+            .transpose()?;
+        if min.zip(max).is_some_and(|(min, max)| min > max) {
+            return Err(MailError::input());
+        }
+        if let Some(n) = min
+            && n > 0
+        {
+            keys.push(format!("LARGER {}", n - 1));
+        }
+        if let Some(n) = max
+            && n < u32::MAX as u64
+        {
+            keys.push(format!("SMALLER {}", n + 1));
+        }
+    }
+    Ok(keys.join(" "))
+}
+fn batch_ids(a: &Value) -> Result<Vec<u32>> {
+    number(a, "uid_validity", 0, 1, u32::MAX as u64)?;
+    let list = a["uids"].as_array().ok_or_else(MailError::input)?;
+    if list.is_empty() || list.len() > 50 {
+        return Err(MailError::input());
+    }
+    let mut ids = Vec::new();
+    for id in list {
+        let id = id
+            .as_u64()
+            .filter(|n| *n > 0 && *n <= u32::MAX as u64)
+            .ok_or_else(MailError::input)? as u32;
+        if ids.contains(&id) {
+            return Err(MailError::input());
+        }
+        ids.push(id);
+    }
+    Ok(ids)
+}
+fn batch_unprocessed(ids: &[u32]) -> Value {
+    json!({"items":ids.iter().map(|id|json!({"uid":id,"status":"unprocessed","retry_allowed":false})).collect::<Vec<_>>(),"requested":ids.len(),"error":MailError::backend(),"retry_allowed":false})
+}
 fn record_send(
     journal: &Journal,
     principal: &str,
@@ -904,6 +1265,44 @@ fn attachment(raw: &[u8], index: usize, max: usize) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn advanced_search_intersects_filters_and_sync_literal_fields() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let (client, server) = tokio::io::duplex(4096);
+            let backend = tokio::spawn(async move {
+                let mut server = BufReader::new(server);
+                for (expected, rows) in [
+                    ("LOGIN \"synthetic\" \"test-only\"", ""),
+                    ("EXAMINE \"&mHl27g-&-\"", "* 2 EXISTS\r\n* OK [UIDVALIDITY 9] valid\r\n* OK [UIDNEXT 8] next\r\n"),
+                    ("UID SEARCH UID 1:7 SINCE 29-Feb-2024 UNSEEN", "* SEARCH 6 7\r\n"),
+                    ("UID SEARCH UID 1:7 FROM \"sender@example.test\"", "* SEARCH 7\r\n"),
+                ] {
+                    let mut line = String::new();
+                    server.read_line(&mut line).await.unwrap();
+                    let (tag, command) = line.trim_end_matches("\r\n").split_once(' ').unwrap();
+                    assert_eq!(command, expected);
+                    server.write_all(format!("{rows}{tag} OK completed\r\n").as_bytes()).await.unwrap();
+                }
+                let mut line = String::new();
+                server.read_line(&mut line).await.unwrap();
+                let (tag, command) = line.trim_end_matches("\r\n").split_once(' ').unwrap();
+                assert_eq!(command, "UID SEARCH CHARSET UTF-8 UID 1:7 SUBJECT {6}");
+                let tag = tag.to_owned();
+                server.write_all(b"+ ready\r\n").await.unwrap();
+                let mut query = [0; 8];
+                server.read_exact(&mut query).await.unwrap();
+                assert_eq!(&query, "发票\r\n".as_bytes());
+                server.write_all(format!("* SEARCH 6\r\n{tag} OK completed\r\n").as_bytes()).await.unwrap();
+            });
+            let service = MailService::new(crate::config::fixture(), Arc::new(Journal::open(std::path::Path::new(":memory:")).unwrap())).unwrap();
+            let mut session = async_imap::Client::new(client).login("synthetic", "test-only").await.unwrap();
+            let found = service.with_session(&mut session, "search_emails", &json!({"mailbox":"项目&","uid_validity":9,"since":"2024-02-29","seen":false,"from":"sender@example.test","subject":"发票"})).await.unwrap();
+            assert_eq!(found["emails"], json!([]));
+            backend.await.unwrap();
+        }).await.unwrap();
+    }
+
     #[tokio::test]
     async fn rev1_mailbox_names_round_trip_through_tools() {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -1418,6 +1817,69 @@ mod tests {
             "hel"
         );
         assert_eq!(attachment(b"\r\nhello", 0, 5).unwrap()["size"], 5);
+    }
+    #[test]
+    fn attachment_filter_cursor_preserves_holes_and_empty_pages() {
+        // Server candidates 499,490,480,470; only 490 and 470 have attachments.
+        // Returning 490 must resume below the candidate consumed at 490.
+        assert_eq!(page_cursor(1, &[490], 1, false, true, Some(490)), Some(490));
+        // Exhausted sparse window advances even without an attachment match.
+        assert_eq!(page_cursor(501, &[], 20, false, true, Some(520)), Some(501));
+        assert_eq!(page_cursor(1, &[], 20, false, true, Some(20)), None);
+        assert_eq!(
+            page_cursor(501, &[980, 970], 2, true, false, None),
+            Some(970)
+        );
+    }
+    #[test]
+    fn advanced_search_is_inclusive_bounded_and_quoted() {
+        let query = search_query(&json!({"since":"2024-02-29","before":"2024-03-02","from":"a\"b","seen":false,"flagged":true,"answered":false,"min_size":100,"max_size":200}),1,500,true).unwrap();
+        assert_eq!(
+            query,
+            "UID 1:500 FROM \"a\\\"b\" SINCE 29-Feb-2024 BEFORE 2-Mar-2024 UNSEEN FLAGGED UNANSWERED LARGER 99 SMALLER 201"
+        );
+        for date in [
+            "2023-02-29",
+            "2024-02-30",
+            "0000-01-01",
+            "2024-13-01",
+            "2024-01-00",
+            "2024-1-01",
+            "é24-01-01",
+        ] {
+            assert!(imap_date(date).is_err());
+        }
+        assert!(
+            search_query(
+                &json!({"since":"2024-03-01","before":"2024-02-29"}),
+                1,
+                500,
+                true
+            )
+            .is_err()
+        );
+        assert!(search_query(&json!({"from":"x\nALL"}), 1, 500, true).is_err());
+        assert!(search_query(&json!({"min_size":201,"max_size":200}), 1, 500, true).is_err());
+    }
+    #[test]
+    fn batch_requires_unique_explicit_uids_and_validity() {
+        assert_eq!(
+            batch_ids(&json!({"uids":[3,1],"uid_validity":7})).unwrap(),
+            vec![3, 1]
+        );
+        for args in [
+            json!({"uids":[1]}),
+            json!({"uids":[1,1],"uid_validity":7}),
+            json!({"uids":[],"uid_validity":7}),
+            json!({"uids":[0],"uid_validity":7}),
+            json!({"uids":vec![1;51],"uid_validity":7}),
+        ] {
+            assert!(batch_ids(&args).is_err());
+        }
+        let result = batch_unprocessed(&[5, 3]);
+        assert_eq!(result["items"].as_array().unwrap().len(), 2);
+        assert_eq!(result["items"][1]["status"], "unprocessed");
+        assert_eq!(result["retry_allowed"], false);
     }
     async fn smtp_fixture(disconnect_after_data: bool, fail_journal: bool, slow_quit: bool) {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};

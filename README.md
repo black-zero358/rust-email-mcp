@@ -21,10 +21,12 @@ MCP 客户端 ── HTTPS ── Nginx ── Rust Email MCP ── IMAP / SMTP
 | --- | --- |
 | 账户与文件夹 | `list_accounts`、`list_mailboxes` |
 | 邮件查询 | `list_emails`、`search_emails`、`get_email`、`get_emails`、`get_email_status` |
-| 附件 | `download_attachment` |
+| 附件 | `list_attachments`、`download_attachment`、`prepare_attachment_download` |
+| 会话与定位 | `read_conversation`、`locate_message` |
+| 诊断与统计 | `diagnose_connectivity`、`get_mailbox_statistics` |
 | 草稿与发送 | `save_draft`、`send_draft`、`send_email`、`reply_email`、`forward_email` |
 | 发送状态 | `get_operation` |
-| 邮件整理 | `mark_email`、`move_email`、`delete_email` |
+| 邮件整理 | `mark_email`、`move_email`、`delete_email`、`mark_emails`、`move_emails`、`delete_emails` |
 | 文件夹管理 | `create_mailbox`、`rename_mailbox`、`delete_mailbox` |
 
 读取使用 IMAP `EXAMINE` 和 `BODY.PEEK`，保持邮件标记。每个邮件引用由文件夹、UID 和 UIDVALIDITY 组成，避免文件夹重建后误操作旧 UID。
@@ -38,6 +40,11 @@ JSON-RPC id 的序列化 JSON（包括引号、转义和 UTF-8 字节）最多 1
 MIME 在构建结构时限制为 256 个节点、20 层嵌套，头部每段最多 32 KiB，累计最多 256 KiB、2048 行（含折行）。正文解码前按编码字节数的四倍预留共享的 8 MiB 预算，覆盖字符集转为 UTF-8 的放大；附件解码也先限制编码输入。超限返回 `LIMIT_EXCEEDED`，因此部分原始大小合规的复杂邮件或长正文仍会被拒绝。回复和草稿发送只解析有界头部，保留草稿正文原始字节。边界分隔行按完整 boundary 匹配，接受尾部空格和制表符；不再把仅具有相同前缀的行当作分隔符。
 
 文件夹名称在工具参数、LIST 返回值和 DRAFTS_MAILBOX/TRASH_MAILBOX 配置中使用 Unicode；返回的 name 可直接传给读取、移动或重命名工具。连接采用 IMAP4rev1，线路上的名称使用 modified UTF-7，包含 & 的名称也会正确转换。非规范或无法安全往返的服务端名称返回 MAIL_BACKEND，避免误引用其他文件夹。ASCII 搜索继续使用 US-ASCII；中文等非 ASCII 查询使用 CHARSET UTF-8 和同步 literal。服务器返回 BADCHARSET 时报告 UNSUPPORTED_CHARSET，不降级为含义不同的查询；未协商 UTF8=ACCEPT 或 IMAP4rev2。
+搜索支持日期、发件人、收件人、主题、已读、星标、已回复、附件和大小组合。会话根据关联头组织；跨文件夹定位使用精确 Message-ID。批量整理最多 50 个明确 UID，保留逐项结果，批量删除必须确认。
+
+正文支持完整或去引用模式、长度设置及省略提示。单封 MIME 邮件上限 8 MiB，单次工具输出上限 256 KiB。附件发现、准备下载及二进制 GET 均通过现有有界整封 MIME 读取，保持统一索引和整体 multipart 附件语义；每封原始邮件和解码后的附件分别受 8 MiB 限制。新邮件支持文本；现有草稿发送保留原 MIME 附件。转发工具发送原邮件的纯文本内容。
+
+`download_attachment` 保留原有内联 Base64 返回格式及输出预算。新增 `prepare_attachment_download` 返回短期下载 URL；客户端需携带同一用户的 OAuth Bearer 令牌。普通链接点击和 ChatGPT 自动文件解析尚未验收。参数与范围限制见 [邮件能力扩展](docs/capabilities.md)。
 
 ## 发送行为
 
@@ -124,7 +131,23 @@ Rauthy 使用嵌入式 Hiqlite/SQLite，省去独立数据库容器。建议配�
 - Argon2id 至少采用 32 MiB 内存、3 次迭代、2 个并行通道。
 - 测试使用独立用户和客户端。
 
-在 ChatGPT 创建自定义 MCP 连接，填入 `MCP_RESOURCE`，认证选择 OAuth，并填写预注册客户端 ID。公共 PKCE 客户端无需客户端密钥。完成登录后，先调用 `list_accounts` 和 `list_mailboxes`。
+在 ChatGPT 创建自定义 MCP 连接，使用以下设置。先按[部署指南](docs/deployment.md)完成 Rauthy 客户端与发现文档配置。
+
+| ChatGPT 设置 | 本项目示例值 |
+| --- | --- |
+| MCP 服务器 URL | `MCP_RESOURCE` 的完整 HTTPS 地址 |
+| 认证 / 客户端注册方法 | OAuth / 自定义 OAuth 客户端 |
+| OAuth 客户端 ID | `email-mcp`，与 Rauthy 中的客户端一致 |
+| OAuth 客户端密钥 | 留空，使用公共 PKCE 客户端 |
+| Token 端点身份验证方法 | `none` |
+| 默认请求的权限范围 | `email:mcp` |
+| 基础授权范围 | `openid` |
+| 注册 URL | 留空，此配置使用预注册客户端 |
+| 可选 OIDC 邮箱身份功能 | 当前最小配置关闭；启用前配置相应身份 scope |
+
+将 ChatGPT 页面显示的回调 URL 精确复制到 Rauthy 的 Redirect URI。授权地址、Token URL、issuer 和资源地址由发现文档提供；检查其域名和路径与实际部署一致。
+
+完成登录后，先调用 `list_accounts` 和 `list_mailboxes`，再确认访问令牌到期后的自然刷新。遇到设置验证失败、登录页 `500` 或 `ERR_CONNECTION_CLOSED`，参阅[接入排障](docs/troubleshooting.md)。
 
 从旧 FastMCP/Dex 服务迁移时，重新创建或重新授权连接，使客户端获取新的认证发现信息。旧令牌属于旧身份服务。
 
@@ -140,7 +163,7 @@ Rauthy 使用嵌入式 Hiqlite/SQLite，省去独立数据库容器。建议配�
 
 日志输出 JSON，字段包括 request ID、工具名称、耗时、HTTP 状态、错误码和发送结果。工具参数、邮件正文、主题、地址、附件与令牌不进入运行日志。关闭依赖库的协议调试日志。Docker 日志建议 `max-size=5m`、`max-file=2`。
 
-`/healthz` 检查进程与配置。邮箱连通性通过单独的只读验收检查 IMAP；SMTP 登录探测应与真实发送分开进行。
+`/healthz` 检查进程与配置。`diagnose_connectivity` 在认证后检查 IMAP 连接、TLS、登录和能力阶段，返回脱敏结果；不探测 SMTP。`get_mailbox_statistics` 使用 STATUS 获取数量，并可按有限日期及 UID 范围统计分布。
 
 备份时同时保留 Rauthy 配置、加密密钥、完整 Hiqlite 数据目录和邮件操作数据库。SQLite 在线备份使用 backup API；停机备份时复制数据库及其 WAL/SHM 文件。恢复先在隔离端口验证，再切换反向代理。
 
