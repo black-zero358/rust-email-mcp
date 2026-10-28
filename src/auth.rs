@@ -27,6 +27,20 @@ pub struct Auth {
     client: reqwest::Client,
     jwks_uri: String,
     keys: Mutex<(JwkSet, Instant)>,
+    refresh: Mutex<RefreshState>,
+}
+const KEY_TTL: Duration = Duration::from_secs(300);
+const REFRESH_COOLDOWN: Duration = Duration::from_secs(10);
+
+struct RefreshState {
+    completed: Instant,
+    failed: bool,
+}
+
+#[derive(Debug, PartialEq)]
+enum AuthError {
+    InvalidToken,
+    Unavailable,
 }
 async fn bounded_json<T: serde::de::DeserializeOwned>(
     mut response: reqwest::Response,
@@ -83,44 +97,79 @@ impl Auth {
             client,
             jwks_uri,
             keys: Mutex::new((keys, Instant::now())),
+            refresh: Mutex::new(RefreshState {
+                completed: Instant::now(),
+                failed: false,
+            }),
         }))
     }
-    async fn verify(&self, token: &str) -> Option<Principal> {
-        if token.len() > 16384 {
-            return None;
-        }
-        let h = decode_header(token).ok()?;
-        if h.alg != Algorithm::RS256 {
-            return None;
-        }
-        let kid = h.kid?;
-        let mut keys = self.keys.lock().await;
-        if keys.1.elapsed() > Duration::from_secs(300)
-            || (keys.0.find(&kid).is_none() && keys.1.elapsed() > Duration::from_secs(10))
+    async fn key_for(&self, kid: &str) -> Result<DecodingKey, AuthError> {
         {
+            let keys = self.keys.lock().await;
+            if keys.1.elapsed() < KEY_TTL
+                && let Some(key) = keys.0.find(kid)
+            {
+                return DecodingKey::from_jwk(key).map_err(|_| AuthError::InvalidToken);
+            }
+        }
+        // Only refreshers wait on this lock. Cached-key readers never wait for I/O.
+        let mut refresh = self.refresh.lock().await;
+        {
+            let keys = self.keys.lock().await;
+            if keys.1.elapsed() < KEY_TTL
+                && let Some(key) = keys.0.find(kid)
+            {
+                return DecodingKey::from_jwk(key).map_err(|_| AuthError::InvalidToken);
+            }
+        }
+        if refresh.completed.elapsed() < REFRESH_COOLDOWN {
+            return Err(if refresh.failed {
+                AuthError::Unavailable
+            } else {
+                AuthError::InvalidToken
+            });
+        }
+        // Cancellation also leaves a bounded failure cooldown, never a fresh key cache.
+        refresh.completed = Instant::now();
+        refresh.failed = true;
+        let result = async {
             let response = self
                 .client
                 .get(&self.jwks_uri)
                 .send()
-                .await
-                .ok()?
-                .error_for_status()
-                .ok()?;
-            if response.content_length().is_some_and(|n| n > 256 * 1024) {
-                return None;
-            }
-            let updated: JwkSet = bounded_json(response).await.ok()?;
-            *keys = (updated, Instant::now());
+                .await?
+                .error_for_status()?;
+            bounded_json::<JwkSet>(response).await
         }
-        let key = DecodingKey::from_jwk(keys.0.find(&kid)?).ok()?;
-        drop(keys);
+        .await;
+        refresh.completed = Instant::now();
+        let updated = result.map_err(|_| AuthError::Unavailable)?;
+        let key = updated
+            .find(kid)
+            .and_then(|key| DecodingKey::from_jwk(key).ok());
+        *self.keys.lock().await = (updated, Instant::now());
+        refresh.failed = false;
+        key.ok_or(AuthError::InvalidToken)
+    }
+    async fn verify(&self, token: &str) -> Result<Principal, AuthError> {
+        if token.len() > 16384 {
+            return Err(AuthError::InvalidToken);
+        }
+        let h = decode_header(token).map_err(|_| AuthError::InvalidToken)?;
+        if h.alg != Algorithm::RS256 {
+            return Err(AuthError::InvalidToken);
+        }
+        let kid = h.kid.ok_or(AuthError::InvalidToken)?;
+        let key = self.key_for(&kid).await?;
         let mut validation = Validation::new(Algorithm::RS256);
         validation.set_issuer(&[&self.config.issuer]);
         validation.set_audience(&[&self.config.audience]);
         validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
         validation.validate_nbf = true;
         validation.leeway = 30;
-        let claims = decode::<Claims>(token, &key, &validation).ok()?.claims;
+        let claims = decode::<Claims>(token, &key, &validation)
+            .map_err(|_| AuthError::InvalidToken)?
+            .claims;
         if !self.config.subjects.contains(&claims.sub)
             || !claims
                 .scope
@@ -129,16 +178,16 @@ impl Auth {
                 .split_whitespace()
                 .any(|s| s == self.config.scope)
         {
-            return None;
+            return Err(AuthError::InvalidToken);
         }
         if claims
             .typ
             .as_deref()
             .is_some_and(|s| s != "Bearer" && s != "at+jwt")
         {
-            return None;
+            return Err(AuthError::InvalidToken);
         }
-        Some(Principal(claims.sub))
+        Ok(Principal(claims.sub))
     }
 }
 pub async fn require_auth(State(auth): State<Arc<Auth>>, mut req: Request, next: Next) -> Response {
@@ -151,12 +200,17 @@ pub async fn require_auth(State(auth): State<Arc<Auth>>, mut req: Request, next:
         .and_then(|h| h.strip_prefix("Bearer "));
     let principal = match token {
         Some(token) => auth.verify(token).await,
-        None => None,
+        None => Err(AuthError::InvalidToken),
     };
-    let mut response = if let Some(principal) = principal {
+    let mut response = if let Ok(principal) = principal {
         req.extensions_mut().insert(principal);
         req.extensions_mut().insert(RequestId(request_id.clone()));
         next.run(req).await
+    } else if matches!(principal, Err(AuthError::Unavailable)) {
+        let mut r = StatusCode::SERVICE_UNAVAILABLE.into_response();
+        r.headers_mut()
+            .insert(header::RETRY_AFTER, header::HeaderValue::from_static("10"));
+        r
     } else {
         let mut r = StatusCode::UNAUTHORIZED.into_response();
         let metadata = format!(
@@ -198,6 +252,152 @@ mod tests {
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use jsonwebtoken::{EncodingKey, Header, encode};
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn test_auth(jwks: JwkSet, uri: String) -> Arc<Auth> {
+        Arc::new(Auth {
+            config: crate::config::fixture(),
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(1))
+                .build()
+                .unwrap(),
+            jwks_uri: uri,
+            keys: Mutex::new((jwks, Instant::now())),
+            refresh: Mutex::new(RefreshState {
+                completed: Instant::now() - REFRESH_COOLDOWN,
+                failed: false,
+            }),
+        })
+    }
+
+    fn test_keys(kid: &str) -> JwkSet {
+        let key = KeyPair::generate(KeySize::Rsa2048).unwrap();
+        let public = key.public_key();
+        serde_json::from_value(json!({"keys":[{"kty":"RSA","kid":kid,"alg":"RS256","use":"sig","n":URL_SAFE_NO_PAD.encode(public.modulus().big_endian_without_leading_zero()),"e":URL_SAFE_NO_PAD.encode(public.exponent().big_endian_without_leading_zero())}]})).unwrap()
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_is_shared_and_expired_keys_fail_closed() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let app = axum::Router::new().route(
+            "/jwks",
+            axum::routing::get(move || {
+                let count = count.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let auth = test_auth(
+            test_keys("test"),
+            format!("http://{}/jwks", listener.local_addr().unwrap()),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        auth.keys.lock().await.1 = Instant::now() - KEY_TTL;
+        let (a, b, c) = tokio::join!(
+            auth.key_for("test"),
+            auth.key_for("test"),
+            auth.key_for("unknown")
+        );
+        for result in [a, b, c] {
+            assert!(matches!(result, Err(AuthError::Unavailable)));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            auth.key_for("test").await,
+            Err(AuthError::Unavailable)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // The cooldown expires and permits one further attempt, without extending trust.
+        auth.refresh.lock().await.completed = Instant::now() - REFRESH_COOLDOWN;
+        assert!(matches!(
+            auth.key_for("test").await,
+            Err(AuthError::Unavailable)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        auth.keys.lock().await.1 = Instant::now();
+        assert!(auth.key_for("test").await.is_ok());
+        auth.keys.lock().await.1 = Instant::now() - KEY_TTL;
+
+        use tower::ServiceExt;
+        let app = axum::Router::new()
+            .route("/", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(auth, require_auth));
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","kid":"test"}"#);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(header::AUTHORIZATION, format!("Bearer {header}.e30.AA"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "10");
+        assert!(!response.headers().contains_key(header::WWW_AUTHENTICATE));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cached_key_does_not_wait_for_rotation_and_refresh_updates_snapshot() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let started_tx = Arc::new(Mutex::new(Some(started_tx)));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let gate = release.clone();
+        let rotated = serde_json::to_string(&test_keys("rotated")).unwrap();
+        let app = axum::Router::new().route(
+            "/jwks",
+            axum::routing::get(move || {
+                let started_tx = started_tx.clone();
+                let gate = gate.clone();
+                let rotated = rotated.clone();
+                async move {
+                    if let Some(tx) = started_tx.lock().await.take() {
+                        let _ = tx.send(());
+                    }
+                    gate.notified().await;
+                    rotated
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let auth = test_auth(
+            test_keys("test"),
+            format!("http://{}/jwks", listener.local_addr().unwrap()),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let refresh_auth = auth.clone();
+        let refresh = tokio::spawn(async move { refresh_auth.key_for("rotated").await });
+        started_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), auth.key_for("test"))
+                .await
+                .unwrap()
+                .is_ok()
+        );
+        release.notify_one();
+        assert!(refresh.await.unwrap().is_ok());
+        assert!(auth.key_for("rotated").await.is_ok());
+        assert!(matches!(
+            auth.key_for("test").await,
+            Err(AuthError::InvalidToken)
+        ));
+        assert!(matches!(
+            auth.key_for("random").await,
+            Err(AuthError::InvalidToken)
+        ));
+        server.abort();
+    }
     #[tokio::test]
     async fn jwt_trust_boundaries() {
         let key = KeyPair::generate(KeySize::Rsa2048).unwrap();
@@ -214,6 +414,10 @@ mod tests {
             client: reqwest::Client::new(),
             jwks_uri: "https://invalid.example/jwks".into(),
             keys: Mutex::new((jwks, Instant::now())),
+            refresh: Mutex::new(RefreshState {
+                completed: Instant::now(),
+                failed: false,
+            }),
         };
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -223,7 +427,7 @@ mod tests {
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some("test".into());
         let token = encode(&header, &claims, &signing).unwrap();
-        assert!(auth.verify(&token).await.is_some());
+        assert!(auth.verify(&token).await.is_ok());
         for (field, value) in [
             ("sub", json!("attacker")),
             ("iss", json!("https://other.example/")),
@@ -238,17 +442,17 @@ mod tests {
             assert!(
                 auth.verify(&encode(&header, &changed, &signing).unwrap())
                     .await
-                    .is_none(),
+                    .is_err(),
                 "{field}"
             );
         }
-        assert!(auth.verify("invalid").await.is_none());
+        assert!(auth.verify("invalid").await.is_err());
         let token = encode(
             &Header::new(Algorithm::HS256),
             &claims,
             &EncodingKey::from_secret(b"test"),
         )
         .unwrap();
-        assert!(auth.verify(&token).await.is_none());
+        assert!(auth.verify(&token).await.is_err());
     }
 }
