@@ -68,7 +68,7 @@ cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
-容器交付使用 `docker build --tag rust-email-mcp:local .` 验证实际 Dockerfile。构建上下文只包含 Cargo 清单、源码和所需的 vendored 依赖；CI 同步执行镜像构建，避免本地 Cargo 成功而容器缺少 path 依赖。
+容器交付先运行 `bash scripts/test-docker-context.sh`，用合成哨兵和实际 Docker 构建器验证上下文仅包含 Cargo 清单、源码和所需的 vendored 依赖，再用 `docker build --tag rust-email-mcp:local .` 验证实际 Dockerfile。CI 同步执行上下文检查和镜像构建，避免意外放行 vendor 同级目录或遗漏 path 依赖。
 
 测试覆盖发送状态持久化、并发去重、草稿 BCC 与 MIME 保留、日志写入后置失败、实际字节与 literal 声明限额、参数校验，以及 JWT 信任边界。测试邮件使用本地合成数据。
 

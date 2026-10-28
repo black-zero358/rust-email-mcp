@@ -4,5 +4,6 @@
 !src/
 !src/**
 !vendor/
+vendor/**
 !vendor/async-imap/
 !vendor/async-imap/**
