@@ -49,7 +49,7 @@
 
 IMAP 文本模式固定为 rev1：所有邮箱参数编码为 modified UTF-7，LIST 名称解码为 Unicode 后验证规范往返。不得直接把 UTF-8 字节放入 quoted search；非 ASCII 查询使用 `CHARSET UTF-8` 与同步 literal，等待 continuation 和对应命令的 tagged OK。`BADCHARSET` 返回 `UNSUPPORTED_CHARSET`，不降级为含义不同的查询。当前未协商 `UTF8=ACCEPT` 或 IMAP4rev2。
 
-async-imap 0.12 的 APPEND flags 原样序列化，必须传入 `(\Draft)` 这样的带括号列表。合成 duplex 回归覆盖 literal continuation 及 OK/NO/BAD。vendored completion-status 补丁只允许匹配 tag 的 OK 成功；NO/BAD、缺失终结响应和错误 tag 均失败。来源、退出条件与审计方式见 [PATCHES.md](../vendor/async-imap/PATCHES.md)。
+async-imap 0.12 的 APPEND flags 原样序列化，必须传入 `(\Draft)` 这样的带括号列表。合成 duplex 回归覆盖 literal continuation 及 OK/NO/BAD。vendored completion-status 补丁只允许匹配 tag 的 OK 成功；NO/BAD、缺失终结响应和错误 tag 均失败。SELECT/EXAMINE（含 CONDSTORE）和 STATUS 共用这一完成边界；无响应或只有 `0 EXISTS`/部分元数据的断连不能解释成成功空邮箱，列表/搜索不得在未完成 EXAMINE 时返回空页。来源、退出条件与审计方式见 [PATCHES.md](../vendor/async-imap/PATCHES.md)。
 
 `mail/attachments.rs` 使用现有有界整封邮件与 MIME 解析发现附件，统一 `get_email`、列表、内联 Base64 和二进制下载的索引与附件子树边界。`download_attachment` 保持原契约；新增 `prepare_attachment_download` 保存最多 16 个主体绑定、300 秒有效的元数据句柄。GET 再核对 UIDVALIDITY 并重新读取整封邮件；不引入 BODYSTRUCTURE 或单部分 FETCH。两份二进制传输许可持有至响应消费或丢弃，邮箱连接仍共用原槽位与预算。
 
@@ -102,7 +102,7 @@ JSON 日志使用固定事件名和受控字段，记录服务端生成的 reque
 | 原则 | 实现入口 | 现有验证与审阅入口 |
 | --- | --- | --- |
 | D1 身份与授权 | `auth`、`server::allowed/call_tool`、`main` 接线 | `jwt_trust_boundaries`、`failed_refresh_is_shared_and_expired_keys_fail_closed`、`cached_key_does_not_wait_for_rotation_and_refresh_updates_snapshot`、`schemas_match_policy`；另做隔离 OAuth/登录资产验收 |
-| D2 读取无副作用与 UIDVALIDITY | `mail`、`imap_text`、vendored completion boundary | `status_uses_only_target_uid_and_distinguishes_missing_from_empty_flags`、`rev1_mailbox_names_round_trip_through_tools`、`statistics_status_requires_complete_matching_snapshot_and_tag`、`refused_imap_tools_return_backend_error_and_stop_delete`、`tests/imap_completion.rs`；只读邮箱验收核对读前后 flags |
+| D2 读取无副作用与 UIDVALIDITY | `mail`、`imap_text`、vendored completion boundary | `status_uses_only_target_uid_and_distinguishes_missing_from_empty_flags`、`rev1_mailbox_names_round_trip_through_tools`、`statistics_status_requires_complete_matching_snapshot_and_tag`、`refused_imap_tools_return_backend_error_and_stop_delete`、`mailbox_commands_require_matching_tagged_completion`、`empty_mailbox_pages_require_completed_examine`、`tests/imap_completion.rs`；只读邮箱验收核对读前后 flags |
 | D3 资源有界 | `BudgetStream`、`mime`、`html`、`server` | `rejects_split_oversized_literal_before_parser`、`headers_and_decode_are_bounded_before_allocation`、`attributes_are_bounded_before_tokenization_without_whitespace`、`final_wire_budget_covers_duplicates_escaping_unicode_and_attachments`、`oversized_rpc_id_is_rejected_before_execution` |
 | D4 发送结果与幂等 | `journal`、`mail::send`、`smtp` | `durable_dedup_and_principal_isolation`、`concurrent_claim_has_single_winner`、`smtp_lost_reply_does_not_resend`、`smtp_accepted_is_persisted_before_unresponsive_quit`、`smtp_accepted_survives_quit_timeout_and_journal_failure` |
 | D5 隐私与不可信内容 | `mail`、`mime`、`html`、`main` 日志 | `discovery_matches_message_indices_and_multipart_attachment_trees`、`http_download_authorization_binary_headers_and_transfer_capacity`、`draft_envelope_and_privacy_filter_share_canonical_fields`、`ambiguous_draft_headers_are_rejected`、`text_attachments_stay_downloadable_but_leave_body_and_forward`、`html_read_and_forward_preserve_original_content`；日志字段和 panic 脱敏仍需代码审阅 |

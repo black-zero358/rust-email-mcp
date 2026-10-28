@@ -1266,6 +1266,59 @@ fn attachment(raw: &[u8], index: usize, max: usize) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     #[tokio::test]
+    async fn empty_mailbox_pages_require_completed_examine() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = tempfile::tempdir().unwrap();
+        let service = MailService::new(
+            crate::config::fixture(),
+            Arc::new(Journal::open(&dir.path().join("db")).unwrap()),
+        )
+        .unwrap();
+        for tool in ["list_emails", "search_emails"] {
+            for completion in ["OK", "EOF", "WRONG_TAG", "NO", "BAD"] {
+                for partial in [false, true] {
+                    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                        let (client, server) = tokio::io::duplex(2048);
+                        let backend = tokio::spawn(async move {
+                            let mut server = BufReader::new(server);
+                            let mut line = String::new();
+                            server.read_line(&mut line).await.unwrap();
+                            let tag = line.split_whitespace().next().unwrap();
+                            server.write_all(format!("{tag} OK login\r\n").as_bytes()).await.unwrap();
+                            line.clear();
+                            server.read_line(&mut line).await.unwrap();
+                            let (tag, command) = line.trim_end_matches("\r\n").split_once(' ').unwrap();
+                            assert_eq!(command, "EXAMINE \"INBOX\"");
+                            let mut reply = if partial { "* 0 EXISTS\r\n* OK [UIDVALIDITY 99] synthetic\r\n* OK [UIDNEXT 1] synthetic\r\n".to_owned() } else { String::new() };
+                            match completion {
+                                "EOF" => {}
+                                "WRONG_TAG" => reply.push_str("OTHER OK synthetic\r\n"),
+                                _ => reply.push_str(&format!("{tag} {completion} synthetic\r\n")),
+                            }
+                            server.write_all(reply.as_bytes()).await.unwrap();
+                            // An empty page must not issue SEARCH/FETCH or any write command.
+                            line.clear();
+                            server.get_mut().shutdown().await.unwrap();
+                            assert_eq!(server.read_line(&mut line).await.unwrap(), 0);
+                        });
+                        let mut session = async_imap::Client::new(client).login("synthetic", "test-only").await.unwrap();
+                        let result = service.with_session(&mut session, tool, &json!({})).await;
+                        drop(session);
+                        backend.await.unwrap();
+                        if completion == "OK" {
+                            let page = result.unwrap();
+                            assert_eq!(page["emails"], json!([]));
+                            assert_eq!(page["next_before_uid"], Value::Null);
+                            assert_eq!(page["uid_validity"], if partial { json!(99) } else { Value::Null });
+                        } else {
+                            assert_eq!(result.unwrap_err().code, "MAIL_BACKEND", "{tool}/{completion}/{partial}");
+                        }
+                    }).await.unwrap();
+                }
+            }
+        }
+    }
+    #[tokio::test]
     async fn advanced_search_intersects_filters_and_sync_literal_fields() {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
         tokio::time::timeout(std::time::Duration::from_secs(2), async {

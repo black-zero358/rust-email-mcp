@@ -121,32 +121,9 @@ pub(crate) async fn parse_status<T: Stream<Item = io::Result<ResponseData>> + Un
 ) -> Result<Mailbox> {
     let mut mbox = Mailbox::default();
 
-    while let Some(resp) = stream.try_next().await? {
+    let mut responses = checked_responses(stream, command_tag);
+    while let Some(resp) = responses.try_next().await? {
         match resp.parsed() {
-            Response::Done {
-                tag,
-                status,
-                outcome,
-                ..
-            } if tag == &command_tag => {
-                use imap_proto::Status;
-                match status {
-                    Status::Ok => {
-                        break;
-                    }
-                    Status::Bad => {
-                        return Err(Error::Bad(format!("outcome: {outcome:?}")));
-                    }
-                    Status::No => {
-                        return Err(Error::No(format!("outcome: {outcome:?}")));
-                    }
-                    _ => {
-                        return Err(Error::Io(io::Error::other(format!(
-                            "status: {status:?}, outcome: {outcome:?}"
-                        ))));
-                    }
-                }
-            }
             Response::MailboxData(MailboxDatum::Status { mailbox, status })
                 if mailbox == expected_mailbox =>
             {
@@ -246,32 +223,9 @@ pub(crate) async fn parse_mailbox<T: Stream<Item = io::Result<ResponseData>> + U
 ) -> Result<Mailbox> {
     let mut mailbox = Mailbox::default();
 
-    while let Some(resp) = stream.try_next().await? {
+    let mut responses = checked_responses(stream, command_tag);
+    while let Some(resp) = responses.try_next().await? {
         match resp.parsed() {
-            Response::Done {
-                tag,
-                status,
-                outcome,
-                ..
-            } if tag == &command_tag => {
-                use imap_proto::Status;
-                match status {
-                    Status::Ok => {
-                        break;
-                    }
-                    Status::Bad => {
-                        return Err(Error::Bad(format!("outcome: {outcome:?}")));
-                    }
-                    Status::No => {
-                        return Err(Error::No(format!("outcome: {outcome:?}")));
-                    }
-                    _ => {
-                        return Err(Error::Io(io::Error::other(format!(
-                            "status: {status:?}, outcome: {outcome:?}"
-                        ))));
-                    }
-                }
-            }
             Response::Data { status, outcome } => {
                 use imap_proto::Status;
 

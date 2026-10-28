@@ -11,7 +11,7 @@
 
 ## Constraints to preserve
 
-- Read with EXAMINE/PEEK and retain UIDVALIDITY checks. Keep target-UID FETCH handling, IMAP4rev1 text encoding, APPEND flag syntax and tagged completion checks as specified in [MCP and mail](docs/architecture.md#mcp-and-mail).
+- Read with EXAMINE/PEEK and retain UIDVALIDITY checks. Keep target-UID FETCH handling, IMAP4rev1 text encoding, APPEND flag syntax and tagged completion checks for SELECT/EXAMINE (including empty mailboxes) and STATUS as specified in [MCP and mail](docs/architecture.md#mcp-and-mail).
 - Bound connections, response bytes and parser allocation. MIME structure, header and decoding budgets apply before allocation; do not restore `mailparse::parse_mail` on untrusted input. Preserve shared read/forward body selection and bounded tokenizer-only HTML handling, including foreign-content rejection and adjacent-attribute regressions. See [MIME and HTML](docs/architecture.md#mime-and-html).
 - Persist intent before SMTP. Preserve accepted/unknown outcomes across journal or cleanup failures; never automatically retry unknown sends. Keep the documented principal-scoped operation keys, bounded QUIT cleanup, TLS/AUTH and SMTPUTF8/8BITMIME policy. Preserve the canonical draft-header privacy boundary and body bytes. See [send lifecycle](docs/architecture.md#send-lifecycle).
 - Authenticate every HTTP request entering MCP. Preserve issuer, audience, expiry, nbf, scope and subject validation, the hard JWKS TTL and shared refresh cooldown. Keep deployment-specific OAuth and login-asset checks in [authentication](docs/architecture.md#authentication).
