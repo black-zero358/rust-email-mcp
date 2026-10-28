@@ -10,10 +10,10 @@ use std::cell::RefCell;
 const MAX_INPUT: usize = 128 * 1024;
 const MAX_TOKENS: usize = 4096;
 const MAX_OUTPUT: usize = 256 * 1024;
-// Every HTML attribute starts after ASCII whitespace. Count conservatively
-// across the whole input before tokenization to bound attribute-vector growth
-// and the tokenizer's duplicate-name comparisons, including malformed markup.
-const MAX_WHITESPACE: usize = 8192;
+// Attribute boundaries can also use quoted-value adjacency or slash recovery
+// without whitespace. Count all potential separators across the entire input,
+// before tokenizer allocation, instead of trying to duplicate its lexer.
+const MAX_MARKUP_SEPARATORS: usize = 8192;
 
 #[derive(Default)]
 struct Text {
@@ -25,6 +25,7 @@ struct Text {
     templates: usize,
     raw_ignore: Option<&'static str>,
     parse_error: bool,
+    unsupported: bool,
 }
 
 impl Text {
@@ -62,6 +63,9 @@ impl TokenSink for Sink {
     type Handle = ();
     fn process_token(&self, token: Token, _: u64) -> TokenSinkResult<()> {
         let mut text = self.0.borrow_mut();
+        if text.unsupported {
+            return TokenSinkResult::Continue;
+        }
         text.tokens += 1;
         if text.tokens > MAX_TOKENS || text.limited {
             text.limited = true;
@@ -89,6 +93,13 @@ impl TokenSink for Sink {
             Token::TagToken(tag) => {
                 use html5ever::tokenizer::TagKind::{EndTag, StartTag};
                 let name: &str = tag.name.as_ref();
+                // A tokenizer-only sink has no foreign-namespace tree state.
+                // Reject the whole body, even after visible text, rather than
+                // discarding SVG/MathML CDATA as an HTML bogus comment.
+                if tag.kind == StartTag && matches!(name, "svg" | "math") {
+                    text.unsupported = true;
+                    return TokenSinkResult::Plaintext;
+                }
                 if let Some(ignored) = text.raw_ignore {
                     if tag.kind == EndTag && name == ignored {
                         text.raw_ignore = None;
@@ -194,12 +205,21 @@ impl TokenSink for Sink {
     }
 }
 
-pub(crate) fn to_text(html: &str) -> Result<String> {
+fn check_input(html: &str) -> Result<()> {
     if html.len() > MAX_INPUT
-        || html.bytes().filter(u8::is_ascii_whitespace).count() > MAX_WHITESPACE
+        || html
+            .bytes()
+            .filter(|b| b.is_ascii_whitespace() || matches!(b, b'\'' | b'"' | b'/' | b'='))
+            .count()
+            > MAX_MARKUP_SEPARATORS
     {
         return Err(MailError::limit());
     }
+    Ok(())
+}
+
+pub(crate) fn to_text(html: &str) -> Result<String> {
+    check_input(html)?;
     let input = BufferQueue::default();
     input.push_back(html.into());
     let tokenizer = Tokenizer::new(Sink::default(), Default::default());
@@ -209,6 +229,9 @@ pub(crate) fn to_text(html: &str) -> Result<String> {
     }
     tokenizer.end();
     let mut text = tokenizer.sink.0.into_inner();
+    if text.unsupported {
+        return Err(unsupported());
+    }
     if text.limited {
         return Err(MailError::limit());
     }
@@ -264,7 +287,9 @@ mod tests {
             "LIMIT_EXCEEDED"
         );
         assert_eq!(
-            to_text(&" ".repeat(MAX_WHITESPACE + 1)).unwrap_err().code,
+            to_text(&" ".repeat(MAX_MARKUP_SEPARATORS + 1))
+                .unwrap_err()
+                .code,
             "LIMIT_EXCEEDED"
         );
         assert_eq!(
@@ -280,5 +305,18 @@ mod tests {
         assert_eq!(text.out.len(), MAX_OUTPUT - 1);
         assert_eq!(to_text("<p>ordinary</p>").unwrap(), "ordinary");
         assert_eq!(to_text("<html><body></body></html>").unwrap(), "");
+    }
+    #[test]
+    fn attributes_are_bounded_before_tokenization_without_whitespace() {
+        for attributes in [
+            (0..10000).map(|i| format!("a{i}=''")).collect::<String>(),
+            (0..10000).map(|i| format!("/a{i}")).collect::<String>(),
+        ] {
+            let html = format!("<p {attributes}>visible</p>");
+            assert!(html.len() < MAX_INPUT);
+            assert_eq!(check_input(&html).unwrap_err().code, "LIMIT_EXCEEDED");
+            assert_eq!(to_text(&html).unwrap_err().code, "LIMIT_EXCEEDED");
+        }
+        assert_eq!(to_text("<p a=''b=''>ordinary</p>").unwrap(), "ordinary");
     }
 }

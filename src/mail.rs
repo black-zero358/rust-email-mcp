@@ -1372,6 +1372,20 @@ mod tests {
                 "UNSUPPORTED_BODY"
             );
         }
+        for foreign in [
+            "<svg><text><![CDATA[CRITICAL_INVOICE]]></text></svg>",
+            "<math><mtext>CRITICAL_INVOICE</mtext></math>",
+        ] {
+            let raw = format!("Content-Type: text/html\n\n<p>Visible intro</p>{foreign}");
+            assert_eq!(
+                parsed(raw.as_bytes(), 1, None, 1024).unwrap_err().code,
+                "UNSUPPORTED_BODY"
+            );
+            assert_eq!(
+                forward_body(raw.as_bytes(), "FYI").unwrap_err().code,
+                "UNSUPPORTED_BODY"
+            );
+        }
         let raw = format!("Content-Type: text/html\n\n{}", "x".repeat(128 * 1024 + 1));
         assert_eq!(
             parsed(raw.as_bytes(), 1, None, 1024).unwrap_err().code,
