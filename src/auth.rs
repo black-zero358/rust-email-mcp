@@ -455,4 +455,51 @@ mod tests {
         .unwrap();
         assert!(auth.verify(&token).await.is_err());
     }
+
+    #[tokio::test]
+    async fn attachment_route_requires_bearer_before_handler() {
+        use axum::{Router, body::Body, http::Request, middleware, routing::get};
+        use tower::ServiceExt;
+        let config = crate::config::fixture();
+        let auth = Arc::new(Auth {
+            config: config.clone(),
+            client: reqwest::Client::new(),
+            jwks_uri: "https://invalid.example/jwks".into(),
+            keys: Mutex::new((JwkSet { keys: vec![] }, Instant::now())),
+            refresh: Mutex::new(RefreshState {
+                completed: Instant::now(),
+                failed: false,
+            }),
+        });
+        let mail = Arc::new(
+            crate::mail::MailService::new(
+                config,
+                Arc::new(crate::journal::Journal::open(std::path::Path::new(":memory:")).unwrap()),
+            )
+            .unwrap(),
+        );
+        // Match the production route layering, including the nested MCP service.
+        let router = Router::new()
+            .route(
+                "/mcp/attachments/{token}",
+                get(crate::mail::attachments::download),
+            )
+            .with_state(mail)
+            .nest_service("/mcp", Router::new().route("/", get(|| async { "mcp" })))
+            .layer(middleware::from_fn_with_state(auth, require_auth));
+        for bearer in [None, Some("Bearer invalid")] {
+            let mut request = Request::builder().uri("/mcp/attachments/unknown");
+            if let Some(bearer) = bearer {
+                request = request.header(header::AUTHORIZATION, bearer);
+            }
+            let response = router
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert!(response.headers().contains_key(header::WWW_AUTHENTICATE));
+            assert!(response.headers().contains_key("x-request-id"));
+        }
+    }
 }

@@ -121,6 +121,8 @@ docker build --tag rust-email-mcp:local .
 
 发布与安全维护责任由仓库维护者承担；PR 作者负责本次变更的实现和证据，部署操作者负责具体环境的验收与恢复。角色可由同一人担任，记录中应明确执行结果。
 
+能力扩展的隔离验收尚待维护者另行授权：真实 IMAP 对新搜索、会话、统计和附件读取的兼容性；专用测试邮箱的批量标记/移动/删除；认证二进制下载及 ChatGPT 文件消费；持续附件并发/慢客户端内存；用户侧 ChatGPT 重连及自然刷新。源码测试通过不表示这些验收已完成。
+
 ## 参考依据
 
 - [Cargo：Rust 支持版本](https://doc.rust-lang.org/cargo/reference/rust-version.html)与[应用兼容性](https://doc.rust-lang.org/cargo/reference/semver.html#application-compatibility)。固定工具链是当前支持策略，新增 MSRV 承诺需要对应测试。

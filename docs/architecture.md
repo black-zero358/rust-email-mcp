@@ -13,7 +13,8 @@
 | `auth` | OIDC 发现、JWT/JWKS 校验、请求主体和 HTTP 认证错误 | 依赖配置与身份服务，不执行邮件操作 |
 | `server` | MCP 工具目录、权限模式、输入校验、响应封装与预算 | 将已认证主体传给 `mail`；协议适配不直接操作邮箱或数据库 |
 | `mail` | IMAP 会话、邮件操作编排、发送意图与结果记录 | 调用 `imap_text`、`mime`、`smtp`、`journal`，持有执行槽位 |
-| `imap_text` | rev1 邮箱名和非 ASCII 搜索的线路编码 | 处理编码、literal 和命令终结；不承担 MCP 授权 |
+| `mail/attachments`、`mail/insights` | 附件交付及有界读取扩展 | 由 `mail` 编排，共用 MIME、协议、槽位与预算 |
+| `imap_text` | rev1 邮箱名、非 ASCII 搜索与严格统计 STATUS | 处理编码、literal 和命令终结；不承担 MCP 授权 |
 | `mime`、`html` | 有界 MIME 解析、正文选择、附件分类、HTML 文本提取 | `mime` 调用 `html`；不执行网络请求、不发送邮件 |
 | `smtp` | 经验证 TLS/AUTH 的提交事务及独立清理 | 返回事务结果；由 `mail` 调用 `journal` 持久化，不在适配器中自动重试 |
 | `journal` | SQLite 操作键、参数摘要、状态持久化及重启恢复 | 不调用邮件后端；数据库事务不跨 SMTP/IMAP 网络请求 |
@@ -49,6 +50,10 @@
 IMAP 文本模式固定为 rev1：所有邮箱参数编码为 modified UTF-7，LIST 名称解码为 Unicode 后验证规范往返。不得直接把 UTF-8 字节放入 quoted search；非 ASCII 查询使用 `CHARSET UTF-8` 与同步 literal，等待 continuation 和对应命令的 tagged OK。`BADCHARSET` 返回 `UNSUPPORTED_CHARSET`，不降级为含义不同的查询。当前未协商 `UTF8=ACCEPT` 或 IMAP4rev2。
 
 async-imap 0.12 的 APPEND flags 原样序列化，必须传入 `(\Draft)` 这样的带括号列表。合成 duplex 回归覆盖 literal continuation 及 OK/NO/BAD。vendored completion-status 补丁只允许匹配 tag 的 OK 成功；NO/BAD、缺失终结响应和错误 tag 均失败。来源、退出条件与审计方式见 [PATCHES.md](../vendor/async-imap/PATCHES.md)。
+
+`mail/attachments.rs` 使用现有有界整封邮件与 MIME 解析发现附件，统一 `get_email`、列表、内联 Base64 和二进制下载的索引与附件子树边界。`download_attachment` 保持原契约；新增 `prepare_attachment_download` 保存最多 16 个主体绑定、300 秒有效的元数据句柄。GET 再核对 UIDVALIDITY 并重新读取整封邮件；不引入 BODYSTRUCTURE 或单部分 FETCH。两份二进制传输许可持有至响应消费或丢弃，邮箱连接仍共用原槽位与预算。
+
+`mail/insights.rs` 提供有界标识符图会话、精确 Message-ID 定位、严格 STATUS 统计、脱敏诊断与正文展示。头部缓存最多 128 项/2 MiB、30 秒，只保存不可变头部并以新 UIDVALIDITY 失效；正文共用 `mime`/`html` 选择器。统计用 `imap_text::status_counts` 验证完整字段和命令完成。批量修改使用明确 UID、总体期限和逐项结果，失败项保守为 unknown、后续 unprocessed；没有持久化修改日志，重试前必须检查邮箱。范围与限制见 [能力说明](capabilities.md)。
 
 ## MIME and HTML
 
@@ -97,10 +102,10 @@ JSON 日志使用固定事件名和受控字段，记录服务端生成的 reque
 | 原则 | 实现入口 | 现有验证与审阅入口 |
 | --- | --- | --- |
 | D1 身份与授权 | `auth`、`server::allowed/call_tool`、`main` 接线 | `jwt_trust_boundaries`、`failed_refresh_is_shared_and_expired_keys_fail_closed`、`cached_key_does_not_wait_for_rotation_and_refresh_updates_snapshot`、`schemas_match_policy`；另做隔离 OAuth/登录资产验收 |
-| D2 读取无副作用与 UIDVALIDITY | `mail`、`imap_text`、vendored completion boundary | `status_uses_only_target_uid_and_distinguishes_missing_from_empty_flags`、`rev1_mailbox_names_round_trip_through_tools`、`refused_imap_tools_return_backend_error_and_stop_delete`、`tests/imap_completion.rs`；只读邮箱验收核对读前后 flags |
+| D2 读取无副作用与 UIDVALIDITY | `mail`、`imap_text`、vendored completion boundary | `status_uses_only_target_uid_and_distinguishes_missing_from_empty_flags`、`rev1_mailbox_names_round_trip_through_tools`、`statistics_status_requires_complete_matching_snapshot_and_tag`、`refused_imap_tools_return_backend_error_and_stop_delete`、`tests/imap_completion.rs`；只读邮箱验收核对读前后 flags |
 | D3 资源有界 | `BudgetStream`、`mime`、`html`、`server` | `rejects_split_oversized_literal_before_parser`、`headers_and_decode_are_bounded_before_allocation`、`attributes_are_bounded_before_tokenization_without_whitespace`、`final_wire_budget_covers_duplicates_escaping_unicode_and_attachments`、`oversized_rpc_id_is_rejected_before_execution` |
 | D4 发送结果与幂等 | `journal`、`mail::send`、`smtp` | `durable_dedup_and_principal_isolation`、`concurrent_claim_has_single_winner`、`smtp_lost_reply_does_not_resend`、`smtp_accepted_is_persisted_before_unresponsive_quit`、`smtp_accepted_survives_quit_timeout_and_journal_failure` |
-| D5 隐私与不可信内容 | `mail`、`mime`、`html`、`main` 日志 | `draft_envelope_and_privacy_filter_share_canonical_fields`、`ambiguous_draft_headers_are_rejected`、`text_attachments_stay_downloadable_but_leave_body_and_forward`、`html_read_and_forward_preserve_original_content`；日志字段和 panic 脱敏仍需代码审阅 |
+| D5 隐私与不可信内容 | `mail`、`mime`、`html`、`main` 日志 | `discovery_matches_message_indices_and_multipart_attachment_trees`、`http_download_authorization_binary_headers_and_transfer_capacity`、`draft_envelope_and_privacy_filter_share_canonical_fields`、`ambiguous_draft_headers_are_rejected`、`text_attachments_stay_downloadable_but_leave_body_and_forward`、`html_read_and_forward_preserve_original_content`；日志字段和 panic 脱敏仍需代码审阅 |
 | D6 简单可维护与明确范围 | 模块边界、工具链、补丁来源、部署模板 | CI 的 fmt/test/clippy/build；`scripts/audit-dependencies.sh`；`scripts/test-docker-context.sh` 和生产 Dockerfile 构建；升级/恢复证据见维护与部署指南 |
 
 vendored 构建依赖必须由 `.dockerignore` 明确允许并复制进 Docker builder；允许范围不能扩大到 vendor 同级目录、秘密或部署数据。Docker context 检查使用合成哨兵与真实构建器。普通 `cargo audit` 会跳过 path package，因此本地与 CI 统一运行专用审计脚本，同时独立审阅本地补丁代码；升级时同步更新来源、脚本和回归测试。

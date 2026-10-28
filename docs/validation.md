@@ -2,6 +2,16 @@
 
 本文件保存带版本与环境边界的证据。每次新增记录注明提交/tag、日期与时区、环境、命令、结果、CI 链接及未覆盖项；保留历史结果，不把其测试数量或部署状态当作当前版本的证明。验证要求见 [贡献指南](../CONTRIBUTING.md#验证与完成标准)。
 
+## 2026-10-29 工作流兼容整合（Asia/Shanghai）
+
+- 代码提交：`4fa02133974c1fae527c454e4d2e17249aec735f`；基于 main `957c37600fdc286fc366e0d3d9fc3ccd31517576`，选择性整合保留分支并保留当前主线的协议、MIME、发送和输出边界。
+- 环境：Windows 工作树，WSL Ubuntu 中 Rust 1.99.1；合成 MIME、本地 IMAP/SMTP 与注入下载后端，无真实邮箱或生产操作。
+- 本地 `cargo fmt --check`、`cargo test --locked` 通过，78 项单元测试和 1 项 IMAP 完成状态集成测试；高级字段交集与同步 UTF-8 literal、统一 multipart 附件索引、正文选项共享 HTML/MIME、严格 STATUS、主体绑定/过期/下载容量、批量中断及主线回归均在覆盖范围内。
+- `bash scripts/audit-dependencies.sh`（cargo-audit 0.22.2，307 项依赖）和 `bash scripts/test-docker-context.sh` 本地通过。依赖版本与 vendored 补丁均未改变；lockfile 只更新服务版本至 0.1.1。
+- 本地 Clippy、release 与生产 Dockerfile 构建仍在运行；最终候选的 `check`、`audit`、`container` 必须在合并前全部成功，以最终 PR 检查及后续结果记录为准。
+- 兼容性：29 个唯一工具，旧 `download_attachment` 保留内联 Base64，新工具 `prepare_attachment_download` 提供认证 GET；没有配置或数据库迁移。附件发现与 GET 都读取受限整封邮件，不宣称 BODYSTRUCTURE/单部分读取或超过 8 MiB 邮件支持。
+- 边界：未验收真实 IMAP 兼容性、真实批量修改、ChatGPT 认证下载/文件消费、自然刷新、持续负载或 musl 发布产物；待验收入口见 CONTRIBUTING，不把本地合成测试当成部署验收。
+
 ## 2026-10-28 源码 CI 快照
 
 - 提交：[`c775e922e29ff04a0dfafe3f0e501a8b926b290a`](https://github.com/black-zero358/rust-email-mcp/commit/c775e922e29ff04a0dfafe3f0e501a8b926b290a)。
@@ -32,6 +42,16 @@
 使用独立测试身份与 OAuth 客户端，完成同用户两次登录、两份刷新令牌独立使用、提前刷新和服务重启后的刷新恢复。QQ 邮箱验证包括工具发现、账户、文件夹、单条列表、正文读取和读前后标记一致。工具数量为 20。
 
 SMTP 故障测试使用本地模拟服务器。真实邮箱发送、移动、删除和文件夹写入由专用测试邮箱另行验收。
+
+### 2026-10-28 ChatGPT 接入排障历史
+
+原始保留分支的现场记录未保存源码映射；不作为当前版本的验收证据。当时已修正回调地址，并为 Rauthy 0.37.2 的公开发现文档补充公共客户端认证方式 `none`。发现文档移入 Nginx 可读取的公共目录，服务私有目录保持原权限。
+
+登录页一次加载约 60 个静态资源，原认证路径限流使部分资源返回 429，前端显示 500。静态资源拆分到独立 location 后，引用的脚本、样式和主题请求均返回 200。
+
+此前的限流事件还触发了 `nginx-limit-req` Fail2ban jail，封禁客户端出口 IP，造成 `ERR_CONNECTION_CLOSED`。核实规则并解除该 IP 的封禁后，客户端 HTTPS 恢复，浏览器实际显示中文登录页。检查保留了认证接口限流和 Fail2ban 防护。
+
+待验收：用户在 ChatGPT 完成完整授权、邮件工具调用，以及访问令牌到期后的自然刷新。排障步骤见[接入排障](troubleshooting.md)。
 
 ### 内存与存储
 

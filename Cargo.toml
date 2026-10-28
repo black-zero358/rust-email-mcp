@@ -1,6 +1,6 @@
 [package]
 name = "rust-email-mcp"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 description = "Bounded IMAP/SMTP MCP server with durable send tracking and OIDC authentication"

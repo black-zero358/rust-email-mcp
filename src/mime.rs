@@ -186,6 +186,10 @@ impl Part<'_> {
         )
     }
 
+    pub fn encoded_len(&self) -> usize {
+        self.body.len()
+    }
+
     pub fn body_raw(&self, max: usize) -> Result<Vec<u8>> {
         // Transfer codecs never expand beyond encoded bytes. Limit their input
         // before they allocate cleaning buffers or decoded output.

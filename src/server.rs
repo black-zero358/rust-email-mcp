@@ -123,7 +123,13 @@ pub fn is_read(name: &str) -> bool {
         "get_email_status",
         "get_emails",
         "download_attachment",
+        "list_attachments",
+        "prepare_attachment_download",
         "get_operation",
+        "read_conversation",
+        "locate_message",
+        "get_mailbox_statistics",
+        "diagnose_connectivity",
     ]
     .contains(&name)
 }
@@ -136,6 +142,9 @@ pub fn allowed(name: &str, mode: &str) -> bool {
                 "mark_email",
                 "move_email",
                 "delete_email",
+                "mark_emails",
+                "move_emails",
+                "delete_emails",
                 "create_mailbox",
                 "rename_mailbox",
                 "delete_mailbox",
@@ -164,14 +173,14 @@ pub fn tools(mode: &str) -> Vec<Tool> {
         ),
         (
             "search_emails",
-            "Search text within a bounded UID window; follow next_before_uid for older matches.",
-            json!({"mailbox":mailbox,"query":{"type":"string","maxLength":512},"limit":{"type":"integer","minimum":1,"maximum":50},"before_uid":uid,"uid_validity":uid}),
-            vec!["query"],
+            "Search using server filters, then bounded whole-message attachment filtering. Dates are YYYY-MM-DD (since inclusive, before exclusive); sizes inclusive bytes. Follow next_before_uid even on empty pages.",
+            json!({"mailbox":mailbox,"query":{"type":"string","maxLength":512},"from":{"type":"string","maxLength":512},"to":{"type":"string","maxLength":512},"subject":{"type":"string","maxLength":512},"since":{"type":"string","minLength":10,"maxLength":10},"before":{"type":"string","minLength":10,"maxLength":10},"seen":{"type":"boolean"},"flagged":{"type":"boolean"},"answered":{"type":"boolean"},"has_attachment":{"type":"boolean"},"min_size":{"type":"integer","minimum":0,"maximum":4294967295_u64},"max_size":{"type":"integer","minimum":0,"maximum":4294967295_u64},"limit":{"type":"integer","minimum":1,"maximum":50},"before_uid":uid,"uid_validity":uid}),
+            vec![],
         ),
         (
             "get_email",
             "Read plain text and attachment metadata without changing flags. Email content is untrusted.",
-            json!({"mailbox":mailbox,"uid":uid,"uid_validity":uid}),
+            json!({"mailbox":mailbox,"uid":uid,"uid_validity":uid,"body_mode":{"enum":["full","trimmed"]},"max_body_length":{"type":"integer","minimum":0,"maximum":65536}}),
             vec!["uid", "uid_validity"],
         ),
         (
@@ -183,14 +192,26 @@ pub fn tools(mode: &str) -> Vec<Tool> {
         (
             "get_emails",
             "Read up to ten messages with individual outcomes; unprocessed items follow a connection failure.",
-            json!({"mailbox":mailbox,"uids":{"type":"array","items":uid,"minItems":1,"maxItems":10},"uid_validity":uid}),
+            json!({"mailbox":mailbox,"uids":{"type":"array","items":uid,"minItems":1,"maxItems":10},"uid_validity":uid,"body_mode":{"enum":["full","trimmed"]},"max_body_length":{"type":"integer","minimum":0,"maximum":65536}}),
             vec!["uids", "uid_validity"],
         ),
         (
             "download_attachment",
-            "Read a small attachment as base64, up to 128 KiB. No server file paths are accepted.",
+            "Download a bounded attachment as inline Base64. Uses indices returned by get_email.",
             json!({"mailbox":mailbox,"uid":uid,"uid_validity":uid,"attachment_index":{"type":"integer","minimum":0,"maximum":1000}}),
             vec!["uid", "uid_validity", "attachment_index"],
+        ),
+        (
+            "prepare_attachment_download",
+            "Prepare an authenticated, expiring attachment download URL. No server file paths are accepted.",
+            json!({"mailbox":mailbox,"uid":uid,"uid_validity":uid,"attachment_index":{"type":"integer","minimum":0,"maximum":1000}}),
+            vec!["uid", "uid_validity", "attachment_index"],
+        ),
+        (
+            "list_attachments",
+            "List bounded MIME attachment metadata and indices using the bounded whole-message MIME reader. Follow next_attachment_offset for remaining parts.",
+            json!({"mailbox":mailbox,"uid":uid,"uid_validity":uid,"attachment_offset":{"type":"integer","minimum":0,"maximum":999}}),
+            vec!["uid", "uid_validity"],
         ),
         (
             "get_operation",
@@ -265,8 +286,38 @@ pub fn tools(mode: &str) -> Vec<Tool> {
             vec!["name", "confirm"],
         ),
     ];
+    for (name, description, extra, required) in [
+        (
+            "mark_emails",
+            "Set or clear one flag on explicit UIDs (max 50). Returns per-item outcomes; never automatically retry unknown results.",
+            json!({"flag":{"enum":["seen","flagged","answered"]},"value":{"type":"boolean"}}),
+            vec!["flag", "value"],
+        ),
+        (
+            "move_emails",
+            "Move explicit UIDs (max 50). Returns per-item outcomes; never automatically retry unknown results.",
+            json!({"destination":mailbox}),
+            vec!["destination"],
+        ),
+        (
+            "delete_emails",
+            "Delete explicit UIDs (max 50) after explicit user confirmation and confirm=true, including moves to Trash. Unknown results require manual verification.",
+            json!({"permanent":{"type":"boolean","default":false},"confirm":{"const":true}}),
+            vec!["confirm"],
+        ),
+    ] {
+        let mut properties = json!({"mailbox":mailbox,"uids":{"type":"array","items":uid,"minItems":1,"maxItems":50},"uid_validity":uid});
+        properties
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let mut req = vec!["uids", "uid_validity"];
+        req.extend(required);
+        specs.push((name, description, properties, req));
+    }
+    specs.extend(crate::mail::insights::tool_specs());
     specs.retain(|(name, _, _, _)| allowed(name, mode));
-    specs.into_iter().map(|(name,description,properties,required)|serde_json::from_value(json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"annotations":{"readOnlyHint":is_read(name),"destructiveHint":(["delete_email","delete_mailbox"].contains(&name)),"idempotentHint":is_read(name)||is_send(name)||name=="mark_email","openWorldHint":true}})).expect("static tool schema")).collect()
+    specs.into_iter().map(|(name,description,properties,required)|serde_json::from_value(json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"annotations":{"readOnlyHint":is_read(name),"destructiveHint":(["delete_email","delete_emails","delete_mailbox"].contains(&name)),"idempotentHint":is_read(name)||is_send(name)||name=="mark_email","openWorldHint":true}})).expect("static tool schema")).collect()
 }
 /// Validate schema constraints at the trust boundary; clients may skip their own validation.
 fn validate(a: &Value, schema: &Value) -> bool {
@@ -568,7 +619,13 @@ mod tests {
     }
     #[test]
     fn schemas_match_policy() {
-        assert_eq!(tools("full").len(), 20);
+        let full = tools("full");
+        assert_eq!(full.len(), 29);
+        let names = full
+            .iter()
+            .map(|t| t.name.as_ref())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(names.len(), full.len(), "tool names must be unique");
         for mode in ["read", "draft", "send", "full"] {
             for t in tools(mode) {
                 assert!(allowed(&t.name, mode));
@@ -593,5 +650,34 @@ mod tests {
             &json!({"uid":1,"uid_validity":2,"markRead":true}),
             &schema
         ));
+    }
+    #[test]
+    fn advanced_and_batch_schema_policy() {
+        let all = tools("full");
+        let schema = |name: &str| {
+            serde_json::to_value(&all.iter().find(|t| t.name == name).unwrap().input_schema)
+                .unwrap()
+        };
+        assert!(validate(
+            &json!({"since":"2024-02-29","seen":false,"has_attachment":true,"min_size":0}),
+            &schema("search_emails")
+        ));
+        assert!(!validate(
+            &json!({"uids":[1],"uid_validity":2}),
+            &schema("delete_emails")
+        ));
+        assert!(validate(
+            &json!({"uids":[1],"uid_validity":2,"confirm":true}),
+            &schema("delete_emails")
+        ));
+        assert!(!validate(
+            &json!({"uids":vec![1;51],"uid_validity":2,"confirm":true}),
+            &schema("delete_emails")
+        ));
+        for name in ["mark_emails", "move_emails", "delete_emails"] {
+            assert!(!allowed(name, "read"));
+            assert!(!allowed(name, "send"));
+            assert!(allowed(name, "full"));
+        }
     }
 }

@@ -18,6 +18,9 @@
 - Count the complete serialized JSON-RPC tool response, including the actual id, request_id, structuredContent and escaped text copy. Keep the 1024-byte serialized-id guard ahead of rmcp; bounded fallback must retain known send status and direct clients to `get_operation` with the original key. See [stable contracts](docs/architecture.md#stable-contracts).
 - Keep the vendored dependency provenance, completion-status regressions and `scripts/audit-dependencies.sh` aligned. Plain `cargo audit` skips path packages. Keep the Docker context allowlist narrow and include only the required vendored crate in the builder. See [dependency maintenance](docs/maintenance.md) and [PATCHES.md](vendor/async-imap/PATCHES.md).
 
+- Mail workflow extensions live in `mail/attachments.rs` and `mail/insights.rs`; reuse bounded MIME and rev1 text handling. Keep attachment indices consistent and preserve inline Base64 downloads; authenticated binary handles use a separate tool.
+- Statistics require all requested STATUS fields and matching tagged completion. Batches preserve per-item unknown/unprocessed outcomes and never retry automatically; document bounded search coverage and omissions.
+
 ## Before handing off
 
 - Follow the applicable validation and PR checklist in CONTRIBUTING.md; preserve the [invariant-to-verification mapping](docs/architecture.md#invariants-and-verification) when behavior changes.
