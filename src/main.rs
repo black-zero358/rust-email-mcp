@@ -7,7 +7,7 @@ use rust_email_mcp::{
     config::Config,
     journal::Journal,
     mail::MailService,
-    server::EmailServer,
+    server::{EmailServer, limit_rpc_id},
 };
 use std::{path::Path, sync::Arc};
 use tracing_subscriber::EnvFilter;
@@ -53,6 +53,7 @@ async fn main() -> anyhow::Result<()> {
     );
     let secured = Router::new()
         .nest_service("/mcp", service)
+        .layer(middleware::from_fn(limit_rpc_id))
         .layer(middleware::from_fn_with_state(auth, require_auth))
         .layer(tower_http::catch_panic::CatchPanicLayer::new())
         .layer(tower_http::limit::RequestBodyLimitLayer::new(256 * 1024));
