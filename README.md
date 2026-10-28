@@ -131,3 +131,9 @@ Rauthy 使用嵌入式 Hiqlite/SQLite，省去独立数据库容器。建议配�
 请勿在 issue 中提交邮件原文、授权码、访问令牌或生产配置。问题反馈可提供版本、request ID、错误码和使用合成数据复现的步骤。安全问题处理方式见 [SECURITY.md](SECURITY.md)。
 
 架构、选型依据与官方资料见 [docs/architecture.md](docs/architecture.md)。许可证为 [MIT](LICENSE)。感谢官方 Rust MCP SDK、async-imap、lettre、mailparse、SQLite 和 Rauthy 社区。
+
+## 依赖补丁与审计
+
+async-imap 0.12.0 的流式命令终结状态补丁位于 vendor/async-imap，来源、许可证和维护说明见 [PATCHES.md](vendor/async-imap/PATCHES.md)。仅匹配命令 tag 的 OK 表示成功，NO/BAD 或缺失终结响应返回错误。
+
+本地和 CI 统一运行 bash scripts/audit-dependencies.sh。普通 cargo audit 会跳过 path 依赖；脚本在临时锁文件中恢复上游版本的注册表身份，使审计覆盖本地补丁对应的上游版本及全部锁定依赖。实际 Cargo.lock 不变，补丁代码仍需独立审核。升级依赖时必须同步核对脚本和回归测试。

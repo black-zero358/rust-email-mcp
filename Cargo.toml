@@ -35,6 +35,9 @@ webpki-roots = "1"
 tempfile = "3"
 aws-lc-rs = "1"
 
+[patch.crates-io]
+async-imap = { path = "vendor/async-imap" }
+
 [profile.release]
 lto = "thin"
 strip = true
