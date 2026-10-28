@@ -1562,6 +1562,71 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn save_draft_waits_for_continuation_after_notifications() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        for notices in [0, 1, 3] {
+            for outcome in ["OK", "NO", "BAD", "BYE", "EOF", "WRONG_TAG", "EARLY_OK"] {
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    let (client, server) = tokio::io::duplex(8192);
+                    let backend = tokio::spawn(async move {
+                        let mut server = BufReader::new(server);
+                        let mut line = String::new();
+                        server.read_line(&mut line).await.unwrap();
+                        let tag = line.split_whitespace().next().unwrap();
+                        server.write_all(format!("{tag} OK login\r\n").as_bytes()).await.unwrap();
+                        line.clear();
+                        server.read_line(&mut line).await.unwrap();
+                        let (tag, command) = line.trim_end_matches("\r\n").split_once(' ').unwrap();
+                        let tag = tag.to_owned();
+                        let size: usize = command.strip_prefix("APPEND \"Drafts\" (\\Draft) {").unwrap().strip_suffix('}').unwrap().parse().unwrap();
+                        for notice in ["* OK [ALERT] synthetic notice\r\n", "* 2 EXISTS\r\n", "* 1 RECENT\r\n"].iter().take(notices) {
+                            server.write_all(notice.as_bytes()).await.unwrap();
+                        }
+                        if outcome == "OK" {
+                            server.write_all(b"+ ready for literal\r\n").await.unwrap();
+                            let mut literal = vec![0; size];
+                            server.read_exact(&mut literal).await.unwrap();
+                            let parsed = mailparse::parse_mail(&literal).unwrap();
+                            assert_eq!(parsed.headers.get_first_value("Subject").as_deref(), Some("synthetic draft"));
+                            assert_eq!(parsed.get_body().unwrap().trim(), "synthetic body");
+                            let mut end = [0; 2];
+                            server.read_exact(&mut end).await.unwrap();
+                            assert_eq!(end, *b"\r\n");
+                            server.write_all(format!("{tag} OK appended\r\n").as_bytes()).await.unwrap();
+                        } else {
+                            let rejection = match outcome {
+                                "EOF" => String::new(),
+                                "BYE" => "* BYE synthetic\r\n".to_owned(),
+                                "WRONG_TAG" => "OTHER OK synthetic\r\n".to_owned(),
+                                "EARLY_OK" => format!("{tag} OK premature\r\n"),
+                                _ => format!("{tag} {outcome} refused\r\n"),
+                            };
+                            server.write_all(rejection.as_bytes()).await.unwrap();
+                            if outcome != "EOF" {
+                                // A queued continuation cannot revive a rejected command.
+                                server.write_all(b"+ ignored after failure\r\n").await.unwrap();
+                            }
+                            server.get_mut().shutdown().await.unwrap();
+                            let mut literal = Vec::new();
+                            server.read_to_end(&mut literal).await.unwrap();
+                            assert!(literal.is_empty(), "literal sent after {outcome}");
+                        }
+                    });
+                    let mut session = async_imap::Client::new(client).login("synthetic", "test-only").await.unwrap();
+                    let result = save_draft(&mut session, &crate::config::fixture(), &json!({"to":["recipient@example.test"],"subject":"synthetic draft","body":"synthetic body"})).await;
+                    if outcome == "OK" {
+                        assert_eq!(result.unwrap(), json!({"status":"saved","mailbox":"Drafts"}), "{notices} notifications");
+                        assert_eq!(session.unsolicited_responses.len(), notices);
+                    } else {
+                        assert_eq!(result.unwrap_err().code, "MAIL_BACKEND");
+                    }
+                    drop(session);
+                    backend.await.unwrap();
+                }).await.unwrap();
+            }
+        }
+    }
+    #[tokio::test]
     async fn save_draft_append_protocol() {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
         // Exercise the same operation as the tool, using only synthetic mailbox data.

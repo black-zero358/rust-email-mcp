@@ -1177,12 +1177,24 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
             ))
             .await?;
 
-        let Some(res) = self.read_response().await? else {
-            return Err(Error::Append);
-        };
-        let Response::Continue { .. } = res.parsed() else {
-            return Err(Error::Append);
-        };
+        loop {
+            let Some(res) = self.read_response().await? else {
+                return Err(Error::Append);
+            };
+            match res.parsed() {
+                Response::Continue { .. } => break,
+                // A tagged result (even OK) before the literal, or a closing
+                // connection, cannot authorize sending the message bytes.
+                Response::Done { .. }
+                | Response::Data {
+                    status: imap_proto::Status::Bye,
+                    ..
+                } => {
+                    return Err(Error::Append);
+                }
+                _ => handle_unilateral(res, self.unsolicited_responses_tx.clone()),
+            }
+        }
 
         self.stream.as_mut().write_all(content).await?;
         self.stream.as_mut().write_all(b"\r\n").await?;
