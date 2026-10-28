@@ -45,6 +45,3 @@
 - 首轮并行：#24 parser 分配预算、#25 alternative 完整性、#27 正文完整响应预算。
 - PowerShell PATH 未找到 Cargo；已定位 WSL Ubuntu `/home/oeic_fe/.cargo/bin/cargo`，使用现有分离构建缓存。
 - 最终源码：`e6495729cef5bf2b7303de91e74e19ead3bdcdc8`；11 个独立修复 PR 均已合并，GitHub 开放 issue 为 0。本汇总是单独的文档归档，不发布版本或操作生产环境。
-
-
-
