@@ -61,6 +61,8 @@ async-imap 0.12 的 APPEND flags 原样序列化，必须传入 `(\Draft)` 这�
 
 正文选择排除显式 attachment 或带文件名的部件及其整个子树；`multipart/alternative` 选一个受支持表示并优先纯文本，`multipart/related` 只选主部件。读取和转发共用选择逻辑，附件列表和下载共用分类规则，multipart 附件可整体下载。真实空正文与“不支持或无法完整解释的正文”必须区分。
 
+依据 [RFC 2046 §5.1.4](https://www.rfc-editor.org/rfc/rfc2046#section-5.1.4)，alternative 每个候选表示同一份信息，选择必须覆盖候选的完整内联正文。纯文本探测遇到非空 HTML 时判定该候选不完整，回滚其中已收集的所有片段（如 plain 签名），继续寻找完整纯文本表示；不存在时才允许 HTML 转换。此规则沿 mixed、嵌套 alternative 和 related 主部件递归传播，附件仍排除；真正空的 HTML 不引入待转换内容，真正空的 plain 仍是有效完整表示。探测不解码、不分配正文，最终选中叶子继续共用既有解码预算。
+
 HTML 回退只用有界 tokenizer sink，不引入 DOM/layout 引擎、不执行脚本或加载资源。tokenizer 前检查输入和属性复杂度，处理时继续限制 token 与输出；属性复杂度必须覆盖无空白的相邻 quoted attributes 和 slash recovery。tokenizer-only sink 无法解释 SVG/MathML 外来内容及其 CDATA，出现时即使已有可见文字也拒绝整段正文。其他非空但无法完整解释的内联内容同样显式失败，转发必须在发送 claim 前拒绝不完整原文。所有新构建纯文本邮件显式声明 UTF-8，保持转发中的 Unicode 内容。
 
 ## Send lifecycle
@@ -105,7 +107,7 @@ JSON 日志使用固定事件名和受控字段，记录服务端生成的 reque
 | D2 读取无副作用与 UIDVALIDITY | `mail`、`imap_text`、vendored completion boundary | `status_uses_only_target_uid_and_distinguishes_missing_from_empty_flags`、`rev1_mailbox_names_round_trip_through_tools`、`statistics_status_requires_complete_matching_snapshot_and_tag`、`refused_imap_tools_return_backend_error_and_stop_delete`、`tests/imap_completion.rs`；只读邮箱验收核对读前后 flags |
 | D3 资源有界 | `BudgetStream`、`mime`、`html`、`server` | `rejects_split_oversized_literal_before_parser`、`headers_and_decode_are_bounded_before_allocation`、`attributes_are_bounded_before_tokenization_without_whitespace`、`final_wire_budget_covers_duplicates_escaping_unicode_and_attachments`、`oversized_rpc_id_is_rejected_before_execution` |
 | D4 发送结果与幂等 | `journal`、`mail::send`、`smtp` | `durable_dedup_and_principal_isolation`、`concurrent_claim_has_single_winner`、`smtp_lost_reply_does_not_resend`、`smtp_accepted_is_persisted_before_unresponsive_quit`、`smtp_accepted_survives_quit_timeout_and_journal_failure` |
-| D5 隐私与不可信内容 | `mail`、`mime`、`html`、`main` 日志 | `discovery_matches_message_indices_and_multipart_attachment_trees`、`http_download_authorization_binary_headers_and_transfer_capacity`、`draft_envelope_and_privacy_filter_share_canonical_fields`、`ambiguous_draft_headers_are_rejected`、`text_attachments_stay_downloadable_but_leave_body_and_forward`、`html_read_and_forward_preserve_original_content`；日志字段和 panic 脱敏仍需代码审阅 |
+| D5 隐私与不可信内容 | `mail`、`mime`、`html`、`main` 日志 | `discovery_matches_message_indices_and_multipart_attachment_trees`、`http_download_authorization_binary_headers_and_transfer_capacity`、`draft_envelope_and_privacy_filter_share_canonical_fields`、`ambiguous_draft_headers_are_rejected`、`text_attachments_stay_downloadable_but_leave_body_and_forward`、`html_read_and_forward_preserve_original_content`、`alternative_read_and_forward_require_complete_representations`、`plain_probes_require_all_inline_parts_and_prune_only_attachments`；日志字段和 panic 脱敏仍需代码审阅 |
 | D6 简单可维护与明确范围 | 模块边界、工具链、补丁来源、部署模板 | CI 的 fmt/test/clippy/build；`scripts/audit-dependencies.sh`；`scripts/test-docker-context.sh` 和生产 Dockerfile 构建；升级/恢复证据见维护与部署指南 |
 
 vendored 构建依赖必须由 `.dockerignore` 明确允许并复制进 Docker builder；允许范围不能扩大到 vendor 同级目录、秘密或部署数据。Docker context 检查使用合成哨兵与真实构建器。普通 `cargo audit` 会跳过 path package，因此本地与 CI 统一运行专用审计脚本，同时独立审阅本地补丁代码；升级时同步更新来源、脚本和回归测试。
