@@ -1777,6 +1777,54 @@ mod tests {
         }
     }
     #[test]
+    fn alternative_read_and_forward_require_complete_representations() {
+        for fallback in [Some("Complete fallback: invoice total 123"), None] {
+            for signature_first in [false, true] {
+                let html = "Content-Type: text/html\r\n\r\n<p>Invoice total 123</p>";
+                let signature = "Content-Type: text/plain\r\n\r\nRegards, billing";
+                let (first, second) = if signature_first {
+                    (signature, html)
+                } else {
+                    (html, signature)
+                };
+                let fallback_part = fallback.map_or_else(String::new, |text| {
+                    format!("--a\r\nContent-Type: text/plain\r\n\r\n{text}\r\n")
+                });
+                let raw = format!(
+                    "Content-Type: multipart/alternative; boundary=a\r\n\r\n{fallback_part}--a\r\nContent-Type: multipart/mixed; boundary=m\r\n\r\n--m\r\n{first}\r\n--m\r\n{second}\r\n--m--\r\n--a--\r\n"
+                );
+                let expected = fallback.unwrap_or(if signature_first {
+                    "Regards, billingInvoice total 123"
+                } else {
+                    "Invoice total 123Regards, billing"
+                });
+                let read = parsed(raw.as_bytes(), 1, None, 16000).unwrap();
+                assert_eq!(read["body"], expected);
+                assert_eq!(read["body_truncated"], false);
+                let body = forward_body(raw.as_bytes(), "FYI").unwrap();
+                assert_eq!(
+                    body,
+                    format!("FYI\n\n---------- Forwarded message ----------\n{expected}")
+                );
+                let (forward, _) = compose(
+                    &json!({"to":["recipient@example.com"],"subject":"forward","body":body}),
+                    "me@example.com",
+                    Some("<id@example.com>"),
+                )
+                .unwrap();
+                assert_eq!(
+                    mailparse::parse_mail(&forward)
+                        .unwrap()
+                        .get_body()
+                        .unwrap()
+                        .replace("\r\n", "\n")
+                        .trim_end(),
+                    body
+                );
+            }
+        }
+    }
+    #[test]
     fn composed_unicode_subject_address_and_body_keep_utf8_semantics() {
         let args = json!({"to":["用户@example.test"],"subject":"中文主题","body":"中 café 😀"});
         let (raw, envelope) = compose(&args, "me@example.test", Some("<id@example.test>")).unwrap();
