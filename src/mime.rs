@@ -231,8 +231,9 @@ impl Part<'_> {
         Ok(())
     }
 
-    // The bool reports non-empty unsupported inline content. Selection probes
-    // do not decode; one shared budget still covers all selected leaf codecs.
+    // The bool reports non-empty inline content unsupported in this mode,
+    // including HTML during a plain-only probe. Probes do not decode; one
+    // shared budget still covers all selected leaf codecs.
     fn select_text<'a>(&'a self, out: &mut Vec<&'a Self>, html: bool) -> bool {
         if self.is_attachment() {
             return false;
@@ -240,11 +241,7 @@ impl Part<'_> {
         if self.subparts.is_empty() {
             match self.ctype.mimetype.as_str() {
                 "text/plain" => out.push(self),
-                "text/html" => {
-                    if html {
-                        out.push(self);
-                    }
-                }
+                "text/html" if html => out.push(self),
                 _ => return !self.body.is_empty(),
             }
             return false;
@@ -252,8 +249,10 @@ impl Part<'_> {
         match self.ctype.mimetype.as_str() {
             "multipart/alternative" => {
                 // Representations are alternatives, not consecutive body text.
-                // Prefer plain, including a genuinely empty plain body; fall
-                // back to one HTML representation only when plain is absent.
+                // Prefer a complete plain representation, including a genuinely
+                // empty plain body. A mixed candidate containing HTML is not
+                // plain just because it also has a plain signature. Roll back
+                // all fragments of incomplete probes before trying another.
                 let mut unsupported = false;
                 for child in self.subparts.iter().rev() {
                     let before = out.len();
@@ -386,6 +385,25 @@ mod tests {
     }
 
     const NORMAL: &[u8] = b"Subject: example\r\nContent-Type: multipart/mixed; boundary=outer\r\n\r\n--outer\r\nContent-Type: multipart/alternative; boundary=inner\r\n\r\n--inner\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nhello =E2=82=AC\r\n--inner\r\nContent-Type: text/html\r\n\r\n<p>hello</p>\r\n--inner--\r\n--outer\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=example.txt\r\nContent-Transfer-Encoding: base64\r\n\r\nYWJj\r\n--outer--\r\n";
+
+    #[test]
+    fn plain_probes_require_all_inline_parts_and_prune_only_attachments() {
+        for (candidate, expected) in [
+            ("Content-Type: text/html\n\n<p>Invoice 123</p>".to_owned(), "Complete fallback"),
+            ("Content-Type: multipart/related; boundary=r\n\n--r\nContent-Type: text/html\n\n<p>Invoice 123</p>\n--r\n\nRESOURCE_ONLY\n--r--".to_owned(), "Complete fallback"),
+            ("Content-Type: multipart/alternative; boundary=n\n\n--n\nContent-Type: text/html\n\n<p>Invoice 123</p>\n--n--".to_owned(), "Complete fallback"),
+            ("Content-Type: text/html\n\n".to_owned(), "Signature"),
+            ("Content-Type: text/html\nContent-Disposition: attachment\n\n<p>ATTACHMENT_ONLY</p>".to_owned(), "Signature"),
+            ("Content-Type: text/html; name=notes.html\n\n<p>ATTACHMENT_ONLY</p>".to_owned(), "Signature"),
+        ] {
+            let raw = format!("Content-Type: multipart/alternative; boundary=a\n\n--a\n\nComplete fallback\n--a\nContent-Type: multipart/mixed; boundary=m\n\n--m\n\nSignature\n--m\n{candidate}\n--m--\n--a--\n");
+            assert_eq!(parse(raw.as_bytes()).unwrap().plain_body().unwrap(), expected);
+        }
+        // Failed later candidates cannot leak their signature into a genuinely
+        // empty complete plain representation.
+        let raw = b"Content-Type: multipart/alternative; boundary=a\n\n--a\nContent-Type: text/plain\n\n\n--a\nContent-Type: multipart/mixed; boundary=m\n\n--m\n\nSignature\n--m\nContent-Type: text/html\n\n<p>Invoice 123</p>\n--m--\n--a--\n";
+        assert_eq!(parse(raw).unwrap().plain_body().unwrap(), "");
+    }
 
     #[test]
     fn normal_multipart_and_codecs_match_mailparse() {

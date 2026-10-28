@@ -2,6 +2,16 @@
 
 本文件保存带版本与环境边界的证据。每次新增记录注明提交/tag、日期与时区、环境、命令、结果、CI 链接及未覆盖项；保留历史结果，不把其测试数量或部署状态当作当前版本的证明。验证要求见 [贡献指南](../CONTRIBUTING.md#验证与完成标准)。
 
+## 2026-10-29 完整 alternative 正文选择（Asia/Shanghai，issue #25）
+
+- 代码提交：`287074887dbcc8e970855cf900571432ac22fd6e`；基于 main `36177076aae667cd72ba3ca81556b94575ab0fc6`，独立分支 `codex/fix-25-complete-alternative`。
+- 环境：Windows 隔离工作树，WSL Ubuntu、固定 Rust/Cargo 1.99.1，使用现有 Cargo 构建缓存；只有合成 MIME 与本地模拟协议，没有真实邮箱操作或部署。
+- 修复前新增读取/转发回归失败：读取只返回 `Regards, billing`，预期为 `Complete fallback: invoice total 123`。修复后完整 plain 回退与无 plain 时的 HTML 主体加签名均完整保留，验证签名前后顺序及构建出的转发正文；MIME 层另覆盖 related 主部件、嵌套 alternative、空 HTML、空 plain、显式/命名 HTML 附件和候选片段回滚。
+- `cargo fmt --check`、`cargo test --locked`（80 项单元测试、1 项 IMAP 完成状态集成测试）、`cargo clippy --locked --all-targets -- -D warnings`、`cargo build --locked --release` 全部通过。vendored async-imap 的既有 deprecated 宏警告未修改。
+- cargo-audit 0.22.2 的 `bash scripts/audit-dependencies.sh` 通过，覆盖 307 项依赖及 vendored 上游身份。依赖、锁文件、容器上下文没有变化；最终分支的 CI `check`、`audit`、`container` 须在合并前核对，CI 链接以关联 issue #25 的 PR Checks 为准。
+- 兼容性：仅修复不完整表示被误选导致主体遗漏的行为；工具 Schema、错误码、配置、权限、依赖和操作库格式保持不变，无迁移要求。候选探测继续不解码，最终叶子共用原有资源预算；不拼接不同 alternatives。
+- 边界：未验证真实邮箱兼容性、真实发送、生产部署、持续负载或 musl 发布产物；本地 release 构建是 Linux GNU 默认目标。
+
 ## 2026-10-29 工作流兼容整合（Asia/Shanghai）
 
 - 代码提交：`4fa02133974c1fae527c454e4d2e17249aec735f`；基于 main `957c37600fdc286fc366e0d3d9fc3ccd31517576`，选择性整合保留分支并保留当前主线的协议、MIME、发送和输出边界。
