@@ -17,6 +17,7 @@
 - 新增 `mailbox_commands_require_matching_tagged_completion`：四个命令入口，各验证空响应/部分数据与 OK、NO、BAD、EOF、错误 tag 的组合；成功时检查 0 EXISTS、UIDVALIDITY 和 UIDNEXT。
 - 新增 `empty_mailbox_pages_require_completed_examine`：应用 list/search 在缺少或拒绝完成时返回稳定 `MAIL_BACKEND`，真正成功空邮箱返回原有空页和元数据，同时断言没有后续 SEARCH/FETCH 或写命令。
 - 随后合入 main issue #25，运行时代码无冲突；但共享 WSL 新会话出现 `WSL/Service/WSAETIMEDOUT`，后续本地重测、专用依赖审计和 Docker 检查尚未完成，不能标为通过。未重启共享 WSL；最终候选必须以 PR 的 `check`、`audit`、`container` 全部成功为合并门禁。
+- WSL 恢复后，合入 main `717a302e3ca955a084c3a0cca78d38dcb0fc141a` 的提交 `3363aa00378ed5c7346e30eebe08af57e9c8967a` 重新完成 fmt、84 单元+2 集成、Clippy 和 release，均通过；专用依赖审计（cargo-audit 0.22.2，307 依赖）及 Docker context allowlist 通过，生产 Dockerfile 由最终 PR #41 的 container 门禁验证。
 - vendored 上游版本、checksum、许可证和 Cargo.lock 不变；PATCHES.md 与审计脚本的本地补丁审阅范围同步更新。上游已有 `unsafe_pinned` 弃用警告保留，未引入新警告。
 
 ## 兼容性与边界
