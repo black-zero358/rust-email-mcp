@@ -434,8 +434,8 @@ impl MailService {
             .map_err(|_| MailError::backend())?;
         let size = metadata
             .iter()
-            .find(|f| f.uid == Some(uid))
-            .and_then(|f| f.size)
+            .filter(|f| f.uid == Some(uid))
+            .find_map(|f| f.size)
             .ok_or_else(MailError::backend)? as usize;
         if size > self.config.max_message {
             return Err(MailError::limit());
@@ -452,8 +452,8 @@ impl MailService {
             .map_err(|_| MailError::backend())?;
         let body = f
             .iter()
-            .find(|f| f.uid == Some(uid))
-            .and_then(|f| f.body())
+            .filter(|f| f.uid == Some(uid))
+            .find_map(|f| f.body())
             .ok_or_else(MailError::backend)?;
         if body.len() > self.config.max_message {
             return Err(MailError::limit());
@@ -571,25 +571,40 @@ impl MailService {
             .try_collect::<Vec<_>>()
             .await
             .map_err(|_| MailError::backend())?;
-        let mut out = Vec::new();
-        for f in fetched {
-            if !f.uid.is_some_and(|id| ids.contains(&id)) {
-                continue;
-            }
-            if let Some(id) = f.uid
-                && f.header().is_some_and(|header| header.len() < 8192)
-            {
-                self.remember_headers(
-                    folder(a)?,
-                    m.uid_validity,
-                    id,
-                    f.header().unwrap_or_default(),
-                );
-            }
-            let headers = mime::headers(f.header().unwrap_or_default())?;
-            out.push(json!({"uid":f.uid,"subject":headers.get_first_value("Subject"),"from":headers.get_first_value("From"),"date":headers.get_first_value("Date"),"size":f.size,"flags":f.flags().map(|f|format!("{f:?}")).collect::<Vec<_>>()}));
+        #[derive(Default)]
+        struct Summary<'a> {
+            header: Option<&'a [u8]>,
+            size: Option<u32>,
+            flags: Vec<String>,
         }
-        out.sort_by_key(|v| std::cmp::Reverse(v["uid"].as_u64()));
+        let mut summaries = std::collections::BTreeMap::<u32, Summary<'_>>::new();
+        for f in &fetched {
+            let Some(id) = f.uid.filter(|id| ids.contains(id)) else {
+                continue;
+            };
+            let summary = summaries.entry(id).or_default();
+            if let Some(header) = f.header() {
+                summary.header = Some(header);
+            }
+            if let Some(size) = f.size {
+                summary.size = Some(size);
+            }
+            if f.has_flags() {
+                summary.flags = f.flags().map(|flag| format!("{flag:?}")).collect();
+            }
+        }
+        let mut out = Vec::new();
+        for (id, summary) in summaries.into_iter().rev() {
+            // A FLAGS-only update is not evidence of an empty message header.
+            let Some(header) = summary.header else {
+                continue;
+            };
+            if header.len() < 8192 {
+                self.remember_headers(folder(a)?, m.uid_validity, id, header);
+            }
+            let headers = mime::headers(header)?;
+            out.push(json!({"uid":id,"subject":headers.get_first_value("Subject"),"from":headers.get_first_value("From"),"date":headers.get_first_value("Date"),"size":summary.size,"flags":summary.flags}));
+        }
         Ok(
             json!({"emails":out,"uid_validity":m.uid_validity,"next_before_uid":next,"scanned_uid_range":[start,end]}),
         )
@@ -1226,6 +1241,265 @@ fn attachment(raw: &[u8], index: usize, max: usize) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    async fn fetch_script(
+        script: Vec<(String, String, &'static str)>,
+    ) -> (
+        async_imap::Session<tokio::io::DuplexStream>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (client, server) = tokio::io::duplex(32768);
+        let backend = tokio::spawn(async move {
+            let mut server = BufReader::new(server);
+            let mut line = String::new();
+            server.read_line(&mut line).await.unwrap();
+            let tag = line.split_whitespace().next().unwrap().to_owned();
+            server
+                .write_all(format!("{tag} OK login\r\n").as_bytes())
+                .await
+                .unwrap();
+            for (expected, rows, status) in script {
+                line.clear();
+                server.read_line(&mut line).await.unwrap();
+                let (tag, command) = line.trim_end_matches("\r\n").split_once(' ').unwrap();
+                assert_eq!(command, expected);
+                let completion = match status {
+                    "EOF" => String::new(),
+                    "WRONG_TAG" => "unrelated OK completed\r\n".to_owned(),
+                    status => format!("{tag} {status} completed\r\n"),
+                };
+                server
+                    .write_all(format!("{rows}{completion}").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let session = async_imap::Client::new(client)
+            .login("synthetic", "test-only")
+            .await
+            .unwrap();
+        (session, backend)
+    }
+
+    fn fetch_fixture() -> (tempfile::TempDir, MailService) {
+        let dir = tempfile::tempdir().unwrap();
+        let service = MailService::new(
+            crate::config::fixture(),
+            Arc::new(Journal::open(&dir.path().join("db")).unwrap()),
+        )
+        .unwrap();
+        (dir, service)
+    }
+
+    #[tokio::test]
+    async fn raw_fetch_ignores_interleaved_flags_and_requires_target_attributes() {
+        let (_dir, service) = fetch_fixture();
+        let raw = "Subject: synthetic\r\n\r\nbody";
+        let size_command = "UID FETCH 7 (UID RFC822.SIZE)".to_owned();
+        let body_command = format!(
+            "UID FETCH 7 (UID BODY.PEEK[]<0.{}>)",
+            service.config.max_message + 1
+        );
+        let flags = "* 1 FETCH (UID 7 FLAGS (\\Seen))\r\n";
+        let size = format!("* 1 FETCH (UID 7 RFC822.SIZE {})\r\n", raw.len());
+        let body = format!("* 1 FETCH (UID 7 BODY[] {{{}}}\r\n{raw})\r\n", raw.len());
+        for size_first in [true, false] {
+            for body_first in [true, false] {
+                let size_rows = if size_first {
+                    format!("{size}{flags}")
+                } else {
+                    format!("{flags}{size}")
+                };
+                let body_rows = if body_first {
+                    format!("{body}{flags}")
+                } else {
+                    format!("{flags}{body}")
+                };
+                let unrelated = "* 2 FETCH (UID 99 RFC822.SIZE 99999999)\r\n* 3 FETCH (RFC822.SIZE 99999999)\r\n";
+                let (mut session, backend) = fetch_script(vec![
+                    (size_command.clone(), format!("{unrelated}{size_rows}"), "OK"),
+                    (body_command.clone(), format!("* 2 FETCH (UID 99 BODY[] {{5}}\r\nother)\r\n* 3 FETCH (BODY[] {{5}}\r\nother)\r\n{body_rows}"), "OK"),
+                ]).await;
+                assert_eq!(service.raw(&mut session, 7).await.unwrap(), raw.as_bytes());
+                backend.await.unwrap();
+            }
+        }
+        for missing_body in [true, false] {
+            let mut script = vec![(
+                size_command.clone(),
+                if missing_body {
+                    size.clone()
+                } else {
+                    flags.to_owned()
+                },
+                "OK",
+            )];
+            if missing_body {
+                script.push((body_command.clone(), flags.to_owned(), "OK"));
+            }
+            let (mut session, backend) = fetch_script(script).await;
+            assert_eq!(
+                service.raw(&mut session, 7).await.unwrap_err().code,
+                "MAIL_BACKEND"
+            );
+            backend.await.unwrap();
+        }
+        for status in ["NO", "BAD", "EOF", "WRONG_TAG"] {
+            for body_failure in [true, false] {
+                let mut script = vec![(
+                    size_command.clone(),
+                    size.clone(),
+                    if body_failure { "OK" } else { status },
+                )];
+                if body_failure {
+                    script.push((body_command.clone(), body.clone(), status));
+                }
+                let (mut session, backend) = fetch_script(script).await;
+                assert_eq!(
+                    service.raw(&mut session, 7).await.unwrap_err().code,
+                    "MAIL_BACKEND"
+                );
+                backend.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn list_fetch_requires_header_and_successful_tagged_completion() {
+        let (_dir, service) = fetch_fixture();
+        for status in ["OK", "NO", "BAD", "EOF", "WRONG_TAG"] {
+            for header in [None, Some("")] {
+                let rows = match header {
+                    Some(header) => format!(
+                        "* 1 FETCH (UID 7 FLAGS () BODY[HEADER] {{{}}}\r\n{header})\r\n",
+                        header.len()
+                    ),
+                    None => "* 1 FETCH (UID 7 FLAGS (\\Seen))\r\n".into(),
+                };
+                let (mut session, backend) = fetch_script(vec![
+                    (
+                        "EXAMINE \"INBOX\"".into(),
+                        "* 1 EXISTS\r\n* OK [UIDVALIDITY 9] valid\r\n* OK [UIDNEXT 8] next\r\n"
+                            .into(),
+                        "OK",
+                    ),
+                    ("UID SEARCH UID 1:7".into(), "* SEARCH 7\r\n".into(), "OK"),
+                    (
+                        "UID FETCH 7 (UID FLAGS RFC822.SIZE BODY.PEEK[HEADER]<0.8192>)".into(),
+                        rows,
+                        status,
+                    ),
+                ])
+                .await;
+                let result = service.list(&mut session, &json!({"limit":1}), false).await;
+                backend.await.unwrap();
+                if status == "OK" {
+                    assert_eq!(
+                        result.unwrap()["emails"].as_array().unwrap().len(),
+                        usize::from(header.is_some())
+                    );
+                } else {
+                    assert_eq!(result.unwrap_err().code, "MAIL_BACKEND");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn list_fetch_split_attributes_keep_unique_requested_uids_and_order() {
+        let (_dir, service) = fetch_fixture();
+        let header = "Subject: split\r\n\r\n";
+        let mut rows = String::new();
+        for uid in [5, 6, 7] {
+            rows.push_str(&format!("* 1 FETCH (UID {uid} FLAGS (\\Flagged))\r\n* 1 FETCH (UID {uid} BODY[HEADER] {{{}}}\r\n{header})\r\n* 1 FETCH (UID {uid} RFC822.SIZE 100)\r\n", header.len()));
+        }
+        rows.push_str(&format!(
+            "* 1 FETCH (BODY[HEADER] {{{}}}\r\n{header})\r\n",
+            header.len()
+        ));
+        let (mut session, backend) = fetch_script(vec![
+            (
+                "EXAMINE \"INBOX\"".into(),
+                "* 3 EXISTS\r\n* OK [UIDVALIDITY 9] valid\r\n* OK [UIDNEXT 8] next\r\n".into(),
+                "OK",
+            ),
+            (
+                "UID SEARCH UID 1:7".into(),
+                "* SEARCH 5 6 7\r\n".into(),
+                "OK",
+            ),
+            (
+                "UID FETCH 7,6 (UID FLAGS RFC822.SIZE BODY.PEEK[HEADER]<0.8192>)".into(),
+                rows,
+                "OK",
+            ),
+        ])
+        .await;
+        let result = service
+            .list(&mut session, &json!({"limit":2}), false)
+            .await
+            .unwrap();
+        backend.await.unwrap();
+        assert_eq!(result["emails"].as_array().unwrap().len(), 2);
+        assert_eq!(result["emails"][0]["uid"], 7);
+        assert_eq!(result["emails"][1]["uid"], 6);
+        for email in result["emails"].as_array().unwrap() {
+            assert_eq!(email["subject"], "split");
+            assert_eq!(email["flags"], json!(["Flagged"]));
+            assert_eq!(email["size"], 100);
+        }
+    }
+
+    #[tokio::test]
+    async fn list_fetch_merges_uid_attributes_and_only_actual_flag_updates() {
+        let (_dir, service) = fetch_fixture();
+        let header = "Subject: synthetic\r\nFrom: sender@example.invalid\r\n\r\n";
+        let full = format!(
+            "* 1 FETCH (UID 7 FLAGS (\\Seen) RFC822.SIZE 100 BODY[HEADER] {{{}}}\r\n{header})\r\n",
+            header.len()
+        );
+        for tool in ["list_emails", "search_emails"] {
+            for update in ["\\Flagged", ""] {
+                let rows = format!(
+                    "* 2 FETCH (UID 99 FLAGS (\\Deleted))\r\n* 3 FETCH (FLAGS (\\Answered))\r\n* 1 FETCH (UID 7 FLAGS (\\Answered))\r\n{full}* 1 FETCH (UID 7 FLAGS ({update}))\r\n* 1 FETCH (UID 7 RFC822.SIZE 101)\r\n* 1 FETCH (UID 7)\r\n"
+                );
+                let (mut session, backend) = fetch_script(vec![
+                    (
+                        "EXAMINE \"INBOX\"".into(),
+                        "* 1 EXISTS\r\n* OK [UIDVALIDITY 9] valid\r\n* OK [UIDNEXT 8] next\r\n"
+                            .into(),
+                        "OK",
+                    ),
+                    ("UID SEARCH UID 1:7".into(), "* SEARCH 7\r\n".into(), "OK"),
+                    (
+                        "UID FETCH 7 (UID FLAGS RFC822.SIZE BODY.PEEK[HEADER]<0.8192>)".into(),
+                        rows,
+                        "OK",
+                    ),
+                ])
+                .await;
+                let result = service
+                    .with_session(&mut session, tool, &json!({"limit":1}))
+                    .await
+                    .unwrap();
+                backend.await.unwrap();
+                let emails = result["emails"].as_array().unwrap();
+                assert_eq!(emails.len(), 1);
+                assert_eq!(emails[0]["uid"], 7);
+                assert_eq!(emails[0]["subject"], "synthetic");
+                assert_eq!(emails[0]["size"], 101);
+                assert_eq!(
+                    emails[0]["flags"],
+                    if update.is_empty() {
+                        json!([])
+                    } else {
+                        json!(["Flagged"])
+                    }
+                );
+            }
+        }
+    }
+
     #[test]
     fn long_parsed_email_returns_a_wire_bounded_readable_prefix() {
         let body = "a".repeat(150000);
@@ -1849,6 +2123,61 @@ mod tests {
                 );
             }
         }
+    }
+    #[test]
+    fn unknown_transfer_encoding_cannot_be_read_forwarded_or_downloaded_as_decoded() {
+        for content_type in ["text/plain", "text/html", "multipart/mixed; boundary=m"] {
+            for encoding in ["x-example", "X-Example", "", " \t"] {
+                let raw = format!(
+                    "Content-Type: {content_type}\r\nContent-Transfer-Encoding: {encoding}\r\n\r\nRAW_ENCODED"
+                );
+                assert_eq!(
+                    parsed(raw.as_bytes(), 1, None, 16000).unwrap_err().code,
+                    "UNSUPPORTED_BODY"
+                );
+                assert_eq!(
+                    forward_body(raw.as_bytes(), "FYI").unwrap_err().code,
+                    "UNSUPPORTED_BODY"
+                );
+            }
+        }
+        let unknown =
+            "Content-Type: text/plain\r\nContent-Transfer-Encoding: x-example\r\n\r\nRAW_ENCODED";
+        let mixed = format!(
+            "Content-Type: multipart/mixed; boundary=m\r\n\r\n--m\r\nContent-Type: text/plain\r\n\r\nVisible intro\r\n--m\r\n{unknown}\r\n--m--\r\n"
+        );
+        assert_eq!(
+            parsed(mixed.as_bytes(), 1, None, 16000).unwrap_err().code,
+            "UNSUPPORTED_BODY"
+        );
+        assert_eq!(
+            forward_body(mixed.as_bytes(), "FYI").unwrap_err().code,
+            "UNSUPPORTED_BODY"
+        );
+        let alternative = format!(
+            "Content-Type: multipart/alternative; boundary=a\r\n\r\n--a\r\nContent-Type: text/plain\r\n\r\nComplete fallback\r\n--a\r\n{unknown}\r\n--a--\r\n"
+        );
+        assert_eq!(
+            parsed(alternative.as_bytes(), 1, None, 16000).unwrap()["body"],
+            "Complete fallback"
+        );
+        assert_eq!(
+            forward_body(alternative.as_bytes(), "FYI").unwrap(),
+            "FYI\n\n---------- Forwarded message ----------\nComplete fallback"
+        );
+        let attached = b"Content-Type: text/plain\r\nContent-Disposition: attachment\r\nContent-Transfer-Encoding: x-example\r\n\r\nRAW_ENCODED";
+        let read = parsed(attached, 1, None, 16000).unwrap();
+        assert_eq!(read["body"], "");
+        assert_eq!(read["attachments"][0]["attachment_index"], 0);
+        assert!(
+            !forward_body(attached, "FYI")
+                .unwrap()
+                .contains("RAW_ENCODED")
+        );
+        assert_eq!(
+            attachment(attached, 0, 1024).unwrap_err().code,
+            "UNSUPPORTED_BODY"
+        );
     }
     #[test]
     fn composed_unicode_subject_address_and_body_keep_utf8_semantics() {
