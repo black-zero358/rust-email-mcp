@@ -4,6 +4,9 @@ cd "$(dirname "$0")/.."
 
 # RustSec skips path packages. Audit this local fork using its upstream release
 # identity too; never alter Cargo's actual lockfile or dependency sources.
+# Local FETCH attribute-presence accessors require root behavioral regressions
+# and code review; upstream advisory matching does not validate local changes.
+
 # Local completion-status AND parser allocation patches require code review and
 # synthetic regressions separately; advisories cannot validate their behavior.
 upstream_checksum=$(cat vendor/async-imap/UPSTREAM.sha256)

@@ -12,6 +12,7 @@
 ## Constraints to preserve
 
 - Read with EXAMINE/PEEK and retain UIDVALIDITY checks. Keep target-UID FETCH handling, IMAP4rev1 text encoding, APPEND flag syntax and tagged completion checks as specified in [MCP and mail](docs/architecture.md#mcp-and-mail).
+- Match raw FETCH results by UID plus required attribute; merge listing attributes per requested UID. Only actual FLAGS attributes replace flags, including empty FLAGS; missing headers must not create blank summaries.
 - Bound connections, response bytes and parser allocation. Supply the same application limit to `BudgetStream` and `Client::with_buffer_limit`; transport scanning is not a parser allocation boundary. MIME structure, header and decoding budgets apply before allocation; do not restore `mailparse::parse_mail` on untrusted input. Preserve shared read/forward body selection and bounded tokenizer-only HTML handling, including foreign-content rejection and adjacent-attribute regressions. See [MIME and HTML](docs/architecture.md#mime-and-html).
 - Treat explicit unsupported Content-Disposition types as attachments across body selection, discovery and downloads; preserve absent/empty and inline semantics, filename detection and multipart subtree pruning.
 - Plain-only alternative probes must cover the complete inline representation: non-empty HTML makes the candidate incomplete, and all collected fragments must be rolled back before trying another candidate.
