@@ -32,14 +32,11 @@ use tokio_rustls::{
     rustls::{ClientConfig, RootCertStore, pki_types::ServerName},
 };
 
-/// Limits bytes before the IMAP parser can allocate an attacker-controlled literal.
+/// Limits cumulative transport bytes; the parser separately bounds allocation.
 #[derive(Debug)]
 pub struct BudgetStream<T> {
     inner: T,
     remaining: Arc<AtomicUsize>,
-    line: Vec<u8>,
-    literal_remaining: usize,
-    max_literal: usize,
 }
 impl<T> BudgetStream<T> {
     pub fn new(inner: T, budget: usize) -> (Self, Arc<AtomicUsize>) {
@@ -48,45 +45,9 @@ impl<T> BudgetStream<T> {
             Self {
                 inner,
                 remaining: remaining.clone(),
-                line: Vec::new(),
-                literal_remaining: 0,
-                max_literal: budget,
             },
             remaining,
         )
-    }
-    fn inspect(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        for &byte in bytes {
-            if self.literal_remaining > 0 {
-                self.literal_remaining -= 1;
-                continue;
-            }
-            if self.line.len() >= 65536 {
-                return Err(std::io::Error::other("IMAP line limit"));
-            }
-            self.line.push(byte);
-            if byte == b'\n' {
-                let line = self.line.strip_suffix(b"\r\n").unwrap_or(&self.line);
-                if let Some(prefix) = line.strip_suffix(b"}")
-                    && let Some(start) = prefix.iter().rposition(|b| *b == b'{')
-                {
-                    let digits = &prefix[start + 1..];
-                    let digits = digits.strip_suffix(b"+").unwrap_or(digits);
-                    if !digits.is_empty() && digits.iter().all(u8::is_ascii_digit) {
-                        let n = std::str::from_utf8(digits)
-                            .ok()
-                            .and_then(|s| s.parse::<usize>().ok())
-                            .ok_or_else(|| std::io::Error::other("Invalid literal size"))?;
-                        if n > self.max_literal || n > self.remaining.load(Ordering::Relaxed) {
-                            return Err(std::io::Error::other("IMAP literal limit"));
-                        }
-                        self.literal_remaining = n;
-                    }
-                }
-                self.line.clear();
-            }
-        }
-        Ok(())
     }
 }
 impl<T: AsyncRead + Unpin> AsyncRead for BudgetStream<T> {
@@ -103,7 +64,6 @@ impl<T: AsyncRead + Unpin> AsyncRead for BudgetStream<T> {
         match Pin::new(&mut self.inner).poll_read(cx, &mut limited) {
             Poll::Ready(Ok(())) => {
                 let n = limited.filled().len();
-                self.inspect(limited.filled())?;
                 self.remaining.fetch_sub(n, Ordering::Relaxed);
                 buf.advance(n);
                 Poll::Ready(Ok(()))
@@ -163,8 +123,9 @@ impl MailService {
             .connect(name, tcp)
             .await
             .map_err(|_| MailError::backend())?;
-        let (stream, _) = BudgetStream::new(stream, self.config.max_message + 2 * 1024 * 1024);
-        let mut client = async_imap::Client::new(stream);
+        let budget = self.config.max_message + 2 * 1024 * 1024;
+        let (stream, _) = BudgetStream::new(stream, budget);
+        let mut client = async_imap::Client::with_buffer_limit(stream, budget);
         client
             .read_response()
             .await
@@ -2302,20 +2263,63 @@ mod tests {
             "unknown"
         );
     }
-    #[test]
-    fn rejects_split_oversized_literal_before_parser() {
-        let (mut stream, _) = BudgetStream::new(&b""[..], 1024);
-        stream.inspect(b"* 1 FETCH (BODY[] {536870").unwrap();
-        assert!(stream.inspect(b"912}\r\n").is_err());
+    #[tokio::test]
+    async fn bounded_parser_accepts_fragmented_text_and_normal_literal() {
+        use tokio::io::AsyncWriteExt;
+        let (input, mut output) = tokio::io::duplex(64);
+        let writer = tokio::spawn(async move {
+            for byte in
+                b"* OK ordinary text {2048}\r\n* 1 FETCH (UID 1 BODY[] {10}\r\n{999999}\r\n)\r\n"
+            {
+                output.write_all(&[*byte]).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        });
+        let (stream, _) = BudgetStream::new(input, 1024);
+        let mut client = async_imap::Client::with_buffer_limit(stream, 1024);
+        assert!(client.read_response().await.unwrap().is_some());
+        assert!(client.read_response().await.unwrap().is_some());
+        writer.await.unwrap();
     }
-    #[test]
-    fn literal_contents_are_not_parsed_as_protocol() {
-        let (mut stream, _) = BudgetStream::new(&b""[..], 1024);
-        stream
-            .inspect(b"* 1 FETCH (BODY[] {10}\r\n{999999}\r\n)\r\n")
+
+    #[tokio::test]
+    async fn bounded_parser_rejects_incomplete_response_at_application_limit() {
+        use tokio::io::AsyncWriteExt;
+        let (input, mut output) = tokio::io::duplex(128);
+        output
+            .write_all(b"* 1 FETCH (BODY[] {2048}\r\n")
+            .await
             .unwrap();
-        assert_eq!(stream.literal_remaining, 0);
+        let (stream, _) = BudgetStream::new(input, 1024);
+        let mut client = async_imap::Client::with_buffer_limit(stream, 1024);
+        // Keep the peer open: rejection must precede another network read.
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(1), client.read_response()).await;
+        assert!(result.unwrap().is_err());
+        assert!(client.read_response().await.unwrap().is_none());
     }
+
+    #[tokio::test]
+    async fn bounded_parser_handles_exact_text_budget_and_unknown_need() {
+        use tokio::io::AsyncWriteExt;
+        for complete in [true, false] {
+            let (input, mut output) = tokio::io::duplex(2048);
+            let mut text = b"* OK ".to_vec();
+            text.resize(if complete { 1022 } else { 1024 }, b'a');
+            if complete {
+                text.extend_from_slice(b"\r\n");
+            }
+            output.write_all(&text).await.unwrap();
+            let (stream, _) = BudgetStream::new(input, 1024);
+            let mut client = async_imap::Client::with_buffer_limit(stream, 1024);
+            let result =
+                tokio::time::timeout(std::time::Duration::from_secs(1), client.read_response())
+                    .await
+                    .unwrap();
+            assert_eq!(result.is_ok(), complete);
+        }
+    }
+
     #[test]
     fn saved_draft_keeps_bcc_but_sent_message_strips_it() {
         let args = json!({"to":["a@example.com"],"bcc":["secret@example.com"],"subject":"s","body":"hello"});
