@@ -14,3 +14,4 @@
 - ChatGPT callback must exactly match its setup UI. Rauthy 0.37.2 discovery omits supported public-client `none`; see deployment guide for the metadata correction and refresh it when upgrading.
 - Keep Rauthy static asset/theme requests outside login rate limits. Test every login-page script/style, including burst loads; HTML 200 alone misses frontend initialization failures.
 - APPEND flags passed to async-imap 0.12 are serialized verbatim: use a parenthesized list such as `(\Draft)`. The synthetic duplex regression covers literal continuation, OK and rejected NO/BAD outcomes without contacting a mailbox.
+- Issue #3: parse MIME structure with shared node/depth/header budgets before allocation; reserve transfer/charset decoding budgets before decoding. Do not restore mailparse::parse_mail on untrusted input. Reply/draft paths need bounded headers only. Limits and strict delimiter matching are documented in README; regressions use synthetic data only.

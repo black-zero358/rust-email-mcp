@@ -2,6 +2,7 @@ use crate::{
     config::Config,
     error::{MailError, Result},
     journal::{Journal, Operation},
+    mime,
 };
 use futures::TryStreamExt;
 use lettre::{
@@ -483,9 +484,7 @@ impl MailService {
             if !f.uid.is_some_and(|id| ids.contains(&id)) {
                 continue;
             }
-            let headers = mailparse::parse_headers(f.header().unwrap_or_default())
-                .map_err(|_| MailError::backend())?
-                .0;
+            let headers = mime::headers(f.header().unwrap_or_default())?;
             out.push(json!({"uid":f.uid,"subject":headers.get_first_value("Subject"),"from":headers.get_first_value("From"),"date":headers.get_first_value("Date"),"size":f.size,"flags":f.flags().map(|f|format!("{f:?}")).collect::<Vec<_>>()}));
         }
         out.sort_by_key(|v| std::cmp::Reverse(v["uid"].as_u64()));
@@ -534,22 +533,22 @@ impl MailService {
             })
             .await
             .map_err(|_| MailError::timeout())??;
-            let p = mailparse::parse_mail(&original).map_err(|_| MailError::backend())?;
+            let headers = mime::headers(&original)?;
             let mut args = a.clone();
             let prefix = if name == "reply_email" { "Re:" } else { "Fwd:" };
             args["subject"] = json!(format!(
                 "{prefix} {}",
-                p.headers.get_first_value("Subject").unwrap_or_default()
+                headers.get_first_value("Subject").unwrap_or_default()
             ));
             if name == "reply_email" {
                 args["in_reply_to"] =
-                    json!(p.headers.get_first_value("Message-ID").unwrap_or_default());
+                    json!(headers.get_first_value("Message-ID").unwrap_or_default());
             }
             if name == "forward_email" {
                 args["body"] = json!(format!(
                     "{}\n\n---------- Forwarded message ----------\n{}",
                     text(a, "body")?,
-                    plain_body(&p, 0)?
+                    mime::parse(&original)?.plain_body()?
                 ));
             }
             compose(&args, &self.config.address, Some(&message_id))?
@@ -726,10 +725,10 @@ pub fn compose(a: &Value, from: &str, id: Option<&str>) -> Result<(Vec<u8>, Enve
     Ok((message.formatted(), message.envelope().clone()))
 }
 pub fn prepare_draft(raw: &[u8], from: &str, id: &str) -> Result<(Vec<u8>, Envelope)> {
-    let parsed = mailparse::parse_mail(raw).map_err(|_| MailError::input())?;
+    let headers = mime::headers(raw)?;
     let mut recipients = Vec::new();
     for key in ["To", "Cc", "Bcc"] {
-        for val in parsed.headers.get_all_values(key) {
+        for val in headers.get_all_values(key) {
             let list = mailparse::addrparse(&val).map_err(|_| MailError::input())?;
             for a in list.iter() {
                 match a {
@@ -786,25 +785,9 @@ pub fn prepare_draft(raw: &[u8], from: &str, id: &str) -> Result<(Vec<u8>, Envel
     clean.extend_from_slice(&raw[header_end.0 + header_end.1..]);
     Ok((clean, envelope))
 }
-fn plain_body(p: &mailparse::ParsedMail<'_>, depth: usize) -> Result<String> {
-    if depth > 20 {
-        return Err(MailError::limit());
-    }
-    if p.subparts.is_empty() {
-        if p.ctype.mimetype == "text/plain" {
-            return p.get_body().map_err(|_| MailError::backend());
-        }
-        return Ok(String::new());
-    }
-    let mut out = String::new();
-    for part in &p.subparts {
-        out.push_str(&plain_body(part, depth + 1)?);
-    }
-    Ok(out)
-}
 fn leaves<'a, 'b>(
-    p: &'a mailparse::ParsedMail<'b>,
-    out: &mut Vec<&'a mailparse::ParsedMail<'b>>,
+    p: &'a mime::Part<'b>,
+    out: &mut Vec<&'a mime::Part<'b>>,
     depth: usize,
 ) -> Result<()> {
     if depth > 20 || out.len() > 1000 {
@@ -820,8 +803,8 @@ fn leaves<'a, 'b>(
     Ok(())
 }
 fn parsed(raw: &[u8], uid: u32, validity: Option<u32>, max: usize) -> Result<Value> {
-    let p = mailparse::parse_mail(raw).map_err(|_| MailError::backend())?;
-    let mut body = plain_body(&p, 0)?;
+    let p = mime::parse(raw)?;
+    let mut body = p.plain_body()?;
     let truncated = body.len() > max;
     if truncated {
         let mut cut = max;
@@ -839,14 +822,11 @@ fn parsed(raw: &[u8], uid: u32, validity: Option<u32>, max: usize) -> Result<Val
 }
 fn attachment(raw: &[u8], index: usize, max: usize) -> Result<Value> {
     use base64::Engine;
-    let p = mailparse::parse_mail(raw).map_err(|_| MailError::backend())?;
+    let p = mime::parse(raw)?;
     let mut parts = Vec::new();
     leaves(&p, &mut parts, 0)?;
     let part = parts.get(index).ok_or_else(MailError::input)?;
-    let bytes = part.get_body_raw().map_err(|_| MailError::backend())?;
-    if bytes.len() > max {
-        return Err(MailError::limit());
-    }
+    let bytes = part.body_raw(max)?;
     Ok(
         json!({"content_type":part.ctype.mimetype,"size":bytes.len(),"base64":base64::engine::general_purpose::STANDARD.encode(bytes)}),
     )
@@ -930,6 +910,29 @@ mod tests {
         }
     }
     use super::*;
+    #[test]
+    fn mail_consumers_enforce_mime_limits_and_recover() {
+        let oversized_header = vec![b'x'; 33 * 1024];
+        assert_eq!(
+            parsed(&oversized_header, 1, None, 1024).unwrap_err().code,
+            "LIMIT_EXCEEDED"
+        );
+        assert_eq!(
+            attachment(&oversized_header, 0, 1024).unwrap_err().code,
+            "LIMIT_EXCEEDED"
+        );
+        assert_eq!(
+            prepare_draft(&oversized_header, "me@example.com", "<id@example.com>")
+                .unwrap_err()
+                .code,
+            "LIMIT_EXCEEDED"
+        );
+        assert_eq!(
+            parsed(b"Subject: ok\r\n\r\nhello", 1, None, 3).unwrap()["body"],
+            "hel"
+        );
+        assert_eq!(attachment(b"\r\nhello", 0, 5).unwrap()["size"], 5);
+    }
     async fn smtp_fixture(disconnect_after_data: bool, fail_journal: bool) {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let dir = tempfile::tempdir().unwrap();
