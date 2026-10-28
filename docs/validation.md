@@ -2,6 +2,24 @@
 
 本文件保存带版本与环境边界的证据。每次新增记录注明提交/tag、日期与时区、环境、命令、结果、CI 链接及未覆盖项；保留历史结果，不把其测试数量或部署状态当作当前版本的证明。验证要求见 [贡献指南](../CONTRIBUTING.md#验证与完成标准)。
 
+## 2026-10-29 Issue #24–#34 源码修复索引（Asia/Shanghai）
+
+最终集成源码为 [`e6495729cef5bf2b7303de91e74e19ead3bdcdc8`](https://github.com/black-zero358/rust-email-mcp/commit/e6495729cef5bf2b7303de91e74e19ead3bdcdc8)，源码版本 `0.2.0`。11 项启动时仍存在的问题均已逐项核实、修复，并经独立子代理审阅和最终 PR head 的 `check`、`audit`、`container` 成功后合并；各项根因、回归摘要、最终 head、审阅、CI 与 merge SHA 见 [完成清单](../ISSUE_PROGRESS.md)。2026-10-29 核对 GitHub 开放 issue 列表为空。
+
+| 独立验证记录 | 内容 |
+| --- | --- |
+| [Issue #28](validation/issue-28.md) | SELECT/EXAMINE 与 STATUS 的匹配 tagged completion |
+| [Issue #29](validation/issue-29.md) | 按请求 UID 归并 FETCH 属性及唯一摘要 |
+| [Issue #30](validation/issue-30.md) | APPEND continuation 前的非请求通知 |
+| [Issue #31](validation/issue-31.md) | 批量读取的本地 MIME 错误隔离 |
+| [Issue #32](validation/issue-32.md) | 原始国际化头的 SMTPUTF8 需求与确定拒绝 |
+| [Issue #33](validation/issue-33.md) | claim/SMTP 前的 DATA 格式校验 |
+| [Issue #34](validation/issue-34.md) | 未知 Content-Transfer-Encoding 的不透明处理 |
+
+#24–#27 的早期带版本验证段保留在本文件下方；不改写其中的提交、环境或测试数量。各独立记录也只证明标注的代码和环境，后续整合结果以完成清单中对应最终 head 的审阅、PR COMMENT 和 CI 为准，不将不同提交的历史测试数量相加为一次最终验收。
+
+`0.2.0` 按 [兼容政策](maintenance.md#版本与兼容性) 记录发送输入收紧：非规范 DATA 格式与无法在预算内确定国际化头需求的非 ASCII 草稿可被明确拒绝。没有配置或数据库迁移；既有发送结果与操作键仍需保留。源码合并和版本号不代表产物已发布或生产已部署；本轮没有真实邮件操作、生产部署、持续负载或 musl 发布产物验收。
+
 ## 2026-10-29 disposition 兼容分类（Asia/Shanghai，issue #26）
 
 - 代码提交：`2d279eb948fba69ffaf7ae50e99521cbb8bcdda6`；基线 main `36177076aae667cd72ba3ca81556b94575ab0fc6`，独立分支 `codex/fix-26-disposition-extensions`。
