@@ -310,6 +310,12 @@ impl Part<'_> {
 
     fn append_plain_leaf(&self, out: &mut String, remaining: &mut usize) -> Result<()> {
         if matches!(self.ctype.mimetype.as_str(), "text/plain" | "text/html") {
+            if !self.body.is_empty()
+                && charset::Charset::for_label_no_replacement(self.ctype.charset.as_bytes())
+                    .is_none()
+            {
+                return Err(crate::html::unsupported());
+            }
             // Reserve conservatively before decoding: transfer output <= input,
             // and charset-to-UTF8 conversion needs at most four bytes per input
             // byte. All leaves share one budget, including temporary strings.

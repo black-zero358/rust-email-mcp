@@ -1361,6 +1361,17 @@ mod tests {
             forward_body(raw, "FYI").unwrap_err().code,
             "UNSUPPORTED_BODY"
         );
+        for charset in ["x-unknown", "iso-2022-kr"] {
+            let raw = format!("Content-Type: text/html; charset={charset}\n\n<p>original</p>");
+            assert_eq!(
+                parsed(raw.as_bytes(), 1, None, 1024).unwrap_err().code,
+                "UNSUPPORTED_BODY"
+            );
+            assert_eq!(
+                forward_body(raw.as_bytes(), "FYI").unwrap_err().code,
+                "UNSUPPORTED_BODY"
+            );
+        }
         let raw = format!("Content-Type: text/html\n\n{}", "x".repeat(128 * 1024 + 1));
         assert_eq!(
             parsed(raw.as_bytes(), 1, None, 1024).unwrap_err().code,
