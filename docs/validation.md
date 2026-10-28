@@ -5,6 +5,7 @@
 ## 2026-10-29 disposition 兼容分类（Asia/Shanghai，issue #26）
 
 - 代码提交：`2d279eb948fba69ffaf7ae50e99521cbb8bcdda6`；基线 main `36177076aae667cd72ba3ca81556b94575ab0fc6`，独立分支 `codex/fix-26-disposition-extensions`。
+- 整合提交：`5a3940319a05f8d114f523ea5189d1949e274f7a` 合并 main `18b26dd`，保留 #25 完整正文选择及 #26 分类规则；仅文档冲突人工整合，源码自动合并。整合后独立 target 重跑 fmt、81 单元 + 1 集成、Clippy、release 全部通过；以下 79 项记录对应原分类代码提交。
 - 环境：Windows 隔离工作树、WSL Ubuntu、固定 Rust/Cargo 1.99.1；独立 `CARGO_TARGET_DIR=/home/oeic_fe/issue-disposition-target`，复制依赖缓存后清除本项目及 vendored async-imap 构建结果，明确重编。分类测试命名执行为 1 项通过；`--lib -- --list` 确认分类测试存在且共 79 项。
 - 修复前分类回归在显式扩展类型处失败，修复后通过；公开测试只包含分类头值，覆盖缺省、空/空白、inline 大小写、未知类型、form-data 及 filename/name。依据 [RFC 2183 §2.8–2.9](https://www.rfc-editor.org/rfc/rfc2183#section-2.8) 和锁定 mailparse 0.18.0 源码，区分空 Extension 与显式不支持类型。
 - 本地临时扩展既有 `text_attachments_stay_downloadable_but_leave_body_and_forward` 与 `discovery_matches_message_indices_and_multipart_attachment_trees` 各执行 1 项通过，验证分类在读取/转发、附件发现、整体 multipart 下载与索引间一致；测试后恢复原文件。依照 issue #26 和 SECURITY 的公开范围，完整触发邮件未提交，公开仓库保留最小分类回归和既有普通附件集成回归。
