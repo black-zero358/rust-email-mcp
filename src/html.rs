@@ -7,13 +7,13 @@ use html5ever::tokenizer::{
 };
 use std::cell::RefCell;
 
-const MAX_INPUT: usize = 128 * 1024;
-const MAX_TOKENS: usize = 4096;
-const MAX_OUTPUT: usize = 256 * 1024;
+pub(crate) const MAX_INPUT: usize = 1024 * 1024;
+const MAX_TOKENS: usize = 32768;
+const MAX_OUTPUT: usize = 1024 * 1024;
 // Attribute boundaries can also use quoted-value adjacency or slash recovery
 // without whitespace. Count all potential separators across the entire input,
 // before tokenizer allocation, instead of trying to duplicate its lexer.
-const MAX_MARKUP_SEPARATORS: usize = 8192;
+const MAX_MARKUP_SEPARATORS: usize = 65536;
 
 #[derive(Default)]
 struct Text {
@@ -309,8 +309,8 @@ mod tests {
     #[test]
     fn attributes_are_bounded_before_tokenization_without_whitespace() {
         for attributes in [
-            (0..10000).map(|i| format!("a{i}=''")).collect::<String>(),
-            (0..10000).map(|i| format!("/a{i}")).collect::<String>(),
+            (0..70000).map(|i| format!("a{i}=''")).collect::<String>(),
+            (0..70000).map(|i| format!("/a{i}")).collect::<String>(),
         ] {
             let html = format!("<p {attributes}>visible</p>");
             assert!(html.len() < MAX_INPUT);

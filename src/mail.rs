@@ -93,6 +93,7 @@ pub struct MailService {
     pub config: Arc<Config>,
     pub journal: Arc<Journal>,
     slots: Semaphore,
+    admission: Semaphore,
     smtp: SmtpSender,
     pub attachments: attachments::AttachmentStore,
     metadata_cache: std::sync::Mutex<insights::MetadataCache>,
@@ -105,7 +106,8 @@ impl MailService {
             metadata_cache: Default::default(),
             config,
             journal,
-            slots: Semaphore::new(2),
+            slots: Semaphore::new(4),
+            admission: Semaphore::new(20),
             smtp,
         })
     }
@@ -123,7 +125,7 @@ impl MailService {
             .connect(name, tcp)
             .await
             .map_err(|_| MailError::backend())?;
-        let budget = self.config.max_message + 2 * 1024 * 1024;
+        let budget = self.config.max_message * 4;
         let (stream, _) = BudgetStream::new(stream, budget);
         let mut client = async_imap::Client::with_buffer_limit(stream, budget);
         client
@@ -146,14 +148,20 @@ impl MailService {
                 json!({"operation":self.journal.get(principal,text(args,"operation_key")?)?}),
             );
         }
-        let _permit = tokio::time::timeout(std::time::Duration::from_secs(2), self.slots.acquire())
-            .await
-            .map_err(|_| MailError {
-                code: "BUSY",
-                message: "Mailbox concurrency limit reached.",
-                retryable: true,
-            })?
-            .map_err(|_| MailError::backend())?;
+        let _admission = self.admission.try_acquire().map_err(|_| MailError {
+            code: "BUSY",
+            message: "Mailbox queue is full. Retry this read later; inspect write outcomes first.",
+            retryable: true,
+        })?;
+        let _permit =
+            tokio::time::timeout(std::time::Duration::from_secs(10), self.slots.acquire())
+                .await
+                .map_err(|_| MailError {
+                    code: "BUSY",
+                    message: "Mailbox concurrency limit reached.",
+                    retryable: true,
+                })?
+                .map_err(|_| MailError::backend())?;
         // Sending has its own timeout and durable outcome handling. Never cancel it at the HTTP boundary.
         if ["send_email", "send_draft", "reply_email", "forward_email"].contains(&name) {
             return self.send(name, args, principal).await;
@@ -248,14 +256,14 @@ impl MailService {
                     return attachment(
                         &raw,
                         number(a, "attachment_index", 0, 0, 1000)? as usize,
-                        self.config.max_output / 2,
+                        self.config.max_output / 4,
                     );
                 }
                 insights::parsed_with_options(
                     &raw,
                     uid,
                     state.uid_validity,
-                    self.config.max_output / 2,
+                    (self.config.max_output / 2).min(crate::config::MAX_DISPLAY_BODY),
                     a,
                 )
             }
@@ -297,7 +305,8 @@ impl MailService {
                     };
                     // Both FETCH commands completed successfully. Local MIME
                     // failures affect this message, not the synchronized session.
-                    match insights::parsed_with_options(&raw, id, state.uid_validity, 16000, a) {
+                    match insights::parsed_with_options(&raw, id, state.uid_validity, 64 * 1024, a)
+                    {
                         Ok(value) => items.push(json!({"uid":id,"ok":true,"email":value})),
                         Err(error) => {
                             items.push(json!({"uid":id,"ok":false,"error":error}));
@@ -1365,7 +1374,7 @@ mod tests {
                 "UNSUPPORTED_BODY",
             ),
             (
-                format!("Subject: {}\r\n\r\nbody", "x".repeat(33000)),
+                format!("Subject: {}\r\n\r\nbody", "x".repeat(129 * 1024)),
                 "LIMIT_EXCEEDED",
             ),
             (" orphaned-fold\r\n\r\nbody".to_owned(), "MAIL_BACKEND"),
@@ -2533,7 +2542,10 @@ mod tests {
                 "UNSUPPORTED_BODY"
             );
         }
-        let raw = format!("Content-Type: text/html\n\n{}", "x".repeat(128 * 1024 + 1));
+        let raw = format!(
+            "Content-Type: text/html\n\n{}",
+            "x".repeat(crate::html::MAX_INPUT + 1)
+        );
         assert_eq!(
             parsed(raw.as_bytes(), 1, None, 1024).unwrap_err().code,
             "LIMIT_EXCEEDED"
@@ -2545,7 +2557,7 @@ mod tests {
     }
     #[test]
     fn mail_consumers_enforce_mime_limits_and_recover() {
-        let oversized_header = vec![b'x'; 33 * 1024];
+        let oversized_header = vec![b'x'; 129 * 1024];
         assert_eq!(
             parsed(&oversized_header, 1, None, 1024).unwrap_err().code,
             "LIMIT_EXCEEDED"

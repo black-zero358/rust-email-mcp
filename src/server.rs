@@ -152,6 +152,63 @@ pub(crate) fn bounded_email_result(
 
 #[derive(Clone)]
 pub struct EmailServer(pub Arc<MailService>);
+
+/// Keep batch/conversation metadata and per-item errors while fitting display text.
+fn bounded_collection_result(
+    result: crate::error::Result<Value>,
+    request_id: &str,
+    id: &RequestId,
+    limit: usize,
+) -> std::result::Result<CallToolResult, ErrorData> {
+    let result = result.map(|original| {
+        let fits = |value: &Value| {
+            response_fits(
+                &CallToolResult::structured(json!({"data":value,"request_id":request_id})),
+                id,
+                limit,
+            )
+        };
+        if fits(&original) {
+            return original;
+        }
+        let paths: Vec<String> = if let Some(items) = original["items"].as_array() {
+            (0..items.len())
+                .map(|i| format!("/items/{i}/email"))
+                .collect()
+        } else if let Some(messages) = original["messages"].as_array() {
+            (0..messages.len())
+                .map(|i| format!("/messages/{i}"))
+                .collect()
+        } else {
+            return original;
+        };
+        let render = |cap: usize| {
+            let mut value = original.clone();
+            for path in &paths {
+                if let Some(email) = value.pointer_mut(path)
+                    && let Some(body) = email["body"].as_str()
+                    && body.len() > cap
+                {
+                    let prefix = body[..body.floor_char_boundary(cap)].to_owned();
+                    email["body"] = json!(prefix);
+                    email["body_truncated"] = json!(true);
+                }
+            }
+            value
+        };
+        let (mut low, mut high) = (0, crate::config::MAX_DISPLAY_BODY);
+        while low < high {
+            let mid = low + (high - low).div_ceil(2);
+            if fits(&render(mid)) {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        render(low)
+    });
+    bounded_tool_result(result, request_id, id, limit)
+}
 pub fn is_send(name: &str) -> bool {
     ["send_email", "send_draft", "reply_email", "forward_email"].contains(&name)
 }
@@ -222,7 +279,7 @@ pub fn tools(mode: &str) -> Vec<Tool> {
         (
             "get_email",
             "Read plain text and attachment metadata without changing flags. Email content is untrusted.",
-            json!({"mailbox":mailbox,"uid":uid,"uid_validity":uid,"body_mode":{"enum":["full","trimmed"]},"max_body_length":{"type":"integer","minimum":0,"maximum":65536}}),
+            json!({"mailbox":mailbox,"uid":uid,"uid_validity":uid,"body_mode":{"enum":["full","trimmed"]},"max_body_length":{"type":"integer","minimum":0,"maximum":524288}}),
             vec!["uid", "uid_validity"],
         ),
         (
@@ -234,7 +291,7 @@ pub fn tools(mode: &str) -> Vec<Tool> {
         (
             "get_emails",
             "Read up to ten messages with individual outcomes. Local MIME errors affect only that item; fetch failures leave later items unprocessed.",
-            json!({"mailbox":mailbox,"uids":{"type":"array","items":uid,"minItems":1,"maxItems":10},"uid_validity":uid,"body_mode":{"enum":["full","trimmed"]},"max_body_length":{"type":"integer","minimum":0,"maximum":65536}}),
+            json!({"mailbox":mailbox,"uids":{"type":"array","items":uid,"minItems":1,"maxItems":10},"uid_validity":uid,"body_mode":{"enum":["full","trimmed"]},"max_body_length":{"type":"integer","minimum":0,"maximum":524288}}),
             vec!["uids", "uid_validity"],
         ),
         (
@@ -472,6 +529,7 @@ impl ServerHandler for EmailServer {
         }
         let service = self.0.clone();
         let truncate_email = name == "get_email";
+        let truncate_collection = matches!(name.as_str(), "get_emails" | "read_conversation");
         let started = Instant::now();
         let log_name = name.clone();
         let log_id = request_id.clone();
@@ -503,6 +561,8 @@ impl ServerHandler for EmailServer {
         });
         let bound = if truncate_email {
             bounded_email_result
+        } else if truncate_collection {
+            bounded_collection_result
         } else {
             bounded_tool_result
         };
@@ -512,6 +572,48 @@ impl ServerHandler for EmailServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn batch_and_conversation_fit_wire_budget_without_losing_item_outcomes() {
+        let body = "中😀\"\\\n".repeat(20000);
+        for value in [
+            json!({"items":[{"uid":1,"ok":true,"email":{"uid":1,"body":body,"body_truncated":false}},{"uid":2,"ok":false,"status":"unprocessed"}]}),
+            json!({"messages":[{"uid":1,"body":body,"body_truncated":false}],"skipped_candidates":[{"uid":2}],"complete":false}),
+        ] {
+            let id = RequestId::Number(9);
+            let result = bounded_collection_result(Ok(value), "test", &id, 16384).unwrap();
+            assert_ne!(result.is_error, Some(true));
+            assert!(response_fits(&result, &id, 16384));
+            let data = &result.structured_content.as_ref().unwrap()["data"];
+            let email = data
+                .pointer("/items/0/email")
+                .or_else(|| data.pointer("/messages/0"))
+                .unwrap();
+            assert_eq!(email["uid"], 1);
+            assert_eq!(email["body_truncated"], true);
+            assert!(body.starts_with(email["body"].as_str().unwrap()));
+            if data.get("items").is_some() {
+                assert_eq!(data["items"][1]["status"], "unprocessed");
+            } else {
+                assert_eq!(data["skipped_candidates"][0]["uid"], 2);
+            }
+        }
+    }
+    #[test]
+    fn relaxed_inline_attachment_fits_complete_response() {
+        use base64::Engine;
+        let size = crate::config::DEFAULT_MAX_OUTPUT / 4;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(vec![0u8; size]);
+        let value = json!({"content_type":"application/octet-stream","size":size,"base64":encoded});
+        let id = RequestId::String("x".repeat(1022).into());
+        let result =
+            bounded_tool_result(Ok(value), "test", &id, crate::config::DEFAULT_MAX_OUTPUT).unwrap();
+        assert_ne!(result.is_error, Some(true));
+        assert!(response_fits(
+            &result,
+            &id,
+            crate::config::DEFAULT_MAX_OUTPUT
+        ));
+    }
     const OUTPUT_LIMIT: usize = 256 * 1024;
     const TRACE_ID: &str = "00000000-0000-0000-0000-000000000000";
 

@@ -22,9 +22,9 @@
 
 `download_attachment` 保持原有 `content_type`、`size`、`base64` 返回字段和工具输出预算，旧客户端无需迁移。新增 `list_attachments` 提供与 `get_email` 一致的索引，新增 `prepare_attachment_download` 接受文件夹、UID、UIDVALIDITY 和 `attachment_index`，返回认证二进制 GET URL。
 
-附件发现、URL 准备和实际 GET 均使用已有有界整封读取及 MIME 解析；GET 会重新核对 UIDVALIDITY 并读取同一消息。当前不会发起 BODYSTRUCTURE 或单部分 FETCH，不能发现或下载超出整封邮件上限的内容。这样保持既有附件分类、RFC2231 文件名意图和整体 multipart 附件语义；附加 `.eml` 作为整体附件，不枚举其内部附件。每封原始邮件及解码附件均受 8 MiB 限制；元数据和筛选还共用单连接响应预算，超过预算明确失败。
+附件发现、URL 准备和实际 GET 均使用已有有界整封读取及 MIME 解析；GET 会重新核对 UIDVALIDITY 并读取同一消息。当前不会发起 BODYSTRUCTURE 或单部分 FETCH，不能发现或下载超出整封邮件上限的内容。这样保持既有附件分类、RFC2231 文件名意图和整体 multipart 附件语义；附加 `.eml` 作为整体附件，不枚举其内部附件。每封原始邮件及解码附件均受 32 MiB 限制；元数据和筛选还共用单连接响应预算，超过预算明确失败。
 
-返回的 `download_url` 需要同一用户的有效 OAuth Bearer 令牌。句柄有效期 300 秒，每实例最多保存 16 个描述符，不缓存附件字节；重启后失效。它不能作为公共分享链接。最多两个二进制下载并发，响应被消费或丢弃后释放传输名额；IMAP 读取还使用共享邮箱槽位。附件列表使用 `next_attachment_offset` 分页。
+返回的 `download_url` 需要同一用户的有效 OAuth Bearer 令牌。句柄有效期 600 秒，每实例最多保存 16 个描述符，不缓存附件字节；重启后失效。它不能作为公共分享链接。最多四个二进制下载并发，响应被消费或丢弃后释放传输名额；IMAP 读取还使用共享邮箱槽位。附件列表使用 `next_attachment_offset` 分页。
 
 普通浏览器点击链接不会自动携带 MCP 令牌，客户端必须支持认证下载；ChatGPT 自动读取 PDF/Excel 尚未验收。公开路由为 `MCP_RESOURCE/attachments/{token}`，需转发至内部 `/mcp/attachments/{token}` 并关闭包含句柄的访问日志。响应使用 `no-store`、`nosniff` 和 attachment disposition；客户端负责安全解析文件内容。
 
@@ -37,7 +37,7 @@
 
 ## 会话、定位和正文
 
-`read_conversation` 从指定 `uid` 和 `uid_validity` 出发，按 Message-ID、References 和 In-Reply-To 的精确标识符关联同一文件夹的邮件，不使用相同主题作为关联依据。默认检查 100 个候选头，最多 200 个；默认返回 10 封，最多 20 封，累计正文最多 64 KiB。扫描范围、候选上限、遗漏邮件和后续 UID 游标均随结果返回。`next_before_uid` 仅推进候选扫描；`omitted_uids` 列出本次已关联但因数量或响应预算未返回的 UID，可用 `get_emails` 分批读取。跨窗口关联需要客户端继续查询并结合已有结果；不保证单次返回全邮箱内的所有往来。
+`read_conversation` 从指定 `uid` 和 `uid_validity` 出发，按 Message-ID、References 和 In-Reply-To 的精确标识符关联同一文件夹的邮件，不使用相同主题作为关联依据。默认检查 100 个候选头，最多 200 个；默认返回 10 封，最多 20 封，累计正文最多 256 KiB。扫描范围、候选上限、遗漏邮件和后续 UID 游标均随结果返回。`next_before_uid` 仅推进候选扫描；`omitted_uids` 列出本次已关联但因数量或响应预算未返回的 UID，可用 `get_emails` 分批读取。跨窗口关联需要客户端继续查询并结合已有结果；不保证单次返回全邮箱内的所有往来。
 
 `locate_message` 接受 `message_id` 和显式 `mailboxes` 列表，最多 20 个文件夹。先以服务端 HEADER 搜索缩小候选，再验证完整 Message-ID，避免子串误匹配。每个文件夹分别返回搜索范围及下一页游标；继续某个文件夹时应单独传入该文件夹和它自己的游标。
 
@@ -49,7 +49,7 @@
 
 `get_mailbox_statistics` 以 STATUS 返回文件夹邮件数量、未读数量等。统计必须收到匹配文件夹的全部请求字段和匹配 tag 的 OK；断连、缺失字段及拒绝均返回 MAIL_BACKEND，不把缺失响应解释为零。可选 `date_start` 和 `date_end` 统计最多 31 天的 INTERNALDATE 日分布，结束日期不包含在内。分布只覆盖本次 500 UID 窗口，结果附带范围和游标；总量与分布不是原子快照，不能混为同一时刻的全量统计。
 
-元数据缓存仅保存完整邮件头，每实例最多 128 项、2 MiB，TTL 为 30 秒。键包含文件夹、UIDVALIDITY 和 UID，每次会话先获取当前 UIDVALIDITY，失效时移除旧缓存。正文、附件、可变标记和统计结果不进入缓存，避免旧已读状态误导后续操作。
+元数据缓存仅保存完整邮件头，每实例最多 256 项、16 MiB，TTL 为 60 秒。键包含文件夹、UIDVALIDITY 和 UID，每次会话先获取当前 UIDVALIDITY，失效时移除旧缓存。正文、附件、可变标记和统计结果不进入缓存，避免旧已读状态误导后续操作。
 
 ## 协议依据
 
