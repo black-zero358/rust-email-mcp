@@ -35,19 +35,19 @@
 | 结果与错误 | 工具执行结果使用结构化内容；常规成功含 `data`、`request_id`，工具错误含 `error`、`request_id`，错误具有 `code/message/retryable`。协议层错误仍使用 MCP 错误；不能把协议错误、业务失败与发送结果混为一类。超限降级结果保留已知发送状态及禁止自动重试的提示。 |
 | 用户授权 | 客户端负责展示收件人与内容并取得明确发送授权；破坏性操作先确认。服务端执行权限模式和相应 `confirm` 校验；工具提示或 annotations 不能替代服务端检查，也不是用户授权的证明。 |
 
-一次工具响应的 **完整序列化 JSON-RPC** 预算为 256 KiB，计入实际 `id`、`request_id`、`structuredContent` 及文本客户端使用的转义副本，不计 HTTP 头和 SSE 帧。JSON-RPC id 的序列化 JSON 最多 1024 字节，HTTP 中间件必须在 rmcp/工具执行前以 413 拒绝超限 id。超限错误本身也必须有界；已知发送结果不能因输出超限而丢失。客户端使用原 `operation_key` 调用 `get_operation` 后再决定后续操作。其他发现/握手响应按固定结构生成，不应混称为已经覆盖工具响应预算。
+一次工具响应的 **完整序列化 JSON-RPC** 预算为 2 MiB，计入实际 `id`、`request_id`、`structuredContent` 及文本客户端使用的转义副本，不计 HTTP 头和 SSE 帧。JSON-RPC id 的序列化 JSON 最多 1024 字节，HTTP 中间件必须在 rmcp/工具执行前以 413 拒绝超限 id。超限错误本身也必须有界；已知发送结果不能因输出超限而丢失。客户端使用原 `operation_key` 调用 `get_operation` 后再决定后续操作。其他发现/握手响应按固定结构生成，不应混称为已经覆盖工具响应预算。
 
 **当前已知偏差：**JSON Schema 的 `minLength/maxLength` 表示字符数，现有 `server::validate` 使用 Rust `str::len()` 计算 UTF-8 字节数，底层文件夹名也有字节限制。文档整理未修复此实现；不能声称 Unicode 输入已与 Schema 完全一致。后续应把标准字符约束与额外资源字节预算分开定义并验证，见 [待闭环事项](../CONTRIBUTING.md#待闭环事项)。
 
 ## MCP and mail
 
-`get_email` 的正文先受 MIME 解码和正文长度选项约束，再由 `server::bounded_email_result` 按实际 JSON-RPC 响应二分选择可容纳的最长 UTF-8 前缀。计量包含真实 id、request_id、全部元数据及两份 JSON 内容；需要额外截断时设置 `body_truncated=true`，保留已有截断标记。`body_byte_limit` 仍表示正文选项与解析硬上限的交集，实际前缀可能更短。非正文元数据不裁剪，空正文仍超限时保留有界 `LIMIT_EXCEEDED`。其他工具和发送结果继续使用原有预算及状态降级路径。
+`get_email` 的正文先受 MIME 解码和正文长度选项约束，再由 `server::bounded_email_result` 按实际 JSON-RPC 响应二分选择可容纳的最长 UTF-8 前缀。计量包含真实 id、request_id、全部元数据及两份 JSON 内容；需要额外截断时设置 `body_truncated=true`，保留已有截断标记。`body_byte_limit` 仍表示正文选项与解析硬上限的交集，实际前缀可能更短。非正文元数据不裁剪，空正文仍超限时保留有界 `LIMIT_EXCEEDED`。批量读取和会话也按实际完整响应预算统一缩短展示正文，保留元数据、UID和逐项结果；发送结果使用状态降级路径。
 
-服务使用官方 Rust MCP SDK rmcp 3.8.0 与 Streamable HTTP。IMAP 使用 async-imap 和证书校验的 TLS；SMTP 使用 lettre 的隐式 TLS 或必须成功的 STARTTLS。每个需要邮箱后端的操作获取两个执行槽位之一，连接归单次操作所有，在完成、超时或解析失败后关闭。只读的本地账户/发送状态查询不需要邮箱连接。
+服务使用官方 Rust MCP SDK rmcp 3.8.0 与 Streamable HTTP。IMAP 使用 async-imap 和证书校验的 TLS；SMTP 使用 lettre 的隐式 TLS 或必须成功的 STARTTLS。每个需要邮箱后端的操作获取四个执行槽位之一，连接归单次操作所有，在完成、超时或解析失败后关闭。只读的本地账户/发送状态查询不需要邮箱连接。
 
 读取必须使用 `EXAMINE` 和 `BODY.PEEK`。状态 FETCH 只接受所请求 UID 的结果，忽略其他 UID 或无 UID 的非请求更新；目标不存在返回 `NOT_FOUND`，目标存在但 `FLAGS ()` 为空应成功，后出现的同 UID flags 覆盖先前值。整封读取按目标 UID 及所需 SIZE/BODY 属性筛选，异步 FLAGS 不代替所需属性；缺失所需属性仍返回 `MAIL_BACKEND`。列表/搜索按请求 UID 归并 HEADER、SIZE 与最后实际出现的 FLAGS；用 vendored `Fetch::has_flags` 区分未提供 FLAGS 与显式空集合，不让后到的无 FLAGS 响应清空标记。只有明确返回 HEADER（包括真实空头部）才生成摘要，每个 UID 一条、按 UID 降序且数量不超过 limit，忽略其他 UID/无 UID 响应；缺失 HEADER 不从缓存伪造摘要。所有结果均等待匹配 tag 的 OK，不以已收到部分数据代替成功终结。依据 [RFC 3501 §5.2](https://www.rfc-editor.org/rfc/rfc3501#section-5.2) 与 [§7.4.2](https://www.rfc-editor.org/rfc/rfc3501#section-7.4.2)。不得以关闭会话为由引入 `CLOSE/EXPUNGE` 等额外副作用。
 
-连接、原始响应和单封邮件都必须有预算；`BudgetStream` 对连接累计读取字节计量；`Client::with_buffer_limit` 在真实 parser 的 `decode_needs`、扩容及剩余数据重置前执行同一个应用字节上限（`max_message + 2 MiB`，另保留上游 512 MiB 硬上限）。已用字节与 parser 所需追加字节采用 checked arithmetic；初始化、分块取整和替换缓冲区同样不超过该上限。移除独立的行尾 literal 猜测扫描，合法响应文本中的花括号不会被当作 literal。预算约束每个 parser 缓冲块，非进程 RSS；增长时新旧块、已交付响应及协议对象可能同时存活。列表和搜索最多扫描 500 个 UID、返回 50 条摘要，批量读取最多 10 封并保留逐项结果。具体字节、结构及输出限额见 README；调整数值仍须满足 D3 并评估客户端兼容性。
+连接、原始响应和单封邮件都必须有预算；`BudgetStream` 对连接累计读取字节计量；`Client::with_buffer_limit` 在真实 parser 的 `decode_needs`、扩容及剩余数据重置前执行同一个应用字节上限（`max_message * 4`，默认 128 MiB，另保留上游 512 MiB 硬上限）。已用字节与 parser 所需追加字节采用 checked arithmetic；初始化、分块取整和替换缓冲区同样不超过该上限。移除独立的行尾 literal 猜测扫描，合法响应文本中的花括号不会被当作 literal。预算约束每个 parser 缓冲块，非进程 RSS；增长时新旧块、已交付响应及协议对象可能同时存活。列表和搜索最多扫描 500 个 UID、返回 50 条摘要，批量读取最多 10 封并保留逐项结果。具体字节、结构及输出限额见 README；调整数值仍须满足 D3 并评估客户端兼容性。
 
 IMAP 文本模式固定为 rev1：所有邮箱参数编码为 modified UTF-7，LIST 名称解码为 Unicode 后验证规范往返。不得直接把 UTF-8 字节放入 quoted search；非 ASCII 查询使用 `CHARSET UTF-8` 与同步 literal，等待 continuation 和对应命令的 tagged OK。`BADCHARSET` 返回 `UNSUPPORTED_CHARSET`，不降级为含义不同的查询。当前未协商 `UTF8=ACCEPT` 或 IMAP4rev2。
 
@@ -55,9 +55,9 @@ async-imap 0.12 的 APPEND flags 原样序列化，必须传入 `(\Draft)` 这�
 
 APPEND 等待同步 literal continuation 时，先将合法 untagged 通知交给现有有界 unsolicited 队列，再继续读取；只有 `Continue` 才发送正文。continuation 前任何 tagged 结果（包括提前 OK 和错误 tag）、BYE、EOF 或读取错误均失败且不发送 literal，拒绝后排队的 continuation 不能恢复命令。完整 literal 后仍等待匹配 tag 的 OK。`save_draft_waits_for_continuation_after_notifications` 和 `save_draft_append_protocol` 覆盖这一 D2 协议边界；不改变草稿 flags/MIME 或发送策略。
 
-`mail/attachments.rs` 使用现有有界整封邮件与 MIME 解析发现附件，统一 `get_email`、列表、内联 Base64 和二进制下载的索引与附件子树边界。`download_attachment` 保持原契约；新增 `prepare_attachment_download` 保存最多 16 个主体绑定、300 秒有效的元数据句柄。GET 再核对 UIDVALIDITY 并重新读取整封邮件；不引入 BODYSTRUCTURE 或单部分 FETCH。两份二进制传输许可持有至响应消费或丢弃，邮箱连接仍共用原槽位与预算。
+`mail/attachments.rs` 使用现有有界整封邮件与 MIME 解析发现附件，统一 `get_email`、列表、内联 Base64 和二进制下载的索引与附件子树边界。`download_attachment` 保持原契约；新增 `prepare_attachment_download` 保存最多 64 个主体绑定、600 秒有效的元数据句柄。GET 再核对 UIDVALIDITY 并重新读取整封邮件；不引入 BODYSTRUCTURE 或单部分 FETCH。四份二进制传输许可持有至响应消费或丢弃，邮箱连接仍共用原槽位与预算。
 
-`mail/insights.rs` 提供有界标识符图会话、精确 Message-ID 定位、严格 STATUS 统计、脱敏诊断与正文展示。头部缓存最多 128 项/2 MiB、30 秒，只保存不可变头部并以新 UIDVALIDITY 失效；正文共用 `mime`/`html` 选择器。统计用 `imap_text::status_counts` 验证完整字段和命令完成。批量修改使用明确 UID、总体期限和逐项结果，失败项保守为 unknown、后续 unprocessed；没有持久化修改日志，重试前必须检查邮箱。范围与限制见 [能力说明](capabilities.md)。
+`mail/insights.rs` 提供有界标识符图会话、精确 Message-ID 定位、严格 STATUS 统计、脱敏诊断与正文展示。头部缓存最多 256 项/16 MiB、60 秒，只保存不可变头部并以新 UIDVALIDITY 失效；正文共用 `mime`/`html` 选择器。统计用 `imap_text::status_counts` 验证完整字段和命令完成。批量修改使用明确 UID、总体期限和逐项结果，失败项保守为 unknown、后续 unprocessed；没有持久化修改日志，重试前必须检查邮箱。范围与限制见 [能力说明](capabilities.md)。
 
 ## MIME and HTML
 
@@ -157,3 +157,11 @@ SMTPUTF8 需求与确定拒绝对应 D3/D4：`mime::requires_smtputf8`、`smtp::
 - [Rauthy refresh configuration](https://sebadob.github.io/rauthy/config/config.html)
 - [lettre BCC handling](https://docs.rs/lettre/latest/lettre/message/struct.MessageBuilder.html#method.keep_bcc)
 - [async-imap session operations](https://docs.rs/async-imap/latest/async_imap/struct.Session.html)
+
+### 0.2.1 容量与局部失败
+
+会话完整头预算128 KiB与MIME单头预算一致。候选HEADER命令已完整消费后，局部超限/头解析错误加入skipped_candidates并继续；所选消息在完整FETCH后的内容错误加入message_errors。原始FETCH的LIMIT_EXCEEDED仅由已完成SIZE检查或完整BODY检查产生，可以跳过；传输/协议错误立即终止连接。种子头是关联起点，失败仍中止。完整性字段同时考虑跳过的候选。
+
+默认32 MiB单封、128 MiB累计连接预算、2 MiB完整输出；parser与BudgetStream共用同一累计上限参数。mail默认4槽，20个工具请求准入与10秒等待共同约束排队。二进制下载另有4个传输槽，取邮件共用邮箱槽，读取阶段60秒期限含等待。
+
+新增回归：conversation_large_headers_skip_local_failures_but_stop_protocol_errors；batch_and_conversation_fit_wire_budget_without_losing_item_outcomes；relaxed_inline_attachment_fits_complete_response；relaxed_parallel_attachment_decode_accepts_large_payloads。

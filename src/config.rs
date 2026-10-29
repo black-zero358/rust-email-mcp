@@ -1,5 +1,9 @@
 use std::{env, sync::Arc, time::Duration};
 
+pub const DEFAULT_MAX_MESSAGE: usize = 32 * 1024 * 1024;
+pub const DEFAULT_MAX_OUTPUT: usize = 2 * 1024 * 1024;
+pub const MAX_DISPLAY_BODY: usize = 512 * 1024;
+
 #[derive(Clone)]
 pub struct Config {
     pub address: String,
@@ -64,9 +68,9 @@ impl Config {
             drafts: value("DRAFTS_MAILBOX", "Drafts"),
             trash: value("TRASH_MAILBOX", "Trash"),
             mode: value("MAIL_MODE", "read"),
-            timeout: Duration::from_secs(30),
-            max_message: 8 * 1024 * 1024,
-            max_output: 256 * 1024,
+            timeout: Duration::from_secs(60),
+            max_message: DEFAULT_MAX_MESSAGE,
+            max_output: DEFAULT_MAX_OUTPUT,
             resource: required("MCP_RESOURCE")?,
             issuer: required("OIDC_ISSUER")?,
             audience: required("OIDC_AUDIENCE")?,

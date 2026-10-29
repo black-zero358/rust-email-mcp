@@ -4,12 +4,12 @@
 use crate::error::{MailError, Result};
 use mailparse::{MailHeader, MailHeaderMap, ParsedContentType, body::Body};
 
-const MAX_PARTS: usize = 256;
-const MAX_DEPTH: usize = 20;
-const MAX_HEADER_BLOCK: usize = 32 * 1024;
-const MAX_HEADER_BYTES: usize = 256 * 1024;
-const MAX_HEADER_LINES: usize = 2048;
-const MAX_DECODE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PARTS: usize = 1024;
+const MAX_DEPTH: usize = 32;
+const MAX_HEADER_BLOCK: usize = 128 * 1024;
+const MAX_HEADER_BYTES: usize = 1024 * 1024;
+const MAX_HEADER_LINES: usize = 8192;
+const MAX_DECODE_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Default)]
 struct Budget {
@@ -421,6 +421,26 @@ impl Part<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn relaxed_parallel_attachment_decode_accepts_large_payloads() {
+        use base64::Engine;
+        let barrier = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(vec![42u8; 12 * 1024 * 1024]);
+                    let raw = format!("Content-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\n{encoded}");
+                    drop(encoded);
+                    let part = parse(raw.as_bytes()).unwrap();
+                    let decoded = part.body_raw(crate::config::DEFAULT_MAX_MESSAGE).unwrap();
+                    barrier.wait();
+                    assert_eq!(decoded.len(), 12 * 1024 * 1024);
+                    assert!(decoded.iter().all(|b| *b == 42));
+                });
+            }
+        });
+    }
     use super::*;
 
     #[test]

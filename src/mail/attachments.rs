@@ -15,8 +15,9 @@ use std::{
 };
 use tokio::sync::Mutex;
 
-const HANDLE_TTL: Duration = Duration::from_secs(300);
-const MAX_HANDLES: usize = 16;
+const HANDLE_TTL: Duration = Duration::from_secs(600);
+const MAX_HANDLES: usize = 64;
+const MAX_TRANSFERS: usize = 4;
 
 #[derive(Clone)]
 struct Part {
@@ -43,7 +44,7 @@ impl AttachmentStore {
     pub fn new(_config: Arc<Config>) -> Self {
         Self {
             handles: Mutex::new(HashMap::new()),
-            transfers: Arc::new(Semaphore::new(2)),
+            transfers: Arc::new(Semaphore::new(MAX_TRANSFERS)),
         }
     }
     async fn insert(&self, transfer: Transfer) -> Result<String> {
@@ -394,7 +395,10 @@ mod tests {
         );
         assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
         assert_eq!(response.headers()["x-content-type-options"], "nosniff");
-        assert_eq!(service.attachments.transfers.available_permits(), 1);
+        assert_eq!(
+            service.attachments.transfers.available_permits(),
+            MAX_TRANSFERS - 1
+        );
         assert_eq!(
             axum::body::to_bytes(response.into_body(), 1024 * 1024)
                 .await
@@ -402,9 +406,16 @@ mod tests {
                 .as_ref(),
             expected
         );
-        assert_eq!(service.attachments.transfers.available_permits(), 2);
-        let _p1 = service.attachments.transfers.acquire().await.unwrap();
-        let _p2 = service.attachments.transfers.acquire().await.unwrap();
+        assert_eq!(
+            service.attachments.transfers.available_permits(),
+            MAX_TRANSFERS
+        );
+        let _permits = service
+            .attachments
+            .transfers
+            .acquire_many(MAX_TRANSFERS as u32)
+            .await
+            .unwrap();
         let rejected = download_with(
             service.clone(),
             Principal("owner".into()),

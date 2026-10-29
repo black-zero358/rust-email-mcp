@@ -5,10 +5,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-const HEADER_LIMIT: usize = 16 * 1024;
-const CACHE_BYTES: usize = 2 * 1024 * 1024;
-const CACHE_ITEMS: usize = 128;
-const CACHE_TTL: Duration = Duration::from_secs(30);
+const HEADER_LIMIT: usize = 128 * 1024;
+const CACHE_BYTES: usize = 16 * 1024 * 1024;
+const CACHE_ITEMS: usize = 256;
+const CACHE_TTL: Duration = Duration::from_secs(60);
 
 struct Entry {
     folder: String,
@@ -113,8 +113,8 @@ impl MailService {
             .map_err(|_| MailError::backend())?;
         let bytes = items
             .iter()
-            .find(|f| f.uid == Some(uid))
-            .and_then(|f| f.header())
+            .filter(|f| f.uid == Some(uid))
+            .find_map(|f| f.header())
             .ok_or_else(MailError::backend)?;
         if bytes.len() > HEADER_LIMIT || !(bytes.ends_with(b"\r\n\r\n") || bytes.ends_with(b"\n\n"))
         {
@@ -242,23 +242,56 @@ impl MailService {
             None
         };
         let mut headers = Vec::new();
+        let mut skipped_candidates = Vec::new();
         for id in ids {
-            let raw = self
+            // cached_headers only emits LIMIT_EXCEEDED after FETCH completed.
+            // Transport/protocol failures still stop the connection.
+            let raw = match self
                 .cached_headers(s, mailbox, state.uid_validity, id)
-                .await?;
-            headers.push((id, thread_headers(&raw)?));
+                .await
+            {
+                Ok(raw) => raw,
+                Err(error) if error.code == "LIMIT_EXCEEDED" => {
+                    skipped_candidates.push(json!({"uid":id,"error":error}));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            match thread_headers(&raw) {
+                Ok(value) => headers.push((id, value)),
+                Err(error) => skipped_candidates.push(json!({"uid":id,"error":error})),
+            }
         }
         let (connected, linked) = connected_messages(seed, &seed_links, &headers, usize::MAX);
         let selected = connected.iter().copied().take(limit).collect::<Vec<_>>();
-        let total_budget = self.config.max_output.saturating_div(2).min(65536);
+        let total_budget = self.config.max_output.saturating_div(4).min(256 * 1024);
         let mut remaining = total_budget;
         let mut messages = Vec::new();
         let mut output_remaining = self.config.max_output.saturating_sub(4096);
         let mut response_budget_omitted = false;
+        let mut message_errors = Vec::new();
         for id in selected {
-            let raw = self.raw(s, id).await?;
-            let mut value =
-                parsed_with_options(&raw, id, state.uid_validity, remaining.min(16000), a)?;
+            let raw = match self.raw(s, id).await {
+                Ok(raw) => raw,
+                Err(error) if error.code == "LIMIT_EXCEEDED" => {
+                    message_errors.push(json!({"uid":id,"error":error}));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let mut value = match parsed_with_options(
+                &raw,
+                id,
+                state.uid_validity,
+                remaining.min(64 * 1024),
+                a,
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    message_errors.push(json!({"uid":id,"error":error}));
+                    continue;
+                }
+            };
             bound_conversation_metadata(&mut value);
             let bytes = serde_json::to_vec(&value)
                 .map_err(|_| MailError::backend())?
@@ -287,7 +320,8 @@ impl MailService {
             "next_before_uid":next,"candidate_limit_reached":candidate_limit_reached,"messages_omitted":linked>messages.len(),
             "response_budget_omitted":response_budget_omitted,
             "older_uids_omitted":start>1,"total_body_byte_limit":total_budget,
-            "complete":!candidate_limit_reached && start<=1 && linked<=messages.len(),"content_trust":"untrusted"}),
+            "skipped_candidates":skipped_candidates,"message_errors":message_errors,
+            "complete":!candidate_limit_reached && start<=1 && linked<=messages.len() && skipped_candidates.is_empty(),"content_trust":"untrusted"}),
         )
     }
 
@@ -549,7 +583,13 @@ pub(super) fn parsed_with_options(
         return Err(MailError::input());
     }
     let max = if a.get("max_body_length").is_some() {
-        number(a, "max_body_length", 0, 0, 65536)? as usize
+        number(
+            a,
+            "max_body_length",
+            0,
+            0,
+            crate::config::MAX_DISPLAY_BODY as u64,
+        )? as usize
     } else {
         hard_limit
     };
@@ -720,7 +760,7 @@ pub(crate) fn tool_specs() -> Vec<(&'static str, &'static str, Value, Vec<&'stat
         (
             "read_conversation",
             "Read a bounded same-folder conversation linked by message identifiers; inspect scope and omission flags.",
-            json!({"mailbox":mailbox,"uid":uid,"uid_validity":uid,"before_uid":uid,"candidate_limit":{"type":"integer","minimum":1,"maximum":200},"limit":{"type":"integer","minimum":1,"maximum":20},"body_mode":{"type":"string","enum":["full","trimmed"]},"max_body_length":{"type":"integer","minimum":0,"maximum":65536}}),
+            json!({"mailbox":mailbox,"uid":uid,"uid_validity":uid,"before_uid":uid,"candidate_limit":{"type":"integer","minimum":1,"maximum":200},"limit":{"type":"integer","minimum":1,"maximum":20},"body_mode":{"type":"string","enum":["full","trimmed"]},"max_body_length":{"type":"integer","minimum":0,"maximum":524288}}),
             vec!["uid", "uid_validity"],
         ),
         (
@@ -746,6 +786,136 @@ pub(crate) fn tool_specs() -> Vec<(&'static str, &'static str, Value, Vec<&'stat
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn conversation_large_headers_skip_local_failures_but_stop_protocol_errors() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        for (refused, bad_body) in [(false, false), (false, true), (true, false)] {
+            let seed_header = format!(
+                "Message-ID: <seed@example.test>\r\nX-Trace: {}\r\n\r\n",
+                "x".repeat(18000)
+            );
+            let linked_header =
+                "Message-ID: <linked@example.test>\r\nReferences: <seed@example.test>\r\n\r\n";
+            let too_large = format!("X-Trace: {}\r\n\r\n", "x".repeat(HEADER_LIMIT));
+            let raw_seed = format!("{seed_header}seed body");
+            let raw_linked = if bad_body {
+                "Content-Type: text/plain\r\nContent-Transfer-Encoding: unsupported\r\n\r\nopaque"
+                    .to_owned()
+            } else {
+                format!("{linked_header}linked body")
+            };
+            let literal = |uid, section: &str, raw: &str| {
+                format!(
+                    "* 1 FETCH (UID {uid} FLAGS ())\r\n* 1 FETCH (UID {uid} {section} {{{}}}\r\n{raw})\r\n",
+                    raw.len()
+                )
+            };
+            let mut script = vec![
+                (
+                    "LOGIN \"synthetic\" \"test\"".to_owned(),
+                    String::new(),
+                    "OK",
+                ),
+                (
+                    "EXAMINE \"INBOX\"".to_owned(),
+                    "* 3 EXISTS\r\n* OK [UIDVALIDITY 9] valid\r\n* OK [UIDNEXT 4] next\r\n"
+                        .to_owned(),
+                    "OK",
+                ),
+                (
+                    format!(
+                        "UID FETCH 1 (UID BODY.PEEK[HEADER]<0.{}>)",
+                        HEADER_LIMIT + 1
+                    ),
+                    literal(1, "BODY[HEADER]", &seed_header),
+                    "OK",
+                ),
+                (
+                    "UID SEARCH UID 1:3".to_owned(),
+                    "* SEARCH 1 2 3\r\n".to_owned(),
+                    "OK",
+                ),
+                (
+                    format!(
+                        "UID FETCH 3 (UID BODY.PEEK[HEADER]<0.{}>)",
+                        HEADER_LIMIT + 1
+                    ),
+                    literal(3, "BODY[HEADER]", linked_header),
+                    "OK",
+                ),
+                (
+                    format!(
+                        "UID FETCH 2 (UID BODY.PEEK[HEADER]<0.{}>)",
+                        HEADER_LIMIT + 1
+                    ),
+                    literal(2, "BODY[HEADER]", &too_large),
+                    if refused { "NO" } else { "OK" },
+                ),
+            ];
+            if !refused {
+                for (uid, raw) in [(1, raw_seed), (3, raw_linked)] {
+                    script.push((
+                        format!("UID FETCH {uid} (UID RFC822.SIZE)"),
+                        format!("* 1 FETCH (UID {uid} RFC822.SIZE {})\r\n", raw.len()),
+                        "OK",
+                    ));
+                    script.push((
+                        format!("UID FETCH {uid} (UID BODY.PEEK[]<0.8388609>)"),
+                        literal(uid, "BODY[]", &raw),
+                        "OK",
+                    ));
+                }
+            }
+            let (client, server) = tokio::io::duplex(262144);
+            let backend = tokio::spawn(async move {
+                let mut server = BufReader::new(server);
+                server.get_mut().write_all(b"* OK test\r\n").await.unwrap();
+                for (expected, data, status) in script {
+                    let mut line = String::new();
+                    server.read_line(&mut line).await.unwrap();
+                    let (tag, cmd) = line.trim_end().split_once(' ').unwrap();
+                    assert_eq!(cmd, expected);
+                    server
+                        .get_mut()
+                        .write_all(format!("{data}{tag} {status} completed\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+            });
+            let mut client = async_imap::Client::new(client);
+            client.read_response().await.unwrap();
+            let mut session = client.login("synthetic", "test").await.unwrap();
+            let service = MailService::new(
+                crate::config::fixture(),
+                Arc::new(Journal::open(std::path::Path::new(":memory:")).unwrap()),
+            )
+            .unwrap();
+            let result = service
+                .insight_operation(
+                    &mut session,
+                    "read_conversation",
+                    &json!({"uid":1,"uid_validity":9}),
+                )
+                .await;
+            if refused {
+                assert_eq!(result.unwrap_err().code, "MAIL_BACKEND");
+            } else {
+                let result = result.unwrap();
+                assert_eq!(result["skipped_candidates"][0]["uid"], 2);
+                assert_eq!(result["complete"], false);
+                assert_eq!(
+                    result["messages"].as_array().unwrap().len(),
+                    if bad_body { 1 } else { 2 }
+                );
+                assert_eq!(
+                    result["message_errors"].as_array().unwrap().len(),
+                    usize::from(bad_body)
+                );
+            }
+            drop(session);
+            backend.await.unwrap();
+        }
+    }
     #[test]
     fn new_reads_require_nonzero_reference_metadata() {
         let mut state = async_imap::types::Mailbox::default();
