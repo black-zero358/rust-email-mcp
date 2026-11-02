@@ -386,7 +386,7 @@ UIDVALIDITY 改变立即停用旧世代数据、句柄和游标，后台清理�
 | R02 | 已完成，提交 `b60a686`；输出 Schema、default 持久身份、账户能力与文件夹用途 | R02/R03 的 [PR #64](https://github.com/black-zero358/rust-email-mcp/pull/64) 已合并，URI 审阅发现修复于 `928a866`；最终 CI 全部通过；见[验证记录](validation.md#2026-11-02-r00r04-pr-审阅与合并) |
 | R03 | 已完成，提交 `b60a686`；独立 HTML 展示策略，交叉审阅与预算修复闭环 | 随 R02 完成集成检查；旧转发与 MIME 候选回归通过 |
 | R04 | 本阶段已完成，提交 `60b8cca`；164 单元 + 2 集成、fmt/clippy/release、7 组客户端测试及 8 文件联调通过 | [PR #65](https://github.com/black-zero358/rust-email-mcp/pull/65) 已合并；最终 head `99aa4e4` 增补 URI 回归并通过全部 CI；[离线验证记录](validation.md#2026-11-02-r04-附件离线下载与内容读取)；真实 ChatGPT 测试后移 |
-| R05 | 实现与交叉审阅完成；配置/注册同源模块 26 项、mail 86 项（含调度 9 项）、HTTP 输出 19 项、输入 6 项、server 14 项通过 | 合入最新 main 后执行整仓检查并提交 PR；[设计与配置](multi-account-design.md) |
+| R05 | 实现与交叉审阅完成，源码 `ffd1bda`；200 单元 + 2 集成、fmt/clippy/release、8 文件客户端联调通过 | 提交 PR，核对最终 CI 后合并；[设计与配置](multi-account-design.md)、[离线验证](validation.md#2026-11-02-r05-多账户离线验证) |
 | R06–R09 | 待实施；R06 已定位锁定 parser 的递归及分配入口 | 先提交有界 BODYSTRUCTURE parser 子 PR，再实现部件读取、预览分类、跨目录会话 |
 | R10–R13 | 待实施 | 持久化、完整回填、离线及发布验收 |
 
