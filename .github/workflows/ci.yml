@@ -23,6 +23,7 @@ jobs:
         with:
           toolchain: 1.99.1
       - run: cargo install cargo-audit --version 0.22.2 --locked
+      - run: bash scripts/test-audit-dependencies.sh
       - run: bash scripts/audit-dependencies.sh
   container:
     runs-on: ubuntu-latest

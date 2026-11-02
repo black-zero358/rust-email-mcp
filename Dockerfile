@@ -3,6 +3,7 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY vendor/async-imap ./vendor/async-imap
+COPY vendor/imap-proto ./vendor/imap-proto
 RUN cargo build --locked --release
 
 FROM debian:bookworm-slim

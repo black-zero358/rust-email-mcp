@@ -47,9 +47,13 @@ R02 的 `jsonschema = 0.60.2`（MIT）仅作为开发依赖检验真实工具结
 
 R04 的[客户端适配工具](../scripts/attachment-client-adapter/README.md)单独使用 pnpm 锁文件，唯一直接开发依赖 `@modelcontextprotocol/ext-apps = 2.0.4`（MIT）用于官方 UI 消息 Schema 验证。标准下载客户端只使用 Node 内置模块；Node 与该 SDK 均不进入 Rust 产品镜像。依赖升级时重跑适配器测试及显式 Rust→Node 联调，核对官方宿主接口；模拟 UI 候选的接收结果和目标 ChatGPT 文件消费分别记录。
 
+R06 将已锁定的 `imap-proto 0.17.0` 纳入本地补丁，以便在 BODYSTRUCTURE 解析及容器扩容前执行预算。版本和依赖解析保持原值；归档 SHA-256 为 `5ccf963d57074747b455398a1763d174da80bcaba6f51e3671a82252b531a68b`，许可证 MIT OR Apache-2.0。来源、API、边界和替换条件见[补丁记录](../vendor/imap-proto/PATCHES.md)。根 Cargo patch 同时覆盖直接依赖和 async-imap 的传递依赖。
+
+专用审计脚本在同一临时锁文件中恢复 async-imap 与 imap-proto 的精确上游 registry 身份，再运行 cargo-audit；原 Cargo.lock 保持原字节。版本、校验和、缺失/重复记录、意外 source/checksum 及未登记的 path/git 包均触发拒绝。`scripts/test-audit-dependencies.sh` 在 CI 中验证这些边界和失败清理。Docker builder 与上下文仅允许这两个 vendored 目录，context 回归同时验证两个允许项及其他文件拒绝项。
+
 - 每周运行 `bash scripts/audit-dependencies.sh`，在没有代码变更时也检查新公开的漏洞；遇到相关安全公告时及时复核。审计失败应记录受影响版本、可达性、处置和验证结果，不能为保持绿色而无说明地忽略。
 - 至少每月复核 Rust 依赖、工具链、GitHub Actions 和部署镜像的更新；升级通过 PR 处理，保留 Cargo.lock、Actions 完整 SHA 和当前 Rauthy 部署镜像 digest。Dockerfile 的 Rust/Debian 基础镜像目前仍按 tag 引用，复核时记录实际使用的镜像来源；不能据此宣称构建环境已全部不可变固定。固定版本不代表永久不升级。
-- 修改 vendored `async-imap` 时遵循 [PATCHES.md](../vendor/async-imap/PATCHES.md)：同步更新来源、版本/checksum、许可证、审计映射和回归；替换为上游版本前验证协议行为，审计不能代替本地补丁审查。
+- 修改 vendored `async-imap` 或 `imap-proto` 时遵循各自 PATCHES.md：同步更新来源、版本/checksum、许可证、审计映射和回归。替换为上游版本前验证协议完成、解析预算和错误行为，并独立审阅本地补丁差异。
 - 运行故障先使用 request ID、错误码和发送状态定位，维持日志脱敏。认证或邮箱依赖故障按相应状态处置；发送结果不确定时先核查记录，禁止自动重试 `unknown`。重大故障的修复须附合成回归，设计约束有变化时同步更新规范。
 - 备份与恢复遵循 [部署指南](deployment.md#备份与恢复)，记录备份时间、对应应用版本和恢复演练结果。应用回滚与操作记录恢复分别决策，不能用旧数据库快照抹去升级后发生的发送。
 

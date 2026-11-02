@@ -2,6 +2,26 @@
 
 本文件保存带版本与环境边界的证据。每次新增记录注明提交/tag、日期与时区、环境、命令、结果、CI 链接及未覆盖项；保留历史结果，不把其测试数量或部署状态当作当前版本的证明。验证要求见 [贡献指南](../CONTRIBUTING.md#验证与完成标准)。
 
+## 2026-11-02 R06 parser 预算基础验证
+
+源码提交 `e85dd988db2913fa17c990a4a259db4f5e072fbd`，最终源码及字节 fixture 提交 `e0433a9693c96e596e876adf079addc5e8e0aa61`。环境为 WSL Ubuntu、Rust 1.99.1、Docker Desktop；协议测试使用合成响应和本地 duplex 流。
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo fmt --check`；修改的 vendor 文件显式 rustfmt | 通过 |
+| `cargo test --locked` | 200 单元 + 28 集成通过，1 项可选 Node 测试默认忽略；新增预算/Client 集成 26 项进入默认 CI |
+| `cargo clippy --locked --all-targets -- -D warnings` | 通过；测试中两处 repeat/take 等价改为 repeat_n |
+| `cargo build --locked --release` | 通过，30.51 秒 |
+| `bash scripts/test-audit-dependencies.sh` | 20 项离线故障回归通过 |
+| `bash scripts/audit-dependencies.sh` | 实时更新后加载 1396 条公告，扫描 340 个依赖，退出 0；两个本地包均映射至已核验上游身份 |
+| `bash scripts/test-docker-context.sh` | 真实构建器核验仅放行两个 vendor 目录及所需源码 |
+| `docker build --tag rust-email-mcp:r06-parser-local .` | 通过，builder 发布编译约 1 分 48 秒 |
+| 独立上游对照 | 2179 个合法响应前缀/完整 AST 对照、1000 组字节 literal 的 lossy 内容与真实 String 容量核验通过 |
+
+独立审阅发现并修复了 `NIL` 分段时误吞 `Incomplete`，以及 `from_utf8_lossy` 的实际持有容量大于内容长度；增加正常拆包、精确预算、实际容量和 Client 终止回归。最终提交复核另补入四份 `include_bytes!` fixture，并以 binary Git 属性保留 CRLF；四份 Git blob 与工作区原字节逐一核对一致。审阅者将源码、两项修复和 fixture 完整性绑定到 `e0433a9`，无剩余发现。
+
+本子包交付分配前解析预算、静态 typed limit 错误、默认 Client 接线、双依赖来源/审计及容器配置。后续 R06 PartManifest 子包负责工具层 `LIMIT_EXCEEDED/mime_structure` 映射、必要头核对和受控整封回退；R07 负责部件下载。当前未执行真实邮箱或 ChatGPT 连接测试。
+
 ## 2026-11-02 R05 多账户离线验证
 
 实现提交 `c3136348ff75709b1208d1cc40750f2c10b3e2a0`，同步 main 的合并提交 `a0a81aac391a240902881df52109c1ab23b5557a` 与其 tree 一致。最终源码 `ffd1bda62ac80de4bfd13008675334173e2962b6` 仅追加 Clippy 要求的静态错误回退简化。环境为 WSL Ubuntu、Rust 1.99.1、锁定 Cargo.lock 和本地模拟 IMAP/JWT/MCP；附件均为合成文件。
@@ -17,7 +37,9 @@
 
 新增验证覆盖严格 JSON 与秘密文件限制、v1/v2 迁移失败恢复、原 Journal 字节保持、同 UID 双账户读取/附件隔离、每次请求 ACL、固定旧写账户、撤权后的历史操作查询、全局 4 槽/20 请求、256 项/16 MiB 缓存、账户独立退避、完整响应预算。真实 HTTP 取消测试分别覆盖 4 个运行加 16 个排队读取，以及附件 GET 断连/撤权/账户移除后的连接与许可释放。
 
-审阅发现并修复了读取任务 detach 导致取消后继续运行，以及附件 GET/连接诊断超时退避记账遗漏；写任务保留原独立生命周期。调度明确采用基础份额优先、同一层级前台优先。全部测试离线完成，真实 ChatGPT 连接与真实邮件测试后移。Linux 文件凭据权限校验已执行，Windows 使用环境变量引用；Windows 专用拒绝文件引用回归待该平台 Rust 环境执行。PR 最终 head 的 CI 与合并结果随实施状态更新。
+审阅发现并修复了读取任务 detach 导致取消后继续运行，以及附件 GET/连接诊断超时退避记账遗漏；写任务保留原独立生命周期。调度明确采用基础份额优先、同一层级前台优先。全部测试离线完成，真实 ChatGPT 连接与真实邮件测试后移。Linux 文件凭据权限校验已执行，Windows 使用环境变量引用；Windows 专用拒绝文件引用回归待该平台 Rust 环境执行。
+
+[PR #67](https://github.com/black-zero358/rust-email-mcp/pull/67) 的最终 head 为 `9019ef7a2edbcdaded854933b6d0b95fcc37ecf1`，相对最终源码仅追加验证文档。[CI 41426244691](https://github.com/black-zero358/rust-email-mcp/actions/runs/41426244691) 的 check/audit/container 全部通过；合并前复查 GitHub reviews 与 review threads 均为空，独立交叉审阅记录已写入 PR。合并提交为 `501e53989ccab7562d2c1ced28602594f0350b0a`，随后本地 main、开发分支及两者远端引用全部同步到该提交。
 
 ## 2026-11-02 R00–R04 PR 审阅与合并
 

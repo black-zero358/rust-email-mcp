@@ -8,6 +8,18 @@ use base64::DecodeError;
 /// A convenience wrapper around `Result` for `imap::Error`.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Return the static BODYSTRUCTURE budget error carried by an I/O parser error.
+/// The value contains only the resource category, configured limit and unit.
+pub fn body_structure_limit(error: &Error) -> Option<imap_proto::bounded::LimitError> {
+    match error {
+        Error::Io(error) => error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<imap_proto::bounded::LimitError>())
+            .copied(),
+        _ => None,
+    }
+}
+
 /// A set of errors that can occur in the IMAP client
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
