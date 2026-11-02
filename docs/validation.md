@@ -2,6 +2,26 @@
 
 本文件保存带版本与环境边界的证据。每次新增记录注明提交/tag、日期与时区、环境、命令、结果、CI 链接及未覆盖项；保留历史结果，不把其测试数量或部署状态当作当前版本的证明。验证要求见 [贡献指南](../CONTRIBUTING.md#验证与完成标准)。
 
+## 2026-11-02 R06 parser 预算基础验证
+
+源码提交 `e85dd988db2913fa17c990a4a259db4f5e072fbd`，最终源码及字节 fixture 提交 `e0433a9693c96e596e876adf079addc5e8e0aa61`。环境为 WSL Ubuntu、Rust 1.99.1、Docker Desktop；协议测试使用合成响应和本地 duplex 流。
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo fmt --check`；修改的 vendor 文件显式 rustfmt | 通过 |
+| `cargo test --locked` | 200 单元 + 28 集成通过，1 项可选 Node 测试默认忽略；新增预算/Client 集成 26 项进入默认 CI |
+| `cargo clippy --locked --all-targets -- -D warnings` | 通过；测试中两处 repeat/take 等价改为 repeat_n |
+| `cargo build --locked --release` | 通过，30.51 秒 |
+| `bash scripts/test-audit-dependencies.sh` | 20 项离线故障回归通过 |
+| `bash scripts/audit-dependencies.sh` | 实时更新后加载 1396 条公告，扫描 340 个依赖，退出 0；两个本地包均映射至已核验上游身份 |
+| `bash scripts/test-docker-context.sh` | 真实构建器核验仅放行两个 vendor 目录及所需源码 |
+| `docker build --tag rust-email-mcp:r06-parser-local .` | 通过，builder 发布编译约 1 分 48 秒 |
+| 独立上游对照 | 2179 个合法响应前缀/完整 AST 对照、1000 组字节 literal 的 lossy 内容与真实 String 容量核验通过 |
+
+独立审阅发现并修复了 `NIL` 分段时误吞 `Incomplete`，以及 `from_utf8_lossy` 的实际持有容量大于内容长度；增加正常拆包、精确预算、实际容量和 Client 终止回归。最终提交复核另补入四份 `include_bytes!` fixture，并以 binary Git 属性保留 CRLF；四份 Git blob 与工作区原字节逐一核对一致。审阅者将源码、两项修复和 fixture 完整性绑定到 `e0433a9`，无剩余发现。
+
+本子包交付分配前解析预算、静态 typed limit 错误、默认 Client 接线、双依赖来源/审计及容器配置。后续 R06 PartManifest 子包负责工具层 `LIMIT_EXCEEDED/mime_structure` 映射、必要头核对和受控整封回退；R07 负责部件下载。当前未执行真实邮箱或 ChatGPT 连接测试。
+
 ## 2026-11-02 R05 多账户离线验证
 
 实现提交 `c3136348ff75709b1208d1cc40750f2c10b3e2a0`，同步 main 的合并提交 `a0a81aac391a240902881df52109c1ab23b5557a` 与其 tree 一致。最终源码 `ffd1bda62ac80de4bfd13008675334173e2962b6` 仅追加 Clippy 要求的静态错误回退简化。环境为 WSL Ubuntu、Rust 1.99.1、锁定 Cargo.lock 和本地模拟 IMAP/JWT/MCP；附件均为合成文件。

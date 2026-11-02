@@ -387,7 +387,7 @@ UIDVALIDITY 改变立即停用旧世代数据、句柄和游标，后台清理�
 | R03 | 已完成，提交 `b60a686`；独立 HTML 展示策略，交叉审阅与预算修复闭环 | 随 R02 完成集成检查；旧转发与 MIME 候选回归通过 |
 | R04 | 本阶段已完成，提交 `60b8cca`；164 单元 + 2 集成、fmt/clippy/release、7 组客户端测试及 8 文件联调通过 | [PR #65](https://github.com/black-zero358/rust-email-mcp/pull/65) 已合并；最终 head `99aa4e4` 增补 URI 回归并通过全部 CI；[离线验证记录](validation.md#2026-11-02-r04-附件离线下载与内容读取)；真实 ChatGPT 测试后移 |
 | R05 | 已完成，源码 `ffd1bda`；200 单元 + 2 集成、fmt/clippy/release、8 文件客户端联调通过 | [PR #67](https://github.com/black-zero358/rust-email-mcp/pull/67) 最终 head `9019ef7` 全部 CI 通过，已合并为 `501e539`；[设计与配置](multi-account-design.md)、[离线验证](validation.md#2026-11-02-r05-多账户离线验证) |
-| R06 | 实施中；有界 parser 和 PartManifest 隔离原型已建立 | 先提交 parser 预算、依赖来源/审计与容器子 PR，再接入已核对的附件映射 |
+| R06 | 实施中；parser 基础 `e0433a9` 已通过独立审阅、200 单元 + 28 集成及完整构建/审计/容器检查；PartManifest 原型已建立 | 提交 parser 子 PR 后接入附件映射；[基础验证](validation.md#2026-11-02-r06-parser-预算基础验证) |
 | R07–R09 | 待实施 | 部件读取、预览分类、跨目录会话 |
 | R10–R13 | 待实施 | 持久化、完整回填、离线及发布验收 |
 
