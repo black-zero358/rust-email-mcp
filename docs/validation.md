@@ -2,6 +2,18 @@
 
 本文件保存带版本与环境边界的证据。每次新增记录注明提交/tag、日期与时区、环境、命令、结果、CI 链接及未覆盖项；保留历史结果，不把其测试数量或部署状态当作当前版本的证明。验证要求见 [贡献指南](../CONTRIBUTING.md#验证与完成标准)。
 
+## 2026-11-02 R00–R04 PR 审阅与合并
+
+按工作包依赖顺序完成审阅和合并，远端 main 与本地 main 同步到 `8b659baf2551ecfec7060e275c29cd13b0ed7f36`。R05 在开发分支继续推进。
+
+| 范围 | PR 与最终 head | CI | 合并提交 |
+| --- | --- | --- | --- |
+| R00/R01 | [#63](https://github.com/black-zero358/rust-email-mcp/pull/63)，`d654ace` | [check/audit/container 成功](https://github.com/black-zero358/rust-email-mcp/actions/runs/41419415243) | `896126a1d57128d5b87a3cc8353c3e7704524498` |
+| R02/R03 | [#64](https://github.com/black-zero358/rust-email-mcp/pull/64)，`928a866` | [check/audit/container 成功](https://github.com/black-zero358/rust-email-mcp/actions/runs/41421214346) | `c13a59826af3c392c42f1018b6974a6dc57b5746` |
+| R04 | [#65](https://github.com/black-zero358/rust-email-mcp/pull/65)，`99aa4e4` | [check/audit/container 成功](https://github.com/black-zero358/rust-email-mcp/actions/runs/41421541914) | `8b659baf2551ecfec7060e275c29cd13b0ed7f36` |
+
+GitHub Codex 自动审阅遇到账户额度限制。此次改由未实现相应模块的子 agent 交叉审阅指定提交，主 agent 复核集成差异，结果逐一记录在 PR。审阅发现 R02 的 `download_url` URI Schema 与直接拼接 Unicode 资源地址冲突；修复 `928a866` 使用 URL 编码，并增加真实 MCP→本地 IMAP 的 Unicode 配置回归。原发现者复核闭环后才合并 #64。#65 整合该修复，生产代码保持原 R04 实现，新增同一回归，最终提交重新通过 CI。合并时三个 PR 均无未解决 review thread。
+
 ## 2026-11-02 R04 附件离线下载与内容读取
 
 源码提交 `60b8cca`，本地分支 `codex/read-capabilities-plan`。按用户确认的范围，本阶段使用本地模拟 IMAP、JWT/MCP 服务和合成文件完成离线测试；ChatGPT 实际连接测试放到后续阶段。
