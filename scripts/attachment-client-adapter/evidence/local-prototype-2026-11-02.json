@@ -1,0 +1,56 @@
+{
+  "recorded_on": "2026-11-02",
+  "node": "v24.15.0",
+  "platform": "win32",
+  "command": "pnpm exec node --test --test-reporter=tap adapter.test.mjs",
+  "tests": 7,
+  "passed": 7,
+  "failed": 0,
+  "scope": "local synthetic HTTP fixture, mocked UI host, official ext-apps 2.0.4 schemas",
+  "phase_exit": "offline_synthetic_download_and_content_reading_passed",
+  "external_connection_testing": "deferred; not part of this phase",
+  "stages_verified": [
+    "local_file_ready",
+    "mock_host_file_registered",
+    "mock_context_acknowledged"
+  ],
+  "sources": [
+    {
+      "url": "https://developers.openai.com/plugins/reference.md",
+      "bytes": 39243,
+      "sha256": "5fdb4fcc9c41827152866392969d9d306ac1eea82f508284bd6e9fea34a6335a"
+    },
+    {
+      "url": "https://developers.openai.com/plugins/build/chatgpt-ui.md",
+      "bytes": 27401,
+      "sha256": "4e5835aed17db410ea224bf56adadf54eced1e9724f628c41a319ef063a173dd"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/modelcontextprotocol/ext-apps/v2.0.4/src/spec.types.ts",
+      "bytes": 29430,
+      "sha256": "f46212be3355fa0437c81b01659187efacdeef6fa50be23be02a47d03610bc6a"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/modelcontextprotocol/ext-apps/v2.0.4/src/app.ts",
+      "bytes": 74988,
+      "sha256": "1f631679e471f66f227f9c603ebc6408f941b5e0c4767dbe73f30d1d07a478ed"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/modelcontextprotocol/ext-apps/v2.0.4/specification/2026-01-26/apps.mdx",
+      "bytes": 59181,
+      "sha256": "ee452a7d1b9b7fb900acfeb4d6932d3963375b0f3f37d196a4b93eb80312af0e"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/modelcontextprotocol/ext-apps/v2.0.4/docs/migrate_from_openai_apps.md",
+      "bytes": 20880,
+      "sha256": "c9b27e34db1777e781fd1ed188b5b04bdaa620f2d3f5aa64153e8b180194aa16"
+    }
+  ],
+  "linux_node_development_tool": {
+    "version": "24.15.0",
+    "source": "https://nodejs.org/dist/v24.15.0/node-v24.15.0-linux-x64.tar.xz",
+    "verification": "official SHASUMS256.txt: sha256sum --check passed",
+    "sha256": "472655581fb851559730c48763e0c9d3bc25975c59d518003fc0849d3e4ba0f6",
+    "location": "ignored generated directory; no system installation"
+  }
+}

@@ -8,6 +8,9 @@ use serde_json::{Value, json};
 /// Standard schema lengths count code points; the extension publishes the
 /// independent UTF-8 budget consumed by this validator.
 pub(super) fn read_properties(mut properties: Value) -> Value {
+    if properties.get("attachment_id").is_some() || properties.get("attachment_offset").is_some() {
+        properties["account_id"] = json!({"type":"string","enum":["default"],"default":"default"});
+    }
     if properties.get("body_mode").is_some() {
         properties["html_display"] =
             json!({"type":"string","enum":["legacy","readable"],"default":"legacy"});
@@ -240,6 +243,35 @@ fn structural(value: &Value, schema: &Value, field: &str, out: &mut Vec<InputVio
 }
 
 fn semantic(name: &str, args: &Value, out: &mut Vec<InputViolation>) {
+    if matches!(name, "download_attachment" | "prepare_attachment_download") {
+        if args.get("attachment_id").is_none() && args.get("attachment_index").is_none() {
+            push(
+                out,
+                InputViolation::new(
+                    "",
+                    "attachment_reference_required",
+                    "provide_attachment_reference",
+                ),
+            );
+        }
+        if let Some(id) = args["attachment_id"].as_str()
+            && !id.strip_prefix("att_v1_").is_some_and(|value| {
+                value.len() == 64
+                    && value
+                        .bytes()
+                        .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+            })
+        {
+            push(
+                out,
+                InputViolation::new(
+                    "/attachment_id",
+                    "invalid_attachment_id",
+                    "relist_attachments",
+                ),
+            );
+        }
+    }
     for key in ["mailbox", "query", "from", "to", "subject"] {
         if args[key].as_str().is_some_and(|text| text.contains('\n')) {
             push(
@@ -620,5 +652,53 @@ mod tests {
             details(check("get_operation", json!({"operation_key":"中".repeat(43)})).unwrap_err());
         assert_eq!(bad["reason"], "utf8_byte_limit");
         assert_eq!(bad["limit"], 128);
+    }
+
+    #[test]
+    fn attachment_selectors_publish_and_enforce_the_same_reference_rules() {
+        let id = format!("att_v1_{}", "a".repeat(64));
+        for name in ["download_attachment", "prepare_attachment_download"] {
+            let input = schema(name);
+            let standard = jsonschema::draft202012::options().build(&input).unwrap();
+            for selector in [
+                json!({"attachment_id":id}),
+                json!({"attachment_index":0}),
+                json!({"attachment_index":1023}),
+                json!({"attachment_id":id,"attachment_index":1023}),
+            ] {
+                let mut args = json!({"uid":7,"uid_validity":9,"account_id":"default"});
+                args.as_object_mut()
+                    .unwrap()
+                    .extend(selector.as_object().unwrap().clone());
+                assert!(standard.is_valid(&args));
+                check(name, args).unwrap();
+            }
+            for selector in [
+                json!({}),
+                json!({"attachment_index":1024}),
+                json!({"attachment_index":-1}),
+                json!({"attachment_id":format!("att_v1_{}","A".repeat(64))}),
+                json!({"attachment_id":null}),
+            ] {
+                let mut args = json!({"uid":7,"uid_validity":9});
+                args.as_object_mut()
+                    .unwrap()
+                    .extend(selector.as_object().unwrap().clone());
+                assert!(!standard.is_valid(&args));
+                assert!(check(name, args).is_err());
+            }
+        }
+        check(
+            "list_attachments",
+            json!({"uid":7,"uid_validity":9,"attachment_offset":1023}),
+        )
+        .unwrap();
+        assert!(
+            check(
+                "list_attachments",
+                json!({"uid":7,"uid_validity":9,"attachment_offset":1024})
+            )
+            .is_err()
+        );
     }
 }

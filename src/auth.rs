@@ -61,6 +61,21 @@ async fn bounded_json<T: serde::de::DeserializeOwned>(
     Ok(serde_json::from_slice(&bytes)?)
 }
 impl Auth {
+    /// Isolated signing keys for HTTP middleware regressions; production keys
+    /// always come from the configured issuer and its bounded JWKS refresh.
+    #[cfg(test)]
+    pub(crate) fn from_test_jwks(config: Arc<Config>, keys: JwkSet) -> Arc<Self> {
+        Arc::new(Self {
+            config,
+            client: reqwest::Client::new(),
+            jwks_uri: "https://isolated.invalid/jwks".into(),
+            keys: Mutex::new((keys, Instant::now())),
+            refresh: Mutex::new(RefreshState {
+                completed: Instant::now(),
+                failed: false,
+            }),
+        })
+    }
     pub async fn new(config: Arc<Config>) -> anyhow::Result<Arc<Self>> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
@@ -193,6 +208,7 @@ impl Auth {
 pub async fn require_auth(State(auth): State<Arc<Auth>>, mut req: Request, next: Next) -> Response {
     let started = Instant::now();
     let request_id = uuid::Uuid::new_v4().to_string();
+    let attachment = req.uri().path().starts_with("/mcp/attachments/");
     let token = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -207,12 +223,32 @@ pub async fn require_auth(State(auth): State<Arc<Auth>>, mut req: Request, next:
         req.extensions_mut().insert(RequestId(request_id.clone()));
         next.run(req).await
     } else if matches!(principal, Err(AuthError::Unavailable)) {
-        let mut r = StatusCode::SERVICE_UNAVAILABLE.into_response();
+        let mut r = if attachment {
+            attachment_auth_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "AUTH_UNAVAILABLE",
+                "Authentication service is unavailable.",
+                "retry_with_backoff",
+                &request_id,
+            )
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        };
         r.headers_mut()
             .insert(header::RETRY_AFTER, header::HeaderValue::from_static("10"));
         r
     } else {
-        let mut r = StatusCode::UNAUTHORIZED.into_response();
+        let mut r = if attachment {
+            attachment_auth_error(
+                StatusCode::UNAUTHORIZED,
+                "UNAUTHORIZED",
+                "A valid access token is required for this attachment.",
+                "refresh_authentication",
+                &request_id,
+            )
+        } else {
+            StatusCode::UNAUTHORIZED.into_response()
+        };
         let metadata = format!(
             "{}/.well-known/oauth-protected-resource",
             auth.config.resource.trim_end_matches("/mcp")
@@ -235,6 +271,24 @@ pub async fn require_auth(State(auth): State<Arc<Auth>>, mut req: Request, next:
         request_id,
         status = response.status().as_u16(),
         duration_ms = started.elapsed().as_millis() as u64
+    );
+    response
+}
+fn attachment_auth_error(
+    status: StatusCode,
+    code: &'static str,
+    message: &'static str,
+    action: &'static str,
+    request_id: &str,
+) -> Response {
+    let mut response = (status, axum::Json(serde_json::json!({"error":{"code":code,"message":message,"phase":"authentication","action":action},"request_id":request_id}))).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    response.headers_mut().insert(
+        "x-content-type-options",
+        header::HeaderValue::from_static("nosniff"),
     );
     response
 }
@@ -500,6 +554,68 @@ mod tests {
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
             assert!(response.headers().contains_key(header::WWW_AUTHENTICATE));
             assert!(response.headers().contains_key("x-request-id"));
+            let request_id = response.headers()["x-request-id"]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["request_id"], request_id);
+            assert_eq!(body["error"]["code"], "UNAUTHORIZED");
+            assert_eq!(body["error"]["phase"], "authentication");
+            assert_eq!(body["error"]["action"], "refresh_authentication");
+        }
+    }
+
+    #[tokio::test]
+    async fn attachment_jwks_outage_has_private_json_and_preserves_mcp_response() {
+        use axum::{Router, body::Body, http::Request, middleware, routing::get};
+        use tower::ServiceExt;
+        let auth = Auth::from_test_jwks(crate::config::fixture(), JwkSet { keys: vec![] });
+        {
+            let mut refresh = auth.refresh.lock().await;
+            refresh.failed = true;
+        }
+        let token = format!(
+            "{}.e30.invalid",
+            URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","kid":"private-missing-key"}"#)
+        );
+        let router = Router::new()
+            .route("/mcp/attachments/{token}", get(|| async { "unreachable" }))
+            .route("/mcp", get(|| async { "unreachable" }))
+            .layer(middleware::from_fn_with_state(auth, require_auth));
+        for path in ["/mcp/attachments/private-handle", "/mcp"] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::get(path)
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()[header::RETRY_AFTER], "10");
+            let id = response.headers()["x-request-id"]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            if path == "/mcp" {
+                assert!(bytes.is_empty());
+            } else {
+                let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(value["request_id"], id);
+                assert_eq!(value["error"]["code"], "AUTH_UNAVAILABLE");
+                assert_eq!(value["error"]["phase"], "authentication");
+                assert_eq!(value["error"]["action"], "retry_with_backoff");
+                assert!(!String::from_utf8_lossy(&bytes).contains("private"));
+            }
         }
     }
 }

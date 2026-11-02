@@ -1,0 +1,15 @@
+{
+  "validated_on": "2026-11-02",
+  "test": "server::output_tests::attachments::standalone_node_adapter_consumes_real_rust_mcp_and_authorized_get",
+  "source": "src/server/output_tests/attachments.rs",
+  "mode": "explicit ignored development acceptance; Node is not required by default Cargo tests",
+  "rust_toolchain": "1.99.1",
+  "node": "24.15.0",
+  "result": { "passed": 1, "failed": 0, "ignored": 0, "fixture_count": 8, "elapsed_seconds": 5.42 },
+  "fixture_ids": ["utf8-csv", "workbook", "paragraph", "same-name-a", "same-name-b", "legacy-over", "inline-exact", "inline-over"],
+  "path": "isolated TLS IMAP fixture -> actual Rust JWT-authenticated MCP prepare -> authorized Rust binary GET -> Node CLI -> local file -> Rust independent length/SHA-256 comparison",
+  "checks": ["R04 descriptor consumed", "HTTP SHA-256 and Content-Digest compared", "decoded bytes complete", "all eight fixture sizes matched", "all eight original SHA-256 values matched", "duplicate filenames retained separately", "524289-byte fixture consumed"],
+  "phase_exit": "offline_synthetic_download_and_content_reading_passed",
+  "external_connection_testing": "deferred; not part of this phase",
+  "secrets": "credentials passed only through process environment; output omits token and URL"
+}

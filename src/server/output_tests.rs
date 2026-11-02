@@ -20,6 +20,8 @@ use tokio_rustls::{
 };
 use tower::ServiceExt;
 
+mod attachments;
+
 fn validator(name: &str) -> jsonschema::Validator {
     let tool = tools("full").into_iter().find(|t| t.name == name).unwrap();
     let schema = serde_json::to_value(tool.output_schema.unwrap()).unwrap();
@@ -77,6 +79,15 @@ impl Harness {
         max_output: usize,
         stall_greeting: bool,
     ) -> Self {
+        Self::with_resource(messages, fatal_uid, max_output, stall_greeting, None).await
+    }
+    async fn with_resource(
+        messages: BTreeMap<u32, Vec<u8>>,
+        fatal_uid: Option<u32>,
+        max_output: usize,
+        stall_greeting: bool,
+        resource: Option<String>,
+    ) -> Self {
         let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let cert = certified.cert.der().clone();
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
@@ -93,6 +104,9 @@ impl Harness {
         configuration.imap_host = "localhost".into();
         configuration.imap_port = listener.local_addr().unwrap().port();
         configuration.max_output = max_output;
+        if let Some(resource) = resource {
+            configuration.resource = resource;
+        }
         configuration.timeout = if stall_greeting {
             Duration::from_millis(100)
         } else {

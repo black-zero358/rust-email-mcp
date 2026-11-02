@@ -33,6 +33,8 @@
 - Keep the vendored dependency provenance, completion-status regressions and `scripts/audit-dependencies.sh` aligned. Plain `cargo audit` skips path packages. Keep the Docker context allowlist narrow and include only the required vendored crate in the builder. See [dependency maintenance](docs/maintenance.md) and [PATCHES.md](vendor/async-imap/PATCHES.md).
 
 - Mail workflow extensions live in `mail/attachments.rs` and `mail/insights.rs`; reuse bounded MIME and rev1 text handling. Keep attachment indices consistent and preserve inline Base64 downloads; authenticated binary handles use a separate tool.
+- Attachment IDs bind AccountKey, mailbox, UIDVALIDITY, UID and the original MIME traversal index; preserve id/index agreement. Download errors use bounded private JSON and release transfer permits on every failure or cancellation. Generate digests from fully decoded bytes after successful tagged completion; retain the same-subject and current-account checks on GET.
+- Attachment acceptance is currently offline only: synthetic files and local simulated IMAP/MCP clients. Defer real ChatGPT connections and real-mail testing. Describe the user-facing behavior as downloading attachments and reading their contents. Preserve byte-exact fixtures through Git attributes.
 - Statistics require all requested STATUS fields and matching tagged completion. Batches preserve per-item unknown/unprocessed outcomes and never retry automatically; document bounded search coverage and omissions.
 - In `get_emails`, continue after local MIME errors only after raw FETCH completed successfully. Keep the conservative stop on raw fetch/transport/protocol failures; later items remain unprocessed, never automatically retried.
 

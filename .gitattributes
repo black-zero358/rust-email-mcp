@@ -1,1 +1,5 @@
 * text=auto eol=lf
+# Attachment fixtures are byte-exact protocol inputs; preserve CRLF and PDF offsets.
+tests/fixtures/attachment_delivery/*.csv binary
+tests/fixtures/attachment_delivery/*.pdf binary
+tests/fixtures/attachment_delivery/*.xlsx binary

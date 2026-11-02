@@ -65,7 +65,9 @@ async-imap 0.12 的 APPEND flags 原样序列化，必须传入 `(\Draft)` 这�
 
 APPEND 等待同步 literal continuation 时，先将合法 untagged 通知交给现有有界 unsolicited 队列，再继续读取；只有 `Continue` 才发送正文。continuation 前任何 tagged 结果（包括提前 OK 和错误 tag）、BYE、EOF 或读取错误均失败且不发送 literal，拒绝后排队的 continuation 不能恢复命令。完整 literal 后仍等待匹配 tag 的 OK。`save_draft_waits_for_continuation_after_notifications` 和 `save_draft_append_protocol` 覆盖这一 D2 协议边界；不改变草稿 flags/MIME 或发送策略。
 
-`mail/attachments.rs` 使用现有有界整封邮件与 MIME 解析发现附件，统一 `get_email`、列表、内联 Base64 和二进制下载的索引与附件子树边界。`download_attachment` 保持原契约；新增 `prepare_attachment_download` 保存最多 64 个主体绑定、600 秒有效的元数据句柄。GET 再核对 UIDVALIDITY 并重新读取整封邮件；不引入 BODYSTRUCTURE 或单部分 FETCH。四份二进制传输许可持有至响应消费或丢弃，邮箱连接仍共用原槽位与预算。
+`mail/attachments.rs` 编排有界整封读取和下载生命周期，`mail/attachments/metadata.rs` 负责稳定引用、索引选择及描述。`get_email`、列表、内联 Base64 和二进制下载共用原 MIME 遍历索引（0–1023）与附件子树边界。`att_v1_` 引用用带域分离的 SHA-256 绑定 AccountKey 命名空间、文件夹、UIDVALIDITY、UID、索引和 MIME 引用版本；同时传入 id/index 时核对一致性。描述中的原文件名保留展示用途，安全文件名另行约束路径字符、控制字符、长度及保留设备名。
+
+`prepare_attachment_download` 保存最多 64 个主体绑定、600 秒有效的元数据句柄。GET 再核对主体、AccountKey、UIDVALIDITY 并重新读取整封邮件；不引入 BODYSTRUCTURE 或单部分 FETCH。四份二进制传输许可持有至响应消费或丢弃，邮箱连接共用原槽位与预算。附件路径按 [RFC 3501 §6.4.5](https://www.rfc-editor.org/rfc/rfc3501#section-6.4.5) 核对完整 BODY[] 长度与 RFC822.SIZE 一致；完整解码并通过匹配 tagged OK 后计算 `X-Content-SHA256` 和 `Content-Digest`。HTTP 内容固定为 octet-stream，带 no-store/nosniff。错误映射见[附件契约](capabilities.md#附件与兼容性)，认证错误同样返回带 request_id 的小型 JSON。仅完成命令且未出现目标 UID 才判为消息不存在；目标 UID 缺必需属性、大小不一致及命令失败返回后端错误。
 
 `mail/insights.rs` 提供有界标识符图会话、精确 Message-ID 定位、严格 STATUS 统计、脱敏诊断与正文展示。头部缓存最多 256 项/16 MiB、60 秒，只保存不可变头部并以新 UIDVALIDITY 失效；正文共用 `mime`/`html` 选择器。统计用 `imap_text::status_counts` 验证完整字段和命令完成。批量修改使用明确 UID、总体期限和逐项结果，失败项保守为 unknown、后续 unprocessed；没有持久化修改日志，重试前必须检查邮箱。范围与限制见 [能力说明](capabilities.md)。
 
@@ -75,7 +77,7 @@ APPEND 等待同步 literal continuation 时，先将合法 untagged 通知交�
 
 邮件正文、主题、头部和附件均按不可信输入处理。构建 MIME 结构前检查共享的节点、深度和头部预算；transfer/charset 解码前预留预算。不得恢复对不可信输入调用 `mailparse::parse_mail`；回复和草稿发送只需要有界头部。boundary 按完整分隔符匹配，接受允许的尾部空白，不能把相同前缀当作分隔符。
 
-依据 [RFC 2045 §6.1、§6.4](https://www.rfc-editor.org/rfc/rfc2045#section-6.4)，缺省 transfer encoding 为 7bit，编码名不区分大小写；未知编码实体不按声明的 MIME 类型解释。解析时对未知编码停止 multipart 递归，选择时把非空内联实体视为不支持，允许 alternative 回滚并选另一完整候选；没有候选时返回既有 `UNSUPPORTED_BODY`。`encoded()` 在调用 mailparse `Body::new` 前显式验证编码，不能依赖该库把未知值默认为 SevenBit 的行为。`body_raw` 同样拒绝未知编码，不把原始编码字节作为已解码附件交付，认证下载保留原 HTTP 502 后端失败映射。显式附件分类和共享索引不变，真正空实体不被当作非空正文错误，原有结构、头部和解码分配前预算继续适用。
+依据 [RFC 2045 §6.1、§6.4](https://www.rfc-editor.org/rfc/rfc2045#section-6.4)，缺省 transfer encoding 为 7bit，编码名不区分大小写；未知编码实体不按声明的 MIME 类型解释。解析时对未知编码停止 multipart 递归，选择时把非空内联实体视为不支持，允许 alternative 回滚并选另一完整候选；没有候选时返回既有 `UNSUPPORTED_BODY`。`encoded()` 在调用 mailparse `Body::new` 前显式验证编码，不能依赖该库把未知值默认为 SevenBit 的行为。`body_raw` 同样拒绝未知编码；附件工具返回 `UNSUPPORTED_TRANSFER_ENCODING`，认证 GET 映射 HTTP 422，坏编码解码失败单独映射 HTTP 502。显式附件分类和共享索引不变，真正空实体不被当作非空正文错误，原有结构、头部和解码分配前预算继续适用。
 
 正文选择排除显式 attachment 或带文件名的部件及其整个子树；`multipart/alternative` 选一个受支持表示并优先纯文本，`multipart/related` 只选主部件。读取和转发共用选择逻辑，附件列表和下载共用分类规则，multipart 附件可整体下载。真实空正文与“不支持或无法完整解释的正文”必须区分。
 
@@ -146,6 +148,8 @@ SMTPUTF8 需求与确定拒绝对应 D3/D4：`mime::requires_smtputf8`、`smtp::
 ## Decision records
 
 R01 的字符与错误回归入口：`read_lengths_count_unicode_code_points_and_publish_byte_limits`、`read_structure_errors_are_bounded_private_and_point_to_array_items`、`read_mailbox_unicode_and_wire_budgets_keep_legacy_writes_frozen`、`read_search_transmits_full_unicode_literal_at_character_boundary`、`legacy_write_argument_schemas_and_byte_validation_stay_frozen`、`legacy_write_mailbox_inputs_and_configured_directories_stay_at_512_bytes`、`recorded_send_status_remains_available_after_legacy_directory_change`、`input_detail_budget_preserves_original_error_and_measures_real_wire`、`budget_errors_identify_header_structure_attachment_and_body_resources`。分别覆盖 D2/D3/D4/D5 的输入、协议、幂等与错误预算边界。
+
+R04 的 D1/D2/D3/D5 回归入口为 `opaque_ids_bind_every_reference_dimension_and_preserve_all_mime_indices`、`attachment_fetch_reports_absence_only_after_successful_tagged_completion`、`http_failure_classes_are_small_private_and_release_transfer_permits`、`four_slow_consumers_cancel_and_timeout_without_losing_capacity`、`expired_wrong_principal_or_account_handles_return_private_reprepare_errors`，以及真实 JWT MCP/GET 的 `server::output_tests::attachments`。它们核对稳定引用、认证隐私、命令完成、失败分类、许可释放、8 组文件完整字节和输出 Schema。跨运行时的 Node 适配验收作为显式 ignored 测试执行，默认 Cargo 测试仅需 Rust。
 
 R02/R03 的新增验证入口：`accounts/tests.rs` 覆盖 D1/D4 的身份绑定、并发初始化、损坏与恢复；`every_read_output_schema_validates_real_handler_success_and_empty_results` 和其余 `server/output_tests` 覆盖 D3/D5 的正常、局部失败、诊断超时和完整 wire 压缩结果；`readable_reads_use_one_display_policy_while_forward_keeps_legacy_body`、`readable_html_expansion_uses_display_budget_after_bounded_charset_decode` 及 `html/readable` 回归覆盖 MIME 候选、旧转发、显示膨胀与跨部件预算。
 
