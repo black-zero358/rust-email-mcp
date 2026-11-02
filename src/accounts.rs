@@ -30,6 +30,13 @@ pub struct AccountKey {
 }
 
 impl AccountKey {
+    pub(crate) fn reference_namespace(&self) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        hash.update(b"email-mcp-account-key-v1\0");
+        hash.update(self.uuid.as_bytes());
+        hash.update(self.generation.to_be_bytes());
+        hash.finalize().into()
+    }
     #[cfg(test)]
     pub(crate) fn synthetic() -> Self {
         Self {

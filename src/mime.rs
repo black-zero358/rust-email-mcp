@@ -4,12 +4,19 @@
 use crate::error::{LimitKind, MailError, Result};
 use mailparse::{MailHeader, MailHeaderMap, ParsedContentType, body::Body};
 
-const MAX_PARTS: usize = 1024;
-const MAX_DEPTH: usize = 32;
+pub(crate) const MAX_PARTS: usize = 1024;
+pub(crate) const MAX_DEPTH: usize = 32;
 const MAX_HEADER_BLOCK: usize = 128 * 1024;
 const MAX_HEADER_BYTES: usize = 1024 * 1024;
 const MAX_HEADER_LINES: usize = 8192;
 const MAX_DECODE_BYTES: usize = 32 * 1024 * 1024;
+
+pub(crate) fn attachment_input_limit(decoded_limit: usize) -> usize {
+    decoded_limit
+        .saturating_mul(2)
+        .saturating_add(4096)
+        .min(MAX_DECODE_BYTES)
+}
 
 #[derive(Default)]
 struct Budget {
@@ -253,15 +260,44 @@ impl Part<'_> {
         self.body.len()
     }
 
+    pub(crate) fn attachment_encoding_supported(&self) -> bool {
+        self.transfer_encoding().is_ok()
+    }
+
+    pub(crate) fn attachment_size_hint(&self) -> (Option<usize>, &'static str) {
+        match self
+            .transfer_encoding()
+            .as_ref()
+            .map(|value| value.as_deref())
+        {
+            Ok(None | Some("7bit" | "8bit" | "binary")) => (Some(self.body.len()), "exact"),
+            Ok(Some("base64")) => {
+                let octets = self
+                    .body
+                    .iter()
+                    .filter(|b| !b.is_ascii_whitespace())
+                    .count();
+                let padding = self
+                    .body
+                    .iter()
+                    .rev()
+                    .filter(|b| !b.is_ascii_whitespace())
+                    .take_while(|b| **b == b'=')
+                    .take(2)
+                    .count();
+                (
+                    Some((octets / 4 * 3 + octets % 4 * 3 / 4).saturating_sub(padding)),
+                    "estimate",
+                )
+            }
+            _ => (None, "unknown"),
+        }
+    }
+
     pub fn body_raw(&self, max: usize) -> Result<Vec<u8>> {
         // Transfer codecs never expand beyond encoded bytes. Limit their input
         // before they allocate cleaning buffers or decoded output.
-        if self.body.len()
-            > max
-                .saturating_mul(2)
-                .saturating_add(4096)
-                .min(MAX_DECODE_BYTES)
-        {
+        if self.body.len() > attachment_input_limit(max) {
             return Err(MailError::limit_kind(LimitKind::DecodedAttachmentBytes));
         }
         let decoded = match self.encoded()? {

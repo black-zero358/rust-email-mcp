@@ -45,6 +45,8 @@
 
 R02 的 `jsonschema = 0.60.2`（MIT）仅作为开发依赖检验真实工具结果，默认特性关闭，使用本地 Schema 定义；产品运行时依赖保持原集合。对应官方 [API](https://docs.rs/jsonschema/0.60.2/jsonschema/) 与[许可证](https://github.com/Stranger6667/jsonschema/blob/master/LICENSE)作为维护入口；锁文件变化继续执行专用审计和容器验证。
 
+R04 的[客户端适配工具](../scripts/attachment-client-adapter/README.md)单独使用 pnpm 锁文件，唯一直接开发依赖 `@modelcontextprotocol/ext-apps = 2.0.4`（MIT）用于官方 UI 消息 Schema 验证。标准下载客户端只使用 Node 内置模块；Node 与该 SDK 均不进入 Rust 产品镜像。依赖升级时重跑适配器测试及显式 Rust→Node 联调，核对官方宿主接口；模拟 UI 候选的接收结果和目标 ChatGPT 文件消费分别记录。
+
 - 每周运行 `bash scripts/audit-dependencies.sh`，在没有代码变更时也检查新公开的漏洞；遇到相关安全公告时及时复核。审计失败应记录受影响版本、可达性、处置和验证结果，不能为保持绿色而无说明地忽略。
 - 至少每月复核 Rust 依赖、工具链、GitHub Actions 和部署镜像的更新；升级通过 PR 处理，保留 Cargo.lock、Actions 完整 SHA 和当前 Rauthy 部署镜像 digest。Dockerfile 的 Rust/Debian 基础镜像目前仍按 tag 引用，复核时记录实际使用的镜像来源；不能据此宣称构建环境已全部不可变固定。固定版本不代表永久不升级。
 - 修改 vendored `async-imap` 时遵循 [PATCHES.md](../vendor/async-imap/PATCHES.md)：同步更新来源、版本/checksum、许可证、审计映射和回归；替换为上游版本前验证协议行为，审计不能代替本地补丁审查。

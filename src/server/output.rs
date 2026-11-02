@@ -1,5 +1,6 @@
 //! Exact structured-content contracts for the currently implemented read tools.
 //! Success, local item errors and the complete-wire fallback share this source.
+use crate::mail::attachments::MAX_ATTACHMENT_INDEX;
 use serde_json::{Value, json};
 
 fn object(properties: Value, required: &[&str]) -> Value {
@@ -43,8 +44,8 @@ fn violation() -> Value {
     object(
         json!({
             "field":{"type":"string","pattern":"^(?:/(?:[^~/]|~[01])*)*$"},
-            "reason":enumeration(&["type_mismatch","required_field","unknown_field","character_minimum","character_limit","utf8_byte_limit","wire_byte_limit","forbidden_control_character","integer_range","item_count","constant_mismatch","unsupported_value","invalid_date","conflicting_range","required_with_field","date_range_limit","invalid_message_id","resource_limit"]),
-            "action":enumeration(&["use_expected_type","provide_field","remove_unknown_fields","provide_longer_field","shorten_field","remove_control_characters","use_expected_range","use_expected_item_count","use_required_value","use_supported_value","use_valid_calendar_date","adjust_range","provide_paired_field","shorten_date_range","use_message_id_header","reduce_request"]),
+            "reason":enumeration(&["type_mismatch","required_field","unknown_field","character_minimum","character_limit","utf8_byte_limit","wire_byte_limit","forbidden_control_character","integer_range","item_count","constant_mismatch","unsupported_value","invalid_date","conflicting_range","required_with_field","date_range_limit","invalid_message_id","resource_limit","attachment_reference_required","invalid_attachment_id","reference_mismatch"]),
+            "action":enumeration(&["use_expected_type","provide_field","remove_unknown_fields","provide_longer_field","shorten_field","remove_control_characters","use_expected_range","use_expected_item_count","use_required_value","use_supported_value","use_valid_calendar_date","adjust_range","provide_paired_field","shorten_date_range","use_message_id_header","reduce_request","provide_attachment_reference","relist_attachments","use_matching_reference","use_default_account"]),
             "expected":string(),"actual_type":enumeration(&["null","boolean","integer","number","string","array","object"]),
             "limit":count(),"actual":count(),"unit":enumeration(&["unicode_code_points","utf8_bytes","modified_utf7_bytes","items","days","bytes"]),
             "minimum":count(),"maximum":count(),"related_field":{"type":"string","pattern":"^(?:/(?:[^~/]|~[01])*)*$"}
@@ -93,7 +94,7 @@ fn error() -> Value {
     details["dependentRequired"] = dependencies;
     object(
         json!({
-            "code":enumeration(&["INVALID_INPUT","MAIL_BACKEND","STORAGE_UNAVAILABLE","LIMIT_EXCEEDED","TIMEOUT","BUSY","STALE_UID","NOT_FOUND","UNSUPPORTED_BODY","UNSUPPORTED_CHARSET","INTERNAL"]),
+            "code":enumeration(&["INVALID_INPUT","MAIL_BACKEND","STORAGE_UNAVAILABLE","LIMIT_EXCEEDED","TIMEOUT","BUSY","STALE_UID","NOT_FOUND","UNSUPPORTED_BODY","UNSUPPORTED_CHARSET","UNSUPPORTED_TRANSFER_ENCODING","ATTACHMENT_DECODE_FAILED","ATTACHMENT_NOT_FOUND","INTERNAL"]),
             "message":string(),"retryable":boolean(),"details":details
         }),
         &["code", "message", "retryable"],
@@ -131,6 +132,34 @@ fn operation() -> Value {
     all_required(
         json!({"status":enumeration(&["sending","accepted","rejected","unknown"]),"message_id":string(),"warnings":array(string())}),
     )
+}
+
+fn attachment_reference() -> Value {
+    json!({"account_id":{"const":"default"},"mailbox":string(),"uid":uid(),"uid_validity":uid(),
+        "attachment_id":{"type":"string","pattern":"^att_v1_[0-9a-f]{64}$"},"attachment_index":{"type":"integer","minimum":0,"maximum":MAX_ATTACHMENT_INDEX}})
+}
+fn checksum() -> Value {
+    all_required(
+        json!({"algorithm":{"const":"sha256"},"value":{"type":"string","pattern":"^[0-9a-f]{64}$"}}),
+    )
+}
+fn delivery() -> Value {
+    all_required(json!({
+        "available_modes":{"type":"array","items":enumeration(&["inline_base64","authenticated_http"]),"maxItems":2,"uniqueItems":true},
+        "authentication":{"const":"same_subject_bearer"},"expires_in_seconds":{"const":600},"expires_at":nullable(count()),
+        "client_delivery_required":{"const":true},"next_action":enumeration(&["prepare_attachment_download","authenticated_get_then_import_file","use_supported_attachment"])
+    }))
+}
+fn attachment_descriptor() -> Value {
+    let mut properties = attachment_reference();
+    properties.as_object_mut().unwrap().extend(json!({
+        "filename":nullable(string()),"safe_filename":string(),"content_type":string(),"declared_content_type":string(),"detected_content_type":{"type":"null"},
+        "encoded_size":count(),"decoded_size":nullable(count()),"size_accuracy":enumeration(&["exact","estimate","unknown"]),
+        "disposition":nullable(string()),"content_id":nullable(string()),"downloadable":boolean(),
+        "unavailable_reason":nullable(enumeration(&["unsupported_transfer_encoding","decoded_attachment_bytes"])),
+        "delivery":delivery(),"checksum":nullable(checksum())
+    }).as_object().unwrap().clone());
+    all_required(properties)
 }
 
 fn accounts() -> Value {
@@ -198,20 +227,22 @@ fn data(name: &str) -> Value {
                 all_required(json!({"uid":uid(),"ok":{"const":false},"status":{"const":"unprocessed"}}))
             ]}},"requested":{"type":"integer","minimum":1,"maximum":10},"completed":{"type":"integer","minimum":0,"maximum":10}
         })),
-        "download_attachment" => all_required(
-            json!({"content_type":string(),"size":count(),"base64":{"type":"string","contentEncoding":"base64"}}),
-        ),
+        "download_attachment" => {
+            let mut properties = attachment_reference();
+            properties.as_object_mut().unwrap().extend(json!({"content_type":string(),"size":count(),"base64":{"type":"string","contentEncoding":"base64"},"checksum":checksum()}).as_object().unwrap().clone());
+            all_required(properties)
+        }
         "list_attachments" => all_required(
-            json!({"uid":uid(),"uid_validity":uid(),"attachments":array(all_required(json!({
-            "attachment_index":count(),"filename":nullable(string()),"content_type":string(),"encoded_size":count(),"downloadable":boolean()
-        }))),"next_attachment_offset":nullable(count()),"content_trust":trust}),
+            json!({"account_id":{"const":"default"},"mailbox":string(),"uid":uid(),"uid_validity":uid(),"attachments":array(attachment_descriptor()),"next_attachment_offset":nullable(json!({"type":"integer","minimum":0,"maximum":MAX_ATTACHMENT_INDEX})),"content_trust":trust}),
         ),
-        "prepare_attachment_download" => all_required(
-            json!({"download_url":{"type":"string","format":"uri"},"method":{"const":"GET"},
+        "prepare_attachment_download" => {
+            let mut properties = attachment_reference();
+            properties.as_object_mut().unwrap().extend(json!({"download_url":{"type":"string","format":"uri"},"method":{"const":"GET"},
                 "required_headers":all_required(json!({"Authorization":{"const":"Bearer <access_token>"}})),"expires_in_seconds":{"const":600},
-                "metadata":all_required(json!({"filename":nullable(string()),"content_type":string(),"encoded_size":count()})),"content_trust":trust
-            }),
-        ),
+                "metadata":attachment_descriptor(),"delivery":delivery(),"content_trust":trust
+            }).as_object().unwrap().clone());
+            all_required(properties)
+        }
         "get_operation" => all_required(json!({"operation":nullable(reference("operation"))})),
         "read_conversation" => all_required(json!({
             "mailbox":string(),"uid_validity":uid(),"messages":{"type":"array","maxItems":20,"items":reference("conversation_message")},"omitted_uids":array(uid()),

@@ -1,3 +1,4 @@
+use crate::mail::attachments::MAX_ATTACHMENT_INDEX;
 use crate::{
     auth::{Principal, RequestId as HttpRequestId},
     error::MailError,
@@ -317,20 +318,20 @@ pub fn tools(mode: &str) -> Vec<Tool> {
         ),
         (
             "download_attachment",
-            "Download a bounded attachment as inline Base64. Uses indices returned by get_email.",
-            json!({"mailbox":mailbox,"uid":uid,"uid_validity":uid,"attachment_index":{"type":"integer","minimum":0,"maximum":1000}}),
-            vec!["uid", "uid_validity", "attachment_index"],
+            "Download complete attachment bytes as bounded inline Base64 with a SHA-256 checksum. Use attachment_id from list_attachments or the original attachment_index; both must match if supplied together. Larger files use prepare_attachment_download.",
+            json!({"mailbox":mailbox,"uid":uid,"uid_validity":uid,"attachment_index":{"type":"integer","minimum":0,"maximum":MAX_ATTACHMENT_INDEX},"attachment_id":{"type":"string","minLength":71,"maxLength":71,"pattern":"^att_v1_[0-9a-f]{64}$","x-maxUtf8Bytes":71}}),
+            vec!["uid", "uid_validity"],
         ),
         (
             "prepare_attachment_download",
-            "Prepare an authenticated attachment URL using the original attachment_index. A client must fetch the complete file with its own Bearer token; after expiry prepare again. Match filenames by index when names repeat.",
-            json!({"mailbox":mailbox,"uid":uid,"uid_validity":uid,"attachment_index":{"type":"integer","minimum":0,"maximum":1000}}),
-            vec!["uid", "uid_validity", "attachment_index"],
+            "Prepare an authenticated attachment URL using attachment_id or the original index. delivery.client_delivery_required directs the client to fetch the complete file with its own Bearer token and import it into the analysis environment. After expiry prepare again; keep distinct references for repeated filenames.",
+            json!({"mailbox":mailbox,"uid":uid,"uid_validity":uid,"attachment_index":{"type":"integer","minimum":0,"maximum":MAX_ATTACHMENT_INDEX},"attachment_id":{"type":"string","minLength":71,"maxLength":71,"pattern":"^att_v1_[0-9a-f]{64}$","x-maxUtf8Bytes":71}}),
+            vec!["uid", "uid_validity"],
         ),
         (
             "list_attachments",
-            "List bounded MIME attachment metadata and indices using the bounded whole-message MIME reader. Follow next_attachment_offset for remaining parts.",
-            json!({"mailbox":mailbox,"uid":uid,"uid_validity":uid,"attachment_offset":{"type":"integer","minimum":0,"maximum":999}}),
+            "List stable attachment references, original indices, filenames, size accuracy, encoding availability and delivery actions using the bounded whole-message reader. Follow next_attachment_offset for remaining parts; use attachment_id to distinguish repeated filenames.",
+            json!({"mailbox":mailbox,"uid":uid,"uid_validity":uid,"attachment_offset":{"type":"integer","minimum":0,"maximum":MAX_ATTACHMENT_INDEX}}),
             vec!["uid", "uid_validity"],
         ),
         (
@@ -440,6 +441,9 @@ pub fn tools(mode: &str) -> Vec<Tool> {
     specs.into_iter().map(|(name,description,properties,required)|{
         let properties = if is_read(name) { input::read_properties(properties) } else { properties };
         let mut tool = json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"annotations":{"readOnlyHint":is_read(name),"destructiveHint":(["delete_email","delete_emails","delete_mailbox"].contains(&name)),"idempotentHint":is_read(name)||is_send(name)||name=="mark_email","openWorldHint":true}});
+        if matches!(name,"download_attachment"|"prepare_attachment_download") {
+            tool["inputSchema"]["anyOf"] = json!([{"required":["attachment_id"]},{"required":["attachment_index"]}]);
+        }
         if is_read(name) { tool["outputSchema"] = output::schema(name); }
         serde_json::from_value(tool).expect("static tool schema")
     }).collect()

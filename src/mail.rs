@@ -319,11 +319,19 @@ impl MailService {
                 if name == "get_email_status" {
                     return email_status(s, uid, state.uid_validity).await;
                 }
-                let raw = self.raw(s, uid).await?;
+                let raw = if name == "download_attachment" {
+                    self.raw_attachment(s, uid).await?
+                } else {
+                    self.raw(s, uid).await?
+                };
                 if name == "download_attachment" {
-                    return attachment(
+                    return attachments::inline_download(
                         &raw,
-                        number(a, "attachment_index", 0, 0, 1000)? as usize,
+                        a,
+                        &self.account,
+                        folder,
+                        uid,
+                        state.uid_validity.ok_or_else(MailError::backend)?,
                         self.config.max_output / 4,
                     );
                 }
@@ -531,6 +539,26 @@ impl MailService {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
     {
+        self.raw_with_absence(s, uid, limits, false).await
+    }
+
+    async fn raw_attachment<S>(&self, s: &mut async_imap::Session<S>, uid: u32) -> Result<Vec<u8>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
+    {
+        self.raw_with_absence(s, uid, InputLimits::Read, true).await
+    }
+
+    async fn raw_with_absence<S>(
+        &self,
+        s: &mut async_imap::Session<S>,
+        uid: u32,
+        limits: InputLimits,
+        report_absence: bool,
+    ) -> Result<Vec<u8>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
+    {
         let metadata = s
             .uid_fetch(uid.to_string(), "(UID RFC822.SIZE)")
             .await
@@ -542,7 +570,9 @@ impl MailService {
             .iter()
             .filter(|f| f.uid == Some(uid))
             .find_map(|f| f.size)
-            .ok_or_else(MailError::backend)? as usize;
+            .ok_or_else(|| {
+                fetch_attribute_error(report_absence, metadata.iter().any(|f| f.uid == Some(uid)))
+            })? as usize;
         if size > self.config.max_message {
             return Err(raw_limit(limits, self.config.max_message, size));
         }
@@ -560,9 +590,16 @@ impl MailService {
             .iter()
             .filter(|f| f.uid == Some(uid))
             .find_map(|f| f.body())
-            .ok_or_else(MailError::backend)?;
+            .ok_or_else(|| {
+                fetch_attribute_error(report_absence, f.iter().any(|f| f.uid == Some(uid)))
+            })?;
         if body.len() > self.config.max_message {
             return Err(raw_limit(limits, self.config.max_message, body.len()));
+        }
+        // Attachment delivery requires the complete RFC 2822 message, even when
+        // the server successfully completes a syntactically valid short literal.
+        if report_absence && body.len() != size {
+            return Err(MailError::backend());
         }
         Ok(body.to_vec())
     }
@@ -1151,6 +1188,19 @@ fn raw_limit(limits: InputLimits, limit: usize, actual: usize) -> MailError {
         InputLimits::LegacyWrite => MailError::limit(),
     }
 }
+
+fn fetch_attribute_error(report_absence: bool, target_present: bool) -> MailError {
+    if report_absence && !target_present {
+        MailError {
+            code: "NOT_FOUND",
+            message: "The requested email is no longer available.",
+            retryable: false,
+            details: None,
+        }
+    } else {
+        MailError::backend()
+    }
+}
 /// Write operations keep their original input budget even when they first read mail.
 fn validate_legacy_write_inputs(name: &str, a: &Value, config: &Config) -> Result<()> {
     let legacy = InputLimits::LegacyWrite;
@@ -1432,7 +1482,7 @@ fn leaves<'a, 'b>(
     out: &mut Vec<&'a mime::Part<'b>>,
     depth: usize,
 ) -> Result<()> {
-    if depth > 20 || out.len() > 1000 {
+    if depth > mime::MAX_DEPTH || out.len() >= mime::MAX_PARTS {
         return Err(MailError::limit());
     }
     if p.subparts.is_empty() || p.is_attachment() {
@@ -1470,6 +1520,7 @@ fn parsed_metadata(p: &mime::Part<'_>, uid: u32, validity: Option<u32>) -> Resul
         json!({"uid":uid,"uid_validity":validity,"subject":p.headers.get_first_value("Subject"),"from":p.headers.get_first_value("From"),"to":p.headers.get_first_value("To"),"attachments":attachments,"content_trust":"untrusted"}),
     )
 }
+#[cfg(test)]
 fn attachment(raw: &[u8], index: usize, max: usize) -> Result<Value> {
     use base64::Engine;
     let p = mime::parse(raw)?;

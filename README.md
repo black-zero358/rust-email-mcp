@@ -46,7 +46,7 @@ MIME 在构建结构时限制为 1024 个节点、32 层嵌套，头部每段最
 
 正文支持完整或去引用模式、长度设置及省略提示。`get_email` 在正文长度上限内，按完整 JSON-RPC 响应预算返回可容纳的最长 UTF-8 正文前缀；额外截断设置 `body_truncated=true`。`body_byte_limit` 表示正文配置上限，实际正文可能因 JSON 转义、元数据和调用 id 而更短；元数据本身超限仍返回 `LIMIT_EXCEEDED`。单封 MIME 邮件上限 32 MiB，单次工具输出上限 2 MiB。附件发现、准备下载及二进制 GET 均通过现有有界整封 MIME 读取，保持统一索引和整体 multipart 附件语义；每封原始邮件和解码后的附件分别受 32 MiB 限制。新邮件支持文本；现有草稿发送保留原 MIME 附件。转发工具发送原邮件的纯文本内容。
 
-`download_attachment` 保留原有内联 Base64 返回格式及输出预算。新增 `prepare_attachment_download` 返回短期下载 URL；客户端需携带同一用户的 OAuth Bearer 令牌。普通链接点击和 ChatGPT 自动文件解析尚未验收。参数与范围限制见 [邮件能力扩展](docs/capabilities.md)。
+`download_attachment` 保留原有内联 Base64 返回格式及输出预算。附件支持稳定 `attachment_id` 或原有 `attachment_index` 选择；`list_attachments` 返回安全文件名、大小精度、可下载状态及交付方式，`prepare_attachment_download` 返回同主体 Bearer 认证的短期 URL。下载响应提供 SHA-256，客户端可核对文件完整性。仓库提供[标准客户端适配器](scripts/attachment-client-adapter/README.md)，用于认证下载、校验及本地落盘。当前仅用模拟邮箱和合成文件离线测试下载及内容读取，ChatGPT 实际连接测试放到后续阶段。参数与范围限制见 [邮件能力扩展](docs/capabilities.md)。
 
 ## 发送行为
 

@@ -24,17 +24,21 @@
 
 ## 附件与兼容性
 
-全部 15 个读取工具声明 `outputSchema`，覆盖实际 `{data, request_id}`、`{error, request_id}`、逐项失败和完整响应预算降级。写工具沿用原契约。常用顺序为 `list_accounts → list_mailboxes → search_emails → get_emails`，再按需调用 `read_conversation` 或 `list_attachments → prepare_attachment_download`；文件进入客户端分析环境的步骤见[附件交付选型](attachment-delivery-probe.md)。
+全部 15 个读取工具声明 `outputSchema`，覆盖实际 `{data, request_id}`、`{error, request_id}`、逐项失败和完整响应预算降级。写工具沿用原契约。常用顺序为 `list_accounts → list_mailboxes → search_emails → get_emails`，再按需调用 `read_conversation` 或 `list_attachments → prepare_attachment_download`。附件当前仅做本地离线测试，核对完整下载和文件内容读取；ChatGPT 实际连接测试后移。
 
 `list_accounts` 的 `default_account_id` 与账户的 `default` 指示默认项；`capabilities` 和 `limits` 给出当前实现及配置值。`list_mailboxes` 保留 `attributes`，增加 `attribute_flags`、`delimiter`、`selectable`、`special_use`、`role_source` 和 `role_candidates`。服务器用途、管理员配置和 INBOX 协议角色分别标记 `server`、`configuration`、`protocol`；只有名称候选时 `special_use` 为空、`role_source` 为 null。
 
-`download_attachment` 保持原有 `content_type`、`size`、`base64` 返回字段和工具输出预算，旧客户端无需迁移。新增 `list_attachments` 提供与 `get_email` 一致的索引，新增 `prepare_attachment_download` 接受文件夹、UID、UIDVALIDITY 和 `attachment_index`，返回认证二进制 GET URL。
+`download_attachment` 保持原有 `content_type`、`size`、`base64` 返回字段和工具输出预算，新增 SHA-256 校验值。`list_attachments` 提供与 `get_email` 一致的原遍历索引（0–1023）及稳定的 `attachment_id`；`prepare_attachment_download` 和 `download_attachment` 接受 id 或索引，至少提供一个，同时提供时必须指向同一部件。这三个工具接受省略或值为 `default` 的 `account_id`。稳定 id 绑定账户身份、文件夹、UIDVALIDITY、UID、遍历位置及 MIME 引用版本；下载授权由请求主体及短期句柄决定。
+
+附件描述保留原字段，增加 `safe_filename`、`declared_content_type`、`detected_content_type`、`decoded_size`、`size_accuracy`、`disposition`、`content_id`、`downloadable`、`unavailable_reason`、`delivery` 和 `checksum`。类型检测及准备阶段摘要当前为 null；identity 编码大小为 exact，Base64 为 estimate，其他为 unknown。未知传输编码列为不可下载，完整解码后才生成摘要。`delivery` 指出可用方式、认证、过期及下一动作，`client_delivery_required` 提醒客户端把下载字节交给文件解析工具。
 
 附件发现、URL 准备和实际 GET 均使用已有有界整封读取及 MIME 解析；GET 会重新核对 UIDVALIDITY 并读取同一消息。当前不会发起 BODYSTRUCTURE 或单部分 FETCH，不能发现或下载超出整封邮件上限的内容。这样保持既有附件分类、RFC2231 文件名意图和整体 multipart 附件语义；附加 `.eml` 作为整体附件，不枚举其内部附件。每封原始邮件及解码附件均受 32 MiB 限制；元数据和筛选还共用单连接响应预算，超过预算明确失败。
 
 返回的 `download_url` 需要同一用户的有效 OAuth Bearer 令牌。句柄有效期 600 秒，每实例最多保存 64 个描述符，不缓存附件字节；重启后失效。它不能作为公共分享链接。最多四个二进制下载并发，响应被消费或丢弃后释放传输名额；IMAP 读取还使用共享邮箱槽位。附件列表使用 `next_attachment_offset` 分页。
 
-普通浏览器点击链接不会自动携带 MCP 令牌，客户端必须支持认证下载；ChatGPT 自动读取 PDF/Excel 尚未验收。公开路由为 `MCP_RESOURCE/attachments/{token}`，需转发至内部 `/mcp/attachments/{token}` 并关闭包含句柄的访问日志。响应使用 `no-store`、`nosniff` 和 attachment disposition；客户端负责安全解析文件内容。
+公开路由为 `MCP_RESOURCE/attachments/{token}`，需转发至内部 `/mcp/attachments/{token}` 并关闭包含句柄的访问日志。响应使用 `application/octet-stream`、`no-store`、`nosniff` 和安全文件名的 attachment disposition，`X-Content-SHA256` 与 `Content-Digest` 校验最终交付字节。客户端负责安全解析文件内容；[标准适配器](../scripts/attachment-client-adapter/README.md)使用独立授权会话完成下载、校验和落盘。[ChatGPT 适配设计](attachment-client-adapter-design.md)记录宿主文件接口及待验收步骤，分析请求由用户发起。
+
+附件 GET 的失败响应为带 `request_id`、固定 `phase` 和 `action` 的小型 JSON：401 重新认证，503 等待认证服务恢复；未知、过期或其他主体的句柄统一 404 并提示重新准备；UIDVALIDITY 变化返回 409；消息或部件删除返回 404；未知编码返回 422；资源超限返回 413 及限制类别；下载满额返回 429 和 `Retry-After`；后端失败/坏编码返回 502，超时返回 504。确认 IMAP tagged OK 后才判定消息缺失；缺必需属性、NO 或断连按后端失败处理。
 
 
 ## 批量整理

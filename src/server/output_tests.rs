@@ -20,6 +20,8 @@ use tokio_rustls::{
 };
 use tower::ServiceExt;
 
+mod attachments;
+
 fn validator(name: &str) -> jsonschema::Validator {
     let tool = tools("full").into_iter().find(|t| t.name == name).unwrap();
     let schema = serde_json::to_value(tool.output_schema.unwrap()).unwrap();
@@ -84,7 +86,7 @@ impl Harness {
         fatal_uid: Option<u32>,
         max_output: usize,
         stall_greeting: bool,
-        resource: Option<&str>,
+        resource: Option<String>,
     ) -> Self {
         let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let cert = certified.cert.der().clone();
@@ -99,12 +101,12 @@ impl Harness {
         roots.add(cert).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut configuration = (*config::fixture()).clone();
-        if let Some(resource) = resource {
-            configuration.resource = resource.into();
-        }
         configuration.imap_host = "localhost".into();
         configuration.imap_port = listener.local_addr().unwrap().port();
         configuration.max_output = max_output;
+        if let Some(resource) = resource {
+            configuration.resource = resource;
+        }
         configuration.timeout = if stall_greeting {
             Duration::from_millis(100)
         } else {
@@ -310,7 +312,7 @@ async fn attachment_download_url_is_a_uri_for_unicode_resource_configuration() {
         None,
         64 * 1024,
         false,
-        Some("https://邮件.example/入口/mcp/"),
+        Some("https://邮件.example/入口/mcp/".into()),
     )
     .await;
     let result = h
