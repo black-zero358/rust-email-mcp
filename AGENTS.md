@@ -8,6 +8,8 @@
 - Keep secrets and deployment identities out of Git and logs. Use synthetic data for regressions. Never send or modify real email for tests without explicit user authorization.
 - Test OAuth with isolated clients and users. Source publishing does not authorize production deployment, cutover or rollback; follow the separate deployment procedure.
 - Preserve the module boundaries and public contracts in [architecture](docs/architecture.md#module-boundaries). Record material design changes there and follow the compatibility rules in CONTRIBUTING.md.
+- Follow the staged [read-capability plan](docs/read-capabilities-plan.md) for attachment delivery, HTML display, Unicode/contracts, multi-account reads, cross-folder conversations and persistent caching. Draft/composition/reply/forward/scheduling enhancements remain deferred. Update current contracts as each work package lands.
+- For this read-capability implementation campaign, the primary agent coordinates scope, ownership, integration and acceptance. Delegate execution to `gpt-6.1-sol` with `high` reasoning and `fork_turns=none`; keep file ownership explicit and preserve existing workspace edits. The plan's implementation table is the progress ledger; distinguish implementation, local verification and client acceptance there.
 
 ## Constraints to preserve
 

@@ -1,7 +1,7 @@
 //! Resource accounting before MIME object creation and transfer/charset decoding.
 //! mailparse's tree entry point cannot enforce a global part/header budget. Keep
 //! structure parsing here, and use its header and leaf codecs only on bounded input.
-use crate::error::{MailError, Result};
+use crate::error::{LimitKind, MailError, Result};
 use mailparse::{MailHeader, MailHeaderMap, ParsedContentType, body::Body};
 
 const MAX_PARTS: usize = 1024;
@@ -40,7 +40,7 @@ fn headers_with_budget<'a>(
             || budget.header_bytes > MAX_HEADER_BYTES
             || budget.header_lines > MAX_HEADER_LINES
         {
-            return Err(MailError::limit());
+            return Err(MailError::limit_kind(LimitKind::HeaderBytes));
         }
         if line == b"\n" || line == b"\r\n" {
             break;
@@ -107,7 +107,7 @@ fn parse_part<'a>(
     digest: bool,
 ) -> Result<Part<'a>> {
     if depth > MAX_DEPTH || budget.parts >= MAX_PARTS {
-        return Err(MailError::limit());
+        return Err(MailError::limit_kind(LimitKind::MimeStructure));
     }
     budget.parts += 1;
     let (headers, body_start) = headers_with_budget(raw, budget)?;
@@ -136,7 +136,7 @@ fn parse_part<'a>(
         && let Some(boundary) = part.ctype.params.get("boundary")
     {
         if boundary.is_empty() || boundary.len() > 200 || boundary.contains(['\r', '\n']) {
-            return Err(MailError::limit());
+            return Err(MailError::limit_kind(LimitKind::MimeStructure));
         }
         let marker = format!("--{boundary}");
         let body = part.body;
@@ -262,7 +262,7 @@ impl Part<'_> {
                 .saturating_add(4096)
                 .min(MAX_DECODE_BYTES)
         {
-            return Err(MailError::limit());
+            return Err(MailError::limit_kind(LimitKind::DecodedAttachmentBytes));
         }
         let decoded = match self.encoded()? {
             Body::Base64(b) | Body::QuotedPrintable(b) => b.get_decoded(),
@@ -271,7 +271,11 @@ impl Part<'_> {
         }
         .map_err(|_| MailError::backend())?;
         if decoded.len() > max {
-            return Err(MailError::limit());
+            return Err(MailError::limit_with(
+                LimitKind::DecodedAttachmentBytes,
+                max,
+                decoded.len(),
+            ));
         }
         Ok(decoded)
     }
@@ -392,10 +396,10 @@ impl Part<'_> {
                 .body
                 .len()
                 .checked_mul(4)
-                .ok_or_else(MailError::limit)?;
+                .ok_or_else(|| MailError::limit_kind(LimitKind::DecodedBodyBytes))?;
             *remaining = remaining
                 .checked_sub(reserve)
-                .ok_or_else(MailError::limit)?;
+                .ok_or_else(|| MailError::limit_kind(LimitKind::DecodedBodyBytes))?;
             let text = match self.encoded()? {
                 Body::Base64(b) | Body::QuotedPrintable(b) => b.get_decoded_as_string(),
                 Body::SevenBit(b) | Body::EightBit(b) => b.get_as_string(),
@@ -403,7 +407,7 @@ impl Part<'_> {
             }
             .map_err(|_| MailError::backend())?;
             if text.len() > reserve {
-                return Err(MailError::limit());
+                return Err(MailError::limit_kind(LimitKind::DecodedBodyBytes));
             }
             let text = if self.ctype.mimetype == "text/html" {
                 crate::html::to_text(&text)?
@@ -411,7 +415,7 @@ impl Part<'_> {
                 text
             };
             if text.len() > reserve {
-                return Err(MailError::limit());
+                return Err(MailError::limit_kind(LimitKind::DecodedBodyBytes));
             }
             out.push_str(&text);
         }
@@ -678,6 +682,47 @@ mod tests {
         assert_eq!(out, "hello");
         assert_eq!(remaining, 0);
         assert!(p.append_plain(&mut out, &mut remaining).is_err());
+    }
+
+    #[test]
+    fn budget_errors_identify_header_structure_attachment_and_body_resources() {
+        let kind = |error: MailError| {
+            serde_json::to_value(error).unwrap()["details"]["limit_kind"].clone()
+        };
+        assert_eq!(
+            kind(headers(&vec![b'x'; MAX_HEADER_BLOCK + 1]).unwrap_err()),
+            "header_bytes"
+        );
+        let mut budget = Budget {
+            parts: MAX_PARTS,
+            ..Default::default()
+        };
+        assert_eq!(
+            kind(parse_part(b"invalid", &mut budget, 0, false).err().unwrap()),
+            "mime_structure"
+        );
+        assert_eq!(budget.header_bytes, 0);
+        let attachment = parse(
+            b"Content-Type: application/octet-stream\r\nContent-Disposition: attachment\r\n\r\nabc",
+        )
+        .unwrap();
+        let error = attachment.body_raw(2).unwrap_err();
+        let details = serde_json::to_value(error).unwrap();
+        assert_eq!(details["details"]["limit_kind"], "decoded_attachment_bytes");
+        assert_eq!(details["details"]["actual"], 3);
+        assert_eq!(details["details"]["limit"], 2);
+        let encoded = parse(b"Content-Type: application/octet-stream\r\n\r\nxxxxxxxx").unwrap();
+        assert_eq!(
+            kind(encoded.body_raw(0).unwrap_err()),
+            "decoded_attachment_bytes"
+        );
+        let body = parse(b"Content-Type: text/plain\r\n\r\nhello").unwrap();
+        let (mut out, mut remaining) = (String::new(), 19);
+        assert_eq!(
+            kind(body.append_plain(&mut out, &mut remaining).unwrap_err()),
+            "decoded_body_bytes"
+        );
+        assert!(out.is_empty());
     }
 
     #[test]

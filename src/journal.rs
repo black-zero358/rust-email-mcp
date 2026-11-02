@@ -55,6 +55,7 @@ impl Journal {
                     code: "IDEMPOTENCY_CONFLICT",
                     message: "This operation key was already used with different arguments.",
                     retryable: false,
+                    details: None,
                 });
             }
             return Ok(Some(Operation {

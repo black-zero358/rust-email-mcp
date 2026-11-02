@@ -3,6 +3,7 @@ pub mod config;
 pub mod error;
 mod html;
 mod imap_text;
+mod input_limits;
 pub mod journal;
 pub mod mail;
 mod mime;

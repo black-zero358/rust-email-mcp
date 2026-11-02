@@ -12,6 +12,7 @@
 | `config` | 环境变量、默认值、配置有效性 | 供认证和邮件适配器读取；凭据不进入日志 |
 | `auth` | OIDC 发现、JWT/JWKS 校验、请求主体和 HTTP 认证错误 | 依赖配置与身份服务，不执行邮件操作 |
 | `server` | MCP 工具目录、权限模式、输入校验、响应封装与预算 | 将已认证主体传给 `mail`；协议适配不直接操作邮箱或数据库 |
+| `server/input`、`input_limits` | 读取字段错误、字符与字节契约、旧写用途限制 | 输入常量供 Schema 与 IMAP 编码共用；协议层不依赖 MCP 请求对象 |
 | `mail` | IMAP 会话、邮件操作编排、发送意图与结果记录 | 调用 `imap_text`、`mime`、`smtp`、`journal`，持有执行槽位 |
 | `mail/attachments`、`mail/insights` | 附件交付及有界读取扩展 | 由 `mail` 编排，共用 MIME、协议、槽位与预算 |
 | `imap_text` | rev1 邮箱名、非 ASCII 搜索与严格统计 STATUS | 处理编码、literal 和命令终结；不承担 MCP 授权 |
@@ -37,7 +38,11 @@
 
 一次工具响应的 **完整序列化 JSON-RPC** 预算为 2 MiB，计入实际 `id`、`request_id`、`structuredContent` 及文本客户端使用的转义副本，不计 HTTP 头和 SSE 帧。JSON-RPC id 的序列化 JSON 最多 1024 字节，HTTP 中间件必须在 rmcp/工具执行前以 413 拒绝超限 id。超限错误本身也必须有界；已知发送结果不能因输出超限而丢失。客户端使用原 `operation_key` 调用 `get_operation` 后再决定后续操作。其他发现/握手响应按固定结构生成，不应混称为已经覆盖工具响应预算。
 
-**当前已知偏差：**JSON Schema 的 `minLength/maxLength` 表示字符数，现有 `server::validate` 使用 Rust `str::len()` 计算 UTF-8 字节数，底层文件夹名也有字节限制。文档整理未修复此实现；不能声称 Unicode 输入已与 Schema 完全一致。后续应把标准字符约束与额外资源字节预算分开定义并验证，见 [待闭环事项](../CONTRIBUTING.md#待闭环事项)。
+读取输入由 `server/input` 按 Unicode 码点执行 Schema 的 `minLength/maxLength`；`input_limits` 共享读取与旧写入的用途限制。读取文件夹及查询字段最多 512 码点、2048 UTF-8 字节，文件夹另有 8192 modified UTF-7 线路字节上限。Schema 的 `x-maxUtf8Bytes` / `x-maxModifiedUtf7Bytes` 公开额外预算。组合字符逐码点计数。旧写工具继续使用原字节校验；写操作中的读取原邮件及配置目录也显式选择 `LegacyWrite`。`get_operation` 保持原操作键的 128 UTF-8 字节预算。
+
+输入错误可附 `details`：首项包含字段 JSON Pointer、稳定原因、预期类型/范围、长度单位和修正动作，`additional_violations` 最多七项，合计最多八项。未知字段指向所属对象，错误不回显字段值或任意未知键。读取资源错误通过 `limit_kind` 区分预算类型；完整响应容纳不下详情时先移除详情，保留基础错误与 request_id，再执行原有有界降级。
+
+共享 MIME 解析器的可选预算分类也适用于原有写操作，错误码和发送状态顺序保留。`raw_message_bytes`、`decoded_attachment_bytes`、`decoded_body_bytes`、`mime_structure`、`header_bytes`、`wire_response_bytes`、`scan_items` 按实际失败来源报告；数值单位使用 bytes 或 items。缓存额度分类随缓存工作包接入。
 
 ## MCP and mail
 
@@ -132,6 +137,8 @@ CTE 支持性对应 D3/D5：`mime::Part::transfer_encoding/encoded/select_text` 
 SMTPUTF8 需求与确定拒绝对应 D3/D4：`mime::requires_smtputf8`、`smtp::submit/transaction` 和 `mail::record_send` 由 `smtp_utf8_inspection_uses_raw_headers_and_shared_budgets`、`smtp_utf8_covers_preserved_draft_headers_but_not_body_bytes`、`smtp_utf8_refusal_is_recorded_as_rejected_without_mail` 验证；原发送故障/QUIT 回归继续验证 accepted/unknown 边界。
 
 ## Decision records
+
+R01 的字符与错误回归入口：`read_lengths_count_unicode_code_points_and_publish_byte_limits`、`read_structure_errors_are_bounded_private_and_point_to_array_items`、`read_mailbox_unicode_and_wire_budgets_keep_legacy_writes_frozen`、`read_search_transmits_full_unicode_literal_at_character_boundary`、`legacy_write_argument_schemas_and_byte_validation_stay_frozen`、`legacy_write_mailbox_inputs_and_configured_directories_stay_at_512_bytes`、`recorded_send_status_remains_available_after_legacy_directory_change`、`input_detail_budget_preserves_original_error_and_measures_real_wire`、`budget_errors_identify_header_structure_attachment_and_body_resources`。分别覆盖 D2/D3/D4/D5 的输入、协议、幂等与错误预算边界。
 
 以下为当前选择的简短追溯记录，状态均为“采用”。新决策记录背景、决定、代价及重审条件；被替代的决策保留并指向后继记录，不以部署状态覆盖设计历史。
 

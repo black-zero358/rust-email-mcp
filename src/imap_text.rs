@@ -1,15 +1,14 @@
 //! IMAP4rev1 text handling. This client never enables UTF8=ACCEPT.
 use crate::error::{MailError, Result};
+use crate::input_limits::{InputLimits, ReadInputLimits, read_query};
 use base64::{Engine, engine::general_purpose::STANDARD_NO_PAD};
 use imap_proto::{MailboxDatum, Response, ResponseCode, Status};
 use std::{collections::HashSet, fmt::Debug};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 /// Encode user-facing Unicode names using RFC 3501 section 5.1.3.
-pub(crate) fn mailbox_name(name: &str) -> Result<String> {
-    if name.len() > 512 || name.contains(['\r', '\n', '\0']) {
-        return Err(MailError::input());
-    }
+pub(crate) fn mailbox_name(name: &str, limits: InputLimits) -> Result<String> {
+    limits.mailbox(name, "/mailbox")?;
     let mut encoded = String::new();
     let mut shifted = Vec::new();
     fn flush(encoded: &mut String, shifted: &mut Vec<u8>) {
@@ -36,13 +35,30 @@ pub(crate) fn mailbox_name(name: &str) -> Result<String> {
         }
     }
     flush(&mut encoded, &mut shifted);
+    if matches!(limits, InputLimits::Read) {
+        validate_mailbox_wire_bytes(encoded.len())?;
+    }
     Ok(encoded)
+}
+
+fn validate_mailbox_wire_bytes(actual: usize) -> Result<()> {
+    if actual > ReadInputLimits::MAILBOX_WIRE_BYTES {
+        return Err(MailError::input_field(
+            crate::error::InputViolation::new("/mailbox", "wire_byte_limit", "shorten_field")
+                .with_length(
+                    ReadInputLimits::MAILBOX_WIRE_BYTES,
+                    actual,
+                    "modified_utf7_bytes",
+                ),
+        ));
+    }
+    Ok(())
 }
 
 /// Reject noncanonical wire names rather than returning a name that encodes to
 /// a different mailbox. API names can be fed directly into later folder tools.
 pub(crate) fn display_name(wire: &str) -> Result<String> {
-    if !wire.is_ascii() || wire.len() > 2048 {
+    if !wire.is_ascii() || validate_mailbox_wire_bytes(wire.len()).is_err() {
         return Err(MailError::backend());
     }
     let mut rest = wire;
@@ -72,7 +88,7 @@ pub(crate) fn display_name(wire: &str) -> Result<String> {
         rest = &rest[end + 1..];
     }
     decoded.push_str(rest);
-    if mailbox_name(&decoded).map_err(|_| MailError::backend())? != wire {
+    if mailbox_name(&decoded, InputLimits::Read).map_err(|_| MailError::backend())? != wire {
         return Err(MailError::backend());
     }
     Ok(decoded)
@@ -84,6 +100,7 @@ fn completion_error(code: Option<&ResponseCode<'_>>) -> MailError {
             code: "UNSUPPORTED_CHARSET",
             message: "The IMAP server does not support UTF-8 search.",
             retryable: false,
+            details: None,
         }
     } else {
         MailError::backend()
@@ -116,9 +133,13 @@ where
     if !["TEXT", "FROM", "TO", "SUBJECT"].contains(&key) {
         return Err(MailError::input());
     }
-    if text.len() > 512 || text.contains(['\r', '\n', '\0']) {
-        return Err(MailError::input());
-    }
+    let field = match key {
+        "FROM" => "/from",
+        "TO" => "/to",
+        "SUBJECT" => "/subject",
+        _ => "/query",
+    };
+    read_query(text, field)?;
     if text.is_ascii() {
         return session
             .uid_search(format!(
@@ -232,7 +253,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + Debug,
 {
     use imap_proto::StatusAttribute;
-    let encoded = mailbox_name(mailbox)?;
+    let encoded = mailbox_name(mailbox, InputLimits::Read)?;
     let quoted = encoded.replace('\\', "\\\\").replace('"', "\\\"");
     let tag = session
         .run_command(format!(
@@ -374,6 +395,99 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
     #[test]
+    fn read_mailbox_unicode_and_wire_budgets_keep_legacy_writes_frozen() {
+        for name in [
+            "x".repeat(512),
+            "中".repeat(512),
+            "😀".repeat(512),
+            "e\u{301}".repeat(256),
+        ] {
+            let wire = mailbox_name(&name, InputLimits::Read).unwrap();
+            assert!(wire.len() <= ReadInputLimits::MAILBOX_WIRE_BYTES);
+            assert_eq!(display_name(&wire).unwrap(), name);
+            assert_eq!(
+                mailbox_name(&name, InputLimits::LegacyWrite).is_ok(),
+                name.len() <= 512
+            );
+        }
+        for name in [
+            "x".repeat(513),
+            "中".repeat(513),
+            "😀".repeat(513),
+            "e\u{301}".repeat(256) + "e",
+        ] {
+            assert!(mailbox_name(&name, InputLimits::Read).is_err());
+        }
+        // The wire ceiling is separate; currently the character ceiling is tighter.
+        assert!(validate_mailbox_wire_bytes(8192).is_ok());
+        assert!(validate_mailbox_wire_bytes(8193).is_err());
+        assert!(display_name(&"x".repeat(8193)).is_err());
+    }
+
+    #[tokio::test]
+    async fn read_search_transmits_full_unicode_literal_at_character_boundary() {
+        for text in [
+            "x".repeat(512),
+            "中".repeat(512),
+            "😀".repeat(512),
+            "e\u{301}".repeat(256),
+        ] {
+            let (client, server) = tokio::io::duplex(16384);
+            let expected = text.clone();
+            let backend = tokio::spawn(async move {
+                let mut server = BufReader::new(server);
+                let mut line = String::new();
+                server.read_line(&mut line).await.unwrap();
+                let tag = line.split_whitespace().next().unwrap().to_owned();
+                server
+                    .write_all(format!("{tag} OK login\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                line.clear();
+                server.read_line(&mut line).await.unwrap();
+                let (tag, command) = line.trim_end_matches("\r\n").split_once(' ').unwrap();
+                let tag = tag.to_owned();
+                if expected.is_ascii() {
+                    assert_eq!(command, format!("UID SEARCH UID 1:500 TEXT \"{expected}\""));
+                } else {
+                    assert_eq!(
+                        command,
+                        format!(
+                            "UID SEARCH CHARSET UTF-8 UID 1:500 TEXT {{{}}}",
+                            expected.len()
+                        )
+                    );
+                    server.write_all(b"+ ready\r\n").await.unwrap();
+                    let mut bytes = vec![0; expected.len() + 2];
+                    server.read_exact(&mut bytes).await.unwrap();
+                    assert_eq!(bytes, format!("{expected}\r\n").as_bytes());
+                }
+                server
+                    .write_all(format!("* SEARCH 7\r\n{tag} OK done\r\n").as_bytes())
+                    .await
+                    .unwrap();
+            });
+            let mut session = async_imap::Client::new(client)
+                .login("synthetic", "test-only")
+                .await
+                .unwrap();
+            assert_eq!(
+                uid_text_search(&mut session, 1, 500, &text).await.unwrap(),
+                HashSet::from([7])
+            );
+            // Rejection happens without another protocol command.
+            assert_eq!(
+                uid_text_search(&mut session, 1, 500, &(text + "x"))
+                    .await
+                    .unwrap_err()
+                    .code,
+                "INVALID_INPUT"
+            );
+            backend.await.unwrap();
+        }
+    }
+
+    #[test]
     fn rev1_names_round_trip_and_reject_ambiguous_wire_names() {
         for (name, wire) in [
             ("INBOX", "INBOX"),
@@ -382,7 +496,7 @@ mod tests {
             ("😀", "&2D3eAA-"),
             ("~peter/mail/台北/日本語", "~peter/mail/&U,BTFw-/&ZeVnLIqe-"),
         ] {
-            assert_eq!(mailbox_name(name).unwrap(), wire);
+            assert_eq!(mailbox_name(name, InputLimits::Read).unwrap(), wire);
             assert_eq!(display_name(wire).unwrap(), name);
         }
         for wire in [
@@ -396,8 +510,8 @@ mod tests {
         ] {
             assert!(display_name(wire).is_err(), "{wire}");
         }
-        assert!(mailbox_name("bad\r\nname").is_err());
-        assert!(mailbox_name(&"x".repeat(513)).is_err());
+        assert!(mailbox_name("bad\r\nname", InputLimits::Read).is_err());
+        assert!(mailbox_name(&"x".repeat(513), InputLimits::Read).is_err());
     }
 
     #[tokio::test]

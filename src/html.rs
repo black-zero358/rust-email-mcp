@@ -249,6 +249,7 @@ pub(crate) fn unsupported() -> MailError {
         code: "UNSUPPORTED_BODY",
         message: "The original body cannot be rendered completely as plain text.",
         retryable: false,
+        details: None,
     }
 }
 

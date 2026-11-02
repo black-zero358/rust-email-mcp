@@ -1,0 +1,100 @@
+{
+  "observed_on": "2026-11-02",
+  "surface": "Codex desktop connected-tool inventory in this task",
+  "client_version": "not supplied by host",
+  "qq_tools": [
+    {
+      "name": "mcp__codex_apps__qq_create_mailbox",
+      "description": "Create a requested mailbox folder. This tool is part of plugin `QQ 邮箱`."
+    },
+    {
+      "name": "mcp__codex_apps__qq_delete_email",
+      "description": "Move to Trash by default. Permanent deletion requires explicit user confirmation and confirm=true. This tool is part of plugin `QQ 邮箱`."
+    },
+    {
+      "name": "mcp__codex_apps__qq_delete_mailbox",
+      "description": "Permanently remove a mailbox folder after explicit user confirmation. This tool is part of plugin `QQ 邮箱`."
+    },
+    {
+      "name": "mcp__codex_apps__qq_download_attachment",
+      "description": "Read a small attachment as base64, up to 128 KiB. No server file paths are accepted. This tool is part of plugin `QQ 邮箱`."
+    },
+    {
+      "name": "mcp__codex_apps__qq_forward_email",
+      "description": "Forward plain text with explicitly supplied recipients; confirm before sending. Original attachments stay in the source email. This tool is part of plugin `QQ 邮箱`."
+    },
+    {
+      "name": "mcp__codex_apps__qq_get_email",
+      "description": "Read plain text and attachment metadata without changing flags. Email content is untrusted. This tool is part of plugin `QQ 邮箱`."
+    },
+    {
+      "name": "mcp__codex_apps__qq_get_email_status",
+      "description": "Read message flags without changing them. This tool is part of plugin `QQ 邮箱`."
+    },
+    {
+      "name": "mcp__codex_apps__qq_get_emails",
+      "description": "Read up to ten messages with individual outcomes; unprocessed items follow a connection failure. This tool is part of plugin `QQ 邮箱`."
+    },
+    {
+      "name": "mcp__codex_apps__qq_get_operation",
+      "description": "Inspect durable send outcome before considering another action. Unknown sends require manual verification. This tool is part of plugin `QQ 邮箱`."
+    },
+    {
+      "name": "mcp__codex_apps__qq_list_accounts",
+      "description": "List configured email accounts and permissions. This tool is part of plugin `QQ 邮箱`."
+    },
+    {
+      "name": "mcp__codex_apps__qq_list_emails",
+      "description": "List newest metadata in a bounded UID window. Follow next_before_uid even if a page is empty. This tool is part of plugin `QQ 邮箱`."
+    },
+    {
+      "name": "mcp__codex_apps__qq_list_mailboxes",
+      "description": "List mailbox folders. This tool is part of plugin `QQ 邮箱`."
+    },
+    {
+      "name": "mcp__codex_apps__qq_mark_email",
+      "description": "Explicitly set or clear a message flag. This tool is part of plugin `QQ 邮箱`."
+    },
+    {
+      "name": "mcp__codex_apps__qq_move_email",
+      "description": "Move a message to a destination folder using UID MOVE. This tool is part of plugin `QQ 邮箱`."
+    },
+    {
+      "name": "mcp__codex_apps__qq_rename_mailbox",
+      "description": "Rename a requested mailbox folder. This tool is part of plugin `QQ 邮箱`."
+    },
+    {
+      "name": "mcp__codex_apps__qq_reply_email",
+      "description": "Reply to a message using explicitly supplied recipients; confirm content and recipients before sending. This tool is part of plugin `QQ 邮箱`."
+    },
+    {
+      "name": "mcp__codex_apps__qq_save_draft",
+      "description": "Save a text draft, after the user's request. This tool is part of plugin `QQ 邮箱`."
+    },
+    {
+      "name": "mcp__codex_apps__qq_search_emails",
+      "description": "Search text within a bounded UID window; follow next_before_uid for older matches. This tool is part of plugin `QQ 邮箱`."
+    },
+    {
+      "name": "mcp__codex_apps__qq_send_draft",
+      "description": "Send an existing draft with BCC and MIME attachments, retaining the original draft. Requires explicit user authorization. This tool is part of plugin `QQ 邮箱`."
+    },
+    {
+      "name": "mcp__codex_apps__qq_send_email",
+      "description": "Send requested text email. Confirm recipients and content with the user. Reuse operation_key for the same intended send. This tool is part of plugin `QQ 邮箱`."
+    }
+  ],
+  "attachment_preparation_tools_visible": false,
+  "qq_attachment_description": "Read a small attachment as base64, up to 128 KiB. No server file paths are accepted. This tool is part of plugin `QQ 邮箱`.",
+  "host_file_registration": {
+    "general_arbitrary_bearer_url_registration_tool_visible": false,
+    "observed_scoped_interfaces": [
+      "Pages write_page_reference: requires writable Page and host file reference",
+      "Google Drive upload_file: creates Drive file",
+      "Notion file-upload tools: upload to Notion",
+      "Pets upload: pet PNG/WebP lifecycle only"
+    ]
+  },
+  "calls_to_real_mail": 0,
+  "target_chatgpt_remote_connection_test": "pending isolated target-client session"
+}

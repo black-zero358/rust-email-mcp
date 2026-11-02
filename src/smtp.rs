@@ -20,6 +20,7 @@ pub(crate) fn validate_data(raw: &[u8]) -> crate::error::Result<()> {
         code: "UNSUPPORTED_DATA_FORMAT",
         message: "SMTP DATA requires CRLF lines of at most 998 bytes without NUL; encode binary attachments before sending.",
         retryable: false,
+        details: None,
     };
     let mut bytes = raw.iter();
     let mut line_bytes = 0;

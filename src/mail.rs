@@ -1,7 +1,8 @@
 use crate::{
     config::Config,
-    error::{MailError, Result},
+    error::{LimitKind, MailError, Result},
     imap_text::{display_name, mailbox_name, uid_field_search},
+    input_limits::InputLimits,
     journal::{Journal, Operation},
     mime,
     smtp::SmtpSender,
@@ -138,6 +139,9 @@ impl MailService {
             .map_err(|_| MailError::backend())
     }
     pub async fn execute(&self, name: &str, args: &Value, principal: &str) -> Result<Value> {
+        if !["send_email", "send_draft", "reply_email", "forward_email"].contains(&name) {
+            validate_legacy_write_inputs(name, args, &self.config)?;
+        }
         if name == "list_accounts" {
             return Ok(
                 json!({"accounts":[{"id":"default","address":self.config.address,"mode":self.config.mode}]}),
@@ -152,6 +156,7 @@ impl MailService {
             code: "BUSY",
             message: "Mailbox queue is full. Retry this read later; inspect write outcomes first.",
             retryable: true,
+            details: None,
         })?;
         let _permit =
             tokio::time::timeout(std::time::Duration::from_secs(10), self.slots.acquire())
@@ -160,6 +165,7 @@ impl MailService {
                     code: "BUSY",
                     message: "Mailbox concurrency limit reached.",
                     retryable: true,
+                    details: None,
                 })?
                 .map_err(|_| MailError::backend())?;
         // Sending has its own timeout and durable outcome handling. Never cancel it at the HTTP boundary.
@@ -179,7 +185,7 @@ impl MailService {
         }
         if ["mark_emails", "move_emails", "delete_emails"].contains(&name) {
             let ids = batch_ids(args)?;
-            folder(args)?;
+            folder(args, InputLimits::LegacyWrite)?;
             if name == "mark_emails"
                 && (!["seen", "flagged", "answered"].contains(&text(args, "flag")?)
                     || !args["value"].is_boolean())
@@ -221,6 +227,7 @@ impl MailService {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
     {
+        validate_legacy_write_inputs(name, a, &self.config)?;
         match name {
             "read_conversation" | "locate_message" | "get_mailbox_statistics" => {
                 self.insight_operation(s, name, a).await
@@ -234,17 +241,17 @@ impl MailService {
                     .await
                     .map_err(|_| MailError::backend())?;
                 if list.len() > 200 {
-                    return Err(MailError::limit());
+                    return Err(MailError::limit_with(LimitKind::ScanItems, 200, list.len()));
                 }
                 let mailboxes = list.iter().map(|m| Ok(json!({"name":display_name(m.name())?,"attributes":format!("{:?}",m.attributes())}))).collect::<Result<Vec<_>>>()?;
                 Ok(json!({"mailboxes":mailboxes}))
             }
             "list_emails" | "search_emails" => self.list(s, a, name == "search_emails").await,
             "get_email" | "get_email_status" | "download_attachment" => {
-                let folder = folder(a)?;
+                let folder = folder(a, InputLimits::Read)?;
                 let uid = uid(a)?;
                 let state = s
-                    .examine(mailbox_name(folder)?)
+                    .examine(mailbox_name(folder, InputLimits::Read)?)
                     .await
                     .map_err(|_| MailError::backend())?;
                 check_validity(a, state.uid_validity)?;
@@ -276,7 +283,10 @@ impl MailService {
                     return Err(MailError::input());
                 }
                 let state = s
-                    .examine(mailbox_name(folder(a)?)?)
+                    .examine(mailbox_name(
+                        folder(a, InputLimits::Read)?,
+                        InputLimits::Read,
+                    )?)
                     .await
                     .map_err(|_| MailError::backend())?;
                 check_validity(a, state.uid_validity)?;
@@ -317,15 +327,15 @@ impl MailService {
             }
             "save_draft" => save_draft(s, &self.config, a).await,
             "create_mailbox" => {
-                s.create(mailbox_name(text(a, "name")?)?)
+                s.create(mailbox_name(text(a, "name")?, InputLimits::LegacyWrite)?)
                     .await
                     .map_err(|_| MailError::backend())?;
                 Ok(json!({"status":"created"}))
             }
             "rename_mailbox" => {
                 s.rename(
-                    mailbox_name(text(a, "name")?)?,
-                    mailbox_name(text(a, "new_name")?)?,
+                    mailbox_name(text(a, "name")?, InputLimits::LegacyWrite)?,
+                    mailbox_name(text(a, "new_name")?, InputLimits::LegacyWrite)?,
                 )
                 .await
                 .map_err(|_| MailError::backend())?;
@@ -335,14 +345,17 @@ impl MailService {
                 if a["confirm"] != true {
                     return Err(MailError::input());
                 }
-                s.delete(mailbox_name(text(a, "name")?)?)
+                s.delete(mailbox_name(text(a, "name")?, InputLimits::LegacyWrite)?)
                     .await
                     .map_err(|_| MailError::backend())?;
                 Ok(json!({"status":"deleted"}))
             }
             "move_email" | "delete_email" | "mark_email" => {
                 let state = s
-                    .select(mailbox_name(folder(a)?)?)
+                    .select(mailbox_name(
+                        folder(a, InputLimits::LegacyWrite)?,
+                        InputLimits::LegacyWrite,
+                    )?)
                     .await
                     .map_err(|_| MailError::backend())?;
                 check_validity(a, state.uid_validity)?;
@@ -377,6 +390,7 @@ impl MailService {
                                 code: "UNSUPPORTED",
                                 message: "Permanent deletion requires UIDPLUS.",
                                 retryable: false,
+                                details: None,
                             });
                         }
                         s.uid_store(&uid, "+FLAGS.SILENT (\\Deleted)")
@@ -404,9 +418,10 @@ impl MailService {
                                 code: "UNSUPPORTED",
                                 message: "Safe movement requires the server MOVE capability.",
                                 retryable: false,
+                                details: None,
                             });
                         }
-                        s.uid_mv(&uid, mailbox_name(dest)?)
+                        s.uid_mv(&uid, mailbox_name(dest, InputLimits::LegacyWrite)?)
                             .await
                             .map_err(|_| MailError::backend())?;
                     }
@@ -443,6 +458,18 @@ impl MailService {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
     {
+        self.raw_with_limits(s, uid, InputLimits::Read).await
+    }
+
+    async fn raw_with_limits<S>(
+        &self,
+        s: &mut async_imap::Session<S>,
+        uid: u32,
+        limits: InputLimits,
+    ) -> Result<Vec<u8>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
+    {
         let metadata = s
             .uid_fetch(uid.to_string(), "(UID RFC822.SIZE)")
             .await
@@ -456,7 +483,7 @@ impl MailService {
             .find_map(|f| f.size)
             .ok_or_else(MailError::backend)? as usize;
         if size > self.config.max_message {
-            return Err(MailError::limit());
+            return Err(raw_limit(limits, self.config.max_message, size));
         }
         let f = s
             .uid_fetch(
@@ -474,7 +501,7 @@ impl MailService {
             .find_map(|f| f.body())
             .ok_or_else(MailError::backend)?;
         if body.len() > self.config.max_message {
-            return Err(MailError::limit());
+            return Err(raw_limit(limits, self.config.max_message, body.len()));
         }
         Ok(body.to_vec())
     }
@@ -488,7 +515,10 @@ impl MailService {
         S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
     {
         let m = s
-            .examine(mailbox_name(folder(a)?)?)
+            .examine(mailbox_name(
+                folder(a, InputLimits::Read)?,
+                InputLimits::Read,
+            )?)
             .await
             .map_err(|_| MailError::backend())?;
         check_validity(a, m.uid_validity)?;
@@ -618,7 +648,7 @@ impl MailService {
                 continue;
             };
             if header.len() < 8192 {
-                self.remember_headers(folder(a)?, m.uid_validity, id, header);
+                self.remember_headers(folder(a, InputLimits::Read)?, m.uid_validity, id, header);
             }
             let headers = mime::headers(header)?;
             out.push(json!({"uid":id,"subject":headers.get_first_value("Subject"),"from":headers.get_first_value("From"),"date":headers.get_first_value("Date"),"size":summary.size,"flags":summary.flags}));
@@ -642,16 +672,18 @@ impl MailService {
                 json!({"operation":self.journal.claim(principal,key,&fingerprint,&old.message_id)?.ok_or_else(MailError::storage)?}),
             );
         }
+        validate_legacy_write_inputs(name, a, &self.config)?;
         let message_id = format!("<{}@email-mcp.local>", uuid::Uuid::new_v4());
         let (raw, envelope) = if name == "send_draft" {
             let raw = tokio::time::timeout(self.config.timeout, async {
                 let mut s = self.connect().await?;
                 let state = s
-                    .examine(mailbox_name(&self.config.drafts)?)
+                    .examine(mailbox_name(&self.config.drafts, InputLimits::LegacyWrite)?)
                     .await
                     .map_err(|_| MailError::backend())?;
                 check_validity(a, state.uid_validity)?;
-                self.raw(&mut s, uid(a)?).await
+                self.raw_with_limits(&mut s, uid(a)?, InputLimits::LegacyWrite)
+                    .await
             })
             .await
             .map_err(|_| MailError::timeout())??;
@@ -660,11 +692,15 @@ impl MailService {
             let original = tokio::time::timeout(self.config.timeout, async {
                 let mut s = self.connect().await?;
                 let state = s
-                    .examine(mailbox_name(folder(a)?)?)
+                    .examine(mailbox_name(
+                        folder(a, InputLimits::LegacyWrite)?,
+                        InputLimits::LegacyWrite,
+                    )?)
                     .await
                     .map_err(|_| MailError::backend())?;
                 check_validity(a, state.uid_validity)?;
-                self.raw(&mut s, uid(a)?).await
+                self.raw_with_limits(&mut s, uid(a)?, InputLimits::LegacyWrite)
+                    .await
             })
             .await
             .map_err(|_| MailError::timeout())??;
@@ -734,7 +770,10 @@ impl BatchExecutor for SessionBatch<'_> {
         args.as_object_mut().unwrap().remove("uids");
         let state = self
             .session
-            .select(mailbox_name(folder(&args)?)?)
+            .select(mailbox_name(
+                folder(&args, InputLimits::LegacyWrite)?,
+                InputLimits::LegacyWrite,
+            )?)
             .await
             .map_err(|_| MailError::backend())?;
         check_validity(&args, state.uid_validity)?;
@@ -972,12 +1011,43 @@ pub fn text<'a>(a: &'a Value, key: &str) -> Result<&'a str> {
     }
     Ok(s)
 }
-fn folder(a: &Value) -> Result<&str> {
+fn folder(a: &Value, limits: InputLimits) -> Result<&str> {
     let f = a.get("mailbox").and_then(Value::as_str).unwrap_or("INBOX");
-    if f.len() > 512 || f.contains(['\r', '\n', '\0']) {
-        return Err(MailError::input());
-    }
+    limits.mailbox(f, "/mailbox")?;
     Ok(f)
+}
+fn raw_limit(limits: InputLimits, limit: usize, actual: usize) -> MailError {
+    match limits {
+        InputLimits::Read => MailError::limit_with(LimitKind::RawMessageBytes, limit, actual),
+        InputLimits::LegacyWrite => MailError::limit(),
+    }
+}
+/// Write operations keep their original input budget even when they first read mail.
+fn validate_legacy_write_inputs(name: &str, a: &Value, config: &Config) -> Result<()> {
+    let legacy = InputLimits::LegacyWrite;
+    match name {
+        "create_mailbox" | "delete_mailbox" | "rename_mailbox" => {
+            mailbox_name(text(a, "name")?, legacy)?;
+            if name == "rename_mailbox" {
+                mailbox_name(text(a, "new_name")?, legacy)?;
+            }
+        }
+        "mark_email" | "mark_emails" | "move_email" | "move_emails" | "delete_email"
+        | "delete_emails" | "reply_email" | "forward_email" => {
+            mailbox_name(folder(a, legacy)?, legacy)?;
+            if matches!(name, "move_email" | "move_emails") {
+                mailbox_name(text(a, "destination")?, legacy)?;
+            }
+            if matches!(name, "delete_email" | "delete_emails") && a["permanent"] != true {
+                mailbox_name(&config.trash, legacy)?;
+            }
+        }
+        "save_draft" | "send_draft" => {
+            mailbox_name(&config.drafts, legacy)?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 fn uid(a: &Value) -> Result<u32> {
     Ok(number(a, "uid", 0, 1, u32::MAX as u64)? as u32)
@@ -1001,6 +1071,7 @@ fn check_validity(a: &Value, current: Option<u32>) -> Result<()> {
             code: "STALE_UID",
             message: "Mailbox UIDVALIDITY changed. List the mailbox again.",
             retryable: false,
+            details: None,
         });
     }
     Ok(())
@@ -1049,6 +1120,7 @@ where
             code: "NOT_FOUND",
             message: "The requested email UID was not returned by the mailbox.",
             retryable: false,
+            details: None,
         })?;
     Ok(
         json!({"uid":uid,"uid_validity":validity,"flags":target.flags().map(|f|format!("{f:?}")).collect::<Vec<_>>()}),
@@ -1064,9 +1136,14 @@ where
         return Err(MailError::limit());
     }
     // async-imap serializes flags verbatim; RFC 3501 APPEND requires a flag list.
-    s.append(mailbox_name(&config.drafts)?, Some("(\\Draft)"), None, &raw)
-        .await
-        .map_err(|_| MailError::backend())?;
+    s.append(
+        mailbox_name(&config.drafts, InputLimits::LegacyWrite)?,
+        Some("(\\Draft)"),
+        None,
+        &raw,
+    )
+    .await
+    .map_err(|_| MailError::backend())?;
     Ok(json!({"status":"saved","mailbox":config.drafts}))
 }
 
@@ -1144,6 +1221,7 @@ fn canonical_draft_headers(raw: &[u8]) -> Result<(Vec<u8>, usize)> {
                     code: "UNSUPPORTED_DRAFT_HEADERS",
                     message: "Resent header blocks are not supported for draft sending.",
                     retryable: false,
+                    details: None,
                 });
             }
             canonical.extend(name.iter().map(u8::to_ascii_lowercase));
@@ -1261,7 +1339,13 @@ fn attachment(raw: &[u8], index: usize, max: usize) -> Result<Value> {
     let mut parts = Vec::new();
     leaves(&p, &mut parts, 0)?;
     let part = parts.get(index).ok_or_else(MailError::input)?;
-    let bytes = part.body_raw(max)?;
+    let bytes = part.body_raw(max).map_err(|error| {
+        if error.code == "LIMIT_EXCEEDED" && error.details.is_none() {
+            MailError::limit_kind(LimitKind::DecodedAttachmentBytes)
+        } else {
+            error
+        }
+    })?;
     Ok(
         json!({"content_type":part.ctype.mimetype,"size":bytes.len(),"base64":base64::engine::general_purpose::STANDARD.encode(bytes)}),
     )
@@ -1269,6 +1353,155 @@ fn attachment(raw: &[u8], index: usize, max: usize) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn recorded_send_status_remains_available_after_legacy_directory_change() {
+        for tool in ["send_draft", "reply_email", "forward_email"] {
+            let journal = Arc::new(Journal::open(std::path::Path::new(":memory:")).unwrap());
+            let args = json!({"operation_key":"recorded","mailbox":"中".repeat(171),"uid":7});
+            let fingerprint = format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&json!([tool, args])).unwrap())
+            );
+            journal
+                .claim("owner", "recorded", &fingerprint, "synthetic-id")
+                .unwrap();
+            journal
+                .finish("owner", "recorded", "accepted", &[])
+                .unwrap();
+            let mut config = (*crate::config::fixture()).clone();
+            config.drafts = "中".repeat(171);
+            let service = MailService::new(Arc::new(config), journal).unwrap();
+            let result = service.execute(tool, &args, "owner").await.unwrap();
+            assert_eq!(result["operation"]["status"], "accepted", "{tool}");
+        }
+    }
+
+    #[test]
+    fn legacy_write_mailbox_inputs_and_configured_directories_stay_at_512_bytes() {
+        let mut config = (*crate::config::fixture()).clone();
+        let long = "中".repeat(171);
+        assert!(folder(&json!({"mailbox":long}), InputLimits::Read).is_ok());
+        let cases = [
+            ("create_mailbox", json!({"name":long})),
+            ("rename_mailbox", json!({"name":long,"new_name":"ok"})),
+            ("rename_mailbox", json!({"name":"ok","new_name":long})),
+            ("delete_mailbox", json!({"name":long,"confirm":true})),
+            ("move_email", json!({"mailbox":"ok","destination":long})),
+            ("move_emails", json!({"mailbox":"ok","destination":long})),
+        ];
+        for (name, args) in cases {
+            let error = validate_legacy_write_inputs(name, &args, &config).unwrap_err();
+            assert_eq!(error.code, "INVALID_INPUT", "{name}");
+            assert!(error.details.is_none());
+        }
+        for name in [
+            "mark_email",
+            "mark_emails",
+            "move_email",
+            "move_emails",
+            "delete_email",
+            "delete_emails",
+            "reply_email",
+            "forward_email",
+        ] {
+            assert!(
+                validate_legacy_write_inputs(
+                    name,
+                    &json!({"mailbox":long,"destination":"ok"}),
+                    &config
+                )
+                .is_err(),
+                "{name}"
+            );
+        }
+        config.drafts = long.clone();
+        for name in ["save_draft", "send_draft"] {
+            assert!(
+                validate_legacy_write_inputs(name, &json!({}), &config).is_err(),
+                "{name}"
+            );
+        }
+        config.trash = long;
+        for name in ["delete_email", "delete_emails"] {
+            assert!(
+                validate_legacy_write_inputs(name, &json!({"mailbox":"ok"}), &config).is_err(),
+                "{name}"
+            );
+        }
+        assert!(raw_limit(InputLimits::LegacyWrite, 1, 2).details.is_none());
+        assert_eq!(
+            serde_json::to_value(raw_limit(InputLimits::Read, 1, 2)).unwrap()["details"]["limit_kind"],
+            "raw_message_bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_mailbox_unicode_boundary_reaches_examine_without_write_commands() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let name = "😀".repeat(512);
+        let wire = mailbox_name(&name, InputLimits::Read).unwrap();
+        let (client, server) = tokio::io::duplex(16384);
+        let backend = tokio::spawn(async move {
+            let mut server = BufReader::new(server);
+            for (expected, response) in [
+                ("LOGIN \"synthetic\" \"test-only\"".to_string(), ""),
+                (
+                    format!("EXAMINE \"{wire}\""),
+                    "* 1 EXISTS\r\n* OK [UIDVALIDITY 9] valid\r\n",
+                ),
+                (
+                    "UID FETCH 7 (UID FLAGS)".to_string(),
+                    "* 1 FETCH (UID 7 FLAGS ())\r\n",
+                ),
+            ] {
+                let mut line = String::new();
+                server.read_line(&mut line).await.unwrap();
+                let (tag, command) = line.trim_end_matches("\r\n").split_once(' ').unwrap();
+                assert_eq!(command, expected);
+                server
+                    .write_all(format!("{response}{tag} OK done\r\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            let mut bytes = Vec::new();
+            server.read_to_end(&mut bytes).await.unwrap();
+            assert!(bytes.is_empty());
+        });
+        let service = MailService::new(
+            crate::config::fixture(),
+            Arc::new(Journal::open(std::path::Path::new(":memory:")).unwrap()),
+        )
+        .unwrap();
+        let mut session = async_imap::Client::new(client)
+            .login("synthetic", "test-only")
+            .await
+            .unwrap();
+        service
+            .with_session(
+                &mut session,
+                "get_email_status",
+                &json!({"mailbox":name,"uid":7}),
+            )
+            .await
+            .unwrap();
+        for tool in ["mark_email", "move_email", "delete_email"] {
+            assert_eq!(
+                service
+                    .with_session(
+                        &mut session,
+                        tool,
+                        &json!({"mailbox":name,"uid":7,"destination":"ok"})
+                    )
+                    .await
+                    .unwrap_err()
+                    .code,
+                "INVALID_INPUT"
+            );
+        }
+        drop(session);
+        backend.await.unwrap();
+    }
+
     async fn batch_read_result(
         messages: Vec<(u32, String)>,
         failure: Option<&'static str>,
@@ -2939,7 +3172,7 @@ mod tests {
     }
     #[test]
     fn reject_injection_and_local_attachments() {
-        assert!(mailbox_name("x\r\nDELETE INBOX").is_err());
+        assert!(mailbox_name("x\r\nDELETE INBOX", InputLimits::Read).is_err());
         assert!(compose(&json!({"to":["a@example.com"],"subject":"x","body":"x","attachments":["/etc/passwd"]}),"me@example.com",None).is_err());
     }
     #[tokio::test]
