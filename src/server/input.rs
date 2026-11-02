@@ -8,6 +8,10 @@ use serde_json::{Value, json};
 /// Standard schema lengths count code points; the extension publishes the
 /// independent UTF-8 budget consumed by this validator.
 pub(super) fn read_properties(mut properties: Value) -> Value {
+    if properties.get("body_mode").is_some() {
+        properties["html_display"] =
+            json!({"type":"string","enum":["legacy","readable"],"default":"legacy"});
+    }
     for (name, schema) in properties.as_object_mut().expect("static properties") {
         match name.as_str() {
             "mailbox" => {

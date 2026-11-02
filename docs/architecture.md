@@ -10,6 +10,7 @@
 | --- | --- | --- |
 | `main` | 读取配置、组装服务、中间件、发现路由、日志和停机流程 | 负责接线；不得绕过认证、请求预算或输出保护 |
 | `config` | 环境变量、默认值、配置有效性 | 供认证和邮件适配器读取；凭据不进入日志 |
+| `accounts` | default 的持久 UUID、世代、IMAP 与操作库绑定 | 独立格式版本注册库；在 Journal 恢复前核验，不迁移发送记录 |
 | `auth` | OIDC 发现、JWT/JWKS 校验、请求主体和 HTTP 认证错误 | 依赖配置与身份服务，不执行邮件操作 |
 | `server` | MCP 工具目录、权限模式、输入校验、响应封装与预算 | 将已认证主体传给 `mail`；协议适配不直接操作邮箱或数据库 |
 | `server/input`、`input_limits` | 读取字段错误、字符与字节契约、旧写用途限制 | 输入常量供 Schema 与 IMAP 编码共用；协议层不依赖 MCP 请求对象 |
@@ -41,6 +42,10 @@
 读取输入由 `server/input` 按 Unicode 码点执行 Schema 的 `minLength/maxLength`；`input_limits` 共享读取与旧写入的用途限制。读取文件夹及查询字段最多 512 码点、2048 UTF-8 字节，文件夹另有 8192 modified UTF-7 线路字节上限。Schema 的 `x-maxUtf8Bytes` / `x-maxModifiedUtf7Bytes` 公开额外预算。组合字符逐码点计数。旧写工具继续使用原字节校验；写操作中的读取原邮件及配置目录也显式选择 `LegacyWrite`。`get_operation` 保持原操作键的 128 UTF-8 字节预算。
 
 输入错误可附 `details`：首项包含字段 JSON Pointer、稳定原因、预期类型/范围、长度单位和修正动作，`additional_violations` 最多七项，合计最多八项。未知字段指向所属对象，错误不回显字段值或任意未知键。读取资源错误通过 `limit_kind` 区分预算类型；完整响应容纳不下详情时先移除详情，保留基础错误与 request_id，再执行原有有界降级。
+
+`server/output` 定义 15 个读取工具的 `outputSchema`，按真实成功、错误、逐项失败和完整响应降级分支描述封装；对象字段、可空值和状态分支均显式声明。`server/output_tests` 通过真实 HTTP MCP handler、隔离 TLS IMAP 与 jsonschema 验证器核验结果，覆盖旧调用、空页、错误和降级；写工具沿用原 Schema。
+
+default 的 `AccountKey` 包含持久 UUID 与配置世代（v1 为 1），存放于独立 `accounts.sqlite`。注册库绑定 IMAP 登录身份/端点及规范化操作库路径，摘要域区分文件操作库与内存操作库；修改绑定拒绝启动。初始化在文件锁下清理固定暂存文件、构建完整 SQLite、同步并原子无覆盖发布，再加载正式路径核验。未知版本、损坏或权限不符返回脱敏错误；初始化成功后才打开 Journal。附件句柄携带 AccountKey，GET 再核对，重启继续使原内存句柄失效。
 
 共享 MIME 解析器的可选预算分类也适用于原有写操作，错误码和发送状态顺序保留。`raw_message_bytes`、`decoded_attachment_bytes`、`decoded_body_bytes`、`mime_structure`、`header_bytes`、`wire_response_bytes`、`scan_items` 按实际失败来源报告；数值单位使用 bytes 或 items。缓存额度分类随缓存工作包接入。
 
@@ -79,6 +84,8 @@ APPEND 等待同步 literal continuation 时，先将合法 untagged 通知交�
 依据 [RFC 2046 §5.1.4](https://www.rfc-editor.org/rfc/rfc2046#section-5.1.4)，alternative 每个候选表示同一份信息，选择必须覆盖候选的完整内联正文。纯文本探测遇到非空 HTML 时判定该候选不完整，回滚其中已收集的所有片段（如 plain 签名），继续寻找完整纯文本表示；不存在时才允许 HTML 转换。此规则沿 mixed、嵌套 alternative 和 related 主部件递归传播，附件仍排除；真正空的 HTML 不引入待转换内容，真正空的 plain 仍是有效完整表示。探测不解码、不分配正文，最终选中叶子继续共用既有解码预算。
 
 HTML 回退只用有界 tokenizer sink，不引入 DOM/layout 引擎、不执行脚本或加载资源。tokenizer 前检查输入和属性复杂度，处理时继续限制 token 与输出；属性复杂度必须覆盖无空白的相邻 quoted attributes 和 slash recovery。tokenizer-only sink 无法解释 SVG/MathML 外来内容及其 CDATA，出现时即使已有可见文字也拒绝整段正文。其他非空但无法完整解释的内联内容同样显式失败，转发必须在发送 claim 前拒绝不完整原文。所有新构建纯文本邮件显式声明 UTF-8，保持转发中的 Unicode 内容。
+
+读取可显式选择 `html_display:readable`；默认和转发继续使用 `legacy`。两种格式复用同一 MIME 候选选择器，读取解析一次 MIME 后分别提取元数据及所选格式正文。`html/readable` 维护有界格式状态：16 层列表/引用/表格、256 个链接、每链接 2048 UTF-8 字节；实体解码后验证 http/https/mailto 协议、控制字符和长度。多个所选 HTML 叶子共用 token、输出和链接预算。输出含 `legacy-v1` / `readable-v1` 及固定原因省略计数，保持外来内容拒绝和原有输入/标记复杂度约束。
 
 ## Send lifecycle
 
@@ -139,6 +146,8 @@ SMTPUTF8 需求与确定拒绝对应 D3/D4：`mime::requires_smtputf8`、`smtp::
 ## Decision records
 
 R01 的字符与错误回归入口：`read_lengths_count_unicode_code_points_and_publish_byte_limits`、`read_structure_errors_are_bounded_private_and_point_to_array_items`、`read_mailbox_unicode_and_wire_budgets_keep_legacy_writes_frozen`、`read_search_transmits_full_unicode_literal_at_character_boundary`、`legacy_write_argument_schemas_and_byte_validation_stay_frozen`、`legacy_write_mailbox_inputs_and_configured_directories_stay_at_512_bytes`、`recorded_send_status_remains_available_after_legacy_directory_change`、`input_detail_budget_preserves_original_error_and_measures_real_wire`、`budget_errors_identify_header_structure_attachment_and_body_resources`。分别覆盖 D2/D3/D4/D5 的输入、协议、幂等与错误预算边界。
+
+R02/R03 的新增验证入口：`accounts/tests.rs` 覆盖 D1/D4 的身份绑定、并发初始化、损坏与恢复；`every_read_output_schema_validates_real_handler_success_and_empty_results` 和其余 `server/output_tests` 覆盖 D3/D5 的正常、局部失败、诊断超时和完整 wire 压缩结果；`readable_reads_use_one_display_policy_while_forward_keeps_legacy_body`、`readable_html_expansion_uses_display_budget_after_bounded_charset_decode` 及 `html/readable` 回归覆盖 MIME 候选、旧转发、显示膨胀与跨部件预算。
 
 以下为当前选择的简短追溯记录，状态均为“采用”。新决策记录背景、决定、代价及重审条件；被替代的决策保留并指向后继记录，不以部署状态覆盖设计历史。
 

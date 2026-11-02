@@ -1,4 +1,4 @@
-use std::{env, sync::Arc, time::Duration};
+use std::{env, path::PathBuf, sync::Arc, time::Duration};
 
 pub const DEFAULT_MAX_MESSAGE: usize = 32 * 1024 * 1024;
 pub const DEFAULT_MAX_OUTPUT: usize = 2 * 1024 * 1024;
@@ -26,6 +26,7 @@ pub struct Config {
     pub scope: String,
     pub bind: String,
     pub database: String,
+    pub account_registry: Option<PathBuf>,
 }
 
 #[cfg(test)]
@@ -51,6 +52,7 @@ pub(crate) fn fixture() -> Arc<Config> {
         scope: "email:mcp".into(),
         bind: "127.0.0.1:0".into(),
         database: ":memory:".into(),
+        account_registry: None,
     })
 }
 impl Config {
@@ -81,6 +83,7 @@ impl Config {
             scope: value("OIDC_SCOPE", "email:mcp"),
             bind: value("BIND", "127.0.0.1:18590"),
             database: value("DATABASE_PATH", "data/operations.sqlite"),
+            account_registry: env::var_os("ACCOUNT_REGISTRY_PATH").map(PathBuf::from),
         };
         anyhow::ensure!(
             ["read", "draft", "send", "full"].contains(&c.mode.as_str()),

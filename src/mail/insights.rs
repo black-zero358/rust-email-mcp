@@ -391,9 +391,8 @@ impl MailService {
                     Err(_) => return diagnostic_failure(&mut stages, "tcp"),
                 };
             stages.push(json!({"stage":"tcp","status":"passed"}));
-            let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
             let tls = ClientConfig::builder()
-                .with_root_certificates(roots)
+                .with_root_certificates(self.imap_roots())
                 .with_no_client_auth();
             let name = match ServerName::try_from(self.config.imap_host.clone()) {
                 Ok(name) => name,
@@ -600,9 +599,18 @@ pub(super) fn parsed_with_options(
     } else {
         hard_limit
     };
-    let mut value = parsed(raw, uid, validity, hard_limit.max(1))?;
     let p = mime::parse(raw)?;
-    let full = p.plain_body()?;
+    let format = match a.get("html_display") {
+        None => crate::html::HtmlDisplay::Legacy,
+        Some(Value::String(value)) if value == "legacy" => crate::html::HtmlDisplay::Legacy,
+        Some(Value::String(value)) if value == "readable" => crate::html::HtmlDisplay::Readable,
+        _ => return Err(MailError::input()),
+    };
+    let displayed = p.display_body(format)?;
+    let mut value = parsed_metadata(&p, uid, validity)?;
+    value["html_display_metadata"] =
+        serde_json::to_value(displayed.metadata).map_err(|_| MailError::backend())?;
+    let full = displayed.text;
     let (trimmed, quoted_omitted, signature_omitted) = if mode == "trimmed" {
         trim_body(&full)
     } else {

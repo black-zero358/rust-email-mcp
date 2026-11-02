@@ -7,6 +7,9 @@ use html5ever::tokenizer::{
 };
 use std::cell::RefCell;
 
+mod readable;
+pub(crate) use readable::{DisplayBody, DisplayContext, HtmlDisplay};
+
 pub(crate) const MAX_INPUT: usize = 1024 * 1024;
 const MAX_TOKENS: usize = 32768;
 const MAX_OUTPUT: usize = 1024 * 1024;
@@ -26,6 +29,7 @@ struct Text {
     raw_ignore: Option<&'static str>,
     parse_error: bool,
     unsupported: bool,
+    readable: Option<readable::Readable>,
 }
 
 impl Text {
@@ -37,6 +41,11 @@ impl Text {
         }
     }
     fn text(&mut self, value: &str) {
+        if let Some(readable) = &mut self.readable {
+            readable.text(value);
+            self.limited |= readable.limited();
+            return;
+        }
         for c in value.chars() {
             if c.is_whitespace() {
                 self.pending_space = true;
@@ -154,7 +163,9 @@ impl TokenSink for Sink {
                     }
                 }
                 if !text.in_head && text.templates == 0 {
-                    if matches!(
+                    if let Some(readable) = &mut text.readable {
+                        readable.tag(&tag);
+                    } else if matches!(
                         name,
                         "br" | "p"
                             | "div"
@@ -181,7 +192,8 @@ impl TokenSink for Sink {
                     ) {
                         text.newline();
                     }
-                    if tag.kind == StartTag
+                    if text.readable.is_none()
+                        && tag.kind == StartTag
                         && name == "img"
                         && let Some(alt) = tag.attrs.iter().find(|a| &*a.name.local == "alt")
                     {
@@ -198,7 +210,12 @@ impl TokenSink for Sink {
                     return TokenSinkResult::Plaintext;
                 }
             }
-            Token::ParseError(_) => text.parse_error = true,
+            Token::ParseError(_) => {
+                text.parse_error = true;
+                if let Some(readable) = &mut text.readable {
+                    readable.malformed();
+                }
+            }
             _ => {}
         }
         TokenSinkResult::Continue
@@ -219,10 +236,32 @@ fn check_input(html: &str) -> Result<()> {
 }
 
 pub(crate) fn to_text(html: &str) -> Result<String> {
+    tokenize(html, None).map(|(text, _)| text)
+}
+
+pub(crate) fn render_selected(html: &str, context: &mut DisplayContext) -> Result<String> {
+    context.html_part();
+    if context.format() == HtmlDisplay::Legacy {
+        return to_text(html);
+    }
+    let (text, next) = tokenize(html, Some(std::mem::take(context)))?;
+    *context = next.ok_or_else(MailError::backend)?;
+    Ok(text)
+}
+
+fn tokenize(
+    html: &str,
+    context: Option<DisplayContext>,
+) -> Result<(String, Option<DisplayContext>)> {
     check_input(html)?;
     let input = BufferQueue::default();
     input.push_back(html.into());
-    let tokenizer = Tokenizer::new(Sink::default(), Default::default());
+    let mut sink = Sink::default();
+    if let Some(context) = context {
+        sink.0.get_mut().tokens = context.tokens();
+        sink.0.get_mut().readable = Some(readable::Readable::new(context));
+    }
+    let tokenizer = Tokenizer::new(sink, Default::default());
     let _ = tokenizer.feed(&input);
     if !input.is_empty() {
         return Err(unsupported());
@@ -235,13 +274,16 @@ pub(crate) fn to_text(html: &str) -> Result<String> {
     if text.limited {
         return Err(MailError::limit());
     }
+    if let Some(readable) = text.readable {
+        return readable.finish(text.tokens, text.parse_error, html);
+    }
     while text.out.ends_with('\n') {
         text.out.pop();
     }
     if text.out.is_empty() && text.parse_error && !html.trim().is_empty() {
         return Err(unsupported());
     }
-    Ok(text.out)
+    Ok((text.out, None))
 }
 
 pub(crate) fn unsupported() -> MailError {
