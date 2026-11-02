@@ -2,6 +2,26 @@
 
 本文件保存带版本与环境边界的证据。每次新增记录注明提交/tag、日期与时区、环境、命令、结果、CI 链接及未覆盖项；保留历史结果，不把其测试数量或部署状态当作当前版本的证明。验证要求见 [贡献指南](../CONTRIBUTING.md#验证与完成标准)。
 
+## 2026-11-02 R04 附件离线下载与内容读取
+
+源码提交 `60b8cca`，本地分支 `codex/read-capabilities-plan`。按用户确认的范围，本阶段使用本地模拟 IMAP、JWT/MCP 服务和合成文件完成离线测试；ChatGPT 实际连接测试放到后续阶段。
+
+实现包含稳定附件引用、原索引兼容、文件描述与安全名称、认证下载错误、完整邮件长度核对、SHA-256、并发许可释放，以及标准客户端的下载和本地保存。两个实现 agent 交叉审阅服务端与邮件层；主 agent 核对完整性、预算和 Git 中的原始文件字节。Base64 空白造成的编码输入预算也纳入可下载方式判定。
+
+| 检查 | 环境与结果 |
+| --- | --- |
+| `cargo fmt --check` | WSL Ubuntu、固定 Rust 1.99.1，通过 |
+| `cargo test --locked` | 164 单元、2 集成通过；1 个 Node 联调测试默认 ignored |
+| `cargo clippy --locked --all-targets -- -D warnings` | 通过，vendored async-imap 原有四处 deprecated 宏警告保留 |
+| `cargo build --locked --release` | 通过，最终构建 18.94 秒 |
+| `pnpm --dir scripts/attachment-client-adapter test` | Node 24.15.0，7 组通过，覆盖 JSON/SSE、32 MiB 边界、摘要、取消、目录失败和离线 UI mock |
+| 显式 Rust→Node 联调 | 1 项通过，8 组 fixture 经真实 JWT MCP→TLS IMAP→GET→Node 下载，长度与原 SHA-256 全部一致；[命令与证据](attachment-client-adapter-design.md) |
+| 文件内容 | 同组字节由锁定解析器读取：CSV/XLSX 金额 194、XLSX 数量 6、同名 CSV 分别 11/29、PDF 段落 CEDAR-729；见 [R00 记录](attachment-delivery-probe.md) |
+| `git diff --check` 与文件检查 | 通过；68 个本地文档链接有效；8 个暂存 Git blob 的原始大小和 SHA-256 全部核对通过 |
+| 客户端开发依赖审计 | 新增独立 pnpm 锁文件，以官方 npm registry 审计，无已知漏洞；机器默认镜像缺少审计端点，命令临时指定 registry，未修改全局配置 |
+
+CSV/PDF/XLSX fixture 设置 Git binary 属性，保留 CRLF、PDF 偏移及 512 KiB 边界。R04 未修改 Cargo 依赖、vendored 代码或容器构建上下文；标准客户端使用 Node 内置模块，UI Schema 验证依赖只在开发目录。结果保存为本地提交，后续源码 PR 继续执行 CI。
+
 ## 2026-11-02 R02/R03 读取契约与展示
 
 日期与时区：2026-11-02，Asia/Shanghai。源码提交 `b60a686ac379bea4178b7325bd8d6eb0f50aa5d8`。该提交完成 15 个读取工具 outputSchema、default 持久身份与文件夹用途、独立 HTML 可读策略，并同步配置、备份和兼容说明。
