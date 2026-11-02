@@ -644,7 +644,7 @@ impl ServerHandler for EmailServer {
         } else {
             // A detached task owns the write lifecycle even if cancellation
             // drops the caller after the write has started.
-            tokio::spawn(operation).await.unwrap_or_else(|_| {
+            tokio::spawn(operation).await.unwrap_or({
                 Err(MailError {
                     code: "INTERNAL",
                     message: "Operation interrupted. Check operation status before retrying a write.",
