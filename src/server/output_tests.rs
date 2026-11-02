@@ -306,6 +306,33 @@ impl Harness {
 }
 
 #[tokio::test]
+async fn attachment_download_url_is_a_uri_for_unicode_resource_configuration() {
+    let h = Harness::with_resource(
+        BTreeMap::from([(7, multipart())]),
+        None,
+        64 * 1024,
+        false,
+        Some("https://邮件.example/入口/mcp/".into()),
+    )
+    .await;
+    let result = h
+        .call(
+            "prepare_attachment_download",
+            json!({"uid":7,"uid_validity":9,"attachment_index":1}),
+        )
+        .await;
+    let url = result["data"]["download_url"].as_str().unwrap();
+    assert!(url.is_ascii());
+    let parsed = reqwest::Url::parse(url).unwrap();
+    assert!(parsed.host_str().unwrap().starts_with("xn--"));
+    assert!(
+        parsed
+            .path()
+            .starts_with("/%E5%85%A5%E5%8F%A3/mcp/attachments/")
+    );
+}
+
+#[tokio::test]
 async fn every_read_output_schema_validates_real_handler_success_and_empty_results() {
     let h = Harness::new(BTreeMap::from([(7, multipart())]), None, 64 * 1024).await;
     for (name, args) in [
