@@ -2,6 +2,25 @@
 
 本文件保存带版本与环境边界的证据。每次新增记录注明提交/tag、日期与时区、环境、命令、结果、CI 链接及未覆盖项；保留历史结果，不把其测试数量或部署状态当作当前版本的证明。验证要求见 [贡献指南](../CONTRIBUTING.md#验证与完成标准)。
 
+## 2026-11-02 R00/R01 首批实现
+
+日期与时区：2026-11-02，Asia/Shanghai。R01 源码提交 `7def28a01494685f6575730270258dc0c3d2c8e3`；R00 探针提交 `1b7afd35afacaff26294684a5c22efa24d23f8b0`。基线为 `e58090129eda40a47e593a8b89928291559bf1bd`，本次结果对应本地分支 `codex/read-capabilities-plan`。
+
+R01 实现读取 Unicode 码点与独立字节预算、有界字段错误、资源预算分类及旧写输入规则隔离。两个执行 agent 分别完成服务端与 IMAP 层，再交叉审阅；主 agent 复核接口、幂等顺序和兼容范围。发送已有记录优先于当前配置校验，缺头终结保留原错误码，共享 MIME 错误增量提供可选 details。
+
+| 检查 | 环境与结果 |
+| --- | --- |
+| `cargo fmt --check` | WSL Ubuntu、固定 Rust 1.99.1，通过 |
+| `cargo test --locked` | 121 单元测试、2 集成测试通过；最终缺头终结调整后，追加 `conversation_large_headers_skip_local_failures_but_stop_protocol_errors` 通过 |
+| `cargo clippy --locked --all-targets -- -D warnings` | 通过；vendored async-imap 原有四处 deprecated 宏警告仍由依赖编译报告 |
+| `cargo build --locked --release` | WSL Linux 本机 release 构建通过，首次构建 1 分 12 秒 |
+| `git diff --check` | 通过 |
+| R00 `uv run --locked probe.py selftest` | Windows CPython 3.13.13；8 组 fixture 与 12 类负例通过，完整摘要及运行参数见[探针说明](../scripts/attachment-delivery-probe/README.md) |
+
+WSL 构建使用 Linux 文件系统内的 `CARGO_TARGET_DIR`，源码保留在 Windows 工作区；共享磁盘上的首次构建曾出现 I/O 阻塞，迁移构建缓存后完成检查。Rust 依赖、vendored 源码和 Docker 上下文均未修改；本轮执行上述本地行为检查，GitHub CI 和容器检查留待源码 PR 验收。
+
+R00 的合成服务支持 MCP/Bearer GET、resource_link/resources/read 和内联 Base64。8 个文件下载后逐字节与 SHA-256 一致，CSV/XLSX 合计 194、XLSX 数量 6、同名 CSV 分别 11/29、PDF 提取 CEDAR-729。负例覆盖认证、主体/账户隔离、撤销、句柄过期重取及 RPC id 预算，详细证据见[交付报告](attachment-delivery-probe.md)。Rust 附件 handler fixture 集成和目标 ChatGPT 自动文件消费在 R04 执行；本轮使用合成数据及本地服务。
+
 ## 2026-10-29 Issue #24–#34 源码修复索引（Asia/Shanghai）
 
 最终集成源码为 [`e6495729cef5bf2b7303de91e74e19ead3bdcdc8`](https://github.com/black-zero358/rust-email-mcp/commit/e6495729cef5bf2b7303de91e74e19ead3bdcdc8)，源码版本 `0.2.0`。11 项启动时仍存在的问题均已逐项核实、修复，并经独立子代理审阅和最终 PR head 的 `check`、`audit`、`container` 成功后合并；各项根因、回归摘要、最终 head、审阅、CI 与 merge SHA 见 [完成清单](../ISSUE_PROGRESS.md)。2026-10-29 核对 GitHub 开放 issue 列表为空。
