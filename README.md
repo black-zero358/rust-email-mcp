@@ -118,18 +118,24 @@ JWKS 暂不可用时认证返回 HTTP 503 和 `Retry-After: 10`，客户端可�
 | `MCP_RESOURCE` | 公网 MCP 完整 HTTPS 地址 |
 | `OIDC_ISSUER` | 身份服务发现文档中的精确 issuer，包含其尾部斜线 |
 | `OIDC_AUDIENCE` | 访问令牌目标资源，一般与 `MCP_RESOURCE` 相同 |
-| `OIDC_SUBJECTS` | 获准使用此邮箱的用户 subject ID，逗号分隔 |
+| `OIDC_SUBJECTS` | 服务全局准入的用户 subject ID，逗号分隔；多账户还需匹配对应账户 ACL |
 | `OIDC_SCOPE` | 必需权限，默认 `email:mcp` |
 | `BIND`、`DATABASE_PATH` | 监听地址与 SQLite 文件位置 |
 | `ACCOUNT_REGISTRY_PATH` | 可选账户注册库路径；默认位于操作库同目录的 `accounts.sqlite` |
+| `ACCOUNT_CONFIG_PATH` | 可选多账户 JSON 路径；省略时保留原单账户配置 |
+| `MAIL_SECRET_ROOT` | 多账户 JSON 中密码文件引用的根目录；文件路径必须相对于此目录 |
 
 QQ 邮箱通常使用 `imap.qq.com:993` 和 `smtp.qq.com:465`，`SMTP_STARTTLS=false`。iCloud 使用 `imap.mail.me.com:993` 和 `smtp.mail.me.com:587`，`SMTP_STARTTLS=true`。凭据使用服务商签发的应用专用密码或授权码。
 
-每个实例配置一个邮箱。需要多个邮箱时，使用独立实例、数据目录和 OIDC 资源地址，分别设置 subject 白名单。
+一个实例可配置最多 16 个邮箱，包含原 `default`。追加邮箱固定只读。复制 [accounts.json.example](deploy/accounts.json.example)，显式配置各邮箱的读取主体，再设置 `ACCOUNT_CONFIG_PATH`；完整格式、凭据引用和迁移步骤见[多账户设计](docs/multi-account-design.md)及[部署说明](docs/deployment.md#多账户配置)。配置重启生效。
 
-`list_accounts` 返回 default 账户、当前交付方式、读取能力和实际限制；`list_mailboxes` 在原字段之外提供结构化属性、分隔符、可选择状态、用途及来源。用途优先采用服务器标记，再采用 `DRAFTS_MAILBOX` / `TRASH_MAILBOX` 配置；按名称推测的用途单独放在 `role_candidates`。
+13 个账户读取工具接受可选 `account_id`，省略时选择配置的默认读取邮箱。原写工具始终使用旧 `default` 邮箱，并检查它的模式和显式写权限；`get_operation` 按原主体和操作键查询，撤回邮箱权限后仍可核对自己的历史发送结果。`list_accounts` 只返回当前主体可读的账户，默认读取账户不可见时 `default_account_id` 为 null。
+
+`list_accounts` 返回账户别名、显示名、当前交付方式、读取能力和实际限制；`list_mailboxes` 在原字段之外提供结构化属性、分隔符、可选择状态、用途及来源。用途优先采用服务器标记，再采用对应账户的 Drafts/Trash 配置；按名称推测的用途单独放在 `role_candidates`。
 
 default 的内部 UUID 存在独立注册库中，绑定 IMAP 登录身份、端点和操作库规范路径。服务先校验账户绑定，再恢复操作记录；密码轮换和 SMTP 配置变化保持身份。注册库格式不符或绑定变化时启动返回固定恢复/迁移提示。`DATABASE_PATH=:memory:` 保留临时操作库行为，此时注册库默认 `data/accounts.sqlite`；账户身份仍持久保存。首次升级会建立注册库，后续备份需与操作库配套保留。
+
+显式启用多账户后，注册库事务迁移为 v2，保留原 default UUID 和操作库绑定。追加邮箱的显示名或别名变化保持身份；更换实际邮箱、端点，或删除后重新加入时递增配置世代，使旧附件引用及缓存失效。v2 需要显式账户配置才能启动，恢复旧程序时使用保留的 v1 注册副本并保留最新操作记录库。
 
 ## 认证与 ChatGPT 接入
 

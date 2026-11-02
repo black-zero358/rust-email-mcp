@@ -525,9 +525,13 @@ mod tests {
                 failed: false,
             }),
         });
+        let catalog = crate::accounts::AccountCatalog::from_test_accounts(
+            crate::config::ValidatedAccountSet::legacy(config),
+        )
+        .unwrap();
         let mail = Arc::new(
-            crate::mail::MailService::new(
-                config,
+            crate::mail::MailRuntime::new(
+                catalog,
                 Arc::new(crate::journal::Journal::open(std::path::Path::new(":memory:")).unwrap()),
             )
             .unwrap(),

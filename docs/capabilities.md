@@ -28,7 +28,7 @@
 
 `list_accounts` 的 `default_account_id` 与账户的 `default` 指示默认项；`capabilities` 和 `limits` 给出当前实现及配置值。`list_mailboxes` 保留 `attributes`，增加 `attribute_flags`、`delimiter`、`selectable`、`special_use`、`role_source` 和 `role_candidates`。服务器用途、管理员配置和 INBOX 协议角色分别标记 `server`、`configuration`、`protocol`；只有名称候选时 `special_use` 为空、`role_source` 为 null。
 
-`download_attachment` 保持原有 `content_type`、`size`、`base64` 返回字段和工具输出预算，新增 SHA-256 校验值。`list_attachments` 提供与 `get_email` 一致的原遍历索引（0–1023）及稳定的 `attachment_id`；`prepare_attachment_download` 和 `download_attachment` 接受 id 或索引，至少提供一个，同时提供时必须指向同一部件。这三个工具接受省略或值为 `default` 的 `account_id`。稳定 id 绑定账户身份、文件夹、UIDVALIDITY、UID、遍历位置及 MIME 引用版本；下载授权由请求主体及短期句柄决定。
+`download_attachment` 保持原有 `content_type`、`size`、`base64` 返回字段和工具输出预算，新增 SHA-256 校验值。`list_attachments` 提供与 `get_email` 一致的原遍历索引（0–1023）及稳定的 `attachment_id`；`prepare_attachment_download` 和 `download_attachment` 接受 id 或索引，至少提供一个，同时提供时必须指向同一部件。这三个工具与其余账户读取工具共用可选 `account_id`，省略时选择配置默认读取账户并检查当前主体权限。稳定 id 绑定账户身份、文件夹、UIDVALIDITY、UID、遍历位置及 MIME 引用版本；下载授权由请求主体及短期句柄决定。
 
 附件描述保留原字段，增加 `safe_filename`、`declared_content_type`、`detected_content_type`、`decoded_size`、`size_accuracy`、`disposition`、`content_id`、`downloadable`、`unavailable_reason`、`delivery` 和 `checksum`。类型检测及准备阶段摘要当前为 null；identity 编码大小为 exact，Base64 为 estimate，其他为 unknown。未知传输编码列为不可下载，完整解码后才生成摘要。`delivery` 指出可用方式、认证、过期及下一动作，`client_delivery_required` 提醒客户端把下载字节交给文件解析工具。
 
@@ -71,7 +71,7 @@
 
 `get_mailbox_statistics` 以 STATUS 返回文件夹邮件数量、未读数量等。统计必须收到匹配文件夹的全部请求字段和匹配 tag 的 OK；断连、缺失字段及拒绝均返回 MAIL_BACKEND，不把缺失响应解释为零。可选 `date_start` 和 `date_end` 统计最多 31 天的 INTERNALDATE 日分布，结束日期不包含在内。分布只覆盖本次 500 UID 窗口，结果附带范围和游标；总量与分布不是原子快照，不能混为同一时刻的全量统计。
 
-元数据缓存仅保存完整邮件头，每实例最多 256 项、16 MiB，TTL 为 60 秒。键包含文件夹、UIDVALIDITY 和 UID，每次会话先获取当前 UIDVALIDITY，失效时移除旧缓存。正文、附件、可变标记和统计结果不进入缓存，避免旧已读状态误导后续操作。
+元数据缓存仅保存完整邮件头，全实例所有账户合计最多 256 项、16 MiB，TTL 为 60 秒。键包含内部账户身份与世代、文件夹、UIDVALIDITY 和 UID；每次会话先获取当前 UIDVALIDITY，只失效相应账户和文件夹的旧缓存。正文、附件、可变标记和统计结果不进入缓存。
 
 ## 协议依据
 

@@ -13,7 +13,7 @@ use std::{
     convert::Infallible,
     time::{Duration, Instant},
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 const HANDLE_TTL: Duration = Duration::from_secs(600);
 const MAX_HANDLES: usize = 64;
@@ -82,12 +82,18 @@ impl AttachmentStore {
         handles.insert(token.clone(), transfer);
         Ok(token)
     }
+    #[cfg(test)]
     async fn lookup(&self, token: &str, principal: &str, account: &AccountKey) -> Option<Transfer> {
+        self.lookup_principal(token, principal)
+            .await
+            .filter(|transfer| &transfer.account == account)
+    }
+    async fn lookup_principal(&self, token: &str, principal: &str) -> Option<Transfer> {
         let mut handles = self.handles.lock().await;
         handles.retain(|_, t| t.expires > Instant::now());
         handles
             .get(token)
-            .filter(|t| t.principal == principal && &t.account == account)
+            .filter(|t| t.principal == principal)
             .cloned()
     }
 }
@@ -136,7 +142,7 @@ impl MailService {
         a: &Value,
         principal: &str,
     ) -> Result<Value> {
-        metadata::ensure_default_account(a)?;
+        metadata::ensure_account(a, &self.alias)?;
         let mut session = self.connect().await?;
         let mailbox = folder(a, InputLimits::Read)?;
         let uid = uid(a)?;
@@ -149,6 +155,7 @@ impl MailService {
         let raw = self.raw_attachment(&mut session, uid).await?;
         let entries = entries(&raw)?;
         let reference = AttachmentReference {
+            alias: &self.alias,
             account: &self.account,
             mailbox,
             uid,
@@ -178,7 +185,7 @@ impl MailService {
                 metadata.push(item);
             }
             return Ok(
-                json!({"account_id":"default","mailbox":mailbox,"uid":uid,"uid_validity":validity,"attachments":metadata,"next_attachment_offset":next,"content_trust":"untrusted"}),
+                json!({"account_id":self.alias,"mailbox":mailbox,"uid":uid,"uid_validity":validity,"attachments":metadata,"next_attachment_offset":next,"content_trust":"untrusted"}),
             );
         }
         let index = select_part(&entries, a, &reference)?;
@@ -212,18 +219,13 @@ impl MailService {
             })
             .await?;
         Ok(
-            json!({"account_id":"default","mailbox":mailbox,"uid":uid,"uid_validity":validity,"attachment_id":attachment_id,"attachment_index":index,"download_url":download_url(&self.config.resource,&token)?,"method":"GET","required_headers":{"Authorization":"Bearer <access_token>"},"expires_in_seconds":HANDLE_TTL.as_secs(),"delivery":metadata["delivery"],"metadata":metadata,"content_trust":"untrusted"}),
+            json!({"account_id":self.alias,"mailbox":mailbox,"uid":uid,"uid_validity":validity,"attachment_id":attachment_id,"attachment_index":index,"download_url":download_url(&self.config.resource,&token)?,"method":"GET","required_headers":{"Authorization":"Bearer <access_token>"},"expires_in_seconds":HANDLE_TTL.as_secs(),"delivery":metadata["delivery"],"metadata":metadata,"content_trust":"untrusted"}),
         )
     }
     async fn fetch_attachment(&self, transfer: &Transfer) -> Result<Vec<u8>> {
         if transfer.account != self.account {
-            return Err(MailError::input());
+            return Err(MailError::account_unavailable());
         }
-        let _permit = self
-            .slots
-            .acquire()
-            .await
-            .map_err(|_| MailError::backend())?;
         let mut session = self.connect().await?;
         let state = session
             .examine(mailbox_name(&transfer.mailbox, InputLimits::Read)?)
@@ -294,6 +296,7 @@ pub(super) fn inline_download(
     use base64::Engine;
     let entries = entries(raw)?;
     let reference = AttachmentReference {
+        alias: args["account_id"].as_str().unwrap_or("default"),
         account,
         mailbox,
         uid,
@@ -305,7 +308,7 @@ pub(super) fn inline_download(
     leaves(&parsed, &mut parts, 0)?;
     let bytes = decode_part(parts.get(index).ok_or_else(attachment_missing)?, max)?;
     Ok(json!({
-        "account_id":"default", "mailbox":mailbox, "uid":uid, "uid_validity":validity,
+        "account_id":reference.alias, "mailbox":mailbox, "uid":uid, "uid_validity":validity,
         "attachment_id":reference.id(index), "attachment_index":index,
         "content_type":entries[index].content_type,"size":bytes.len(),
         "base64":base64::engine::general_purpose::STANDARD.encode(&bytes),
@@ -339,6 +342,29 @@ pub(crate) fn http_error(
 
 fn fetch_http_error(error: &MailError, request_id: &str, limit: usize) -> Response {
     match error.code {
+        "TIMEOUT" => http_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            "TIMEOUT",
+            "The attachment download timed out.",
+            "backend_fetch",
+            "retry_read",
+            request_id,
+        ),
+        "ACCOUNT_UNAVAILABLE" => handle_not_found(request_id),
+        "BUSY" => {
+            let mut response = http_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "BUSY",
+                "Attachment download capacity is full.",
+                "transfer_admission",
+                "retry_with_backoff",
+                request_id,
+            );
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
+            response
+        }
         "STALE_UID" => http_error(
             StatusCode::CONFLICT,
             "STALE_UID",
@@ -428,26 +454,60 @@ fn fetch_http_error(error: &MailError, request_id: &str, limit: usize) -> Respon
         ),
     }
 }
+fn handle_not_found(request_id: &str) -> Response {
+    http_error(
+        StatusCode::NOT_FOUND,
+        "ATTACHMENT_HANDLE_NOT_FOUND",
+        "The download handle is unavailable.",
+        "handle_lookup",
+        "prepare_attachment_download",
+        request_id,
+    )
+}
 /// Must be mounted inside the same OIDC middleware as the MCP endpoint.
 pub async fn download(
-    State(service): State<Arc<MailService>>,
+    State(runtime): State<Arc<MailRuntime>>,
     Extension(principal): Extension<Principal>,
     Path(token): Path<String>,
     request_id: Option<Extension<RequestId>>,
 ) -> Response {
-    let backend = service.clone();
     let request_id = request_id
         .map(|Extension(value)| value.0)
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    download_with(
-        service,
-        principal,
-        token,
+    let Some(transfer) = runtime
+        .attachments
+        .lookup_principal(&token, &principal.0)
+        .await
+    else {
+        return handle_not_found(&request_id);
+    };
+    let Ok(lease) = runtime.catalog.read_key(&principal.0, &transfer.account) else {
+        return handle_not_found(&request_id);
+    };
+    let config = lease.config.clone();
+    let backend = runtime.clone();
+    download_selected(
+        &runtime.attachments,
+        &config,
+        transfer,
         request_id,
-        move |transfer| async move { backend.fetch_attachment(&transfer).await },
+        move |transfer| async move {
+            let service = backend.service_for(&lease.key)?;
+            backend
+                .run_read(&lease, async {
+                    tokio::time::timeout(
+                        service.config.timeout,
+                        service.fetch_attachment(&transfer),
+                    )
+                    .await
+                    .map_err(|_| service.backend_timeout())?
+                })
+                .await
+        },
     )
     .await
 }
+#[cfg(test)]
 async fn download_with<F, Fut>(
     service: Arc<MailService>,
     principal: Principal,
@@ -464,16 +524,34 @@ where
         .lookup(&token, &principal.0, &service.account)
         .await
     else {
-        return http_error(
-            StatusCode::NOT_FOUND,
-            "ATTACHMENT_HANDLE_NOT_FOUND",
-            "The download handle is unavailable.",
-            "handle_lookup",
-            "prepare_attachment_download",
-            &request_id,
-        );
+        return handle_not_found(&request_id);
     };
-    let Ok(permit) = service.attachments.transfers.clone().try_acquire_owned() else {
+    let timeout = service.config.timeout;
+    download_selected(
+        &service.attachments,
+        &service.config,
+        transfer,
+        request_id,
+        move |transfer| async move {
+            tokio::time::timeout(timeout, fetch(transfer))
+                .await
+                .map_err(|_| MailError::timeout())?
+        },
+    )
+    .await
+}
+async fn download_selected<F, Fut>(
+    store: &AttachmentStore,
+    config: &Config,
+    transfer: Transfer,
+    request_id: String,
+    fetch: F,
+) -> Response
+where
+    F: FnOnce(Transfer) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>>>,
+{
+    let Ok(permit) = store.transfers.clone().try_acquire_owned() else {
         let mut response = http_error(
             StatusCode::TOO_MANY_REQUESTS,
             "BUSY",
@@ -488,25 +566,15 @@ where
         return response;
     };
     let filename = metadata::safe_filename(transfer.part.filename.as_deref(), transfer.part.index);
-    let bytes = match tokio::time::timeout(service.config.timeout, fetch(transfer)).await {
-        Ok(Ok(bytes)) => bytes,
-        Ok(Err(error)) => return fetch_http_error(&error, &request_id, service.config.max_message),
-        Err(_) => {
-            return http_error(
-                StatusCode::GATEWAY_TIMEOUT,
-                "TIMEOUT",
-                "The attachment download timed out.",
-                "backend_fetch",
-                "retry_read",
-                &request_id,
-            );
-        }
+    let bytes = match fetch(transfer).await {
+        Ok(bytes) => bytes,
+        Err(error) => return fetch_http_error(&error, &request_id, config.max_message),
     };
-    if bytes.len() > service.config.max_message {
+    if bytes.len() > config.max_message {
         return fetch_http_error(
             &MailError::limit_kind(LimitKind::DecodedAttachmentBytes),
             &request_id,
-            service.config.max_message,
+            config.max_message,
         );
     }
     let len = bytes.len();
@@ -561,6 +629,21 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    async fn download_legacy(
+        State(service): State<Arc<MailService>>,
+        Extension(principal): Extension<Principal>,
+        Path(token): Path<String>,
+    ) -> Response {
+        let backend = service.clone();
+        download_with(
+            service,
+            principal,
+            token,
+            uuid::Uuid::new_v4().to_string(),
+            move |transfer| async move { backend.fetch_attachment(&transfer).await },
+        )
+        .await
+    }
     fn transfer(principal: &str, expires: Instant, account: &AccountKey) -> Transfer {
         Transfer {
             principal: principal.into(),
@@ -651,7 +734,7 @@ mod tests {
             .await
             .unwrap();
         let route = Router::new()
-            .route("/mcp/attachments/{token}", get(download))
+            .route("/mcp/attachments/{token}", get(download_legacy))
             .with_state(service.clone());
         let request = || {
             Request::builder()

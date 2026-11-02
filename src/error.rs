@@ -84,6 +84,14 @@ pub struct ErrorDetails {
 }
 pub type Result<T> = std::result::Result<T, MailError>;
 impl MailError {
+    pub fn account_unavailable() -> Self {
+        Self {
+            code: "ACCOUNT_UNAVAILABLE",
+            message: "The account is unavailable. List accessible accounts and choose one.",
+            retryable: false,
+            details: None,
+        }
+    }
     pub fn input() -> Self {
         Self {
             code: "INVALID_INPUT",

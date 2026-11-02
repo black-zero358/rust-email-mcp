@@ -1,7 +1,11 @@
 //! Contract checks run the real HTTP MCP handler against an isolated TLS IMAP
 //! fixture, then validate returned structured content with the standard engine.
 use super::*;
-use crate::{config, journal::Journal};
+use crate::{
+    accounts::AccountCatalog,
+    config::{self, ValidatedAccountSet},
+    journal::Journal,
+};
 use axum::{Router, body::Body, http::Request, middleware};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
@@ -20,6 +24,7 @@ use tokio_rustls::{
 };
 use tower::ServiceExt;
 
+mod accounts;
 mod attachments;
 
 fn validator(name: &str) -> jsonschema::Validator {
@@ -57,8 +62,22 @@ fn header(raw: &[u8]) -> &[u8] {
 
 struct Harness {
     app: Router,
-    service: Arc<MailService>,
+    service: Arc<MailRuntime>,
+    journal: Arc<Journal>,
+    roots: RootCertStore,
+    connections: Arc<std::sync::atomic::AtomicUsize>,
+    writes: Arc<std::sync::atomic::AtomicUsize>,
+    allow_writes: Arc<std::sync::atomic::AtomicBool>,
+    stall_greeting: Arc<std::sync::atomic::AtomicBool>,
+    active_connections: Arc<std::sync::atomic::AtomicUsize>,
+    reject_login: Arc<std::sync::atomic::AtomicBool>,
     imap: tokio::task::JoinHandle<()>,
+}
+struct ActiveConnection(Arc<std::sync::atomic::AtomicUsize>);
+impl Drop for ActiveConnection {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 impl Drop for Harness {
     fn drop(&mut self) {
@@ -112,27 +131,48 @@ impl Harness {
         } else {
             Duration::from_secs(5)
         };
+        let configuration = Arc::new(configuration);
+        let journal = Arc::new(Journal::open(std::path::Path::new(":memory:")).unwrap());
+        let catalog =
+            AccountCatalog::from_test_accounts(ValidatedAccountSet::legacy(configuration)).unwrap();
         let service = Arc::new(
-            MailService::new(
-                Arc::new(configuration),
-                Arc::new(Journal::open(std::path::Path::new(":memory:")).unwrap()),
-            )
-            .unwrap()
-            .with_test_imap_roots(roots),
+            MailRuntime::new(catalog, journal.clone())
+                .unwrap()
+                .with_test_imap_roots(roots.clone()),
         );
         let messages = Arc::new(messages);
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = connections.clone();
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let allow_writes = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let write_count = writes.clone();
+        let write_permission = allow_writes.clone();
+        let stall_greeting = Arc::new(std::sync::atomic::AtomicBool::new(stall_greeting));
+        let stall = stall_greeting.clone();
+        let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let active = active_connections.clone();
+        let reject_login = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let login_rejected = reject_login.clone();
         let imap = tokio::spawn(async move {
             let acceptor = TlsAcceptor::from(Arc::new(tls));
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let acceptor = acceptor.clone();
                 let messages = messages.clone();
+                let write_count = write_count.clone();
+                let write_permission = write_permission.clone();
+                let stall = stall.clone();
+                let active = active.clone();
+                let login_rejected = login_rejected.clone();
                 tokio::spawn(async move {
                     let Ok(stream) = acceptor.accept(stream).await else {
                         return;
                     };
+                    active.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _active = ActiveConnection(active);
                     let mut stream = BufReader::new(stream);
-                    if stall_greeting {
+                    if stall.load(std::sync::atomic::Ordering::SeqCst) {
                         // Diagnose waits for the server greeting until its
                         // deadline closes this isolated connection.
                         let _ = stream.read_u8().await;
@@ -156,7 +196,23 @@ impl Harness {
                         };
                         let mut response = Vec::new();
                         if command.starts_with("LOGIN ") {
-                        } else if command.starts_with("EXAMINE ") {
+                            if login_rejected.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                                let _ = stream
+                                    .write_all(
+                                        format!("{tag} NO synthetic login refused\r\n").as_bytes(),
+                                    )
+                                    .await;
+                                return;
+                            }
+                        } else if command.starts_with("EXAMINE ") || command.starts_with("SELECT ")
+                        {
+                            if command.starts_with("SELECT ") {
+                                assert!(
+                                    write_permission.load(std::sync::atomic::Ordering::SeqCst),
+                                    "read issued SELECT"
+                                );
+                                write_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            }
                             let next = messages.keys().next_back().copied().unwrap_or(0) + 1;
                             response.extend_from_slice(format!("* {} EXISTS\r\n* OK [UIDVALIDITY 9] stable\r\n* OK [UIDNEXT {next}] next\r\n",messages.len()).as_bytes());
                         } else if command.starts_with("LIST ") {
@@ -203,6 +259,13 @@ impl Harness {
                                 .collect::<Vec<_>>()
                                 .join(" ");
                             response.extend_from_slice(format!("* SEARCH {ids}\r\n").as_bytes());
+                        } else if command.starts_with("UID STORE ") {
+                            assert!(
+                                write_permission.load(std::sync::atomic::Ordering::SeqCst),
+                                "read issued UID STORE"
+                            );
+                            write_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            response.extend_from_slice(b"* 1 FETCH (UID 7 FLAGS ())\r\n");
                         } else if let Some(fetch) = command.strip_prefix("UID FETCH ") {
                             let (set, attrs) = fetch.split_once(' ').unwrap();
                             for uid in set.split(',').map(|id| id.parse::<u32>().unwrap()) {
@@ -269,7 +332,19 @@ impl Harness {
                     next.run(request).await
                 },
             ));
-        Self { app, service, imap }
+        Self {
+            app,
+            service,
+            journal,
+            roots,
+            connections,
+            writes,
+            allow_writes,
+            stall_greeting,
+            active_connections,
+            reject_login,
+            imap,
+        }
     }
     async fn call(&self, name: &str, args: Value) -> Value {
         self.call_id(name, args, json!(1)).await
@@ -298,11 +373,38 @@ impl Harness {
             serde_json::from_str(wire["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(content, text);
         assert!(
-            bytes.len() <= self.service.config.max_output,
+            bytes.len() <= self.service.config().max_output,
             "actual HTTP JSON exceeds complete response budget"
         );
         content
     }
+}
+
+#[tokio::test]
+async fn attachment_download_url_is_a_uri_for_unicode_resource_configuration() {
+    let h = Harness::with_resource(
+        BTreeMap::from([(7, multipart())]),
+        None,
+        64 * 1024,
+        false,
+        Some("https://邮件.example/入口/mcp/".into()),
+    )
+    .await;
+    let result = h
+        .call(
+            "prepare_attachment_download",
+            json!({"uid":7,"uid_validity":9,"attachment_index":1}),
+        )
+        .await;
+    let url = result["data"]["download_url"].as_str().unwrap();
+    assert!(url.is_ascii());
+    let parsed = reqwest::Url::parse(url).unwrap();
+    assert!(parsed.host_str().unwrap().starts_with("xn--"));
+    assert!(
+        parsed
+            .path()
+            .starts_with("/%E5%85%A5%E5%8F%A3/mcp/attachments/")
+    );
 }
 
 #[tokio::test]
@@ -383,13 +485,11 @@ async fn every_read_output_schema_validates_real_handler_success_and_empty_resul
             .is_null()
     );
     for status in ["sending", "accepted", "rejected", "unknown"] {
-        h.service
-            .journal
+        h.journal
             .claim("owner", status, "hash", "<legacy@example.test>")
             .unwrap();
         if status != "sending" {
-            h.service
-                .journal
+            h.journal
                 .finish("owner", status, status, &["legacy-warning".into()])
                 .unwrap();
         }
@@ -571,12 +671,10 @@ async fn handler_contracts_cover_errors_details_downgrade_and_status_preserving_
         .await;
     assert_eq!(result["error"]["code"], "INVALID_INPUT");
     assert!(result["error"].get("details").is_none());
-    h.service
-        .journal
+    h.journal
         .claim("owner", "large", "hash", "<legacy@example.test>")
         .unwrap();
-    h.service
-        .journal
+    h.journal
         .finish("owner", "large", "accepted", &["large".repeat(10000)])
         .unwrap();
     let result = h

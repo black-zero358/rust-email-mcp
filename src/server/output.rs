@@ -1,5 +1,6 @@
 //! Exact structured-content contracts for the currently implemented read tools.
 //! Success, local item errors and the complete-wire fallback share this source.
+use crate::accounts::ACCOUNT_ID_MAX_CHARACTERS;
 use crate::mail::attachments::MAX_ATTACHMENT_INDEX;
 use serde_json::{Value, json};
 
@@ -39,13 +40,45 @@ fn reference(name: &str) -> Value {
 fn enumeration(values: &[&str]) -> Value {
     json!({"type":"string","enum":values})
 }
+fn account_id() -> Value {
+    json!({"type":"string","minLength":1,"maxLength":ACCOUNT_ID_MAX_CHARACTERS,"pattern":format!("^[A-Za-z0-9][A-Za-z0-9._-]{{0,{}}}$",ACCOUNT_ID_MAX_CHARACTERS-1)})
+}
+
+fn account_context(mut schema: Value, mailbox: bool) -> Value {
+    if let Some(branches) = schema.get_mut("oneOf").and_then(Value::as_array_mut) {
+        for branch in branches {
+            *branch = account_context(branch.clone(), mailbox);
+        }
+        return schema;
+    }
+    if schema.get("$ref").is_some() {
+        return schema;
+    }
+    schema["properties"]["account_id"] = account_id();
+    if mailbox {
+        schema["properties"]["mailbox"] = string();
+    }
+    let required = schema["required"]
+        .as_array_mut()
+        .expect("concrete read object");
+    for key in if mailbox {
+        &["account_id", "mailbox"][..]
+    } else {
+        &["account_id"][..]
+    } {
+        if !required.iter().any(|value| value == key) {
+            required.push(json!(key));
+        }
+    }
+    schema
+}
 
 fn violation() -> Value {
     object(
         json!({
             "field":{"type":"string","pattern":"^(?:/(?:[^~/]|~[01])*)*$"},
-            "reason":enumeration(&["type_mismatch","required_field","unknown_field","character_minimum","character_limit","utf8_byte_limit","wire_byte_limit","forbidden_control_character","integer_range","item_count","constant_mismatch","unsupported_value","invalid_date","conflicting_range","required_with_field","date_range_limit","invalid_message_id","resource_limit","attachment_reference_required","invalid_attachment_id","reference_mismatch"]),
-            "action":enumeration(&["use_expected_type","provide_field","remove_unknown_fields","provide_longer_field","shorten_field","remove_control_characters","use_expected_range","use_expected_item_count","use_required_value","use_supported_value","use_valid_calendar_date","adjust_range","provide_paired_field","shorten_date_range","use_message_id_header","reduce_request","provide_attachment_reference","relist_attachments","use_matching_reference","use_default_account"]),
+            "reason":enumeration(&["type_mismatch","required_field","unknown_field","character_minimum","character_limit","utf8_byte_limit","wire_byte_limit","forbidden_control_character","integer_range","item_count","constant_mismatch","unsupported_value","invalid_date","conflicting_range","required_with_field","date_range_limit","invalid_message_id","resource_limit","attachment_reference_required","invalid_attachment_id","reference_mismatch","invalid_account_id"]),
+            "action":enumeration(&["use_expected_type","provide_field","remove_unknown_fields","provide_longer_field","shorten_field","remove_control_characters","use_expected_range","use_expected_item_count","use_required_value","use_supported_value","use_valid_calendar_date","adjust_range","provide_paired_field","shorten_date_range","use_message_id_header","reduce_request","provide_attachment_reference","relist_attachments","use_matching_reference","use_default_account","list_accounts"]),
             "expected":string(),"actual_type":enumeration(&["null","boolean","integer","number","string","array","object"]),
             "limit":count(),"actual":count(),"unit":enumeration(&["unicode_code_points","utf8_bytes","modified_utf7_bytes","items","days","bytes"]),
             "minimum":count(),"maximum":count(),"related_field":{"type":"string","pattern":"^(?:/(?:[^~/]|~[01])*)*$"}
@@ -94,7 +127,7 @@ fn error() -> Value {
     details["dependentRequired"] = dependencies;
     object(
         json!({
-            "code":enumeration(&["INVALID_INPUT","MAIL_BACKEND","STORAGE_UNAVAILABLE","LIMIT_EXCEEDED","TIMEOUT","BUSY","STALE_UID","NOT_FOUND","UNSUPPORTED_BODY","UNSUPPORTED_CHARSET","UNSUPPORTED_TRANSFER_ENCODING","ATTACHMENT_DECODE_FAILED","ATTACHMENT_NOT_FOUND","INTERNAL"]),
+            "code":enumeration(&["INVALID_INPUT","MAIL_BACKEND","STORAGE_UNAVAILABLE","LIMIT_EXCEEDED","TIMEOUT","BUSY","STALE_UID","NOT_FOUND","UNSUPPORTED_BODY","UNSUPPORTED_CHARSET","UNSUPPORTED_TRANSFER_ENCODING","ATTACHMENT_DECODE_FAILED","ATTACHMENT_NOT_FOUND","ACCOUNT_UNAVAILABLE","INTERNAL"]),
             "message":string(),"retryable":boolean(),"details":details
         }),
         &["code", "message", "retryable"],
@@ -103,6 +136,7 @@ fn error() -> Value {
 
 fn message(conversation: bool) -> Value {
     let mut properties = json!({
+        "account_id":account_id(),"mailbox":string(),
         "uid":uid(),"uid_validity":nullable(uid()),"subject":nullable(string()),"from":nullable(string()),"to":nullable(string()),
         "body":string(),"body_mode":enumeration(&["full","trimmed"]),"body_truncated":boolean(),"body_omitted":boolean(),
         "quoted_content_omitted":boolean(),"signature_omitted":boolean(),"body_original_bytes":count(),"body_byte_limit":count(),
@@ -135,7 +169,7 @@ fn operation() -> Value {
 }
 
 fn attachment_reference() -> Value {
-    json!({"account_id":{"const":"default"},"mailbox":string(),"uid":uid(),"uid_validity":uid(),
+    json!({"account_id":account_id(),"mailbox":string(),"uid":uid(),"uid_validity":uid(),
         "attachment_id":{"type":"string","pattern":"^att_v1_[0-9a-f]{64}$"},"attachment_index":{"type":"integer","minimum":0,"maximum":MAX_ATTACHMENT_INDEX}})
 }
 fn checksum() -> Value {
@@ -182,14 +216,18 @@ fn accounts() -> Value {
         "scan_uid_window",
         "execution_slots",
         "admission_requests",
+        "per_account_base_slots",
+        "background_slots",
+        "queue_wait_seconds",
+        "backend_backoff_seconds",
         "operation_timeout_seconds",
     ] {
         limits[name] = count();
     }
     all_required(
-        json!({"default_account_id":{"const":"default"},"accounts":{"type":"array","items":all_required(json!({
-        "id":{"const":"default"},"address":string(),"mode":enumeration(&["read","draft","send","full"]),"default":{"const":true},"capabilities":capabilities,"limits":all_required(limits)
-    })),"minItems":1,"maxItems":1}}),
+        json!({"default_account_id":nullable(account_id()),"accounts":{"type":"array","items":all_required(json!({
+        "id":account_id(),"display_name":string(),"address":string(),"mode":enumeration(&["read","draft","send","full"]),"default":boolean(),"capabilities":capabilities,"limits":all_required(limits)
+        }))}}),
     )
 }
 
@@ -200,7 +238,7 @@ fn data(name: &str) -> Value {
             "inbox", "all", "archive", "drafts", "flagged", "junk", "sent", "trash",
         ]))
     };
-    match name {
+    let schema = match name {
         "list_accounts" => accounts(),
         "list_mailboxes" => all_required(
             json!({"mailboxes":{"type":"array","maxItems":200,"items":all_required(json!({
@@ -210,7 +248,7 @@ fn data(name: &str) -> Value {
         ),
         "list_emails" | "search_emails" => object(
             json!({
-                "emails":{"type":"array","maxItems":50,"items":all_required(json!({"uid":uid(),"subject":nullable(string()),"from":nullable(string()),"date":nullable(string()),"size":nullable(count()),"flags":array(string())}))},
+                "emails":{"type":"array","maxItems":50,"items":all_required(json!({"account_id":account_id(),"mailbox":string(),"uid_validity":nullable(uid()),"uid":uid(),"subject":nullable(string()),"from":nullable(string()),"date":nullable(string()),"size":nullable(count()),"flags":array(string())}))},
                 "next_before_uid":nullable(uid()),"uid_validity":nullable(uid()),
                 "scanned_uid_range":{"type":"array","prefixItems":[uid(),uid()],"minItems":2,"maxItems":2}
             }),
@@ -221,6 +259,7 @@ fn data(name: &str) -> Value {
             json!({"uid":uid(),"uid_validity":nullable(uid()),"flags":array(string())}),
         ),
         "get_emails" => all_required(json!({
+            "uid_validity":nullable(uid()),
             "items":{"type":"array","minItems":1,"maxItems":10,"items":{"oneOf":[
                 all_required(json!({"uid":uid(),"ok":{"const":true},"email":reference("message")})),
                 all_required(json!({"uid":uid(),"ok":{"const":false},"error":reference("error")})),
@@ -233,7 +272,7 @@ fn data(name: &str) -> Value {
             all_required(properties)
         }
         "list_attachments" => all_required(
-            json!({"account_id":{"const":"default"},"mailbox":string(),"uid":uid(),"uid_validity":uid(),"attachments":array(attachment_descriptor()),"next_attachment_offset":nullable(json!({"type":"integer","minimum":0,"maximum":MAX_ATTACHMENT_INDEX})),"content_trust":trust}),
+            json!({"account_id":account_id(),"mailbox":string(),"uid":uid(),"uid_validity":uid(),"attachments":array(attachment_descriptor()),"next_attachment_offset":nullable(json!({"type":"integer","minimum":0,"maximum":MAX_ATTACHMENT_INDEX})),"content_trust":trust}),
         ),
         "prepare_attachment_download" => {
             let mut properties = attachment_reference();
@@ -252,8 +291,8 @@ fn data(name: &str) -> Value {
             "older_uids_omitted":boolean(),"total_body_byte_limit":count(),"skipped_candidates":array(reference("uid_error")),"message_errors":array(reference("uid_error")),"complete":boolean(),"content_trust":trust
         })),
         "locate_message" => all_required(json!({
-            "matches":{"type":"array","maxItems":50,"items":all_required(json!({"mailbox":string(),"uid":uid(),"uid_validity":uid(),"message_id":string()}))},
-            "scopes":{"type":"array","minItems":1,"maxItems":20,"items":all_required(json!({"mailbox":string(),"uid_validity":uid(),"start_uid":uid(),"end_uid":count(),"next_before_uid":nullable(uid()),"candidates_checked":count(),"candidate_limit_reached":boolean(),"older_uids_omitted":boolean()}))},
+            "matches":{"type":"array","maxItems":50,"items":all_required(json!({"account_id":account_id(),"mailbox":string(),"uid":uid(),"uid_validity":uid(),"message_id":string()}))},
+            "scopes":{"type":"array","minItems":1,"maxItems":20,"items":all_required(json!({"account_id":account_id(),"mailbox":string(),"uid_validity":uid(),"start_uid":uid(),"end_uid":count(),"next_before_uid":nullable(uid()),"candidates_checked":count(),"candidate_limit_reached":boolean(),"older_uids_omitted":boolean()}))},
             "complete":{"const":false},"scope":{"const":"Only explicitly supplied folders and reported UID windows were searched; follow each cursor."}
         })),
         "get_mailbox_statistics" => {
@@ -288,6 +327,17 @@ fn data(name: &str) -> Value {
             json!({"oneOf":[all_required(success),all_required(failed)]})
         }
         _ => unreachable!("only read tools have output schemas"),
+    };
+    if super::is_account_read(name) {
+        account_context(
+            schema,
+            !matches!(
+                name,
+                "list_mailboxes" | "locate_message" | "diagnose_connectivity"
+            ),
+        )
+    } else {
+        schema
     }
 }
 
