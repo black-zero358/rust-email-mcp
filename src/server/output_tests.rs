@@ -77,6 +77,15 @@ impl Harness {
         max_output: usize,
         stall_greeting: bool,
     ) -> Self {
+        Self::with_resource(messages, fatal_uid, max_output, stall_greeting, None).await
+    }
+    async fn with_resource(
+        messages: BTreeMap<u32, Vec<u8>>,
+        fatal_uid: Option<u32>,
+        max_output: usize,
+        stall_greeting: bool,
+        resource: Option<&str>,
+    ) -> Self {
         let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let cert = certified.cert.der().clone();
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
@@ -90,6 +99,9 @@ impl Harness {
         roots.add(cert).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut configuration = (*config::fixture()).clone();
+        if let Some(resource) = resource {
+            configuration.resource = resource.into();
+        }
         configuration.imap_host = "localhost".into();
         configuration.imap_port = listener.local_addr().unwrap().port();
         configuration.max_output = max_output;
@@ -289,6 +301,33 @@ impl Harness {
         );
         content
     }
+}
+
+#[tokio::test]
+async fn attachment_download_url_is_a_uri_for_unicode_resource_configuration() {
+    let h = Harness::with_resource(
+        BTreeMap::from([(7, multipart())]),
+        None,
+        64 * 1024,
+        false,
+        Some("https://邮件.example/入口/mcp/"),
+    )
+    .await;
+    let result = h
+        .call(
+            "prepare_attachment_download",
+            json!({"uid":7,"uid_validity":9,"attachment_index":1}),
+        )
+        .await;
+    let url = result["data"]["download_url"].as_str().unwrap();
+    assert!(url.is_ascii());
+    let parsed = reqwest::Url::parse(url).unwrap();
+    assert!(parsed.host_str().unwrap().starts_with("xn--"));
+    assert!(
+        parsed
+            .path()
+            .starts_with("/%E5%85%A5%E5%8F%A3/mcp/attachments/")
+    );
 }
 
 #[tokio::test]

@@ -19,6 +19,18 @@ const HANDLE_TTL: Duration = Duration::from_secs(600);
 const MAX_HANDLES: usize = 64;
 const MAX_TRANSFERS: usize = 4;
 
+fn download_url(resource: &str, token: &str) -> Result<String> {
+    let mut url = reqwest::Url::parse(resource).map_err(|_| MailError::input())?;
+    url.set_query(None);
+    url.set_fragment(None);
+    url.path_segments_mut()
+        .map_err(|_| MailError::input())?
+        .pop_if_empty()
+        .push("attachments")
+        .push(token);
+    Ok(url.into())
+}
+
 #[derive(Clone)]
 struct Part {
     index: usize,
@@ -152,7 +164,7 @@ impl MailService {
             })
             .await?;
         Ok(
-            json!({"download_url":format!("{}/attachments/{token}", self.config.resource.trim_end_matches('/')),"method":"GET","required_headers":{"Authorization":"Bearer <access_token>"},"expires_in_seconds":HANDLE_TTL.as_secs(),"metadata":metadata,"content_trust":"untrusted"}),
+            json!({"download_url":download_url(&self.config.resource,&token)?,"method":"GET","required_headers":{"Authorization":"Bearer <access_token>"},"expires_in_seconds":HANDLE_TTL.as_secs(),"metadata":metadata,"content_trust":"untrusted"}),
         )
     }
     async fn fetch_attachment(&self, transfer: &Transfer) -> Result<Vec<u8>> {
