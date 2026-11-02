@@ -2,34 +2,82 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# RustSec skips path packages. Audit this local fork using its upstream release
-# identity too; never alter Cargo's actual lockfile or dependency sources.
-# Review local completion patches separately, including SELECT/EXAMINE/STATUS;
-# advisory matching cannot verify protocol completion behavior.
+# RustSec matches default-registry packages. Restore the two local forks' pinned
+# upstream identities in a temporary audit view, preserving the actual lock and
+# dependency sources. Review local protocol/allocation patches and their
+# synthetic regressions separately; see both vendor/*/PATCHES.md files.
+verify_upstream() {
+  local crate=$1 version=$2 checksum=$3
+  [[ "$(cat "vendor/$crate/UPSTREAM.sha256")" == "$checksum" ]]
+  awk -v expected_name="$crate" -v expected_version="$version" '
+    /^\[package\]$/ { in_package = 1; packages++; next }
+    /^\[/ { in_package = 0 }
+    in_package && /^name = / {
+      if ($0 != "name = \"" expected_name "\"") exit 1
+      names++
+    }
+    in_package && /^version = / {
+      if ($0 != "version = \"" expected_version "\"") exit 1
+      versions++
+    }
+    END { if (packages != 1 || names != 1 || versions != 1) exit 1 }
+  ' "vendor/$crate/Cargo.toml"
+}
+verify_upstream async-imap 0.12.0 f97b87216c9f0ccc63c516263169085fa34bba25633f6d96c6a9b9ca1fd5f70a
+verify_upstream imap-proto 0.17.0 5ccf963d57074747b455398a1763d174da80bcaba6f51e3671a82252b531a68b
 
-# APPEND continuation-state patches also require local code/protocol review;
-# advisory matching cannot validate notification and literal ordering.
-
-# Local FETCH attribute-presence accessors require root behavioral regressions
-# and code review; upstream advisory matching does not validate local changes.
-
-# Local completion-status AND parser allocation patches require code review and
-# synthetic regressions separately; advisories cannot validate their behavior.
-upstream_checksum=$(cat vendor/async-imap/UPSTREAM.sha256)
-[[ "$upstream_checksum" == f97b87216c9f0ccc63c516263169085fa34bba25633f6d96c6a9b9ca1fd5f70a ]]
-grep -Fxq 'version = "0.12.0"' vendor/async-imap/Cargo.toml
 audit_lock=$(mktemp)
 trap 'rm -f "$audit_lock"' EXIT
 awk '
-  /^\[\[package\]\]$/ { vendor = 0 }
-  /^name = "async-imap"$/ { vendor = 1; found++ }
-  vendor && /^(source|checksum) = / { exit 1 }
-  { print }
-  vendor && /^version = "0.12.0"$/ {
-    print "source = \"registry+https://github.com/rust-lang/crates.io-index\""
-    print "checksum = \"f97b87216c9f0ccc63c516263169085fa34bba25633f6d96c6a9b9ca1fd5f70a\""
-    injected++
+  BEGIN {
+    versions["async-imap"] = "0.12.0"
+    checksums["async-imap"] = "f97b87216c9f0ccc63c516263169085fa34bba25633f6d96c6a9b9ca1fd5f70a"
+    versions["imap-proto"] = "0.17.0"
+    checksums["imap-proto"] = "5ccf963d57074747b455398a1763d174da80bcaba6f51e3671a82252b531a68b"
   }
-  END { if (found != 1 || injected != 1) exit 1 }
+  function fail() { failed = 1; exit 1 }
+  function flush(  i, name, version, name_count, version_count, sourced, source, checksum_count) {
+    if (!count) return
+    for (i = 1; i <= count; i++) {
+      if (lines[i] ~ /^name = /) {
+        name = lines[i]; sub(/^name = "/, "", name); sub(/"$/, "", name); name_count++
+      }
+      if (lines[i] ~ /^version = /) {
+        version = lines[i]; sub(/^version = "/, "", version); sub(/"$/, "", version); version_count++
+      }
+      if (lines[i] ~ /^source = /) {
+        source = lines[i]; sub(/^source = "/, "", source); sub(/"$/, "", source); sourced++
+      }
+      if (lines[i] ~ /^checksum = /) checksum_count++
+    }
+    if (name_count != 1 || version_count != 1) fail()
+    if (name in versions) {
+      if (version != versions[name] || sourced || checksum_count || ++found[name] != 1) fail()
+    } else if (!sourced) {
+      # Future path packages need an explicit provenance/audit mapping.
+      if (name != "rust-email-mcp" || ++root_count != 1 || checksum_count) fail()
+    } else if (sourced != 1 || source != "registry+https://github.com/rust-lang/crates.io-index") {
+      # Other registries/git dependencies also need a reviewed audit strategy.
+      fail()
+    }
+    for (i = 1; i <= count; i++) {
+      print lines[i]
+      if ((name in versions) && lines[i] ~ /^version = /) {
+        print "source = \"registry+https://github.com/rust-lang/crates.io-index\""
+        print "checksum = \"" checksums[name] "\""
+      }
+      delete lines[i]
+    }
+    count = 0
+  }
+  /^\[\[package\]\]$/ { flush(); in_package = 1 }
+  !in_package { print; next }
+  { lines[++count] = $0 }
+  END {
+    if (failed) exit 1
+    flush()
+    if (failed || root_count != 1) exit 1
+    for (name in versions) if (found[name] != 1) exit 1
+  }
 ' Cargo.lock > "$audit_lock"
 cargo audit --file "$audit_lock" "$@"

@@ -61,7 +61,7 @@
 
 Rust 使用 Cargo 和固定的 Cargo.lock；格式以 rustfmt 为准，Clippy 与构建使用同一工具链。临时 Python 脚本使用 uv，Node 工具使用 pnpm。业务边界沿用现有安全错误模型，不在不可信输入路径依赖 panic；测试或静态不变量中的断言需保持含义明确。存储事务保持短小，不跨越网络等待。
 
-新增依赖必须说明用途、许可证、替代方案和资源影响；升级不能绕过 lockfile 或审计。vendored 代码遵守 [PATCHES.md](vendor/async-imap/PATCHES.md)，同时更新来源、审计脚本和回归。
+新增依赖必须说明用途、许可证、替代方案和资源影响；升级不能绕过 lockfile 或审计。vendored 代码遵守 [async-imap 补丁记录](vendor/async-imap/PATCHES.md)与 [imap-proto 补丁记录](vendor/imap-proto/PATCHES.md)，同时更新来源、审计脚本和回归。
 
 ## 验证与完成标准
 
@@ -80,6 +80,8 @@ cargo build --locked --release
 cargo install cargo-audit --version 0.22.2 --locked
 bash scripts/audit-dependencies.sh
 ```
+
+审计脚本变更同时执行 `bash scripts/test-audit-dependencies.sh`，核对两个本地补丁包的身份恢复、错误传播、临时文件清理及原锁文件保持；CI 的 audit job 持续运行这些离线回归。
 
 容器、构建上下文或 path 依赖变化还需执行：
 

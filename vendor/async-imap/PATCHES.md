@@ -123,3 +123,35 @@ Review these local parser changes separately from advisory matching in
 `scripts/audit-dependencies.sh`. An upstream replacement must pass both the
 completion-status and allocation regressions before removing either patch.
 Protocol semantics reference: [nom streaming take](https://docs.rs/nom/8.0.0/nom/bytes/streaming/fn.take.html).
+
+## BODYSTRUCTURE allocation budgets (R06 parser foundation)
+
+`src/imap_stream.rs::decode` uses the patched imap-proto 0.17.0
+`Response::parse_bounded` for every client, including `Client::new`,
+`Client::with_buffer_limit`, greeting/login and diagnostic connections. The
+application parser-buffer limit and the transport byte budget remain separate.
+Default structure limits are 32 recursive levels, 1024 nodes, 128 KiB per string,
+256 parameter pairs per MIME node, 8192 parameter pairs per response, and 1 MiB
+for structure strings and container capacities. See the imap-proto PATCHES file
+for recursive allocation and backtracking details.
+
+Budget failure returns an `io::Error` containing
+`imap_proto::bounded::LimitError { kind, limit, unit }`. Its Display/Debug values
+contain the resource kind, numeric limit and unit; response fragments are never
+formatted into this error. The raw-input decode trace was removed. Other syntax
+errors retain their previous behavior. `async_imap::error::body_structure_limit`
+detects this typed source in `async_imap::error::Error::Io`. The failed stream
+ends after its first error and rejects subsequent encode attempts, so the failed
+connection cannot be reused for another command.
+
+The default root test `cargo test --locked --test body_structure_budget` runs the
+public API budget matrix and actual Client regressions. It covers both Client
+constructors, rejection of huge literal declarations before buffer growth,
+private typed errors, terminal streams, blocked subsequent commands, ordinary
+BODY literals, fragmented metadata and every NIL split after `N` and `NI`.
+The fixed proper-prefix oracle fixtures were checked with the unmodified
+registry imap-proto 0.17.0. Existing tagged-completion regressions remain required.
+
+This parser foundation provides typed detection. Application mapping to
+`LIMIT_EXCEEDED/mime_structure` and the controlled fresh-connection raw fallback
+are integrated with the subsequent PartManifest reader work package.

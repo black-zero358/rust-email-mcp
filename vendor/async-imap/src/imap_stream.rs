@@ -54,6 +54,12 @@ impl<R: Read + Write + Unpin> ImapStream<R> {
     }
 
     pub async fn encode(&mut self, msg: Request) -> Result<(), io::Error> {
+        if self.read_closed {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "IMAP stream is closed",
+            ));
+        }
         log::trace!(
             "encode: input: {:?}, {:?}",
             msg.0,
@@ -109,15 +115,23 @@ impl<R: Read + Write + Unpin> ImapStream<R> {
 
         let res = ResponseData::try_new_or_recover(block, |buf| {
             let buf = &buf[..self.buffer.used()];
-            log::trace!("decode: input: {:?}", std::str::from_utf8(buf));
-            match imap_proto::Response::parse(buf) {
+            match imap_proto::Response::parse_bounded(
+                buf,
+                &imap_proto::bounded::BodyStructureLimits::default(),
+            ) {
                 Ok((remaining, response)) => {
                     // TODO: figure out if we can use a minimum required size for a response.
                     self.decode_needs = 0;
                     self.buffer.reset_with_data(remaining);
                     Ok(response)
                 }
-                Err(nom::Err::Incomplete(Needed::Size(min))) => {
+                Err(imap_proto::bounded::ParseError::Limit(error)) => {
+                    self.decode_needs = 0;
+                    Err(Some(io::Error::other(error)))
+                }
+                Err(imap_proto::bounded::ParseError::Syntax(nom::Err::Incomplete(
+                    Needed::Size(min),
+                ))) => {
                     log::trace!("decode: incomplete data, need minimum {min} bytes");
                     let needed = self.buffer.used().checked_add(usize::from(min));
                     match needed {
@@ -128,12 +142,12 @@ impl<R: Read + Write + Unpin> ImapStream<R> {
                     }
                     Err(None)
                 }
-                Err(nom::Err::Incomplete(_)) => {
+                Err(imap_proto::bounded::ParseError::Syntax(nom::Err::Incomplete(_))) => {
                     log::trace!("decode: incomplete data, need unknown number of bytes");
                     self.decode_needs = 0;
                     Err(None)
                 }
-                Err(other) => {
+                Err(imap_proto::bounded::ParseError::Syntax(other)) => {
                     self.decode_needs = 0;
                     Err(Some(io::Error::other(format!(
                         "{:?} during parsing of {:?}",
