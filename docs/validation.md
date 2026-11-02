@@ -17,7 +17,9 @@
 
 新增验证覆盖严格 JSON 与秘密文件限制、v1/v2 迁移失败恢复、原 Journal 字节保持、同 UID 双账户读取/附件隔离、每次请求 ACL、固定旧写账户、撤权后的历史操作查询、全局 4 槽/20 请求、256 项/16 MiB 缓存、账户独立退避、完整响应预算。真实 HTTP 取消测试分别覆盖 4 个运行加 16 个排队读取，以及附件 GET 断连/撤权/账户移除后的连接与许可释放。
 
-审阅发现并修复了读取任务 detach 导致取消后继续运行，以及附件 GET/连接诊断超时退避记账遗漏；写任务保留原独立生命周期。调度明确采用基础份额优先、同一层级前台优先。全部测试离线完成，真实 ChatGPT 连接与真实邮件测试后移。Linux 文件凭据权限校验已执行，Windows 使用环境变量引用；Windows 专用拒绝文件引用回归待该平台 Rust 环境执行。PR 最终 head 的 CI 与合并结果随实施状态更新。
+审阅发现并修复了读取任务 detach 导致取消后继续运行，以及附件 GET/连接诊断超时退避记账遗漏；写任务保留原独立生命周期。调度明确采用基础份额优先、同一层级前台优先。全部测试离线完成，真实 ChatGPT 连接与真实邮件测试后移。Linux 文件凭据权限校验已执行，Windows 使用环境变量引用；Windows 专用拒绝文件引用回归待该平台 Rust 环境执行。
+
+[PR #67](https://github.com/black-zero358/rust-email-mcp/pull/67) 的最终 head 为 `9019ef7a2edbcdaded854933b6d0b95fcc37ecf1`，相对最终源码仅追加验证文档。[CI 41426244691](https://github.com/black-zero358/rust-email-mcp/actions/runs/41426244691) 的 check/audit/container 全部通过；合并前复查 GitHub reviews 与 review threads 均为空，独立交叉审阅记录已写入 PR。合并提交为 `501e53989ccab7562d2c1ced28602594f0350b0a`，随后本地 main、开发分支及两者远端引用全部同步到该提交。
 
 ## 2026-11-02 R00–R04 PR 审阅与合并
 
