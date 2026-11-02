@@ -2,6 +2,27 @@
 
 本文件保存带版本与环境边界的证据。每次新增记录注明提交/tag、日期与时区、环境、命令、结果、CI 链接及未覆盖项；保留历史结果，不把其测试数量或部署状态当作当前版本的证明。验证要求见 [贡献指南](../CONTRIBUTING.md#验证与完成标准)。
 
+## 2026-11-02 R02/R03 读取契约与展示
+
+日期与时区：2026-11-02，Asia/Shanghai。源码提交 `b60a686ac379bea4178b7325bd8d6eb0f50aa5d8`。该提交完成 15 个读取工具 outputSchema、default 持久身份与文件夹用途、独立 HTML 可读策略，并同步配置、备份和兼容说明。
+
+三个执行 agent 分别负责服务端契约、账户/邮件接线、HTML/MIME；交叉审阅覆盖彼此模块。审阅修复包括：账户未知 schema 匹配、读取避免先执行旧 HTML 渲染、可读格式膨胀与解码预算分离；补齐诊断失败/超时、集合正文压缩和畸形 HTML 样例。旧写输入规则、发送状态顺序、MIME 候选和转发 legacy 格式继续回归。
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo fmt --check` | 通过 |
+| `cargo test --locked` | 149 单元测试 + 2 集成测试，零失败 |
+| `cargo clippy --locked --all-targets -- -D warnings` | 通过；保留 vendored async-imap 原有四处 deprecated 宏警告 |
+| `cargo build --locked --release` | WSL Ubuntu / Rust 1.99.1，通过，22.13 秒 |
+| `bash scripts/audit-dependencies.sh` | cargo-audit 0.22.2，340 个锁依赖、1395 条公告，exit 0；覆盖 vendored 上游身份 |
+| `bash scripts/test-docker-context.sh` | Docker 实际上下文白名单通过 |
+| `docker build --tag rust-email-mcp:r02-r03-local .` | 本机 Docker Desktop Linux 引擎 29.5.3，通过；builder release 编译及首次依赖获取约 5 分钟 |
+| `git diff --check` | 通过 |
+
+6 项 `server/output_tests` 使用真实 HTTP MCP handler、合成 TLS IMAP 和 jsonschema 验证器，覆盖全部读取工具、正常/空值/逐项失败、STALE_UID/NOT_FOUND、诊断失败/超时、长 ID、转义正文与完整 wire 压缩。账户测试覆盖 UUID 重用、凭据轮换、文件与内存操作库、绑定变更、并发初始化、权限、损坏/未知格式、残留恢复和路径别名冲突。HTML 回归覆盖链接、列表、表格、引用、预格式、外来内容拒绝、跨部件预算及旧转发内容。
+
+`jsonschema = 0.60.2` 只在开发依赖中，关闭默认特性，锁文件增加 33 包，`cargo tree -e normal` 中无该包。运行时继续使用原 Rust 依赖集合。Docker 本轮实际基础镜像摘要：Rust `sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b`，Debian `sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3`；本地结果镜像 manifest `sha256:2c75e2e0b370e2a387de8a0a1e405596cc32df5c4dc04c3c352ca65d73c1d105`。构建完成后保留为本地验收镜像；源码尚未推送，GitHub CI 随后续 PR 验收。
+
 ## 2026-11-02 R00/R01 首批实现
 
 日期与时区：2026-11-02，Asia/Shanghai。R01 源码提交 `7def28a01494685f6575730270258dc0c3d2c8e3`；R00 探针提交 `1b7afd35afacaff26294684a5c22efa24d23f8b0`。基线为 `e58090129eda40a47e593a8b89928291559bf1bd`，本次结果对应本地分支 `codex/read-capabilities-plan`。

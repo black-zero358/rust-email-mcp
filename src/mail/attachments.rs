@@ -19,6 +19,18 @@ const HANDLE_TTL: Duration = Duration::from_secs(600);
 const MAX_HANDLES: usize = 64;
 const MAX_TRANSFERS: usize = 4;
 
+fn download_url(resource: &str, token: &str) -> Result<String> {
+    let mut url = reqwest::Url::parse(resource).map_err(|_| MailError::input())?;
+    url.set_query(None);
+    url.set_fragment(None);
+    url.path_segments_mut()
+        .map_err(|_| MailError::input())?
+        .pop_if_empty()
+        .push("attachments")
+        .push(token);
+    Ok(url.into())
+}
+
 #[derive(Clone)]
 struct Part {
     index: usize,
@@ -30,6 +42,7 @@ struct Part {
 #[derive(Clone)]
 struct Transfer {
     principal: String,
+    account: AccountKey,
     mailbox: String,
     uid: u32,
     validity: u32,
@@ -57,12 +70,12 @@ impl AttachmentStore {
         handles.insert(token.clone(), transfer);
         Ok(token)
     }
-    async fn lookup(&self, token: &str, principal: &str) -> Option<Transfer> {
+    async fn lookup(&self, token: &str, principal: &str, account: &AccountKey) -> Option<Transfer> {
         let mut handles = self.handles.lock().await;
         handles.retain(|_, t| t.expires > Instant::now());
         handles
             .get(token)
-            .filter(|t| t.principal == principal)
+            .filter(|t| t.principal == principal && &t.account == account)
             .cloned()
     }
 }
@@ -142,6 +155,7 @@ impl MailService {
             .attachments
             .insert(Transfer {
                 principal: principal.into(),
+                account: self.account.clone(),
                 mailbox: mailbox.into(),
                 uid,
                 validity,
@@ -150,10 +164,13 @@ impl MailService {
             })
             .await?;
         Ok(
-            json!({"download_url":format!("{}/attachments/{token}", self.config.resource.trim_end_matches('/')),"method":"GET","required_headers":{"Authorization":"Bearer <access_token>"},"expires_in_seconds":HANDLE_TTL.as_secs(),"metadata":metadata,"content_trust":"untrusted"}),
+            json!({"download_url":download_url(&self.config.resource,&token)?,"method":"GET","required_headers":{"Authorization":"Bearer <access_token>"},"expires_in_seconds":HANDLE_TTL.as_secs(),"metadata":metadata,"content_trust":"untrusted"}),
         )
     }
     async fn fetch_attachment(&self, transfer: &Transfer) -> Result<Vec<u8>> {
+        if transfer.account != self.account {
+            return Err(MailError::input());
+        }
         let _permit = self
             .slots
             .acquire()
@@ -207,7 +224,11 @@ where
     F: FnOnce(Transfer) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<u8>>>,
 {
-    let Some(transfer) = service.attachments.lookup(&token, &principal.0).await else {
+    let Some(transfer) = service
+        .attachments
+        .lookup(&token, &principal.0, &service.account)
+        .await
+    else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let Ok(permit) = service.attachments.transfers.clone().try_acquire_owned() else {
@@ -263,9 +284,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn transfer(principal: &str, expires: Instant) -> Transfer {
+    fn transfer(principal: &str, expires: Instant, account: &AccountKey) -> Transfer {
         Transfer {
             principal: principal.into(),
+            account: account.clone(),
             mailbox: "INBOX".into(),
             uid: 1,
             validity: 1,
@@ -282,25 +304,32 @@ mod tests {
     #[tokio::test]
     async fn handles_are_principal_bound_expiring_and_capacity_bounded() {
         let store = AttachmentStore::new(crate::config::fixture());
+        let account = AccountKey::synthetic();
         let token = store
-            .insert(transfer("owner", Instant::now() + HANDLE_TTL))
+            .insert(transfer("owner", Instant::now() + HANDLE_TTL, &account))
             .await
             .unwrap();
-        assert!(store.lookup(&token, "other").await.is_none());
-        assert!(store.lookup(&token, "owner").await.is_some());
-        assert!(store.lookup("bad", "owner").await.is_none());
+        assert!(store.lookup(&token, "other", &account).await.is_none());
+        assert!(store.lookup(&token, "owner", &account).await.is_some());
+        assert!(
+            store
+                .lookup(&token, "owner", &AccountKey::synthetic())
+                .await
+                .is_none()
+        );
+        assert!(store.lookup("bad", "owner", &account).await.is_none());
         store.handles.lock().await.get_mut(&token).unwrap().expires =
             Instant::now() - Duration::from_secs(1);
-        assert!(store.lookup(&token, "owner").await.is_none());
+        assert!(store.lookup(&token, "owner", &account).await.is_none());
         for _ in 0..MAX_HANDLES {
             store
-                .insert(transfer("owner", Instant::now() + HANDLE_TTL))
+                .insert(transfer("owner", Instant::now() + HANDLE_TTL, &account))
                 .await
                 .unwrap();
         }
         assert!(
             store
-                .insert(transfer("owner", Instant::now() + HANDLE_TTL))
+                .insert(transfer("owner", Instant::now() + HANDLE_TTL, &account))
                 .await
                 .is_err()
         );
@@ -336,7 +365,11 @@ mod tests {
         );
         let token = service
             .attachments
-            .insert(transfer("owner", Instant::now() + HANDLE_TTL))
+            .insert(transfer(
+                "owner",
+                Instant::now() + HANDLE_TTL,
+                &service.account,
+            ))
             .await
             .unwrap();
         let route = Router::new()

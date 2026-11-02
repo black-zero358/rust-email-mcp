@@ -3,6 +3,7 @@ use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
 use rust_email_mcp::{
+    accounts,
     auth::{Auth, require_auth},
     config::Config,
     journal::Journal,
@@ -27,12 +28,13 @@ async fn main() -> anyhow::Result<()> {
         )
     }));
     let config = Config::load()?;
+    let account = accounts::open_default(&config)?;
     let path = Path::new(&config.database);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let journal = Arc::new(Journal::open(path)?);
-    let mail = Arc::new(MailService::new(config.clone(), journal)?);
+    let mail = Arc::new(MailService::with_account(config.clone(), journal, account)?);
     let auth = Auth::new(config.clone()).await?;
     let ct = tokio_util::sync::CancellationToken::new();
     let host = reqwest::Url::parse(&config.resource)?

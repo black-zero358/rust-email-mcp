@@ -121,10 +121,15 @@ JWKS 暂不可用时认证返回 HTTP 503 和 `Retry-After: 10`，客户端可�
 | `OIDC_SUBJECTS` | 获准使用此邮箱的用户 subject ID，逗号分隔 |
 | `OIDC_SCOPE` | 必需权限，默认 `email:mcp` |
 | `BIND`、`DATABASE_PATH` | 监听地址与 SQLite 文件位置 |
+| `ACCOUNT_REGISTRY_PATH` | 可选账户注册库路径；默认位于操作库同目录的 `accounts.sqlite` |
 
 QQ 邮箱通常使用 `imap.qq.com:993` 和 `smtp.qq.com:465`，`SMTP_STARTTLS=false`。iCloud 使用 `imap.mail.me.com:993` 和 `smtp.mail.me.com:587`，`SMTP_STARTTLS=true`。凭据使用服务商签发的应用专用密码或授权码。
 
 每个实例配置一个邮箱。需要多个邮箱时，使用独立实例、数据目录和 OIDC 资源地址，分别设置 subject 白名单。
+
+`list_accounts` 返回 default 账户、当前交付方式、读取能力和实际限制；`list_mailboxes` 在原字段之外提供结构化属性、分隔符、可选择状态、用途及来源。用途优先采用服务器标记，再采用 `DRAFTS_MAILBOX` / `TRASH_MAILBOX` 配置；按名称推测的用途单独放在 `role_candidates`。
+
+default 的内部 UUID 存在独立注册库中，绑定 IMAP 登录身份、端点和操作库规范路径。服务先校验账户绑定，再恢复操作记录；密码轮换和 SMTP 配置变化保持身份。注册库格式不符或绑定变化时启动返回固定恢复/迁移提示。`DATABASE_PATH=:memory:` 保留临时操作库行为，此时注册库默认 `data/accounts.sqlite`；账户身份仍持久保存。首次升级会建立注册库，后续备份需与操作库配套保留。
 
 ## 认证与 ChatGPT 接入
 

@@ -281,19 +281,35 @@ impl Part<'_> {
     }
 
     pub fn plain_body(&self) -> Result<String> {
-        let mut out = String::new();
-        let mut remaining = MAX_DECODE_BYTES;
-        self.append_plain(&mut out, &mut remaining)?;
-        Ok(out)
+        Ok(self.display_body(crate::html::HtmlDisplay::Legacy)?.text)
     }
 
-    fn append_plain(&self, out: &mut String, remaining: &mut usize) -> Result<()> {
+    pub fn display_body(
+        &self,
+        format: crate::html::HtmlDisplay,
+    ) -> Result<crate::html::DisplayBody> {
+        let mut out = String::new();
+        let mut remaining = MAX_DECODE_BYTES;
+        let mut context = crate::html::DisplayContext::new(format);
+        self.append_plain(&mut out, &mut remaining, &mut context)?;
+        Ok(crate::html::DisplayBody {
+            text: out,
+            metadata: context.into_metadata(),
+        })
+    }
+
+    fn append_plain(
+        &self,
+        out: &mut String,
+        remaining: &mut usize,
+        context: &mut crate::html::DisplayContext,
+    ) -> Result<()> {
         let mut selected = Vec::new();
         if self.select_text(&mut selected, true) {
             return Err(crate::html::unsupported());
         }
         for part in selected {
-            part.append_plain_leaf(out, remaining)?;
+            part.append_plain_leaf(out, remaining, context)?;
         }
         Ok(())
     }
@@ -381,7 +397,12 @@ impl Part<'_> {
         }
     }
 
-    fn append_plain_leaf(&self, out: &mut String, remaining: &mut usize) -> Result<()> {
+    fn append_plain_leaf(
+        &self,
+        out: &mut String,
+        remaining: &mut usize,
+        context: &mut crate::html::DisplayContext,
+    ) -> Result<()> {
         if matches!(self.ctype.mimetype.as_str(), "text/plain" | "text/html") {
             if !self.body.is_empty()
                 && charset::Charset::for_label_no_replacement(self.ctype.charset.as_bytes())
@@ -410,11 +431,17 @@ impl Part<'_> {
                 return Err(MailError::limit_kind(LimitKind::DecodedBodyBytes));
             }
             let text = if self.ctype.mimetype == "text/html" {
-                crate::html::to_text(&text)?
+                crate::html::render_selected(&text, context)?
             } else {
                 text
             };
-            if text.len() > reserve {
+            // Charset decoding is charged above. Readable HTML can add safe
+            // indentation/address bytes beyond encoded*4; its shared formatter
+            // independently enforces the 1 MiB output cap across selected leaves.
+            if text.len() > reserve
+                && !(self.ctype.mimetype == "text/html"
+                    && context.format() == crate::html::HtmlDisplay::Readable)
+            {
                 return Err(MailError::limit_kind(LimitKind::DecodedBodyBytes));
             }
             out.push_str(&text);
@@ -425,6 +452,132 @@ impl Part<'_> {
 
 #[cfg(test)]
 mod tests {
+    use crate::html::HtmlDisplay;
+
+    fn html_mixed(parts: &[String]) -> Vec<u8> {
+        let mut raw = String::from("Content-Type: multipart/mixed; boundary=r03\r\n\r\n");
+        for body in parts {
+            raw.push_str("--r03\r\nContent-Type: text/html; charset=utf-8\r\n\r\n");
+            raw.push_str(body);
+            raw.push_str("\r\n");
+        }
+        raw.push_str("--r03--\r\n");
+        raw.into_bytes()
+    }
+
+    #[test]
+    fn readable_html_keeps_shared_candidate_selection_and_legacy_forward_text() {
+        let raw = b"Content-Type: text/html; charset=utf-8\r\n\r\n<p><a href='https://example.test/order'>Order</a></p><ul><li>One</li><li>Two</li></ul>";
+        let parsed = super::parse(raw).unwrap();
+        let legacy = parsed.plain_body().unwrap();
+        assert_eq!(legacy, "Order\nOne\nTwo");
+        let readable = parsed.display_body(HtmlDisplay::Readable).unwrap();
+        assert_eq!(
+            readable.text,
+            "Order (https://example.test/order)\n- One\n- Two"
+        );
+        assert_eq!(readable.metadata.format_version, "readable-v1");
+        assert_eq!(readable.metadata.html_parts, 1);
+        assert_eq!(parsed.plain_body().unwrap(), legacy);
+        let raw = b"Content-Type: multipart/alternative; boundary=a\r\n\r\n--a\r\nContent-Type: text/plain\r\n\r\n\r\n--a\r\nContent-Type: text/html\r\n\r\n<p>HTML must not replace empty plain</p>\r\n--a--\r\n";
+        let readable = super::parse(raw)
+            .unwrap()
+            .display_body(HtmlDisplay::Readable)
+            .unwrap();
+        assert_eq!(readable.text, "");
+        assert_eq!(readable.metadata.html_parts, 0);
+        let raw = b"Content-Type: multipart/alternative; boundary=a\r\n\r\n--a\r\n\r\nComplete fallback\r\n--a\r\nContent-Type: multipart/mixed; boundary=m\r\n\r\n--m\r\n\r\nPartial signature\r\n--m\r\nContent-Type: text/html\r\n\r\n<p>HTML candidate</p>\r\n--m--\r\n--a--\r\n";
+        assert_eq!(
+            super::parse(raw)
+                .unwrap()
+                .display_body(HtmlDisplay::Readable)
+                .unwrap()
+                .text,
+            "Complete fallback"
+        );
+    }
+
+    #[test]
+    fn readable_html_shares_link_token_and_output_budgets_across_selected_leaves() {
+        let links = |start: usize, end: usize| {
+            (start..end)
+                .map(|i| format!("<a href='https://example.test/{i}'>item{i}</a> "))
+                .collect::<String>()
+        };
+        let raw = html_mixed(&[links(0, 200), links(200, 300)]);
+        let body = super::parse(&raw)
+            .unwrap()
+            .display_body(HtmlDisplay::Readable)
+            .unwrap();
+        assert_eq!(body.metadata.html_parts, 2);
+        assert_eq!(body.text.matches(" (https://").count(), 256);
+        assert_eq!(
+            body.metadata
+                .omissions
+                .iter()
+                .find(|item| item.reason == "link_limit")
+                .unwrap()
+                .count,
+            44
+        );
+
+        let raw = html_mixed(&["<b></b>".repeat(9000), "<b></b>".repeat(9000)]);
+        let parsed = super::parse(&raw).unwrap();
+        assert_eq!(parsed.plain_body().unwrap(), "");
+        assert_eq!(
+            parsed.display_body(HtmlDisplay::Readable).unwrap_err().code,
+            "LIMIT_EXCEEDED"
+        );
+
+        let raw = html_mixed(&["a".repeat(600_000), "b".repeat(600_000)]);
+        let parsed = super::parse(&raw).unwrap();
+        assert_eq!(parsed.plain_body().unwrap().len(), 1_200_000);
+        assert_eq!(
+            parsed.display_body(HtmlDisplay::Readable).unwrap_err().code,
+            "LIMIT_EXCEEDED"
+        );
+    }
+
+    #[test]
+    fn readable_html_expansion_uses_display_budget_after_bounded_charset_decode() {
+        let html = format!(
+            "{}<pre>{}</pre>{}",
+            "<blockquote>".repeat(16),
+            "x\n".repeat(1000),
+            "</blockquote>".repeat(16)
+        );
+        let raw = format!("Content-Type: text/html; charset=utf-8\r\n\r\n{html}");
+        let parsed = super::parse(raw.as_bytes()).unwrap();
+        let body = parsed.display_body(HtmlDisplay::Readable).unwrap();
+        assert!(body.text.len() > html.len() * 4);
+        assert_eq!(body.text, format!("{}x\n", "> ".repeat(16)).repeat(1000));
+        let mut out = String::new();
+        let mut remaining = html.len() * 4 - 1;
+        let mut context = crate::html::DisplayContext::new(HtmlDisplay::Readable);
+        let error = parsed
+            .append_plain(&mut out, &mut remaining, &mut context)
+            .unwrap_err();
+        assert_eq!(
+            serde_json::to_value(error).unwrap()["details"]["limit_kind"],
+            "decoded_body_bytes"
+        );
+        assert!(out.is_empty());
+        assert_eq!(context.into_metadata().html_parts, 0);
+    }
+
+    #[test]
+    fn readable_html_preserves_foreign_and_unknown_encoding_failures() {
+        for raw in [
+            &b"Content-Type: text/html\r\n\r\nvisible<svg><![CDATA[secret]]></svg>"[..],
+            &b"Content-Type: text/html\r\nContent-Transfer-Encoding: unknown\r\n\r\n<p>opaque</p>"[..],
+            &b"Content-Type: multipart/mixed; boundary=x\r\nContent-Transfer-Encoding: unknown\r\n\r\n--x\r\nContent-Type: text/html\r\n\r\n<p>opaque</p>\r\n--x--\r\n"[..],
+        ] {
+            let parsed = super::parse(raw).unwrap();
+            assert_eq!(parsed.plain_body().unwrap_err().code, "UNSUPPORTED_BODY");
+            assert_eq!(parsed.display_body(HtmlDisplay::Readable).unwrap_err().code, "UNSUPPORTED_BODY");
+        }
+    }
+
     #[test]
     fn relaxed_parallel_attachment_decode_accepts_large_payloads() {
         use base64::Engine;
@@ -673,15 +826,33 @@ mod tests {
         let mut out = String::new();
         let mut remaining = 19;
         assert_eq!(
-            p.append_plain(&mut out, &mut remaining).unwrap_err().code,
+            p.append_plain(
+                &mut out,
+                &mut remaining,
+                &mut crate::html::DisplayContext::default()
+            )
+            .unwrap_err()
+            .code,
             "LIMIT_EXCEEDED"
         );
         assert!(out.is_empty());
         let mut remaining = 20;
-        p.append_plain(&mut out, &mut remaining).unwrap();
+        p.append_plain(
+            &mut out,
+            &mut remaining,
+            &mut crate::html::DisplayContext::default(),
+        )
+        .unwrap();
         assert_eq!(out, "hello");
         assert_eq!(remaining, 0);
-        assert!(p.append_plain(&mut out, &mut remaining).is_err());
+        assert!(
+            p.append_plain(
+                &mut out,
+                &mut remaining,
+                &mut crate::html::DisplayContext::default()
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -719,7 +890,14 @@ mod tests {
         let body = parse(b"Content-Type: text/plain\r\n\r\nhello").unwrap();
         let (mut out, mut remaining) = (String::new(), 19);
         assert_eq!(
-            kind(body.append_plain(&mut out, &mut remaining).unwrap_err()),
+            kind(
+                body.append_plain(
+                    &mut out,
+                    &mut remaining,
+                    &mut crate::html::DisplayContext::default()
+                )
+                .unwrap_err()
+            ),
             "decoded_body_bytes"
         );
         assert!(out.is_empty());

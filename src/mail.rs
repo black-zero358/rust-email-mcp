@@ -1,8 +1,9 @@
 use crate::{
+    accounts::AccountKey,
     config::Config,
     error::{LimitKind, MailError, Result},
     imap_text::{display_name, mailbox_name, uid_field_search},
-    input_limits::InputLimits,
+    input_limits::{InputLimits, ReadInputLimits},
     journal::{Journal, Operation},
     mime,
     smtp::SmtpSender,
@@ -89,33 +90,65 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for BudgetStream<T> {
     }
 }
 type Session = async_imap::Session<BudgetStream<TlsStream<TcpStream>>>;
+const EXECUTION_SLOTS: usize = 4;
+const ADMISSION_REQUESTS: usize = 20;
+const BATCH_READ_ITEMS: usize = 10;
+const LIST_PAGE_ITEMS: usize = 50;
+const SCAN_UID_WINDOW: u32 = 500;
 
 pub struct MailService {
     pub config: Arc<Config>,
     pub journal: Arc<Journal>,
+    pub(crate) account: AccountKey,
     slots: Semaphore,
     admission: Semaphore,
     smtp: SmtpSender,
     pub attachments: attachments::AttachmentStore,
     metadata_cache: std::sync::Mutex<insights::MetadataCache>,
+    #[cfg(test)]
+    test_imap_roots: Option<RootCertStore>,
 }
 impl MailService {
+    #[cfg(test)]
     pub fn new(config: Arc<Config>, journal: Arc<Journal>) -> anyhow::Result<Self> {
+        Self::with_account(config, journal, AccountKey::synthetic())
+    }
+
+    pub fn with_account(
+        config: Arc<Config>,
+        journal: Arc<Journal>,
+        account: AccountKey,
+    ) -> anyhow::Result<Self> {
         let smtp = SmtpSender::new(&config)?;
         Ok(Self {
             attachments: attachments::AttachmentStore::new(config.clone()),
             metadata_cache: Default::default(),
             config,
             journal,
-            slots: Semaphore::new(4),
-            admission: Semaphore::new(20),
+            account,
+            slots: Semaphore::new(EXECUTION_SLOTS),
+            admission: Semaphore::new(ADMISSION_REQUESTS),
             smtp,
+            #[cfg(test)]
+            test_imap_roots: None,
         })
     }
-    async fn connect(&self) -> Result<Session> {
+
+    #[cfg(test)]
+    pub(crate) fn with_test_imap_roots(mut self, roots: RootCertStore) -> Self {
+        self.test_imap_roots = Some(roots);
+        self
+    }
+    fn imap_roots(&self) -> RootCertStore {
         let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        #[cfg(test)]
+        let roots = self.test_imap_roots.clone().unwrap_or(roots);
+        roots
+    }
+
+    async fn connect(&self) -> Result<Session> {
         let tls = ClientConfig::builder()
-            .with_root_certificates(roots)
+            .with_root_certificates(self.imap_roots())
             .with_no_client_auth();
         let tcp = TcpStream::connect((&*self.config.imap_host, self.config.imap_port))
             .await
@@ -138,14 +171,39 @@ impl MailService {
             .await
             .map_err(|_| MailError::backend())
     }
+
+    fn account_discovery(&self) -> Value {
+        json!({
+            "default_account_id":"default",
+            "accounts":[{
+                "id":"default", "address":self.config.address, "mode":self.config.mode, "default":true,
+                "capabilities":{
+                    "attachment_delivery_modes":["inline_base64","authenticated_http"],
+                    "part_fetch":false, "cross_mailbox_conversation":false, "cache_modes":["off"]
+                },
+                "limits":{
+                    "mailbox_characters":ReadInputLimits::MAILBOX_CHARACTERS,
+                    "query_characters":ReadInputLimits::QUERY_CHARACTERS,
+                    "text_utf8_bytes":ReadInputLimits::TEXT_UTF8_BYTES,
+                    "mailbox_modified_utf7_bytes":ReadInputLimits::MAILBOX_WIRE_BYTES,
+                    "raw_message_bytes":self.config.max_message,
+                    "connection_bytes":self.config.max_message * 4,
+                    "wire_response_bytes":self.config.max_output,
+                    "inline_attachment_decoded_bytes":self.config.max_output / 4,
+                    "batch_read_items":BATCH_READ_ITEMS, "list_page_items":LIST_PAGE_ITEMS,
+                    "scan_uid_window":SCAN_UID_WINDOW, "execution_slots":EXECUTION_SLOTS,
+                    "admission_requests":ADMISSION_REQUESTS,
+                    "operation_timeout_seconds":self.config.timeout.as_secs()
+                }
+            }]
+        })
+    }
     pub async fn execute(&self, name: &str, args: &Value, principal: &str) -> Result<Value> {
         if !["send_email", "send_draft", "reply_email", "forward_email"].contains(&name) {
             validate_legacy_write_inputs(name, args, &self.config)?;
         }
         if name == "list_accounts" {
-            return Ok(
-                json!({"accounts":[{"id":"default","address":self.config.address,"mode":self.config.mode}]}),
-            );
+            return Ok(self.account_discovery());
         }
         if name == "get_operation" {
             return Ok(
@@ -243,7 +301,10 @@ impl MailService {
                 if list.len() > 200 {
                     return Err(MailError::limit_with(LimitKind::ScanItems, 200, list.len()));
                 }
-                let mailboxes = list.iter().map(|m| Ok(json!({"name":display_name(m.name())?,"attributes":format!("{:?}",m.attributes())}))).collect::<Result<Vec<_>>>()?;
+                let mailboxes = list
+                    .iter()
+                    .map(|m| mailbox_metadata(m, &self.config))
+                    .collect::<Result<Vec<_>>>()?;
                 Ok(json!({"mailboxes":mailboxes}))
             }
             "list_emails" | "search_emails" => self.list(s, a, name == "search_emails").await,
@@ -279,7 +340,7 @@ impl MailService {
                     .get("uids")
                     .and_then(Value::as_array)
                     .ok_or_else(MailError::input)?;
-                if ids.is_empty() || ids.len() > 10 {
+                if ids.is_empty() || ids.len() > BATCH_READ_ITEMS {
                     return Err(MailError::input());
                 }
                 let state = s
@@ -522,7 +583,7 @@ impl MailService {
             .await
             .map_err(|_| MailError::backend())?;
         check_validity(a, m.uid_validity)?;
-        let limit = number(a, "limit", 20, 1, 50)? as usize;
+        let limit = number(a, "limit", 20, 1, LIST_PAGE_ITEMS as u64)? as usize;
         let before = number(
             a,
             "before_uid",
@@ -535,7 +596,7 @@ impl MailService {
         }
         // Scan a finite UID window; callers explicitly advance the cursor even for sparse results.
         let end = before - 1;
-        let start = end.saturating_sub(499).max(1);
+        let start = end.saturating_sub(SCAN_UID_WINDOW - 1).max(1);
         let mut filters = a.clone();
         for field in ["query", "from", "to", "subject"] {
             filters
@@ -1016,6 +1077,74 @@ fn folder(a: &Value, limits: InputLimits) -> Result<&str> {
     limits.mailbox(f, "/mailbox")?;
     Ok(f)
 }
+
+fn mailbox_metadata(mailbox: &async_imap::types::Name, config: &Config) -> Result<Value> {
+    use async_imap::types::NameAttribute;
+    let name = display_name(mailbox.name())?;
+    let mut flags = Vec::new();
+    let mut roles = Vec::new();
+    for attribute in mailbox.attributes() {
+        let (flag, role) = match attribute {
+            NameAttribute::NoInferiors => ("\\NoInferiors", None),
+            NameAttribute::NoSelect => ("\\NoSelect", None),
+            NameAttribute::Marked => ("\\Marked", None),
+            NameAttribute::Unmarked => ("\\Unmarked", None),
+            NameAttribute::All => ("\\All", Some("all")),
+            NameAttribute::Archive => ("\\Archive", Some("archive")),
+            NameAttribute::Drafts => ("\\Drafts", Some("drafts")),
+            NameAttribute::Flagged => ("\\Flagged", Some("flagged")),
+            NameAttribute::Junk => ("\\Junk", Some("junk")),
+            NameAttribute::Sent => ("\\Sent", Some("sent")),
+            NameAttribute::Trash => ("\\Trash", Some("trash")),
+            NameAttribute::Extension(value) => (value.as_ref(), None),
+            _ => continue,
+        };
+        if !flags.contains(&flag) {
+            flags.push(flag);
+        }
+        if let Some(role) = role
+            && !roles.contains(&role)
+        {
+            roles.push(role);
+        }
+    }
+    let source = if !roles.is_empty() {
+        Some("server")
+    } else if name.eq_ignore_ascii_case("INBOX") {
+        roles.push("inbox");
+        Some("protocol")
+    } else {
+        if name == config.drafts {
+            roles.push("drafts");
+        }
+        if name == config.trash {
+            roles.push("trash");
+        }
+        if roles.is_empty() {
+            None
+        } else {
+            Some("configuration")
+        }
+    };
+    let candidates = if roles.is_empty() {
+        match name.to_lowercase().as_str() {
+            "sent" | "sent items" | "sent mail" | "已发送" => vec!["sent"],
+            "archive" | "archives" | "归档" => vec!["archive"],
+            "drafts" | "草稿" | "草稿箱" => vec!["drafts"],
+            "trash" | "deleted items" | "废纸篓" | "已删除" => vec!["trash"],
+            "junk" | "spam" | "垃圾邮件" | "垃圾箱" => vec!["junk"],
+            _ => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    Ok(json!({
+        "name":name, "attributes":format!("{:?}",mailbox.attributes()),
+        "attribute_flags":flags, "delimiter":mailbox.delimiter(),
+        "selectable":!mailbox.attributes().contains(&NameAttribute::NoSelect),
+        "special_use":roles, "role_source":source, "role_candidates":candidates
+    }))
+}
 fn raw_limit(limits: InputLimits, limit: usize, actual: usize) -> MailError {
     match limits {
         InputLimits::Read => MailError::limit_with(LimitKind::RawMessageBytes, limit, actual),
@@ -1315,6 +1444,7 @@ fn leaves<'a, 'b>(
     }
     Ok(())
 }
+#[cfg(test)]
 fn parsed(raw: &[u8], uid: u32, validity: Option<u32>, max: usize) -> Result<Value> {
     let p = mime::parse(raw)?;
     let mut body = p.plain_body()?;
@@ -1326,11 +1456,18 @@ fn parsed(raw: &[u8], uid: u32, validity: Option<u32>, max: usize) -> Result<Val
         }
         body.truncate(cut);
     }
+    let mut value = parsed_metadata(&p, uid, validity)?;
+    value["body"] = json!(body);
+    value["body_truncated"] = json!(truncated);
+    Ok(value)
+}
+
+fn parsed_metadata(p: &mime::Part<'_>, uid: u32, validity: Option<u32>) -> Result<Value> {
     let mut parts = Vec::new();
-    leaves(&p, &mut parts, 0)?;
+    leaves(p, &mut parts, 0)?;
     let attachments=parts.iter().enumerate().filter(|(_,p)|p.is_attachment()).map(|(i,p)|json!({"attachment_index":i,"content_type":p.ctype.mimetype,"filename":p.filename()})).collect::<Vec<_>>();
     Ok(
-        json!({"uid":uid,"uid_validity":validity,"subject":p.headers.get_first_value("Subject"),"from":p.headers.get_first_value("From"),"to":p.headers.get_first_value("To"),"body":body,"body_truncated":truncated,"attachments":attachments,"content_trust":"untrusted"}),
+        json!({"uid":uid,"uid_validity":validity,"subject":p.headers.get_first_value("Subject"),"from":p.headers.get_first_value("From"),"to":p.headers.get_first_value("To"),"attachments":attachments,"content_trust":"untrusted"}),
     )
 }
 fn attachment(raw: &[u8], index: usize, max: usize) -> Result<Value> {
@@ -1353,6 +1490,160 @@ fn attachment(raw: &[u8], index: usize, max: usize) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn readable_reads_use_one_display_policy_while_forward_keeps_legacy_body() {
+        let raw = b"Subject: synthetic\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p><a href='https://example.test/'>Meeting</a></p><ul><li>Agenda</li></ul>";
+        let legacy = insights::parsed_with_options(raw, 1, Some(2), 10000, &json!({})).unwrap();
+        let readable = insights::parsed_with_options(
+            raw,
+            1,
+            Some(2),
+            10000,
+            &json!({"html_display":"readable"}),
+        )
+        .unwrap();
+        assert!(!legacy["body"].as_str().unwrap().contains("https://"));
+        assert!(
+            readable["body"]
+                .as_str()
+                .unwrap()
+                .contains("https://example.test/")
+        );
+        assert!(readable["body"].as_str().unwrap().contains("- Agenda"));
+        assert_eq!(
+            legacy["html_display_metadata"]["format_version"],
+            "legacy-v1"
+        );
+        assert_eq!(
+            readable["html_display_metadata"]["format_version"],
+            "readable-v1"
+        );
+        assert_eq!(readable["html_display_metadata"]["html_parts"], 1);
+        assert!(!forward_body(raw, "note").unwrap().contains("https://"));
+        for html in [
+            "<a href='https://example.test/'><",
+            "<a href='https://example.test/'></a><broken",
+        ] {
+            let raw = format!("Content-Type: text/html; charset=utf-8\r\n\r\n{html}");
+            if html.ends_with("<broken") {
+                assert_eq!(
+                    insights::parsed_with_options(raw.as_bytes(), 1, None, 10000, &json!({}))
+                        .unwrap_err()
+                        .code,
+                    "UNSUPPORTED_BODY"
+                );
+            }
+            let readable = insights::parsed_with_options(
+                raw.as_bytes(),
+                1,
+                None,
+                10000,
+                &json!({"html_display":"readable"}),
+            )
+            .unwrap();
+            assert!(
+                readable["body"]
+                    .as_str()
+                    .unwrap()
+                    .contains("https://example.test/")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn account_discovery_reports_configured_limits_and_only_implemented_capabilities() {
+        let config = crate::config::fixture();
+        let service = MailService::new(
+            config.clone(),
+            Arc::new(Journal::open(std::path::Path::new(":memory:")).unwrap()),
+        )
+        .unwrap();
+        let discovered = service
+            .execute("list_accounts", &json!({}), "owner")
+            .await
+            .unwrap();
+        assert_eq!(discovered["default_account_id"], "default");
+        let account = &discovered["accounts"][0];
+        assert_eq!(account["id"], "default");
+        assert_eq!(account["address"], config.address);
+        assert_eq!(account["mode"], config.mode);
+        assert_eq!(account["default"], true);
+        assert_eq!(account["capabilities"]["part_fetch"], false);
+        assert_eq!(account["capabilities"]["cross_mailbox_conversation"], false);
+        assert_eq!(account["capabilities"]["cache_modes"], json!(["off"]));
+        assert_eq!(account["limits"]["raw_message_bytes"], config.max_message);
+        assert_eq!(
+            account["limits"]["connection_bytes"],
+            config.max_message * 4
+        );
+        assert_eq!(account["limits"]["wire_response_bytes"], config.max_output);
+        assert_eq!(account["limits"]["mailbox_characters"], 512);
+        assert_eq!(account["limits"]["text_utf8_bytes"], 2048);
+        assert!(!discovered.to_string().contains(&config.password));
+    }
+
+    #[tokio::test]
+    async fn mailbox_discovery_separates_server_config_protocol_and_name_candidates() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (client, server) = tokio::io::duplex(16384);
+        let backend = tokio::spawn(async move {
+            let mut server = BufReader::new(server);
+            for (expected, response) in [
+                ("LOGIN \"synthetic\" \"test-only\"", ""),
+                (
+                    "LIST \"\" *",
+                    concat!(
+                        "* LIST (\\HasNoChildren) \"/\" INBOX\r\n",
+                        "* LIST (\\Archive) \"/\" Drafts\r\n",
+                        "* LIST () NIL Trash\r\n",
+                        "* LIST () \"/\" Sent\r\n",
+                        "* LIST (\\NoSelect) \"/\" Parent\r\n",
+                        "* LIST (\\Drafts \\Flagged) \"/\" &g0l6P3ux-\r\n",
+                    ),
+                ),
+            ] {
+                let mut line = String::new();
+                server.read_line(&mut line).await.unwrap();
+                let (tag, command) = line.trim_end_matches("\r\n").split_once(' ').unwrap();
+                assert_eq!(command, expected);
+                server
+                    .write_all(format!("{response}{tag} OK done\r\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let service = MailService::new(
+            crate::config::fixture(),
+            Arc::new(Journal::open(std::path::Path::new(":memory:")).unwrap()),
+        )
+        .unwrap();
+        let mut session = async_imap::Client::new(client)
+            .login("synthetic", "test-only")
+            .await
+            .unwrap();
+        let result = service
+            .with_session(&mut session, "list_mailboxes", &json!({}))
+            .await
+            .unwrap();
+        let mailboxes = result["mailboxes"].as_array().unwrap();
+        assert_eq!(mailboxes[0]["special_use"], json!(["inbox"]));
+        assert_eq!(mailboxes[0]["role_source"], "protocol");
+        assert_eq!(mailboxes[0]["attribute_flags"], json!(["\\HasNoChildren"]));
+        assert_eq!(mailboxes[1]["special_use"], json!(["archive"]));
+        assert_eq!(mailboxes[1]["role_source"], "server");
+        assert_eq!(mailboxes[1]["delimiter"], "/");
+        assert_eq!(mailboxes[2]["special_use"], json!(["trash"]));
+        assert_eq!(mailboxes[2]["role_source"], "configuration");
+        assert!(mailboxes[2]["delimiter"].is_null());
+        assert_eq!(mailboxes[3]["special_use"], json!([]));
+        assert!(mailboxes[3]["role_source"].is_null());
+        assert_eq!(mailboxes[3]["role_candidates"], json!(["sent"]));
+        assert_eq!(mailboxes[4]["selectable"], false);
+        assert_eq!(mailboxes[5]["special_use"], json!(["drafts", "flagged"]));
+        assert_eq!(mailboxes[5]["role_source"], "server");
+        backend.await.unwrap();
+    }
+
     #[tokio::test]
     async fn recorded_send_status_remains_available_after_legacy_directory_change() {
         for tool in ["send_draft", "reply_email", "forward_email"] {

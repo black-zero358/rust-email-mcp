@@ -24,6 +24,10 @@
 
 ## 附件与兼容性
 
+全部 15 个读取工具声明 `outputSchema`，覆盖实际 `{data, request_id}`、`{error, request_id}`、逐项失败和完整响应预算降级。写工具沿用原契约。常用顺序为 `list_accounts → list_mailboxes → search_emails → get_emails`，再按需调用 `read_conversation` 或 `list_attachments → prepare_attachment_download`；文件进入客户端分析环境的步骤见[附件交付选型](attachment-delivery-probe.md)。
+
+`list_accounts` 的 `default_account_id` 与账户的 `default` 指示默认项；`capabilities` 和 `limits` 给出当前实现及配置值。`list_mailboxes` 保留 `attributes`，增加 `attribute_flags`、`delimiter`、`selectable`、`special_use`、`role_source` 和 `role_candidates`。服务器用途、管理员配置和 INBOX 协议角色分别标记 `server`、`configuration`、`protocol`；只有名称候选时 `special_use` 为空、`role_source` 为 null。
+
 `download_attachment` 保持原有 `content_type`、`size`、`base64` 返回字段和工具输出预算，旧客户端无需迁移。新增 `list_attachments` 提供与 `get_email` 一致的索引，新增 `prepare_attachment_download` 接受文件夹、UID、UIDVALIDITY 和 `attachment_index`，返回认证二进制 GET URL。
 
 附件发现、URL 准备和实际 GET 均使用已有有界整封读取及 MIME 解析；GET 会重新核对 UIDVALIDITY 并读取同一消息。当前不会发起 BODYSTRUCTURE 或单部分 FETCH，不能发现或下载超出整封邮件上限的内容。这样保持既有附件分类、RFC2231 文件名意图和整体 multipart 附件语义；附加 `.eml` 作为整体附件，不枚举其内部附件。每封原始邮件及解码附件均受 32 MiB 限制；元数据和筛选还共用单连接响应预算，超过预算明确失败。
@@ -46,6 +50,16 @@
 `locate_message` 接受 `message_id` 和显式 `mailboxes` 列表，最多 20 个文件夹。先以服务端 HEADER 搜索缩小候选，再验证完整 Message-ID，避免子串误匹配。每个文件夹分别返回搜索范围及下一页游标；继续某个文件夹时应单独传入该文件夹和它自己的游标。
 
 `get_email`、`get_emails` 和 `read_conversation` 支持 `body_mode:full|trimmed` 和 `max_body_length`，长度以 UTF-8 字节计，截断保持字符完整。`trimmed` 按常见引用分隔符及标准签名分隔符进行启发式处理；结果分别报告引用、签名省略及长度截断，可用 `full` 重新读取。HTML-only 邮件仍沿用现有纯文本读取行为，不新增 HTML 渲染器。
+
+这三个工具另支持 `html_display:legacy|readable`，默认 `legacy`。`readable` 在纯文本中保留链接地址、列表编号与层次、表格行列边界、引用前缀和预格式空白；图片保留 alt。链接仅显示 http/https/mailto 地址，外部资源请求数为零。`html_display_metadata` 返回格式版本、HTML 部件数和固定原因的省略计数；旧转发固定使用 legacy 格式。
+
+例如读取会议邮件并保留参会链接：
+
+```json
+{"mailbox":"INBOX","uid":7,"uid_validity":9,"body_mode":"full","html_display":"readable"}
+```
+
+可读格式最多 16 层缩进、256 个链接、每地址 2048 UTF-8 字节；多个所选 HTML 部件共用链接、32768 token 与 1 MiB 输出预算。相对地址、危险协议、控制字符、过长链接和超额层次通过 `omissions` 报告；无法支持的外来内容继续返回 `UNSUPPORTED_BODY`。MIME 候选选择及纯文本优先规则保持一致。
 
 ## 诊断、统计和缓存
 
