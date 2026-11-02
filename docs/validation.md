@@ -22,6 +22,8 @@
 
 本子包交付分配前解析预算、静态 typed limit 错误、默认 Client 接线、双依赖来源/审计及容器配置。后续 R06 PartManifest 子包负责工具层 `LIMIT_EXCEEDED/mime_structure` 映射、必要头核对和受控整封回退；R07 负责部件下载。当前未执行真实邮箱或 ChatGPT 连接测试。
 
+[PR #68](https://github.com/black-zero358/rust-email-mcp/pull/68) 最终 head 为 `0c4e431b3af616131cd2f160bc512bfbf8cc23b1`，相对已审源码仅增加验证文档。[CI 41429841352](https://github.com/black-zero358/rust-email-mcp/actions/runs/41429841352) 的 check/audit/container 全部通过；合并前复查 reviews/review threads 为空，独立审阅记录及发现修复已写入 PR。合并提交为 `6f106d5ead8a957b72698473faad676376303784`，随后本地 main、开发分支与对应远端全部同步。
+
 ## 2026-11-02 R05 多账户离线验证
 
 实现提交 `c3136348ff75709b1208d1cc40750f2c10b3e2a0`，同步 main 的合并提交 `a0a81aac391a240902881df52109c1ab23b5557a` 与其 tree 一致。最终源码 `ffd1bda62ac80de4bfd13008675334173e2962b6` 仅追加 Clippy 要求的静态错误回退简化。环境为 WSL Ubuntu、Rust 1.99.1、锁定 Cargo.lock 和本地模拟 IMAP/JWT/MCP；附件均为合成文件。
