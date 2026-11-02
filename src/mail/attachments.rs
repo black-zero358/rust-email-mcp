@@ -96,10 +96,10 @@ impl MailService {
         principal: &str,
     ) -> Result<Value> {
         let mut session = self.connect().await?;
-        let mailbox = folder(a)?;
+        let mailbox = folder(a, InputLimits::Read)?;
         let uid = uid(a)?;
         let state = session
-            .examine(mailbox_name(mailbox)?)
+            .examine(mailbox_name(mailbox, InputLimits::Read)?)
             .await
             .map_err(|_| MailError::backend())?;
         check_validity(a, state.uid_validity)?;
@@ -161,7 +161,7 @@ impl MailService {
             .map_err(|_| MailError::backend())?;
         let mut session = self.connect().await?;
         let state = session
-            .examine(mailbox_name(&transfer.mailbox)?)
+            .examine(mailbox_name(&transfer.mailbox, InputLimits::Read)?)
             .await
             .map_err(|_| MailError::backend())?;
         check_validity(
@@ -176,6 +176,13 @@ impl MailService {
             .get(transfer.part.index)
             .ok_or_else(MailError::input)?
             .body_raw(self.config.max_message)
+            .map_err(|error| {
+                if error.code == "LIMIT_EXCEEDED" && error.details.is_none() {
+                    MailError::limit_kind(LimitKind::DecodedAttachmentBytes)
+                } else {
+                    error
+                }
+            })
     }
 }
 /// Must be mounted inside the same OIDC middleware as the MCP endpoint.

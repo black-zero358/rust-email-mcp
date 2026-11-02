@@ -4,6 +4,10 @@
 
 ## 筛选与分页
 
+读取文件夹名和 `query/from/to/subject` 最多 512 个 Unicode 码点、2048 UTF-8 字节；文件夹 modified UTF-7 编码后最多 8192 字节。Schema 的 `maxLength` 使用码点，额外字节预算由 `x-maxUtf8Bytes` 和 `x-maxModifiedUtf7Bytes` 公布。例如 200 个汉字可直接作为查询词，组合字符按各自码点计数。旧写工具保留原字节规则。
+
+`INVALID_INPUT` 的可选 `details` 给出字段路径、稳定 `reason`、单位和 `action`。首项直接置于 details，其余放入 `additional_violations`，总计最多八项；未知字段指向所属对象。错误仅返回类型和长度等信息。正文等响应仍按完整 JSON-RPC 预算处理，错误详情在预算紧张时省略。
+
 `search_emails` 支持组合 `query`、`from`、`to`、`subject`、`since`、`before`、`seen`、`flagged`、`answered`、`has_attachment`、`min_size`、`max_size`。日期采用 `YYYY-MM-DD`，`since` 包含当日、`before` 不包含当日，按 IMAP INTERNALDATE 的日历日匹配。大小为整封邮件编码后的字节数，最小值和最大值均包含边界。
 
 例如查询本周未读邮件：
@@ -24,7 +28,7 @@
 
 附件发现、URL 准备和实际 GET 均使用已有有界整封读取及 MIME 解析；GET 会重新核对 UIDVALIDITY 并读取同一消息。当前不会发起 BODYSTRUCTURE 或单部分 FETCH，不能发现或下载超出整封邮件上限的内容。这样保持既有附件分类、RFC2231 文件名意图和整体 multipart 附件语义；附加 `.eml` 作为整体附件，不枚举其内部附件。每封原始邮件及解码附件均受 32 MiB 限制；元数据和筛选还共用单连接响应预算，超过预算明确失败。
 
-返回的 `download_url` 需要同一用户的有效 OAuth Bearer 令牌。句柄有效期 600 秒，每实例最多保存 16 个描述符，不缓存附件字节；重启后失效。它不能作为公共分享链接。最多四个二进制下载并发，响应被消费或丢弃后释放传输名额；IMAP 读取还使用共享邮箱槽位。附件列表使用 `next_attachment_offset` 分页。
+返回的 `download_url` 需要同一用户的有效 OAuth Bearer 令牌。句柄有效期 600 秒，每实例最多保存 64 个描述符，不缓存附件字节；重启后失效。它不能作为公共分享链接。最多四个二进制下载并发，响应被消费或丢弃后释放传输名额；IMAP 读取还使用共享邮箱槽位。附件列表使用 `next_attachment_offset` 分页。
 
 普通浏览器点击链接不会自动携带 MCP 令牌，客户端必须支持认证下载；ChatGPT 自动读取 PDF/Excel 尚未验收。公开路由为 `MCP_RESOURCE/attachments/{token}`，需转发至内部 `/mcp/attachments/{token}` 并关闭包含句柄的访问日志。响应使用 `no-store`、`nosniff` 和 attachment disposition；客户端负责安全解析文件内容。
 

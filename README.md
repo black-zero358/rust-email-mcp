@@ -37,6 +37,8 @@ MCP 客户端 ── HTTPS ── Nginx ── Rust Email MCP ── IMAP / SMTP
 
 JSON-RPC id 的序列化 JSON（包括引号、转义和 UTF-8 字节）最多 1024 字节，超过后 HTTP 返回 413，并在执行工具前拒绝请求。此限制确保超限错误也能携带原 id。若写操作执行后结果超限，响应保留已知发送状态并禁止自动重试；使用原 `operation_key` 调用 `get_operation` 查询。此输出预算约束工具响应，其他协议发现/握手响应另按固定结构生成。
 
+读取查询及文件夹参数最多 512 个 Unicode 码点、2048 UTF-8 字节；组合字符分别计数，emoji 按实际码点计数。文件夹编码后另受 8192 modified UTF-7 字节限制。输入 Schema 同时公开字符与字节预算。错误可附最多八项字段详情，包含 JSON Pointer、限制单位和修正动作；详情过大时保留基础错误。旧写工具及其配置目录继续使用原有字节限制，`get_operation` 的操作键仍为最多 128 UTF-8 字节。
+
 MIME 在构建结构时限制为 1024 个节点、32 层嵌套，头部每段最多 128 KiB，累计最多 1 MiB、8192 行（含折行）。正文解码前按编码字节数的四倍预留共享的 32 MiB 预算，覆盖字符集转为 UTF-8 的放大；附件解码也先限制编码输入。超限返回 `LIMIT_EXCEEDED`，因此部分原始大小合规的复杂邮件或长正文仍会被拒绝。回复和草稿发送只解析有界头部，保留草稿正文原始字节。边界分隔行按完整 boundary 匹配，接受尾部空格和制表符；不再把仅具有相同前缀的行当作分隔符。
 
 文件夹名称在工具参数、LIST 返回值和 DRAFTS_MAILBOX/TRASH_MAILBOX 配置中使用 Unicode；返回的 name 可直接传给读取、移动或重命名工具。连接采用 IMAP4rev1，线路上的名称使用 modified UTF-7，包含 & 的名称也会正确转换。非规范或无法安全往返的服务端名称返回 MAIL_BACKEND，避免误引用其他文件夹。ASCII 搜索继续使用 US-ASCII；中文等非 ASCII 查询使用 CHARSET UTF-8 和同步 literal。服务器返回 BADCHARSET 时报告 UNSUPPORTED_CHARSET，不降级为含义不同的查询；未协商 UTF8=ACCEPT 或 IMAP4rev2。

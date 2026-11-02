@@ -116,8 +116,14 @@ impl MailService {
             .filter(|f| f.uid == Some(uid))
             .find_map(|f| f.header())
             .ok_or_else(MailError::backend)?;
-        if bytes.len() > HEADER_LIMIT || !(bytes.ends_with(b"\r\n\r\n") || bytes.ends_with(b"\n\n"))
-        {
+        if bytes.len() > HEADER_LIMIT {
+            return Err(MailError::limit_with(
+                LimitKind::HeaderBytes,
+                HEADER_LIMIT,
+                bytes.len(),
+            ));
+        }
+        if !(bytes.ends_with(b"\r\n\r\n") || bytes.ends_with(b"\n\n")) {
             return Err(MailError::limit());
         }
         let headers = bytes.to_vec();
@@ -157,7 +163,7 @@ impl MailService {
         let mut scopes = Vec::new();
         for mailbox in folders {
             let state = s
-                .examine(mailbox_name(mailbox)?)
+                .examine(mailbox_name(mailbox, InputLimits::Read)?)
                 .await
                 .map_err(|_| MailError::backend())?;
             require_reference(&state)?;
@@ -206,10 +212,10 @@ impl MailService {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
     {
-        let mailbox = folder(a)?;
+        let mailbox = folder(a, InputLimits::Read)?;
         let seed = uid(a)?;
         let state = s
-            .examine(mailbox_name(mailbox)?)
+            .examine(mailbox_name(mailbox, InputLimits::Read)?)
             .await
             .map_err(|_| MailError::backend())?;
         require_reference(&state)?;
@@ -329,7 +335,7 @@ impl MailService {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
     {
-        let mailbox = folder(a)?;
+        let mailbox = folder(a, InputLimits::Read)?;
         // STATUS UNSEEN is a count; EXAMINE UNSEEN is a sequence number.
         let status = crate::imap_text::status_counts(s, mailbox).await?;
         let mut result = json!({"mailbox":mailbox,"messages":status.exists,"unseen":status.unseen,"recent":status.recent,
@@ -342,7 +348,7 @@ impl MailService {
                 return Err(MailError::input());
             }
             let state = s
-                .examine(mailbox_name(mailbox)?)
+                .examine(mailbox_name(mailbox, InputLimits::Read)?)
                 .await
                 .map_err(|_| MailError::backend())?;
             require_reference(&state)?;
@@ -461,11 +467,12 @@ fn explicit_folders(a: &Value) -> Result<Vec<&str>> {
         return Err(MailError::input());
     }
     let mut folders = Vec::new();
-    for value in array {
+    for (index, value) in array.iter().enumerate() {
         let name = value
             .as_str()
-            .filter(|s| !s.is_empty() && s.len() <= 512 && !s.chars().any(char::is_control))
+            .filter(|s| !s.is_empty() && !s.chars().any(char::is_control))
             .ok_or_else(MailError::input)?;
+        InputLimits::Read.mailbox(name, &format!("/mailboxes/{index}"))?;
         if !folders.contains(&name) {
             folders.push(name);
         }

@@ -11,6 +11,8 @@ use rmcp::{
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Instant};
 
+mod input;
+
 pub const MAX_RPC_ID_BYTES: usize = 1024;
 
 /// Enforce the id bound before rmcp can execute a write or echo an oversized id.
@@ -91,7 +93,18 @@ fn bounded_tool_result(
     if response_fits(&response, id, limit) {
         return Ok(response);
     }
-    let mut fallback = json!({"error":MailError::limit(),"request_id":request_id,
+    // Drop verbose input details first, retaining the actionable base error.
+    if status.is_none() && response.is_error == Some(true) {
+        let mut compact = response.structured_content.clone().unwrap_or_default();
+        if let Some(error) = compact.get_mut("error").and_then(Value::as_object_mut) {
+            error.remove("details");
+        }
+        let compact = CallToolResult::structured_error(compact);
+        if response_fits(&compact, id, limit) {
+            return Ok(compact);
+        }
+    }
+    let mut fallback = json!({"error":MailError::limit_kind(crate::error::LimitKind::WireResponseBytes),"request_id":request_id,
         "recovery":"Inspect get_operation with the original operation_key before retrying a write.",
         "retry_allowed":false});
     if let Some(status) = status {
@@ -416,9 +429,12 @@ pub fn tools(mode: &str) -> Vec<Tool> {
     }
     specs.extend(crate::mail::insights::tool_specs());
     specs.retain(|(name, _, _, _)| allowed(name, mode));
-    specs.into_iter().map(|(name,description,properties,required)|serde_json::from_value(json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"annotations":{"readOnlyHint":is_read(name),"destructiveHint":(["delete_email","delete_emails","delete_mailbox"].contains(&name)),"idempotentHint":is_read(name)||is_send(name)||name=="mark_email","openWorldHint":true}})).expect("static tool schema")).collect()
+    specs.into_iter().map(|(name,description,properties,required)|{
+        let properties = if is_read(name) { input::read_properties(properties) } else { properties };
+        serde_json::from_value(json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"annotations":{"readOnlyHint":is_read(name),"destructiveHint":(["delete_email","delete_emails","delete_mailbox"].contains(&name)),"idempotentHint":is_read(name)||is_send(name)||name=="mark_email","openWorldHint":true}})).expect("static tool schema")
+    }).collect()
 }
-/// Validate schema constraints at the trust boundary; clients may skip their own validation.
+/// Legacy write validation is frozen in bytes; read validation lives in input.
 fn validate(a: &Value, schema: &Value) -> bool {
     if let Some(c) = schema.get("const")
         && a != c
@@ -518,9 +534,16 @@ impl ServerHandler for EmailServer {
             .ok_or_else(|| ErrorData::invalid_params("Unknown or disabled tool", None))?;
         let schema = serde_json::to_value(&tool.input_schema)
             .map_err(|_| ErrorData::internal_error("Tool schema unavailable", None))?;
-        if !validate(&args, &schema) {
+        let validation = if is_read(&name) {
+            input::validate(&name, &args, &schema)
+        } else if validate(&args, &schema) {
+            Ok(())
+        } else {
+            Err(MailError::input())
+        };
+        if let Err(error) = validation {
             return bounded_tool_result(
-                Err(MailError::input()),
+                Err(error),
                 &request_id,
                 &context.id,
                 self.0.config.max_output,
@@ -557,6 +580,7 @@ impl ServerHandler for EmailServer {
                 code: "INTERNAL",
                 message: "Operation interrupted. Check operation status before retrying a write.",
                 retryable: false,
+                details: None,
             })
         });
         let bound = if truncate_email {
@@ -572,6 +596,87 @@ impl ServerHandler for EmailServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_write_argument_schemas_and_byte_validation_stay_frozen() {
+        let all = tools("full");
+        for tool in all.iter().filter(|t| !is_read(&t.name)) {
+            let schema = serde_json::to_value(&tool.input_schema).unwrap();
+            assert!(!schema.to_string().contains("x-maxUtf8Bytes"));
+            for key in ["mailbox", "name", "new_name", "destination"] {
+                if !schema["properties"][key].is_null() {
+                    let field = &schema["properties"][key];
+                    assert_eq!(field["maxLength"], 512);
+                    assert!(validate(&json!("中".repeat(170)), field));
+                    assert!(!validate(&json!("中".repeat(171)), field));
+                    assert!(validate(&json!("😀".repeat(128)), field));
+                    assert!(!validate(&json!("😀".repeat(129)), field));
+                }
+            }
+            if !schema["properties"]["operation_key"].is_null() {
+                let field = &schema["properties"]["operation_key"];
+                assert!(validate(&json!("中".repeat(42)), field));
+                assert!(!validate(&json!("中".repeat(43)), field));
+            }
+            if !schema["properties"]["body"].is_null() {
+                let field = &schema["properties"]["body"];
+                assert!(validate(&json!("a\nb"), field));
+                assert!(!validate(&json!("a\rb"), field));
+                assert!(validate(&json!("😀".repeat(16384)), field));
+                assert!(!validate(&json!("😀".repeat(16385)), field));
+            }
+        }
+    }
+
+    #[test]
+    fn input_detail_budget_preserves_original_error_and_measures_real_wire() {
+        use crate::error::{InputViolation, LimitKind};
+        let error = MailError::input_fields(
+            (0..20)
+                .map(|i| {
+                    InputViolation::new(&format!("/uids/{i}"), "type_mismatch", "use_expected_type")
+                })
+                .collect(),
+        );
+        let verbose =
+            CallToolResult::structured_error(json!({"error":error,"request_id":TRACE_ID}));
+        let compact = CallToolResult::structured_error(
+            json!({"error":MailError::input(),"request_id":TRACE_ID}),
+        );
+        for id in [
+            RequestId::Number(1),
+            RequestId::String("\\\"中".repeat(60).into()),
+        ] {
+            let limit = wire_bytes(compact.clone(), id.clone()).len();
+            assert!(wire_bytes(verbose.clone(), id.clone()).len() > limit);
+            let bounded = bounded_tool_result(Err(error.clone()), TRACE_ID, &id, limit).unwrap();
+            assert_eq!(
+                bounded.structured_content.as_ref().unwrap()["error"]["code"],
+                "INVALID_INPUT"
+            );
+            assert!(
+                bounded.structured_content.as_ref().unwrap()["error"]
+                    .get("details")
+                    .is_none()
+            );
+            assert_eq!(wire_bytes(bounded, id).len(), limit);
+        }
+        let bounded = bounded_tool_result(
+            Ok(json!({"private":"x".repeat(10000)})),
+            TRACE_ID,
+            &RequestId::Number(1),
+            4096,
+        )
+        .unwrap();
+        assert_eq!(
+            bounded.structured_content.unwrap()["error"]["details"]["limit_kind"],
+            "wire_response_bytes"
+        );
+        let items =
+            serde_json::to_value(MailError::limit_with(LimitKind::ScanItems, 20, 21)).unwrap();
+        assert_eq!(items["details"]["unit"], "items");
+        assert_eq!(items["details"]["limit_kind"], "scan_items");
+        assert_eq!(items["details"]["actual"], 21);
+    }
     #[test]
     fn batch_and_conversation_fit_wire_budget_without_losing_item_outcomes() {
         let body = "中😀\"\\\n".repeat(20000);
