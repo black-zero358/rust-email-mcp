@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "mode": "extend_legacy",
+  "default_account_id": "default",
+  "legacy_default": {
+    "display_name": "Primary mailbox",
+    "read_subjects": ["replace-with-original-subject"],
+    "write_subjects": ["replace-with-original-subject"]
+  },
+  "accounts": [
+    {
+      "registration_key": "finance-mailbox",
+      "id": "finance",
+      "display_name": "Finance mailbox",
+      "address": "finance@example.test",
+      "imap": {"host": "imap.example.test", "port": 993},
+      "password": {"env": "FINANCE_MAIL_PASSWORD"},
+      "folders": {"drafts": "Drafts", "trash": "Trash"},
+      "read_subjects": ["replace-with-finance-subject"]
+    }
+  ]
+}

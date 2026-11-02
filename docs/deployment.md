@@ -37,6 +37,27 @@ sudo chmod 700 data/auth data/mail secrets/bootstrap
 sudo chmod 600 secrets/rauthy.toml secrets/mail.env
 ```
 
+## 多账户配置
+
+保留原环境配置即可继续使用单邮箱。追加只读邮箱时，复制 [accounts.json.example](../deploy/accounts.json.example) 到私密配置目录，填写稳定登记键、调用别名、邮箱端点、密码环境变量名称和各账户的主体 ACL。`extend_legacy` 保留原邮箱环境配置；JSON 中的 `legacy_default` 显式列出原邮箱的读写主体。全局 `OIDC_SUBJECTS` 与每账户 ACL 取交集，新加入全局列表的主体按各账户 ACL 获取权限。
+
+在 `secrets/mail.env` 设置 `ACCOUNT_CONFIG_PATH=/run/mail-config/accounts.json`，并填写示例引用的 `FINANCE_MAIL_PASSWORD`。密码值保存在环境文件，JSON 只保存引用。将 JSON 单独只读挂载给 mail 服务；例如在 `deploy/compose.accounts.yaml` 写入：
+
+```yaml
+services:
+  mail:
+    volumes:
+      - ../secrets/accounts.json:/run/mail-config/accounts.json:ro
+```
+
+组合配置使用 `docker compose -f deploy/compose.yaml -f deploy/compose.accounts.yaml`。原 `/data` 挂载继续保留。JSON 文件只允许服务用户及管理员读取；以当前 Compose 的 UID 1000 为例，设置所有者 1000:1000、权限 0600。配置修改后重启 mail 服务生效。
+
+文件密码引用适用于 Linux：设置 `MAIL_SECRET_ROOT=/run/mail-secrets`，将秘密目录只读挂载至该路径，JSON 使用 `{ "file": "finance.secret" }`。根目录及路径上的子目录禁止组/其他用户写入，密码文件设为 0600，所有者为服务用户；禁止符号链接、绝对路径和父目录跳转。Windows 开发环境使用环境变量引用。配置文件最多 128 KiB、当前账户最多 16 个；完整的 `file_only` 配置及校验规则见[多账户设计](multi-account-design.md)。
+
+`default_account_id` 只控制省略账户参数时的读取目标。旧写工具始终操作原 `default` 邮箱；新增账户固定只读。更换调用别名时保留 `registration_key`，使内部账户身份延续；追加邮箱的登录身份/端点变化或删除后重新加入会递增世代并使旧附件引用失效。原邮箱身份与操作库路径保持固定。
+
+首次启用显式账户配置会将账户注册库升级到 v2；升级和回退先按[备份与恢复](#备份与恢复)处理。验证采用独立目录、本地模拟邮箱和合成数据，附件继续只做离线测试。
+
 ## 配置认证
 
 将 `deploy/nginx.conf.example` 放入自己的 HTTPS server 块，执行 `nginx -t` 后 reload。公网只开放 Nginx 的 HTTPS 端口，容器端口绑定 loopback。按部署环境对登录和 API 路径配置速率限制。
@@ -110,12 +131,16 @@ docker compose -f deploy/compose.yaml up -d --build mail
 
 R02 起同时保留 `accounts.sqlite`（或 `ACCOUNT_REGISTRY_PATH` 指定文件）与原操作数据库。注册库 v1 保存 default UUID、世代以及 IMAP 身份和操作库路径的摘要；首次升级在恢复操作记录前建立/核验注册库。Linux 新建目录为 0700、注册库和初始化锁为 0600，既有目录权限由管理员管理。固定 `.staging` 文件在初始化锁内恢复清理；备份正式注册库，保留其文件权限。
 
+R05 显式账户配置使用 v2。从 v1 迁移时保留原 UUID、世代及绑定，并保存完整文件名追加 `.v1-backup` 的副本；替换已有正式库时保存 `.previous` 副本。全新直接建立 v2 时尚无这两份历史副本。同一次备份保存注册库、已有副本、最新操作库及对应账户配置，秘密单独加密保存。多账户运行期持有注册锁，恢复或替换注册库前停止 mail 服务。
+
+启动失败先修正配置、秘密文件权限或路径冲突，再重试完整启动。若正式注册库损坏，停止服务并保留现场，使用配套完整副本恢复，核对相同原邮箱身份与操作库路径。回退至只支持 v1 的程序时，恢复匹配的 `.v1-backup`，使用原环境配置并保留最新操作记录库；追加账户在旧程序中暂停提供。再次升级使用保存的 v2 配置和注册库，使追加账户的 UUID、世代与删除记录延续。v2 注册库要求继续提供 `ACCOUNT_CONFIG_PATH`。
+
 恢复演练可使用隔离容器和独立宿主目录，保持容器内相同的操作库规范路径（例如 `/data/operations.sqlite`）及同一邮箱绑定。改用其他实际邮箱或操作库路径会触发固定迁移错误；先恢复正确的配置和配套注册库，再启动服务。密码轮换及 SMTP 配置调整保持账户 UUID。回滚到旧程序时保留新注册库，供再次升级复用身份。
 
 备份 Hiqlite 时停止认证服务后复制整个数据目录；邮件 SQLite 使用在线 backup API，或停止邮件服务后复制完整目录。加密密钥和配置单独加密备份。记录备份时间、应用版本/commit 和数据库格式说明，定期在隔离数据目录及独立端口演练恢复，先以只读模式验证。
 
-应用版本回滚与操作数据库回退必须分别处理。恢复旧操作库会丢失备份之后的发送记录，原 `operation_key` 查不到记录不代表邮件未发送，也不能继续保证这段时间的重复发送保护。
+应用版本回滚与操作数据库回退必须分别处理。恢复旧操作库会丢失备份之后的发送记录及对应去重信息；这段时间的发送需要结合邮件服务商记录核查，原 `operation_key` 缺失时也按此步骤处理。
 
 若必须从旧备份恢复，先暂停邮件写操作，保留可用的最新数据库及故障现场副本，核对备份后可能执行的发送与邮件服务商记录。无法确认的结果按 `unknown` 处理，不自动重试，也不通过换用新操作键绕过检查。只有在受影响操作已核验、操作记录恢复方案明确后，才恢复已获授权的写模式；当前项目没有自动重建丢失发送记录的工具。
 
-附件扩展路由：公开 `MCP_RESOURCE/attachments/{token}` 应转发至内部 `/mcp/attachments/{token}`。示例 `/email/` 前缀代理覆盖此后缀；自定义仅匹配 MCP 根路径的代理需同步覆盖，保留 Bearer 头、认证中间件，并对含句柄路径关闭访问日志。此说明不代表实际客户端下载验收已完成。
+附件扩展路由：公开 `MCP_RESOURCE/attachments/{token}` 应转发至内部 `/mcp/attachments/{token}`。示例 `/email/` 前缀代理覆盖此后缀；自定义仅匹配 MCP 根路径的代理需同步覆盖，保留 Bearer 头、认证中间件，并对含句柄路径关闭访问日志。当前附件验收仅使用本地模拟服务，真实 ChatGPT 下载与读取测试后移。

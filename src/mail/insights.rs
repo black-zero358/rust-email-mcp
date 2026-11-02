@@ -11,6 +11,7 @@ const CACHE_ITEMS: usize = 256;
 const CACHE_TTL: Duration = Duration::from_secs(60);
 
 struct Entry {
+    account: AccountKey,
     folder: String,
     validity: u32,
     uid: u32,
@@ -25,6 +26,7 @@ pub(super) struct MetadataCache {
 impl MetadataCache {
     fn get(
         &mut self,
+        account: &AccountKey,
         folder: &str,
         validity: Option<u32>,
         uid: u32,
@@ -32,21 +34,33 @@ impl MetadataCache {
     ) -> Option<Vec<u8>> {
         self.entries.retain(|e| {
             now.duration_since(e.inserted) < CACHE_TTL
-                && (e.folder != folder || Some(e.validity) == validity)
+                && (&e.account != account || e.folder != folder || Some(e.validity) == validity)
         });
         let validity = validity?;
         self.entries
             .iter()
-            .find(|e| e.folder == folder && e.validity == validity && e.uid == uid)
+            .find(|e| {
+                &e.account == account
+                    && e.folder == folder
+                    && e.validity == validity
+                    && e.uid == uid
+            })
             .map(|e| e.headers.clone())
     }
-    fn insert(&mut self, folder: &str, validity: Option<u32>, uid: u32, headers: Vec<u8>) {
+    fn insert(
+        &mut self,
+        account: &AccountKey,
+        folder: &str,
+        validity: Option<u32>,
+        uid: u32,
+        headers: Vec<u8>,
+    ) {
         let Some(validity) = validity else { return };
         if headers.len() > HEADER_LIMIT {
             return;
         }
         self.entries
-            .retain(|e| !(e.folder == folder && e.uid == uid));
+            .retain(|e| !(&e.account == account && e.folder == folder && e.uid == uid));
         while self.entries.len() >= CACHE_ITEMS
             || self.entries.iter().map(|e| e.headers.len()).sum::<usize>() + headers.len()
                 > CACHE_BYTES
@@ -54,6 +68,7 @@ impl MetadataCache {
             self.entries.pop_front();
         }
         self.entries.push_back(Entry {
+            account: account.clone(),
             folder: folder.into(),
             validity,
             uid,
@@ -79,7 +94,7 @@ impl MailService {
             return;
         }
         if let Ok(mut cache) = self.metadata_cache.lock() {
-            cache.insert(mailbox, validity, uid, bytes.to_vec());
+            cache.insert(&self.account, mailbox, validity, uid, bytes.to_vec());
         }
     }
 
@@ -97,7 +112,7 @@ impl MailService {
             .metadata_cache
             .lock()
             .map_err(|_| MailError::backend())?
-            .get(mailbox, validity, uid, Instant::now())
+            .get(&self.account, mailbox, validity, uid, Instant::now())
         {
             return Ok(headers);
         }
@@ -130,7 +145,7 @@ impl MailService {
         self.metadata_cache
             .lock()
             .map_err(|_| MailError::backend())?
-            .insert(mailbox, validity, uid, headers.clone());
+            .insert(&self.account, mailbox, validity, uid, headers.clone());
         Ok(headers)
     }
 
@@ -384,11 +399,15 @@ impl MailService {
     /// Every returned string is static. Never return hostnames, credentials, banners or backend errors.
     pub(super) async fn diagnose_connectivity(&self) -> Result<Value> {
         let mut stages = vec![json!({"stage":"mcp_auth","status":"passed"})];
+        let failed_backend = |stages: &mut Vec<Value>, phase: &str| {
+            self.record_backend_failure();
+            diagnostic_failure(stages, phase)
+        };
         let diagnose = async {
             let tcp =
                 match TcpStream::connect((&*self.config.imap_host, self.config.imap_port)).await {
                     Ok(tcp) => tcp,
-                    Err(_) => return diagnostic_failure(&mut stages, "tcp"),
+                    Err(_) => return failed_backend(&mut stages, "tcp"),
                 };
             stages.push(json!({"stage":"tcp","status":"passed"}));
             let tls = ClientConfig::builder()
@@ -400,11 +419,11 @@ impl MailService {
             };
             let stream = match TlsConnector::from(Arc::new(tls)).connect(name, tcp).await {
                 Ok(stream) => stream,
-                Err(_) => return diagnostic_failure(&mut stages, "tls"),
+                Err(_) => return failed_backend(&mut stages, "tls"),
             };
             stages.push(json!({"stage":"tls","status":"passed"}));
             let (stream, _) = BudgetStream::new(stream, 128 * 1024);
-            let mut client = async_imap::Client::new(stream);
+            let mut client = async_imap::Client::with_buffer_limit(stream, 128 * 1024);
             if !client
                 .read_response()
                 .await
@@ -420,7 +439,7 @@ impl MailService {
                     )
                 })
             {
-                return diagnostic_failure(&mut stages, "greeting");
+                return failed_backend(&mut stages, "greeting");
             }
             stages.push(json!({"stage":"greeting","status":"passed"}));
             let mut session = match client
@@ -428,7 +447,7 @@ impl MailService {
                 .await
             {
                 Ok(session) => session,
-                Err(_) => return diagnostic_failure(&mut stages, "login"),
+                Err(_) => return failed_backend(&mut stages, "login"),
             };
             stages.push(json!({"stage":"login","status":"passed"}));
             let capabilities = match session.capabilities().await {
@@ -441,9 +460,12 @@ impl MailService {
         };
         match tokio::time::timeout(self.config.timeout, diagnose).await {
             Ok(value) => Ok(value),
-            Err(_) => Ok(
-                json!({"ok":false,"stages":stages,"failure":"timeout","service":"imap","smtp_tested":false}),
-            ),
+            Err(_) => {
+                self.record_backend_failure();
+                Ok(
+                    json!({"ok":false,"stages":stages,"failure":"timeout","service":"imap","smtp_tested":false}),
+                )
+            }
         }
     }
 }
@@ -1045,26 +1067,198 @@ mod tests {
     #[test]
     fn header_cache_expires_invalidates_and_bounds_capacity() {
         let mut cache = MetadataCache::default();
-        cache.insert("INBOX", Some(1), 1, b"header".to_vec());
-        assert!(cache.get("Other", Some(1), 1, Instant::now()).is_none());
-        assert!(cache.get("INBOX", Some(1), 1, Instant::now()).is_some());
-        assert!(cache.get("INBOX", Some(2), 1, Instant::now()).is_none());
-        assert!(cache.entries.is_empty());
-        cache.insert("INBOX", Some(1), 1, b"header".to_vec());
+        let account = AccountKey::synthetic();
+        cache.insert(&account, "INBOX", Some(1), 1, b"header".to_vec());
         assert!(
             cache
-                .get("INBOX", Some(1), 1, Instant::now() + CACHE_TTL)
+                .get(&account, "Other", Some(1), 1, Instant::now())
+                .is_none()
+        );
+        assert!(
+            cache
+                .get(&account, "INBOX", Some(1), 1, Instant::now())
+                .is_some()
+        );
+        assert!(
+            cache
+                .get(&account, "INBOX", Some(2), 1, Instant::now())
+                .is_none()
+        );
+        assert!(cache.entries.is_empty());
+        cache.insert(&account, "INBOX", Some(1), 1, b"header".to_vec());
+        assert!(
+            cache
+                .get(&account, "INBOX", Some(1), 1, Instant::now() + CACHE_TTL)
                 .is_none()
         );
         for uid in 1..=200 {
-            cache.insert("INBOX", Some(1), uid, vec![b'x'; HEADER_LIMIT]);
+            cache.insert(&account, "INBOX", Some(1), uid, vec![b'x'; HEADER_LIMIT]);
         }
         assert!(cache.entries.len() <= CACHE_ITEMS);
         assert!(cache.entries.iter().map(|e| e.headers.len()).sum::<usize>() <= CACHE_BYTES);
-        assert!(cache.get("INBOX", Some(1), 1, Instant::now()).is_none());
-        cache.insert("INBOX", None, 201, vec![0; 10]);
+        assert!(
+            cache
+                .get(&account, "INBOX", Some(1), 1, Instant::now())
+                .is_none()
+        );
+        cache.insert(&account, "INBOX", None, 201, vec![0; 10]);
         assert!(!cache.entries.iter().any(|e| e.uid == 201));
     }
+    #[test]
+    fn header_cache_account_namespaces_share_one_item_and_byte_quota() {
+        let mut cache = MetadataCache::default();
+        let accounts = (0..16).map(|_| AccountKey::synthetic()).collect::<Vec<_>>();
+        cache.insert(&accounts[0], "INBOX", Some(1), 7, b"first".to_vec());
+        cache.insert(&accounts[1], "INBOX", Some(1), 7, b"second".to_vec());
+        assert_eq!(
+            cache
+                .get(&accounts[0], "INBOX", Some(1), 7, Instant::now())
+                .unwrap(),
+            b"first"
+        );
+        assert_eq!(
+            cache
+                .get(&accounts[1], "INBOX", Some(1), 7, Instant::now())
+                .unwrap(),
+            b"second"
+        );
+        assert!(
+            cache
+                .get(&accounts[0], "INBOX", Some(2), 7, Instant::now())
+                .is_none()
+        );
+        assert_eq!(
+            cache
+                .get(&accounts[1], "INBOX", Some(1), 7, Instant::now())
+                .unwrap(),
+            b"second"
+        );
+        for account in &accounts {
+            for uid in 1..=20 {
+                cache.insert(account, "INBOX", Some(1), uid, vec![0; 1]);
+            }
+        }
+        assert_eq!(cache.entries.len(), CACHE_ITEMS);
+        for account in &accounts {
+            for uid in 1..=20 {
+                cache.insert(account, "INBOX", Some(1), uid, vec![0; HEADER_LIMIT]);
+                assert!(cache.entries.len() <= CACHE_ITEMS);
+                assert!(
+                    cache.entries.iter().map(|e| e.headers.len()).sum::<usize>() <= CACHE_BYTES
+                );
+            }
+        }
+        assert_eq!(
+            cache.entries.iter().map(|e| e.headers.len()).sum::<usize>(),
+            CACHE_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostics_backoff_tracks_connection_stages_and_timeout_not_capability_failure() {
+        use tokio::{
+            io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+            net::TcpListener,
+        };
+        use tokio_rustls::{
+            TlsAcceptor,
+            rustls::{
+                ServerConfig,
+                pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer},
+            },
+        };
+        for phase in ["greeting", "login", "capability", "timeout"] {
+            let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+            let cert = certified.cert.der().clone();
+            let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                certified.signing_key.serialize_der(),
+            ));
+            let tls = ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert.clone()], key)
+                .unwrap();
+            let mut roots = RootCertStore::empty();
+            roots.add(cert).unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut config = (*crate::config::fixture()).clone();
+            config.imap_host = "localhost".into();
+            config.imap_port = listener.local_addr().unwrap().port();
+            config.timeout = if phase == "timeout" {
+                Duration::from_millis(150)
+            } else {
+                Duration::from_secs(2)
+            };
+            let mut service = MailService::new(
+                Arc::new(config),
+                Arc::new(Journal::open(std::path::Path::new(":memory:")).unwrap()),
+            )
+            .unwrap();
+            service.test_imap_roots = Some(roots);
+            let backend = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let stream = TlsAcceptor::from(Arc::new(tls))
+                    .accept(stream)
+                    .await
+                    .unwrap();
+                let mut stream = BufReader::new(stream);
+                if phase == "greeting" {
+                    return;
+                }
+                if phase == "timeout" {
+                    let _ = stream.read_u8().await;
+                    return;
+                }
+                stream
+                    .get_mut()
+                    .write_all(b"* OK synthetic\r\n")
+                    .await
+                    .unwrap();
+                let mut line = String::new();
+                stream.read_line(&mut line).await.unwrap();
+                assert!(line.contains(" LOGIN "));
+                let tag = line.split_whitespace().next().unwrap();
+                let status = if phase == "login" {
+                    "NO refused"
+                } else {
+                    "OK accepted"
+                };
+                stream
+                    .get_mut()
+                    .write_all(format!("{tag} {status}\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                if phase == "login" {
+                    return;
+                }
+                line.clear();
+                stream.read_line(&mut line).await.unwrap();
+                assert!(line.contains(" CAPABILITY"));
+                let tag = line.split_whitespace().next().unwrap();
+                stream
+                    .get_mut()
+                    .write_all(format!("{tag} NO refused\r\n").as_bytes())
+                    .await
+                    .unwrap();
+            });
+            let result = service.diagnose_connectivity().await.unwrap();
+            assert_eq!(result["ok"], false, "{phase}: {result}");
+            if phase == "capability" {
+                assert!(service.backend_ready().is_ok());
+            } else {
+                assert_eq!(service.backend_ready().unwrap_err().code, "BUSY", "{phase}");
+            }
+            if phase == "timeout" {
+                assert_eq!(result["failure"], "timeout");
+            } else {
+                assert_eq!(
+                    result["stages"].as_array().unwrap().last().unwrap()["stage"],
+                    phase
+                );
+            }
+            backend.await.unwrap();
+        }
+    }
+
     #[test]
     fn body_modes_preserve_utf8_and_report_each_omission() {
         let raw="Subject: hi\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n你好\n\nOn Tue wrote:\n> previous".as_bytes();

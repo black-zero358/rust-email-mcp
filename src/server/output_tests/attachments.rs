@@ -76,14 +76,14 @@ fn fixture_message(fixtures: &[Fixture]) -> Vec<u8> {
     message
 }
 
-struct Credentials {
-    auth: Arc<Auth>,
+pub(super) struct Credentials {
+    pub(super) auth: Arc<Auth>,
     signing: EncodingKey,
     header: Header,
     base_claims: Value,
 }
 impl Credentials {
-    fn new(config: Arc<config::Config>) -> Self {
+    pub(super) fn new(config: Arc<config::Config>) -> Self {
         let key = KeyPair::generate(KeySize::Rsa2048).unwrap();
         let public = key.public_key();
         let jwks = serde_json::from_value(json!({"keys":[{"kty":"RSA","kid":"isolated-attachment","alg":"RS256","use":"sig","n":URL_SAFE_NO_PAD.encode(public.modulus().big_endian_without_leading_zero()),"e":URL_SAFE_NO_PAD.encode(public.exponent().big_endian_without_leading_zero())}]})).unwrap();
@@ -108,17 +108,17 @@ impl Credentials {
             base_claims,
         }
     }
-    fn token(&self) -> String {
+    pub(super) fn token(&self) -> String {
         self.changed("sub", json!("owner"))
     }
-    fn changed(&self, field: &str, value: Value) -> String {
+    pub(super) fn changed(&self, field: &str, value: Value) -> String {
         let mut claims = self.base_claims.clone();
         claims[field] = value;
         encode(&self.header, &claims, &self.signing).unwrap()
     }
 }
 
-fn router(service: Arc<MailService>, auth: Arc<Auth>) -> Router {
+pub(super) fn router(service: Arc<MailRuntime>, auth: Arc<Auth>) -> Router {
     let mail = service.clone();
     let transport = StreamableHttpService::new(
         move || Ok(EmailServer(mail.clone())),
@@ -137,7 +137,7 @@ fn router(service: Arc<MailService>, auth: Arc<Auth>) -> Router {
         .layer(middleware::from_fn(limit_rpc_id))
         .layer(middleware::from_fn_with_state(auth, require_auth))
 }
-async fn call(app: &Router, token: &str, name: &str, args: Value) -> Value {
+pub(super) async fn call(app: &Router, token: &str, name: &str, args: Value) -> Value {
     let response = app.clone().oneshot(Request::post("/mcp").header("Host","localhost")
         .header(header::AUTHORIZATION,format!("Bearer {token}"))
         .header(header::CONTENT_TYPE,"application/json").header(header::ACCEPT,"application/json, text/event-stream").header("MCP-Protocol-Version","2025-06-18")
@@ -156,7 +156,11 @@ async fn call(app: &Router, token: &str, name: &str, args: Value) -> Value {
     assert_contract(name, &content);
     content
 }
-async fn get_attachment(app: &Router, token: Option<&str>, url: &str) -> axum::response::Response {
+pub(super) async fn get_attachment(
+    app: &Router,
+    token: Option<&str>,
+    url: &str,
+) -> axum::response::Response {
     let path = if url.starts_with("https://") {
         reqwest::Url::parse(url).unwrap().path().to_owned()
     } else {
@@ -181,7 +185,7 @@ async fn signed_mcp_to_attachment_get_preserves_all_r00_file_bytes_and_hashes() 
         2 * 1024 * 1024,
     )
     .await;
-    let credentials = Credentials::new(h.service.config.clone());
+    let credentials = Credentials::new(h.service.config().clone());
     let app = router(h.service.clone(), credentials.auth.clone());
     let token = credentials.token();
     let listed = call(
@@ -260,7 +264,7 @@ async fn signed_mcp_to_attachment_get_preserves_all_r00_file_bytes_and_hashes() 
     assert_eq!(descriptors[3]["filename"], descriptors[4]["filename"]);
 }
 
-async fn assert_http_error(
+pub(super) async fn assert_http_error(
     response: axum::response::Response,
     status: StatusCode,
     code: &str,
@@ -311,7 +315,7 @@ async fn assert_http_error(
 #[tokio::test]
 async fn attachment_authentication_uses_real_jwt_validation_and_private_json_errors() {
     let h = Harness::new(BTreeMap::from([(7, multipart())]), None, 64 * 1024).await;
-    let credentials = Credentials::new(h.service.config.clone());
+    let credentials = Credentials::new(h.service.config().clone());
     let app = router(h.service.clone(), credentials.auth.clone());
     let secret_path = "/mcp/attachments/private-handle-value";
     let now = std::time::SystemTime::now()
@@ -375,7 +379,7 @@ async fn attachment_authentication_uses_real_jwt_validation_and_private_json_err
 #[tokio::test]
 async fn attachment_id_and_index_contracts_keep_legacy_calls_and_reject_conflicts() {
     let h = Harness::new(BTreeMap::from([(7, multipart())]), None, 64 * 1024).await;
-    let credentials = Credentials::new(h.service.config.clone());
+    let credentials = Credentials::new(h.service.config().clone());
     let token = credentials.token();
     let app = router(h.service.clone(), credentials.auth.clone());
     let listed = call(
@@ -430,7 +434,7 @@ async fn attachment_id_and_index_contracts_keep_legacy_calls_and_reject_conflict
 async fn attachment_partial_pages_and_output_fallback_keep_reference_contracts() {
     let fixture = fixtures();
     let h = Harness::new(BTreeMap::from([(7, fixture_message(&fixture))]), None, 8192).await;
-    let mut configuration = (*h.service.config).clone();
+    let mut configuration = (**h.service.config()).clone();
     configuration.subjects.push("reader".into());
     let credentials = Credentials::new(Arc::new(configuration));
     let token = credentials.token();
@@ -494,7 +498,7 @@ async fn attachment_partial_pages_and_output_fallback_keep_reference_contracts()
             .contains(prepared["data"]["download_url"].as_str().unwrap())
     );
     let compact = Harness::new(BTreeMap::from([(7, multipart())]), None, 1400).await;
-    let credentials = Credentials::new(compact.service.config.clone());
+    let credentials = Credentials::new(compact.service.config().clone());
     let app = router(compact.service.clone(), credentials.auth.clone());
     let fallback = call(
         &app,
@@ -528,7 +532,7 @@ async fn standalone_node_adapter_consumes_real_rust_mcp_and_authorized_get() {
         Some(resource.clone()),
     )
     .await;
-    let credentials = Credentials::new(h.service.config.clone());
+    let credentials = Credentials::new(h.service.config().clone());
     let app = router(h.service.clone(), credentials.auth.clone());
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();

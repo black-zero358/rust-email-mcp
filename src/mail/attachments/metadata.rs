@@ -3,6 +3,7 @@ use super::*;
 use crate::error::InputViolation;
 
 pub(super) struct AttachmentReference<'a> {
+    pub alias: &'a str,
     pub account: &'a AccountKey,
     pub mailbox: &'a str,
     pub uid: u32,
@@ -23,16 +24,9 @@ impl AttachmentReference<'_> {
     }
 }
 
-pub(super) fn ensure_default_account(args: &Value) -> Result<()> {
-    if args
-        .get("account_id")
-        .is_some_and(|value| value != "default")
-    {
-        return Err(MailError::input_field(InputViolation::new(
-            "/account_id",
-            "unsupported_value",
-            "use_default_account",
-        )));
+pub(super) fn ensure_account(args: &Value, alias: &str) -> Result<()> {
+    if args.get("account_id").is_some_and(|value| value != alias) {
+        return Err(MailError::account_unavailable());
     }
     Ok(())
 }
@@ -42,7 +36,7 @@ pub(super) fn select_part(
     args: &Value,
     reference: &AttachmentReference<'_>,
 ) -> Result<usize> {
-    ensure_default_account(args)?;
+    ensure_account(args, reference.alias)?;
     let id = match args.get("attachment_id") {
         None => None,
         Some(Value::String(id))
@@ -165,7 +159,7 @@ pub(super) fn descriptor(
         modes.push("authenticated_http");
     }
     json!({
-        "account_id":"default", "mailbox":reference.mailbox, "uid":reference.uid, "uid_validity":reference.validity,
+        "account_id":reference.alias, "mailbox":reference.mailbox, "uid":reference.uid, "uid_validity":reference.validity,
         "attachment_id":reference.id(part.index), "attachment_index":part.index,
         "filename":part.filename, "safe_filename":safe_filename(part.filename.as_deref(), part.index),
         "content_type":part.content_type, "declared_content_type":part.content_type, "detected_content_type":null,

@@ -2,6 +2,35 @@
 
 本文件保存带版本与环境边界的证据。每次新增记录注明提交/tag、日期与时区、环境、命令、结果、CI 链接及未覆盖项；保留历史结果，不把其测试数量或部署状态当作当前版本的证明。验证要求见 [贡献指南](../CONTRIBUTING.md#验证与完成标准)。
 
+## 2026-11-02 R05 多账户离线验证
+
+实现提交 `c3136348ff75709b1208d1cc40750f2c10b3e2a0`，同步 main 的合并提交 `a0a81aac391a240902881df52109c1ab23b5557a` 与其 tree 一致。最终源码 `ffd1bda62ac80de4bfd13008675334173e2962b6` 仅追加 Clippy 要求的静态错误回退简化。环境为 WSL Ubuntu、Rust 1.99.1、锁定 Cargo.lock 和本地模拟 IMAP/JWT/MCP；附件均为合成文件。
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo fmt --check` | 通过 |
+| `cargo test --locked` | `a0a81aa`：200 单元、2 集成通过；1 个可选 Node 联调默认忽略；8.21 秒 |
+| `cargo clippy --locked --all-targets -- -D warnings` | `ffd1bda` 通过；vendored 上游保留原有 4 条 deprecated 宏提示 |
+| `cargo build --locked --release` | `ffd1bda` 通过，21.54 秒 |
+| 显式执行 `standalone_node_adapter_consumes_real_rust_mcp_and_authorized_get -- --ignored` | `ffd1bda`：1 项通过，7.12 秒；Node 24.15.0 下载并校验 8 组 fixture |
+| 独立审阅 | 配置/注册由协议执行者审阅；协议、授权和 runtime/GET 由配置执行者审阅；主 agent 复核集成。最终源码 head 复核无剩余发现 |
+
+新增验证覆盖严格 JSON 与秘密文件限制、v1/v2 迁移失败恢复、原 Journal 字节保持、同 UID 双账户读取/附件隔离、每次请求 ACL、固定旧写账户、撤权后的历史操作查询、全局 4 槽/20 请求、256 项/16 MiB 缓存、账户独立退避、完整响应预算。真实 HTTP 取消测试分别覆盖 4 个运行加 16 个排队读取，以及附件 GET 断连/撤权/账户移除后的连接与许可释放。
+
+审阅发现并修复了读取任务 detach 导致取消后继续运行，以及附件 GET/连接诊断超时退避记账遗漏；写任务保留原独立生命周期。调度明确采用基础份额优先、同一层级前台优先。全部测试离线完成，真实 ChatGPT 连接与真实邮件测试后移。Linux 文件凭据权限校验已执行，Windows 使用环境变量引用；Windows 专用拒绝文件引用回归待该平台 Rust 环境执行。PR 最终 head 的 CI 与合并结果随实施状态更新。
+
+## 2026-11-02 R00–R04 PR 审阅与合并
+
+按工作包依赖顺序完成审阅和合并，远端 main 与本地 main 同步到 `8b659baf2551ecfec7060e275c29cd13b0ed7f36`。R05 在开发分支继续推进。
+
+| 范围 | PR 与最终 head | CI | 合并提交 |
+| --- | --- | --- | --- |
+| R00/R01 | [#63](https://github.com/black-zero358/rust-email-mcp/pull/63)，`d654ace` | [check/audit/container 成功](https://github.com/black-zero358/rust-email-mcp/actions/runs/41419415243) | `896126a1d57128d5b87a3cc8353c3e7704524498` |
+| R02/R03 | [#64](https://github.com/black-zero358/rust-email-mcp/pull/64)，`928a866` | [check/audit/container 成功](https://github.com/black-zero358/rust-email-mcp/actions/runs/41421214346) | `c13a59826af3c392c42f1018b6974a6dc57b5746` |
+| R04 | [#65](https://github.com/black-zero358/rust-email-mcp/pull/65)，`99aa4e4` | [check/audit/container 成功](https://github.com/black-zero358/rust-email-mcp/actions/runs/41421541914) | `8b659baf2551ecfec7060e275c29cd13b0ed7f36` |
+
+GitHub Codex 自动审阅遇到账户额度限制。此次改由未实现相应模块的子 agent 交叉审阅指定提交，主 agent 复核集成差异，结果逐一记录在 PR。审阅发现 R02 的 `download_url` URI Schema 与直接拼接 Unicode 资源地址冲突；修复 `928a866` 使用 URL 编码，并增加真实 MCP→本地 IMAP 的 Unicode 配置回归。原发现者复核闭环后才合并 #64。#65 整合该修复，生产代码保持原 R04 实现，新增同一回归，最终提交重新通过 CI。合并时三个 PR 均无未解决 review thread。
+
 ## 2026-11-02 R04 附件离线下载与内容读取
 
 源码提交 `60b8cca`，本地分支 `codex/read-capabilities-plan`。按用户确认的范围，本阶段使用本地模拟 IMAP、JWT/MCP 服务和合成文件完成离线测试；ChatGPT 实际连接测试放到后续阶段。

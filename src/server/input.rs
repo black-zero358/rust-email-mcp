@@ -1,5 +1,6 @@
 //! Read-only argument contracts. Write inputs retain the legacy validator.
 use crate::{
+    accounts::{ACCOUNT_ID_MAX_CHARACTERS, valid_account_id},
     error::{InputViolation, MAX_INPUT_VIOLATIONS, MailError, Result},
     input_limits::ReadInputLimits,
 };
@@ -7,9 +8,9 @@ use serde_json::{Value, json};
 
 /// Standard schema lengths count code points; the extension publishes the
 /// independent UTF-8 budget consumed by this validator.
-pub(super) fn read_properties(mut properties: Value) -> Value {
-    if properties.get("attachment_id").is_some() || properties.get("attachment_offset").is_some() {
-        properties["account_id"] = json!({"type":"string","enum":["default"],"default":"default"});
+pub(super) fn read_properties(name: &str, mut properties: Value) -> Value {
+    if super::is_account_read(name) {
+        properties["account_id"] = json!({"type":"string","minLength":1,"maxLength":ACCOUNT_ID_MAX_CHARACTERS,"x-maxUtf8Bytes":ACCOUNT_ID_MAX_CHARACTERS,"pattern":format!("^[A-Za-z0-9][A-Za-z0-9._-]{{0,{}}}$",ACCOUNT_ID_MAX_CHARACTERS-1),"description":"Omit to select the configured default read account; list_accounts shows accounts available to this principal."});
     }
     if properties.get("body_mode").is_some() {
         properties["html_display"] =
@@ -243,6 +244,16 @@ fn structural(value: &Value, schema: &Value, field: &str, out: &mut Vec<InputVio
 }
 
 fn semantic(name: &str, args: &Value, out: &mut Vec<InputViolation>) {
+    if super::is_account_read(name)
+        && args["account_id"]
+            .as_str()
+            .is_some_and(|id| !valid_account_id(id))
+    {
+        push(
+            out,
+            InputViolation::new("/account_id", "invalid_account_id", "list_accounts"),
+        );
+    }
     if matches!(name, "download_attachment" | "prepare_attachment_download") {
         if args.get("attachment_id").is_none() && args.get("attachment_index").is_none() {
             push(
@@ -697,6 +708,53 @@ mod tests {
             check(
                 "list_attachments",
                 json!({"uid":7,"uid_validity":9,"attachment_offset":1024})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn read_account_aliases_share_catalog_syntax_and_never_extend_write_or_journal_inputs() {
+        let schema = schema("get_email");
+        let property = &schema["properties"]["account_id"];
+        let standard = jsonschema::draft202012::options().build(property).unwrap();
+        for alias in [
+            "default".to_owned(),
+            "Billing-A.1".to_owned(),
+            "a".repeat(ACCOUNT_ID_MAX_CHARACTERS),
+        ] {
+            assert!(valid_account_id(&alias));
+            assert!(standard.is_valid(&json!(alias)));
+            check(
+                "get_email",
+                json!({"account_id":alias,"uid":7,"uid_validity":9}),
+            )
+            .unwrap();
+        }
+        for alias in [
+            "".to_owned(),
+            "private account".to_owned(),
+            "账户".to_owned(),
+            "_private".to_owned(),
+            "a".repeat(ACCOUNT_ID_MAX_CHARACTERS + 1),
+        ] {
+            assert!(!valid_account_id(&alias));
+            assert!(!standard.is_valid(&json!(alias)));
+            let error = check(
+                "get_email",
+                json!({"account_id":alias,"uid":7,"uid_validity":9}),
+            )
+            .unwrap_err();
+            assert!(
+                !serde_json::to_string(&error)
+                    .unwrap()
+                    .contains("private account")
+            );
+        }
+        assert!(
+            check(
+                "get_operation",
+                json!({"operation_key":"old","account_id":"default"})
             )
             .is_err()
         );

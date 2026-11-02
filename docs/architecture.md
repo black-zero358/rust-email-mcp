@@ -4,17 +4,18 @@
 
 ## Module boundaries
 
-当前实现是一个 Rust 服务进程，每个实例配置一个邮箱并独占一份本地操作数据库；多个邮箱使用独立实例、数据目录和 OIDC 资源地址。生产路径使用 Streamable HTTP、IMAP4rev1 和 SMTP，认证服务独立部署。Python 和 Node 不参与服务运行时。
+当前实现是一个 Rust 服务进程，独占一份本地操作数据库与账户注册库。原默认邮箱保留既有写工具；可显式配置追加只读邮箱，每实例最多 16 个账户。账户共享全局资源额度，按每次请求的主体分别授权。生产路径使用 Streamable HTTP、IMAP4rev1 和 SMTP，认证服务独立部署。Python 和 Node 不参与服务运行时。
 
 | 模块 | 当前职责 | 依赖与边界 |
 | --- | --- | --- |
 | `main` | 读取配置、组装服务、中间件、发现路由、日志和停机流程 | 负责接线；不得绕过认证、请求预算或输出保护 |
-| `config` | 环境变量、默认值、配置有效性 | 供认证和邮件适配器读取；凭据不进入日志 |
-| `accounts` | default 的持久 UUID、世代、IMAP 与操作库绑定 | 独立格式版本注册库；在 Journal 恢复前核验，不迁移发送记录 |
+| `config` | 环境变量、严格账户 JSON、秘密引用及配置有效性 | 先完整校验配置，凭据不进入日志或注册库 |
+| `accounts` | 持久 UUID、世代、账户 ACL、配置快照和注册库迁移 | 原 default 身份与操作库绑定；在 Journal 恢复前核验，不迁移发送记录 |
 | `auth` | OIDC 发现、JWT/JWKS 校验、请求主体和 HTTP 认证错误 | 依赖配置与身份服务，不执行邮件操作 |
 | `server` | MCP 工具目录、权限模式、输入校验、响应封装与预算 | 将已认证主体传给 `mail`；协议适配不直接操作邮箱或数据库 |
 | `server/input`、`input_limits` | 读取字段错误、字符与字节契约、旧写用途限制 | 输入常量供 Schema 与 IMAP 编码共用；协议层不依赖 MCP 请求对象 |
 | `mail` | IMAP 会话、邮件操作编排、发送意图与结果记录 | 调用 `imap_text`、`mime`、`smtp`、`journal`，持有执行槽位 |
+| `mail/runtime`、`mail/scheduler` | 按主体和账户路由、全局准入及公平调度 | 授权先于队列、缓存和连接；固定原写账户，保持发送生命周期 |
 | `mail/attachments`、`mail/insights` | 附件交付及有界读取扩展 | 由 `mail` 编排，共用 MIME、协议、槽位与预算 |
 | `imap_text` | rev1 邮箱名、非 ASCII 搜索与严格统计 STATUS | 处理编码、literal 和命令终结；不承担 MCP 授权 |
 | `mime`、`html` | 有界 MIME 解析、正文选择、附件分类、HTML 文本提取 | `mime` 调用 `html`；不执行网络请求、不发送邮件 |
@@ -47,6 +48,10 @@
 
 default 的 `AccountKey` 包含持久 UUID 与配置世代（v1 为 1），存放于独立 `accounts.sqlite`。注册库绑定 IMAP 登录身份/端点及规范化操作库路径，摘要域区分文件操作库与内存操作库；修改绑定拒绝启动。初始化在文件锁下清理固定暂存文件、构建完整 SQLite、同步并原子无覆盖发布，再加载正式路径核验。未知版本、损坏或权限不符返回脱敏错误；初始化成功后才打开 Journal。附件句柄携带 AccountKey，GET 再核对，重启继续使原内存句柄失效。
 
+显式账户配置使用注册库 v2，保留原 default 的 UUID、世代与绑定。追加账户按稳定 `registration_key` 登记，别名/显示名变化保留身份；登录身份或端点变化、删除后重新加入均递增世代。删除保留 tombstone。注册库最多 1 MiB、256 个历史键，升级保留 v1-backup 和最近完整 previous 副本，持久锁覆盖多账户运行期。配置、秘密、迁移全部成功后才打开 Journal。配置格式、迁移事务与故障恢复见[多账户设计](multi-account-design.md)。
+
+13 个账户读取工具接受可选 `account_id`，省略时选择配置默认读取账户再授权。`list_accounts` 仅显示当前主体可读账户，隐藏默认项时 `default_account_id=null`。全局 subject 准入与账户 ACL 取交集；未知、未授权、已删除或旧世代统一 `ACCOUNT_UNAVAILABLE`，附件 GET 统一 404。工具发现按当前主体过滤，直接调用读取工具仍执行账户授权。旧写工具始终选择原 default、拒绝 `account_id`，受原模式及写 ACL 共同控制。`get_operation` 保留原参数与 principal + operation_key 语义，全局已准入主体即使失去邮箱权限，仍可检查自己的历史发送结果。
+
 共享 MIME 解析器的可选预算分类也适用于原有写操作，错误码和发送状态顺序保留。`raw_message_bytes`、`decoded_attachment_bytes`、`decoded_body_bytes`、`mime_structure`、`header_bytes`、`wire_response_bytes`、`scan_items` 按实际失败来源报告；数值单位使用 bytes 或 items。缓存额度分类随缓存工作包接入。
 
 ## MCP and mail
@@ -54,6 +59,10 @@ default 的 `AccountKey` 包含持久 UUID 与配置世代（v1 为 1），存�
 `get_email` 的正文先受 MIME 解码和正文长度选项约束，再由 `server::bounded_email_result` 按实际 JSON-RPC 响应二分选择可容纳的最长 UTF-8 前缀。计量包含真实 id、request_id、全部元数据及两份 JSON 内容；需要额外截断时设置 `body_truncated=true`，保留已有截断标记。`body_byte_limit` 仍表示正文选项与解析硬上限的交集，实际前缀可能更短。非正文元数据不裁剪，空正文仍超限时保留有界 `LIMIT_EXCEEDED`。批量读取和会话也按实际完整响应预算统一缩短展示正文，保留元数据、UID和逐项结果；发送结果使用状态降级路径。
 
 服务使用官方 Rust MCP SDK rmcp 3.8.0 与 Streamable HTTP。IMAP 使用 async-imap 和证书校验的 TLS；SMTP 使用 lettre 的隐式 TLS 或必须成功的 STARTTLS。每个需要邮箱后端的操作获取四个执行槽位之一，连接归单次操作所有，在完成、超时或解析失败后关闭。只读的本地账户/发送状态查询不需要邮箱连接。
+
+账户共享 4 个后端槽及 20 个运行/排队请求，排队最多 10 秒。每账户常规 2 槽，无其他符合运行条件且未满常规份额的账户等待时可借用空闲槽；释放后重新公平调度。常规份额先于借槽，同一份额层级内前台先于后台，后台全局最多 1 槽。这样其他账户的后台读取也能取得基本份额。取消、超时及 future 丢弃释放排队名额与许可；已经开始的发送保留原持久化结果流程。附件 64 个句柄、4 个传输许可和头部缓存 256 项/16 MiB 均为全实例额度。
+
+每账户实际 TCP/TLS、欢迎响应或登录失败，以及后端操作超时，触发 1 秒读取退避。期间该账户的新读取返回可重试 `BUSY`，附件 GET 返回 429；服务不自动重试，其他账户可继续。队列等待、本地输入/MIME 错误及连接建立后的命令错误沿用各自结果。账户发现、历史发送状态和旧写工具独立于读取退避。下载的后端计时从取得执行槽开始，客户端取消读取时释放对应队列、连接及许可；旧写任务继续持有其执行状态直到原生命周期结束。
 
 读取必须使用 `EXAMINE` 和 `BODY.PEEK`。状态 FETCH 只接受所请求 UID 的结果，忽略其他 UID 或无 UID 的非请求更新；目标不存在返回 `NOT_FOUND`，目标存在但 `FLAGS ()` 为空应成功，后出现的同 UID flags 覆盖先前值。整封读取按目标 UID 及所需 SIZE/BODY 属性筛选，异步 FLAGS 不代替所需属性；缺失所需属性仍返回 `MAIL_BACKEND`。列表/搜索按请求 UID 归并 HEADER、SIZE 与最后实际出现的 FLAGS；用 vendored `Fetch::has_flags` 区分未提供 FLAGS 与显式空集合，不让后到的无 FLAGS 响应清空标记。只有明确返回 HEADER（包括真实空头部）才生成摘要，每个 UID 一条、按 UID 降序且数量不超过 limit，忽略其他 UID/无 UID 响应；缺失 HEADER 不从缓存伪造摘要。所有结果均等待匹配 tag 的 OK，不以已收到部分数据代替成功终结。依据 [RFC 3501 §5.2](https://www.rfc-editor.org/rfc/rfc3501#section-5.2) 与 [§7.4.2](https://www.rfc-editor.org/rfc/rfc3501#section-7.4.2)。不得以关闭会话为由引入 `CLOSE/EXPUNGE` 等额外副作用。
 
@@ -146,6 +155,8 @@ CTE 支持性对应 D3/D5：`mime::Part::transfer_encoding/encoded/select_text` 
 SMTPUTF8 需求与确定拒绝对应 D3/D4：`mime::requires_smtputf8`、`smtp::submit/transaction` 和 `mail::record_send` 由 `smtp_utf8_inspection_uses_raw_headers_and_shared_budgets`、`smtp_utf8_covers_preserved_draft_headers_but_not_body_bytes`、`smtp_utf8_refusal_is_recorded_as_rejected_without_mail` 验证；原发送故障/QUIT 回归继续验证 accepted/unknown 边界。
 
 ## Decision records
+
+R05 的 D1/D3/D4/D5 回归入口：`accounts/catalog/tests` 与 `config/account_config/tests` 覆盖显式 ACL、默认账户、世代、秘密引用、v1/v2 迁移、发布失败恢复和原 Journal 字节保留；`mail/scheduler/tests` 覆盖全局额度、公平借槽、取消和超时。`server/output_tests/accounts` 通过真实 HTTP/JWT 与双模拟邮箱核对同 UID 隔离、按主体发现、默认读取与旧写目标、历史发送查询、附件撤权、账户独立退避及完整响应预算。`cancelled_http_reads_release_admission_backend_slots_and_connections` 验证 4 个运行/16 个排队读取的取消释放，`in_flight_attachment_gets_stop_on_disconnect_revocation_and_account_removal` 验证下载断连及账户取消释放。
 
 R01 的字符与错误回归入口：`read_lengths_count_unicode_code_points_and_publish_byte_limits`、`read_structure_errors_are_bounded_private_and_point_to_array_items`、`read_mailbox_unicode_and_wire_budgets_keep_legacy_writes_frozen`、`read_search_transmits_full_unicode_literal_at_character_boundary`、`legacy_write_argument_schemas_and_byte_validation_stay_frozen`、`legacy_write_mailbox_inputs_and_configured_directories_stay_at_512_bytes`、`recorded_send_status_remains_available_after_legacy_directory_change`、`input_detail_budget_preserves_original_error_and_measures_real_wire`、`budget_errors_identify_header_structure_attachment_and_body_resources`。分别覆盖 D2/D3/D4/D5 的输入、协议、幂等与错误预算边界。
 

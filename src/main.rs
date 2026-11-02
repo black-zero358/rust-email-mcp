@@ -5,9 +5,9 @@ use rmcp::transport::streamable_http_server::{
 use rust_email_mcp::{
     accounts,
     auth::{Auth, require_auth},
-    config::Config,
+    config,
     journal::Journal,
-    mail::{MailService, attachments},
+    mail::{MailRuntime, attachments},
     server::{EmailServer, limit_rpc_id},
 };
 use std::{path::Path, sync::Arc};
@@ -27,14 +27,14 @@ async fn main() -> anyhow::Result<()> {
             message = "Task panicked; inspect operation state"
         )
     }));
-    let config = Config::load()?;
-    let account = accounts::open_default(&config)?;
+    let catalog = accounts::open_catalog(config::load_runtime()?)?;
+    let config = catalog.config().clone();
     let path = Path::new(&config.database);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let journal = Arc::new(Journal::open(path)?);
-    let mail = Arc::new(MailService::with_account(config.clone(), journal, account)?);
+    let mail = Arc::new(MailRuntime::new(catalog, journal)?);
     let auth = Auth::new(config.clone()).await?;
     let ct = tokio_util::sync::CancellationToken::new();
     let host = reqwest::Url::parse(&config.resource)?

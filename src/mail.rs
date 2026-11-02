@@ -10,9 +10,13 @@ use crate::{
 };
 pub mod attachments;
 pub mod insights;
+mod runtime;
+pub(crate) mod scheduler;
 use futures::TryStreamExt;
 use lettre::{address::Envelope, message::Mailbox};
 use mailparse::MailHeaderMap;
+pub use runtime::MailRuntime;
+use scheduler::{ADMISSION_REQUESTS, EXECUTION_SLOTS};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -26,7 +30,6 @@ use std::{
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpStream,
-    sync::Semaphore,
 };
 use tokio_rustls::{
     TlsConnector,
@@ -90,8 +93,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for BudgetStream<T> {
     }
 }
 type Session = async_imap::Session<BudgetStream<TlsStream<TcpStream>>>;
-const EXECUTION_SLOTS: usize = 4;
-const ADMISSION_REQUESTS: usize = 20;
+const BACKEND_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
 const BATCH_READ_ITEMS: usize = 10;
 const LIST_PAGE_ITEMS: usize = 50;
 const SCAN_UID_WINDOW: u32 = 500;
@@ -100,11 +102,11 @@ pub struct MailService {
     pub config: Arc<Config>,
     pub journal: Arc<Journal>,
     pub(crate) account: AccountKey,
-    slots: Semaphore,
-    admission: Semaphore,
-    smtp: SmtpSender,
-    pub attachments: attachments::AttachmentStore,
-    metadata_cache: std::sync::Mutex<insights::MetadataCache>,
+    pub(crate) alias: String,
+    smtp: Option<SmtpSender>,
+    pub attachments: Arc<attachments::AttachmentStore>,
+    backend_backoff: std::sync::Mutex<Option<std::time::Instant>>,
+    metadata_cache: Arc<std::sync::Mutex<insights::MetadataCache>>,
     #[cfg(test)]
     test_imap_roots: Option<RootCertStore>,
 }
@@ -119,26 +121,46 @@ impl MailService {
         journal: Arc<Journal>,
         account: AccountKey,
     ) -> anyhow::Result<Self> {
-        let smtp = SmtpSender::new(&config)?;
-        Ok(Self {
-            attachments: attachments::AttachmentStore::new(config.clone()),
-            metadata_cache: Default::default(),
+        let store = Arc::new(attachments::AttachmentStore::new(config.clone()));
+        Self::for_account(
             config,
             journal,
             account,
-            slots: Semaphore::new(EXECUTION_SLOTS),
-            admission: Semaphore::new(ADMISSION_REQUESTS),
+            "default".into(),
+            true,
+            store,
+            Default::default(),
+        )
+    }
+
+    fn for_account(
+        config: Arc<Config>,
+        journal: Arc<Journal>,
+        account: AccountKey,
+        alias: String,
+        is_legacy: bool,
+        attachments: Arc<attachments::AttachmentStore>,
+        metadata_cache: Arc<std::sync::Mutex<insights::MetadataCache>>,
+    ) -> anyhow::Result<Self> {
+        let smtp = if is_legacy && !config.smtp_host.is_empty() {
+            Some(SmtpSender::new(&config)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            attachments,
+            metadata_cache,
+            config,
+            journal,
+            account,
+            alias,
             smtp,
+            backend_backoff: Default::default(),
             #[cfg(test)]
             test_imap_roots: None,
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_test_imap_roots(mut self, roots: RootCertStore) -> Self {
-        self.test_imap_roots = Some(roots);
-        self
-    }
     fn imap_roots(&self) -> RootCertStore {
         let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         #[cfg(test)]
@@ -146,7 +168,44 @@ impl MailService {
         roots
     }
 
+    fn backend_ready(&self) -> Result<()> {
+        let mut deadline = self
+            .backend_backoff
+            .lock()
+            .map_err(|_| MailError::backend())?;
+        if deadline.is_some_and(|until| until > std::time::Instant::now()) {
+            return Err(MailError {
+                code: "BUSY",
+                message: "The mailbox connection is cooling down after a backend failure. Retry this read later.",
+                retryable: true,
+                details: None,
+            });
+        }
+        *deadline = None;
+        Ok(())
+    }
+    fn record_backend_failure(&self) {
+        if let Ok(mut deadline) = self.backend_backoff.lock() {
+            *deadline = Some(std::time::Instant::now() + BACKEND_BACKOFF);
+        }
+    }
+    fn backend_timeout(&self) -> MailError {
+        self.record_backend_failure();
+        MailError::timeout()
+    }
+
     async fn connect(&self) -> Result<Session> {
+        let result = self.connect_inner().await;
+        if result
+            .as_ref()
+            .is_err_and(|error| error.code == "MAIL_BACKEND")
+        {
+            self.record_backend_failure();
+        }
+        result
+    }
+
+    async fn connect_inner(&self) -> Result<Session> {
         let tls = ClientConfig::builder()
             .with_root_certificates(self.imap_roots())
             .with_no_client_auth();
@@ -193,6 +252,10 @@ impl MailService {
                     "batch_read_items":BATCH_READ_ITEMS, "list_page_items":LIST_PAGE_ITEMS,
                     "scan_uid_window":SCAN_UID_WINDOW, "execution_slots":EXECUTION_SLOTS,
                     "admission_requests":ADMISSION_REQUESTS,
+                    "per_account_base_slots":scheduler::ACCOUNT_BASE_SLOTS,
+                    "background_slots":scheduler::BACKGROUND_SLOTS,
+                    "queue_wait_seconds":scheduler::QUEUE_WAIT.as_secs(),
+                    "backend_backoff_seconds":BACKEND_BACKOFF.as_secs(),
                     "operation_timeout_seconds":self.config.timeout.as_secs()
                 }
             }]
@@ -210,22 +273,6 @@ impl MailService {
                 json!({"operation":self.journal.get(principal,text(args,"operation_key")?)?}),
             );
         }
-        let _admission = self.admission.try_acquire().map_err(|_| MailError {
-            code: "BUSY",
-            message: "Mailbox queue is full. Retry this read later; inspect write outcomes first.",
-            retryable: true,
-            details: None,
-        })?;
-        let _permit =
-            tokio::time::timeout(std::time::Duration::from_secs(10), self.slots.acquire())
-                .await
-                .map_err(|_| MailError {
-                    code: "BUSY",
-                    message: "Mailbox concurrency limit reached.",
-                    retryable: true,
-                    details: None,
-                })?
-                .map_err(|_| MailError::backend())?;
         // Sending has its own timeout and durable outcome handling. Never cancel it at the HTTP boundary.
         if ["send_email", "send_draft", "reply_email", "forward_email"].contains(&name) {
             return self.send(name, args, principal).await;
@@ -236,7 +283,7 @@ impl MailService {
                 self.prepare_attachment(name, args, principal),
             )
             .await
-            .map_err(|_| MailError::timeout())?;
+            .map_err(|_| self.backend_timeout())?;
         }
         if name == "diagnose_connectivity" {
             return self.diagnose_connectivity().await;
@@ -268,7 +315,7 @@ impl MailService {
         }
         tokio::time::timeout(self.config.timeout, self.imap_operation(name, args))
             .await
-            .map_err(|_| MailError::timeout())?
+            .map_err(|_| self.backend_timeout())?
     }
     async fn imap_operation(&self, name: &str, a: &Value) -> Result<Value> {
         let mut s = self.connect().await?;
@@ -392,7 +439,9 @@ impl MailService {
                         }
                     }
                 }
-                Ok(json!({"items":items,"requested":ids.len(),"completed":attempted}))
+                Ok(
+                    json!({"items":items,"requested":ids.len(),"completed":attempted,"uid_validity":state.uid_validity}),
+                )
             }
             "save_draft" => save_draft(s, &self.config, a).await,
             "create_mailbox" => {
@@ -770,6 +819,10 @@ impl MailService {
                 json!({"operation":self.journal.claim(principal,key,&fingerprint,&old.message_id)?.ok_or_else(MailError::storage)?}),
             );
         }
+        let smtp = self
+            .smtp
+            .as_ref()
+            .ok_or_else(MailError::account_unavailable)?;
         validate_legacy_write_inputs(name, a, &self.config)?;
         let message_id = format!("<{}@email-mcp.local>", uuid::Uuid::new_v4());
         let (raw, envelope) = if name == "send_draft" {
@@ -823,7 +876,7 @@ impl MailService {
         if let Some(old) = self.claim_send(principal, key, &fingerprint, &message_id, &raw)? {
             return Ok(json!({"operation":old}));
         }
-        let submission = self.smtp.submit(&envelope, &raw).await;
+        let submission = smtp.submit(&envelope, &raw).await;
         let operation = record_send(
             &self.journal,
             principal,
@@ -3295,7 +3348,10 @@ mod tests {
             assert!(!payload.contains("hidden@example.com"));
         });
         let mut service = MailService::new(crate::config::fixture(), journal.clone()).unwrap();
-        service.smtp = SmtpSender::fixture(port, std::time::Duration::from_millis(300));
+        service.smtp = Some(SmtpSender::fixture(
+            port,
+            std::time::Duration::from_millis(300),
+        ));
         let args = json!({"to":["receiver@example.com"],"bcc":["hidden@example.com"],"subject":"synthetic","body":"test","operation_key":"test-send"});
         let result = service.send("send_email", &args, "owner").await.unwrap();
         assert_eq!(
