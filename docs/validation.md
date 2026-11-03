@@ -2,6 +2,28 @@
 
 本文件保存带版本与环境边界的证据。每次新增记录注明提交/tag、日期与时区、环境、命令、结果、CI 链接及未覆盖项；保留历史结果，不把其测试数量或部署状态当作当前版本的证明。验证要求见 [贡献指南](../CONTRIBUTING.md#验证与完成标准)。
 
+## 2026-11-03 R07 附件部件下载
+
+源码提交 `d0a1e624c037346564c07c4543fb352136c4f8f9`。环境为 WSL Ubuntu、Rust 1.99.1、Docker Desktop、Node 24.15.0；仅使用合成文件和本地模拟 TLS IMAP、JWT/MCP/HTTP。
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo fmt --check`；变更的 vendor 文件显式 rustfmt | 通过 |
+| `cargo test --locked` | 277 单元 + 34 集成通过，20.03 秒；2 项默认忽略分别为单独执行的 Node 联调和由父测试实际调用的跨进程锁探针 |
+| `cargo clippy --locked --all-targets -- -D warnings` | 通过，沿用上游 4 条 deprecated 宏提示 |
+| `cargo build --locked --release` | 通过，23.04 秒 |
+| 显式 Rust→Node 8 文件下载/校验/内容读取 | 通过，9.15 秒 |
+| 依赖审计、审计脚本故障回归 | 1402 条公告、340 个依赖，退出 0；20 项离线脚本回归通过 |
+| Docker context 与 `docker build --tag rust-email-mcp:r07-attachments-local .` | 通过，builder 发布编译 1 分 36 秒；构建后仅调整测试断言和文档，生产代码保持一致 |
+
+增量解码回归覆盖 5000 组 oracle 差分、Identity/Base64/QP、每字节拆分、64 KiB 边界、32 MiB 精确及超限、QP 尾部空白、EOF 分步完成。暂存模块覆盖四份文件额度、私密权限、跨进程锁、重启恢复、写入/读取/校验错误，以及 Begin/Write/Finish/Read 阶段真实阻塞任务取消后继续持有许可。
+
+10 组认证 HTTP 流程测试包含 18 种编码与尺寸组合、40 MiB 整封邮件中的小附件、首块/后续块错误、收到数据后 NO/BAD/EOF/错 tag、末端额外数据、解码超限、账户/UIDVALIDITY 重查、四路慢消费和文件清理。5 项底层测试验证任意 UID/section 的 literal 声明先限、合法 section 及每个前缀、quoted 逻辑字节、typed 错误隐私/关流、匹配 tag 后恢复普通 raw 解析。
+
+独立审阅发现并闭环 HEADER.FIELDS 分片、quoted 转义长度和暂存创建阶段期限；最终提交复核无遗留发现，记录见 [PR #70](https://github.com/black-zero358/rust-email-mcp/pull/70)。首轮全量有四项旧断言/模拟响应与新合同不一致，已精确更新；同轮并行镜像构建时，取消测试一次未在 2 秒内达到等待状态。该用例保留原期限与 20/4、零连接断言，增加阶段/连接计数；独立、账户并行子集及最终全量均通过。
+
+本批完成附件部件下载。内联 Base64 保持 raw 路径，特殊 MIME 的 raw 回退继续受 32 MiB 整封上限约束；局部正文读取列入 R07 下一 PR。真实邮箱和 ChatGPT 连接测试后移。
+
 ## 2026-11-03 R06 附件清单与受控回退
 
 源码提交 `885a1ce3791f73140aa7ff3efe6d6bfb96434f3c`。环境为 WSL Ubuntu、Rust 1.99.1、Docker Desktop、Node 24.15.0；附件验证只使用本地 TLS IMAP、认证 MCP/HTTP 和合成文件。
