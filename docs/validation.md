@@ -2,6 +2,30 @@
 
 本文件保存带版本与环境边界的证据。每次新增记录注明提交/tag、日期与时区、环境、命令、结果、CI 链接及未覆盖项；保留历史结果，不把其测试数量或部署状态当作当前版本的证明。验证要求见 [贡献指南](../CONTRIBUTING.md#验证与完成标准)。
 
+## 2026-11-03 R06 附件清单与受控回退
+
+源码提交 `885a1ce3791f73140aa7ff3efe6d6bfb96434f3c`。环境为 WSL Ubuntu、Rust 1.99.1、Docker Desktop、Node 24.15.0；附件验证只使用本地 TLS IMAP、认证 MCP/HTTP 和合成文件。
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo fmt --check`；变更的 vendor 源码显式 rustfmt | 通过 |
+| `cargo test --locked` | 234 单元 + 29 集成通过；可选 Node 项单独执行 |
+| `cargo clippy --locked --all-targets -- -D warnings` | 通过；保留上游已有的 4 条 deprecated 宏提示 |
+| `cargo build --locked --release` | 通过，48.49 秒 |
+| 显式 Rust→Node 下载与内容读取 | 1 项通过，8 组文件字节及摘要核对一致 |
+| `bash scripts/audit-dependencies.sh` | 1402 条公告、340 个依赖，退出 0 |
+| `bash scripts/test-audit-dependencies.sh` | 20 项离线故障回归通过 |
+| `bash scripts/test-docker-context.sh` | 通过 |
+| `docker build --tag rust-email-mcp:r06-manifest-local .` | 通过，builder 发布编译 2 分 31 秒 |
+
+新增回归覆盖统一原 DFS 索引、逐节点完整 MIME 头、RFC2231、整体 multipart/message 附件、重复元数据、64 命令和 1 MiB 头证据预算。8 项真实 HTTP 流程测试核对结构路径仅取元数据、明确拒绝/预算的一次新连接回退、UIDVALIDITY 重验、协议失败终止、同一编号的内联和 GET 字节。双账户同 UID 的结构结果继续保持引用及授权隔离。
+
+独立审阅发现并修复了跳过原始头、Base64/QP multipart 和缺 boundary multipart 的索引差异。审阅者在源码提交上复核修复、全部新增文件及相关调用路径，无遗留发现，记录见 [PR #69](https://github.com/black-zero358/rust-email-mcp/pull/69)。
+
+完整请求测试另发现深层结构解析的临时栈占用过大；改用顺序字段解析和流式类型前缀分派，保留深度、节点和分配预算。精确小字符串预算的 TEXT/MESSAGE 全部前缀回归通过，32 层结构在真实 HTTP 流程中按结构预算回退。流式前缀行为依据锁定 [nom 8.0.0 的 tag_no_case](https://github.com/rust-bakery/nom/blob/8.0.0/src/bytes/streaming.rs#L35-L77)。
+
+R06 已实现结构预算、统一清单、读取错误分类及一次受控回退。实际附件下载继续使用整封 reader，`part_fetch=false`；R07 接入部件读取。真实 ChatGPT 连接与真实邮件测试后移。
+
 ## 2026-11-02 R06 parser 预算基础验证
 
 源码提交 `e85dd988db2913fa17c990a4a259db4f5e072fbd`，最终源码及字节 fixture 提交 `e0433a9693c96e596e876adf079addc5e8e0aa61`。环境为 WSL Ubuntu、Rust 1.99.1、Docker Desktop；协议测试使用合成响应和本地 duplex 流。
