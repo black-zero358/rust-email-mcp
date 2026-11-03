@@ -26,6 +26,8 @@
 
 R06 已实现结构预算、统一清单、读取错误分类及一次受控回退。实际附件下载继续使用整封 reader，`part_fetch=false`；R07 接入部件读取。真实 ChatGPT 连接与真实邮件测试后移。
 
+[PR #69](https://github.com/black-zero358/rust-email-mcp/pull/69) 最终 head 为 `351353b4884dee3a55b324a7a61cb922c7a1b965`，相对已审源码仅增加进度及验证文档。[CI 41559868647](https://github.com/black-zero358/rust-email-mcp/actions/runs/41559868647) 的 check/audit/container 全部通过；合并前复核 GitHub reviews/review threads 为空，独立审阅记录已写入 PR。合并提交 `41fb821f583a9342aaf47d9b8372e03622ab7e0c` 已同步到本地 main、开发分支和对应远端。
+
 ## 2026-11-02 R06 parser 预算基础验证
 
 源码提交 `e85dd988db2913fa17c990a4a259db4f5e072fbd`，最终源码及字节 fixture 提交 `e0433a9693c96e596e876adf079addc5e8e0aa61`。环境为 WSL Ubuntu、Rust 1.99.1、Docker Desktop；协议测试使用合成响应和本地 duplex 流。
