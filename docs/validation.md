@@ -24,6 +24,8 @@
 
 本批完成附件部件下载。内联 Base64 保持 raw 路径，特殊 MIME 的 raw 回退继续受 32 MiB 整封上限约束；局部正文读取列入 R07 下一 PR。真实邮箱和 ChatGPT 连接测试后移。
 
+[PR #70](https://github.com/black-zero358/rust-email-mcp/pull/70) 最终 head 为 `bcb2b450a963b4ab0c430e72f04c0c27e0b89b63`，相对已审源码仅追加验证文档。[CI 41565410482](https://github.com/black-zero358/rust-email-mcp/actions/runs/41565410482) 的 check/audit/container 全部通过；合并前复核 GitHub reviews/review threads 为空，独立审阅记录已写入 PR。合并提交 `7837396ac749f7c79eeca20668a99807b466d77e` 已同步到本地 main、开发分支和对应远端。
+
 ## 2026-11-03 R06 附件清单与受控回退
 
 源码提交 `885a1ce3791f73140aa7ff3efe6d6bfb96434f3c`。环境为 WSL Ubuntu、Rust 1.99.1、Docker Desktop、Node 24.15.0；附件验证只使用本地 TLS IMAP、认证 MCP/HTTP 和合成文件。
