@@ -1,5 +1,13 @@
 # Local protocol and allocation patches
 
+`Session::run_command_with_limits` accepts typed `CommandReadLimits`. Its BODY
+section payload cap applies to every received UID/section until the matching
+tagged completion. Another command cannot override an unfinished limited read;
+the stream closes after a parser error. Default command methods retain existing
+raw-response behavior. `error::body_section_literal_limit` recovers the static
+limit/count error without response content. The application still checks UID,
+section, origin, duplicates, byte counts and tagged status before delivery.
+
 The existing `types::ResponseData` reexport is public so the bounded MIME
 manifest reader can retain one response owner without cloning its AST and inspect
 the exact UID, section, origin and duplicate attributes. The type layout and

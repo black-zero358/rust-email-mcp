@@ -78,6 +78,63 @@ pub fn section(i: &[u8]) -> IResult<&[u8], Option<SectionPath>> {
     delimited(char('['), opt(SectionPath::parse), char(']')).parse(i)
 }
 
+/// The same section grammar with pre-allocation accounting for command-limited reads.
+pub(crate) fn section_with_budget<'a>(
+    i: &'a [u8],
+    budget: &crate::bounded::Budget<'_>,
+) -> IResult<&'a [u8], Option<SectionPath>> {
+    fn msgtext<'a>(
+        i: &'a [u8],
+        budget: &crate::bounded::Budget<'_>,
+    ) -> IResult<&'a [u8], MessageSection> {
+        alt((
+            map(
+                (
+                    tag_no_case("HEADER.FIELDS"),
+                    opt(tag_no_case(".NOT")),
+                    tag(" "),
+                    |i| budget.section_fields(i),
+                ),
+                |_| MessageSection::Header,
+            ),
+            map(tag_no_case("HEADER"), |_| MessageSection::Header),
+            map(tag_no_case("TEXT"), |_| MessageSection::Text),
+        ))
+        .parse(i)
+    }
+    fn path<'a>(
+        i: &'a [u8],
+        budget: &crate::bounded::Budget<'_>,
+    ) -> IResult<&'a [u8], SectionPath> {
+        alt((map(|i| msgtext(i, budget), SectionPath::Full), |i| {
+            let (mut rest, first) = number(i)?;
+            let mut parts = Vec::new();
+            budget.section_number(i, &mut parts, first)?;
+            loop {
+                match preceded(tag("."), number).parse(rest) {
+                    Ok((next, value)) => {
+                        budget.section_number(rest, &mut parts, value)?;
+                        rest = next;
+                    }
+                    Err(nom::Err::Error(_)) => break,
+                    Err(error) => return Err(error),
+                }
+            }
+            let (rest, kind) = opt(preceded(
+                tag("."),
+                alt((
+                    |i| msgtext(i, budget),
+                    map(tag_no_case("MIME"), |_| MessageSection::Mime),
+                )),
+            ))
+            .parse(rest)?;
+            Ok((rest, SectionPath::Part(parts, kind)))
+        }))
+        .parse(i)
+    }
+    delimited(char('['), opt(|i| path(i, budget)), char(']')).parse(i)
+}
+
 pub fn msg_att_body_section(i: &[u8]) -> IResult<&[u8], AttributeValue<'_>> {
     map(
         (

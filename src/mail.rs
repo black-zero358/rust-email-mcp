@@ -1,7 +1,7 @@
 use crate::{
     accounts::AccountKey,
     config::Config,
-    error::{LimitKind, MailError, Result},
+    error::{ConnectionBudgetExceeded, LimitKind, MailError, Result},
     imap_text::{display_name, mailbox_name, uid_field_search},
     input_limits::{InputLimits, ReadInputLimits},
     journal::{Journal, Operation},
@@ -45,6 +45,7 @@ pub struct BudgetStream<T> {
     inner: T,
     remaining: Arc<AtomicUsize>,
 }
+
 impl<T> BudgetStream<T> {
     pub fn new(inner: T, budget: usize) -> (Self, Arc<AtomicUsize>) {
         let remaining = Arc::new(AtomicUsize::new(budget));
@@ -63,9 +64,12 @@ impl<T: AsyncRead + Unpin> AsyncRead for BudgetStream<T> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
         let limit = self.remaining.load(Ordering::Relaxed).min(buf.remaining());
         if limit == 0 {
-            return Poll::Ready(Err(std::io::Error::other("IMAP response byte limit")));
+            return Poll::Ready(Err(std::io::Error::other(ConnectionBudgetExceeded)));
         }
         let mut limited = ReadBuf::new(buf.initialize_unfilled_to(limit));
         match Pin::new(&mut self.inner).poll_read(cx, &mut limited) {
@@ -2065,7 +2069,16 @@ mod tests {
             .await;
             assert_eq!(result["requested"], 2);
             assert_eq!(result["completed"], 1);
-            assert_eq!(result["items"][0]["error"]["code"], "MAIL_BACKEND");
+            if status.is_none() {
+                assert_eq!(result["items"][0]["error"]["code"], "LIMIT_EXCEEDED");
+                assert_eq!(
+                    result["items"][0]["error"]["details"]["limit_kind"],
+                    "connection_bytes"
+                );
+            } else {
+                assert_eq!(result["items"][0]["error"]["code"], "MAIL_BACKEND");
+                assert!(result["items"][0]["error"].get("details").is_none());
+            }
             assert_eq!(
                 result["items"][1],
                 json!({"uid":8,"ok":false,"status":"unprocessed"})

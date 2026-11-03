@@ -62,6 +62,20 @@ R06 manifest work package.
 
 ## Verification
 
+`Response::parse_bounded_with_fetch_limit` adds a command-scoped BODY section
+payload cap. Literal declarations are checked before `take` can request more
+buffer space, for every UID and section. `ParseError::FetchLiteralLimit` carries
+only the configured limit and observed logical byte count. The section grammar
+retains HEADER.FIELDS/HEADER.FIELDS.NOT, numeric suffixes and legal incomplete
+prefixes; its field and path allocations share the structure budget. Quoted
+payloads are unescaped into checked logical octets only in this new entry point;
+owned payload storage is charged before allocation. Existing ordinary parsing
+keeps its wire representation and raw literal budgets.
+
+The root `tests/part_fetch_budget.rs` covers declaration rejection without any
+payload, section/quoted prefix compatibility, typed error privacy and command
+completion reset through the real async client.
+
 Recursive multipart and message parsing uses sequential field parsing and
 special-type prefix dispatch to keep debug-build parser frames small. Streaming
 prefix probes preserve `Incomplete` before selecting a variant, including exact

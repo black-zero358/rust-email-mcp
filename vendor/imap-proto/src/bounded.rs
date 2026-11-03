@@ -80,8 +80,26 @@ impl std::error::Error for LimitError {}
 #[derive(Debug, PartialEq)]
 pub enum ParseError<'a> {
     Limit(LimitError),
+    FetchLiteralLimit(FetchLiteralLimitError),
     Syntax(nom::Err<Error<&'a [u8]>>),
 }
+
+/// A command-scoped BODY section literal exceeded the requested byte count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FetchLiteralLimitError {
+    pub limit: usize,
+    pub actual: usize,
+}
+impl std::fmt::Display for FetchLiteralLimitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "IMAP FETCH literal byte limit exceeded (limit {})",
+            self.limit
+        )
+    }
+}
+impl std::error::Error for FetchLiteralLimitError {}
 pub type ParseResult<'a> = Result<(&'a [u8], Response<'a>), ParseError<'a>>;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BudgetUsage {
@@ -122,6 +140,8 @@ pub(crate) struct Budget<'l> {
     limits: Option<&'l BodyStructureLimits>,
     usage: Cell<Usage>,
     failure: Cell<Option<LimitError>>,
+    fetch_literal_bytes: Option<usize>,
+    fetch_failure: Cell<Option<FetchLiteralLimitError>>,
 }
 pub(crate) struct Guard<'b, 'l> {
     budget: &'b Budget<'l>,
@@ -140,6 +160,8 @@ impl<'l> Budget<'l> {
             limits: None,
             usage: Cell::new(Usage::default()),
             failure: Cell::new(None),
+            fetch_literal_bytes: None,
+            fetch_failure: Cell::new(None),
         }
     }
     fn new(limits: &'l BodyStructureLimits) -> Self {
@@ -376,7 +398,7 @@ impl<'l> Budget<'l> {
     pub(crate) fn boxed<'a, T>(&self, i: &'a [u8]) -> Result<(), nom::Err<Error<&'a [u8]>>> {
         self.charge(i, size_of::<T>(), false)
     }
-    fn push<'a, T>(
+    pub(crate) fn push<'a, T>(
         &self,
         i: &'a [u8],
         items: &mut Vec<T>,
@@ -489,6 +511,145 @@ impl<'l> Budget<'l> {
         let (rest, _) = tag(")")(rest)?;
         Ok((rest, Some(items)))
     }
+
+    pub(crate) fn section_number<'a>(
+        &self,
+        input: &'a [u8],
+        parts: &mut Vec<u32>,
+        number: u32,
+    ) -> Result<(), nom::Err<Error<&'a [u8]>>> {
+        if let Some(limits) = self.limits {
+            if parts.len() >= limits.depth.min(32) {
+                return self.fail(input, LimitKind::Depth).map(|(_, value)| value);
+            }
+        }
+        self.push(input, parts, number)
+    }
+    pub(crate) fn section_field<'a>(&self, input: &'a [u8]) -> IResult<&'a [u8], &'a [u8]> {
+        if matches!(input.first(), Some(b'"' | b'{')) {
+            return self.string(input);
+        }
+        for (position, &byte) in input.iter().enumerate() {
+            if !core::is_astring_char(byte) {
+                break;
+            }
+            self.string_check(input, position + 1)?;
+        }
+        let (rest, field) = core::astring(input)?;
+        self.charge(input, field.len(), true)?;
+        Ok((rest, field))
+    }
+    pub(crate) fn section_fields<'a>(&self, input: &'a [u8]) -> IResult<&'a [u8], Vec<&'a [u8]>> {
+        if input == b"( " {
+            return Err(nom::Err::Incomplete(nom::Needed::new(1)));
+        }
+        if let Some(rest) = input.strip_prefix(b"()") {
+            return Ok((rest, Vec::new()));
+        }
+        if let Some(rest) = input.strip_prefix(b"( )") {
+            return Ok((rest, Vec::new()));
+        }
+        self.list(input, |input| self.section_field(input))
+    }
+
+    fn fetch_limit<'a, T>(
+        &self,
+        input: &'a [u8],
+        limit: usize,
+        actual: usize,
+    ) -> IResult<&'a [u8], T> {
+        self.fetch_failure
+            .set(Some(FetchLiteralLimitError { limit, actual }));
+        Err(nom::Err::Failure(Error::new(input, ErrorKind::TooLarge)))
+    }
+
+    fn fetch_data<'a>(
+        &self,
+        input: &'a [u8],
+        limit: usize,
+    ) -> IResult<&'a [u8], Option<Cow<'a, [u8]>>> {
+        match core::nil(input) {
+            Ok((rest, _)) => return Ok((rest, None)),
+            Err(nom::Err::Error(_)) => {}
+            Err(error) => return Err(error),
+        }
+        if input.first() == Some(&b'{') {
+            let (rest, _) = tag("{")(input)?;
+            let (rest, count) = core::number(rest)?;
+            let (_, _) = tag("}\r\n")(rest)?;
+            if count as usize > limit {
+                return self.fetch_limit(input, limit, count as usize);
+            }
+        } else if input.first() == Some(&b'"') {
+            let mut escaped = false;
+            let mut logical = 0;
+            for &byte in &input[1..] {
+                if byte == b'"' && !escaped {
+                    break;
+                }
+                if byte == b'\\' && !escaped {
+                    escaped = true;
+                    continue;
+                }
+                escaped = false;
+                logical += 1;
+                if logical > limit {
+                    return self.fetch_limit(input, limit, logical);
+                }
+            }
+            let (rest, quoted) = core::quoted(input)?;
+            if !quoted.contains(&b'\\') {
+                return Ok((rest, Some(Cow::Borrowed(quoted))));
+            }
+            // IMAP quoting is transport escaping, not attachment content. Reserve
+            // only the checked logical octets and charge owned bytes separately.
+            self.charge(input, logical, true)?;
+            let mut bytes = Vec::new();
+            if bytes.try_reserve_exact(logical).is_err() {
+                return self.fail(input, LimitKind::AggregateBytes);
+            }
+            self.charge(input, bytes.capacity().saturating_sub(logical), true)?;
+            let mut characters = quoted.iter().copied();
+            while let Some(byte) = characters.next() {
+                let value = if byte == b'\\' {
+                    characters
+                        .next()
+                        .ok_or_else(|| nom::Err::Failure(Error::new(input, ErrorKind::Escaped)))?
+                } else {
+                    byte
+                };
+                bytes.push(value);
+            }
+            return Ok((rest, Some(Cow::Owned(bytes))));
+        }
+        let (rest, data) = core::string(input)?;
+        if data.len() > limit {
+            return self.fetch_limit(input, limit, data.len());
+        }
+        Ok((rest, Some(Cow::Borrowed(data))))
+    }
+
+    fn fetch_body_section<'a>(
+        &self,
+        input: &'a [u8],
+        limit: usize,
+    ) -> IResult<&'a [u8], AttributeValue<'a>> {
+        let (rest, _) = nom::bytes::streaming::tag_no_case("BODY")(input)?;
+        let (rest, section) = crate::rfc3501::body::section_with_budget(rest, self)?;
+        let (rest, index) =
+            nom::combinator::opt(nom::sequence::delimited(tag("<"), core::number, tag(">")))
+                .parse(rest)?;
+        let (rest, _) = tag(" ")(rest)?;
+        let (rest, data) = self.fetch_data(rest, limit)?;
+        Ok((
+            rest,
+            AttributeValue::BodySection {
+                section,
+                index,
+                data,
+            },
+        ))
+    }
 }
 fn prefix(i: &[u8]) -> IResult<&[u8], u32> {
     let (i, _) = tag("* ")(i)?;
@@ -503,13 +664,22 @@ pub(crate) fn parse_response_with_usage<'a>(
     i: &'a [u8],
     limits: &BodyStructureLimits,
 ) -> (ParseResult<'a>, BudgetUsage) {
+    parse_response_with_fetch_limit(i, limits, None)
+}
+
+pub(crate) fn parse_response_with_fetch_limit<'a>(
+    i: &'a [u8],
+    limits: &BodyStructureLimits,
+    fetch_literal_bytes: Option<usize>,
+) -> (ParseResult<'a>, BudgetUsage) {
     let Ok((rest, sequence)) = prefix(i) else {
         return (
             Response::parse(i).map_err(ParseError::Syntax),
             BudgetUsage::default(),
         );
     };
-    let budget = Budget::new(limits);
+    let mut budget = Budget::new(limits);
+    budget.fetch_literal_bytes = fetch_literal_bytes;
     let result = (|| {
         let (rest, items) = budget.list(rest, |i| {
             if let Ok((rest, _)) =
@@ -525,6 +695,12 @@ pub(crate) fn parse_response_with_usage<'a>(
                 budget.boxed::<Envelope>(i)?;
                 return Ok((rest, AttributeValue::Envelope(Box::new(value))));
             }
+            if let Some(limit) = budget.fetch_literal_bytes.filter(|_| {
+                i.get(..5)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"BODY["))
+            }) {
+                return budget.fetch_body_section(i, limit);
+            }
             AttributeValue::parse(i)
         })?;
         let mut rest = rest;
@@ -534,9 +710,15 @@ pub(crate) fn parse_response_with_usage<'a>(
         let (rest, _) = tag("\r\n")(rest)?;
         Ok((rest, Response::Fetch(sequence, items)))
     })();
-    let result = result.map_err(|error| match budget.failure.get() {
-        Some(kind) => ParseError::Limit(kind),
-        None => ParseError::Syntax(error),
+    let result = result.map_err(|error| {
+        if let Some(error) = budget.fetch_failure.get() {
+            ParseError::FetchLiteralLimit(error)
+        } else {
+            match budget.failure.get() {
+                Some(kind) => ParseError::Limit(kind),
+                None => ParseError::Syntax(error),
+            }
+        }
     });
     let usage = budget.usage.get();
     let mut report = usage.report;

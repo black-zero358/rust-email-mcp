@@ -67,6 +67,33 @@ fn shipped_configuration_example_matches_strict_schema() {
 }
 
 #[test]
+fn attachment_staging_path_is_a_shared_service_setting_and_does_not_block_config_loading() {
+    let mut environment = environment();
+    environment.insert(
+        "ATTACHMENT_STAGING_DIR".into(),
+        "./synthetic-downloads".into(),
+    );
+    let legacy = load_checked(&|key| environment.get(key).cloned()).unwrap();
+    assert_eq!(
+        legacy.service_config.attachment_staging_dir.as_deref(),
+        Some(Path::new("./synthetic-downloads"))
+    );
+    let extended = load_document(&document(), &environment).unwrap();
+    for account in &extended.accounts {
+        assert_eq!(
+            account.config.attachment_staging_dir,
+            extended.service_config.attachment_staging_dir
+        );
+    }
+    environment.insert("ATTACHMENT_STAGING_DIR".into(), OsString::new());
+    let loaded = load_checked(&|key| environment.get(key).cloned()).unwrap();
+    assert_eq!(
+        loaded.service_config.attachment_staging_dir.as_deref(),
+        Some(Path::new(""))
+    );
+}
+
+#[test]
 fn strict_json_rejects_unknown_fields_duplicates_acl_versions_and_raw_secrets_privately() {
     let mut invalid = vec![];
     let mut value = document();

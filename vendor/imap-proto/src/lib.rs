@@ -92,6 +92,16 @@ impl<'a> Response<'a> {
         bounded::parse_response_with_usage(msg, limits)
     }
 
+    /// Also reject BODY section literals above the current command's requested size.
+    /// A declared literal is checked before requesting its payload from the buffer.
+    pub fn parse_bounded_with_fetch_limit(
+        msg: &'a [u8],
+        limits: &bounded::BodyStructureLimits,
+        max_literal_bytes: usize,
+    ) -> bounded::ParseResult<'a> {
+        bounded::parse_response_with_fetch_limit(msg, limits, Some(max_literal_bytes)).0
+    }
+
     pub fn into_owned(self) -> Response<'static> {
         match self {
             Response::Capabilities(capabilities) => Response::Capabilities(

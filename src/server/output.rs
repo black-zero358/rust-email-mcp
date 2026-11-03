@@ -97,6 +97,8 @@ fn error() -> Value {
         "limit_kind".into(),
         enumeration(&[
             "raw_message_bytes",
+            "connection_bytes",
+            "part_fetch_bytes",
             "decoded_attachment_bytes",
             "decoded_body_bytes",
             "mime_structure",
@@ -127,7 +129,7 @@ fn error() -> Value {
     details["dependentRequired"] = dependencies;
     object(
         json!({
-            "code":enumeration(&["INVALID_INPUT","MAIL_BACKEND","STORAGE_UNAVAILABLE","LIMIT_EXCEEDED","TIMEOUT","BUSY","STALE_UID","NOT_FOUND","UNSUPPORTED_BODY","UNSUPPORTED_CHARSET","UNSUPPORTED_TRANSFER_ENCODING","ATTACHMENT_DECODE_FAILED","ATTACHMENT_NOT_FOUND","ACCOUNT_UNAVAILABLE","INTERNAL"]),
+            "code":enumeration(&["INVALID_INPUT","MAIL_BACKEND","STORAGE_UNAVAILABLE","ATTACHMENT_STORAGE_UNAVAILABLE","LIMIT_EXCEEDED","TIMEOUT","BUSY","STALE_UID","NOT_FOUND","UNSUPPORTED_BODY","UNSUPPORTED_CHARSET","UNSUPPORTED_TRANSFER_ENCODING","ATTACHMENT_DECODE_FAILED","ATTACHMENT_NOT_FOUND","ACCOUNT_UNAVAILABLE","INTERNAL"]),
             "message":string(),"retryable":boolean(),"details":details
         }),
         &["code", "message", "retryable"],
@@ -190,7 +192,7 @@ fn attachment_descriptor() -> Value {
         "filename":nullable(string()),"safe_filename":string(),"content_type":string(),"declared_content_type":string(),"detected_content_type":{"type":"null"},
         "encoded_size":count(),"decoded_size":nullable(count()),"size_accuracy":enumeration(&["exact","estimate","unknown"]),
         "disposition":nullable(string()),"content_id":nullable(string()),"downloadable":boolean(),
-        "unavailable_reason":nullable(enumeration(&["unsupported_transfer_encoding","decoded_attachment_bytes"])),
+        "unavailable_reason":nullable(enumeration(&["unsupported_transfer_encoding","decoded_attachment_bytes","connection_bytes"])),
         "delivery":delivery(),"checksum":nullable(checksum())
     }).as_object().unwrap().clone());
     all_required(properties)

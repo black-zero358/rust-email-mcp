@@ -11,7 +11,8 @@ use nom::Needed;
 #[cfg(feature = "runtime-tokio")]
 use tokio::io::{AsyncRead as Read, AsyncWrite as Write, AsyncWriteExt};
 
-use crate::types::{Request, ResponseData};
+use crate::types::{CommandReadLimits, Request, ResponseData};
+use imap_proto::{RequestId, Response};
 
 /// Wraps a stream, and parses incoming data as imap server messages. Writes outgoing data
 /// as imap client messages.
@@ -34,6 +35,7 @@ pub struct ImapStream<R: Read + Write> {
     /// and `poll_next()` does not read
     /// from the underlying stream.
     read_closed: bool,
+    command_limits: Option<(RequestId, CommandReadLimits)>,
 }
 
 impl<R: Read + Write + Unpin> ImapStream<R> {
@@ -50,6 +52,7 @@ impl<R: Read + Write + Unpin> ImapStream<R> {
             buffer: Buffer::with_limit(max_buffer),
             decode_needs: 0,
             read_closed: false,
+            command_limits: None,
         }
     }
 
@@ -59,6 +62,11 @@ impl<R: Read + Write + Unpin> ImapStream<R> {
                 io::ErrorKind::BrokenPipe,
                 "IMAP stream is closed",
             ));
+        }
+        if let Some((tag, _)) = &self.command_limits {
+            if msg.0.as_ref() != Some(tag) {
+                return Err(io::Error::other("A limited command is still active"));
+            }
         }
         log::trace!(
             "encode: input: {:?}, {:?}",
@@ -73,6 +81,20 @@ impl<R: Read + Write + Unpin> ImapStream<R> {
         self.inner.write_all(&msg.1).await?;
         self.inner.write_all(b"\r\n").await?;
 
+        Ok(())
+    }
+
+    pub(crate) fn set_command_limits(
+        &mut self,
+        tag: RequestId,
+        limits: CommandReadLimits,
+    ) -> io::Result<()> {
+        if self.read_closed || self.command_limits.is_some() {
+            return Err(io::Error::other("IMAP command is unavailable"));
+        }
+        self.command_limits = Some((tag, limits));
+        // Any incomplete literal is re-parsed with the new command's cap.
+        self.decode_needs = 0;
         Ok(())
     }
 
@@ -115,17 +137,34 @@ impl<R: Read + Write + Unpin> ImapStream<R> {
 
         let res = ResponseData::try_new_or_recover(block, |buf| {
             let buf = &buf[..self.buffer.used()];
-            match imap_proto::Response::parse_bounded(
-                buf,
-                &imap_proto::bounded::BodyStructureLimits::default(),
-            ) {
+            let structure_limits = imap_proto::bounded::BodyStructureLimits::default();
+            let parsed = match &self.command_limits {
+                Some((_, limits)) => imap_proto::Response::parse_bounded_with_fetch_limit(
+                    buf,
+                    &structure_limits,
+                    limits.body_section_literal_bytes,
+                ),
+                None => imap_proto::Response::parse_bounded(buf, &structure_limits),
+            };
+            match parsed {
                 Ok((remaining, response)) => {
+                    if let (Some((expected, _)), Response::Done { tag, .. }) =
+                        (&self.command_limits, &response)
+                    {
+                        if tag == expected {
+                            self.command_limits = None;
+                        }
+                    }
                     // TODO: figure out if we can use a minimum required size for a response.
                     self.decode_needs = 0;
                     self.buffer.reset_with_data(remaining);
                     Ok(response)
                 }
                 Err(imap_proto::bounded::ParseError::Limit(error)) => {
+                    self.decode_needs = 0;
+                    Err(Some(io::Error::other(error)))
+                }
+                Err(imap_proto::bounded::ParseError::FetchLiteralLimit(error)) => {
                     self.decode_needs = 0;
                     Err(Some(io::Error::other(error)))
                 }

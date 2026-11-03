@@ -37,6 +37,12 @@ sudo chmod 700 data/auth data/mail secrets/bootstrap
 sudo chmod 600 secrets/rauthy.toml secrets/mail.env
 ```
 
+附件 HTTP 下载使用专属暂存目录。`ATTACHMENT_STAGING_DIR` 可显式指定；默认位于 `DATABASE_PATH` 的父目录下，名称为 `mail-downloads`，上述 Compose 配置对应 `/data/mail-downloads`。目录由服务用户独占，权限为 0700，文件为 0600；四份下载文件合计最多 128 MiB。目录用于下载过程中的临时文件，客户端消费或取消后清理，重启时在取得目录锁后清理可识别的残留文件。备份时排除此目录。
+
+使用 `DATABASE_PATH=:memory:` 且需要 HTTP 附件下载时，显式配置 `ATTACHMENT_STAGING_DIR`。暂存目录初始化失败时，普通邮件读取和内联附件下载继续可用；准备 HTTP 下载返回 `ATTACHMENT_STORAGE_UNAVAILABLE`。检查目录权限、可用空间和是否被另一个服务进程占用，修正后重启服务。运行中写入或清理失败同样停止相关下载，日志仅记录固定错误类别。
+
+暂存路径可以是绝对路径或相对进程工作目录的路径，允许 `.`，拒绝空值和 `..`。父目录须已存在，服务只创建最后一级目录；已有目录需满足私密权限要求。路径中的符号链接、非目录和目录锁冲突均使 HTTP 下载不可用，服务保留原有目录权限。
+
 ## 多账户配置
 
 保留原环境配置即可继续使用单邮箱。追加只读邮箱时，复制 [accounts.json.example](../deploy/accounts.json.example) 到私密配置目录，填写稳定登记键、调用别名、邮箱端点、密码环境变量名称和各账户的主体 ACL。`extend_legacy` 保留原邮箱环境配置；JSON 中的 `legacy_default` 显式列出原邮箱的读写主体。全局 `OIDC_SUBJECTS` 与每账户 ACL 取交集，新加入全局列表的主体按各账户 ACL 获取权限。

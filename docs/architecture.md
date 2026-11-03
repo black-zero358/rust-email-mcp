@@ -83,7 +83,15 @@ APPEND 等待同步 literal continuation 时，先将合法 untagged 通知交�
 
 附件列表和准备先以独立 UID FETCH 命令取得 RFC822.SIZE 并等待 tagged OK，再取得 BODYSTRUCTURE，逐条筛选目标 UID 和必需属性。只有确认原始大小不超过配置/32 MiB 上限后，才允许结构超限、明确结构拒绝或映射待核对触发一次新连接 raw 回退。发布索引前，逐个核对实际 DFS 节点的完整 MIME 头；确认整体附件或 message/rfc822 后停止展开该子树。重复 MIME 元数据、Base64/QP multipart 或缺少 boundary 的 multipart 进入受控整封回退，保持与 raw 解析的索引一致。必要头 section 由服务器端生成，每命令最多 16 个、最多 64 命令、单头 128 KiB、合计 1 MiB；按 UID、section、origin 和必需属性核对，并等待每个命令完成。协议失败直接返回；头证据超出预算允许一次 raw 回退。第二连接重新 EXAMINE 并核对 UIDVALIDITY，沿用原操作 deadline，raw 失败直接结束。成功结果通过固定 `read_diagnostics` 保留来源和回退原因。
 
-`prepare_attachment_download` 保存最多 64 个主体绑定、600 秒有效的元数据句柄。GET 再核对主体、AccountKey、UIDVALIDITY 并重新读取整封邮件，部件下载由 R07 接入。四份二进制传输许可持有至响应消费或丢弃，邮箱连接共用原槽位与预算。附件路径按 [RFC 3501 §6.4.5](https://www.rfc-editor.org/rfc/rfc3501#section-6.4.5) 核对完整 BODY[] 长度与 RFC822.SIZE 一致；完整解码并通过匹配 tagged OK 后计算 `X-Content-SHA256` 和 `Content-Digest`。HTTP 内容固定为 octet-stream，带 no-store/nosniff。错误映射见[附件契约](capabilities.md#附件与兼容性)，认证错误同样返回带 request_id 的小型 JSON。仅完成命令且未出现目标 UID 才判为消息不存在；目标 UID 缺必需属性、大小不一致及命令失败返回后端错误。
+`prepare_attachment_download` 保存最多 64 个主体绑定、600 秒有效的元数据句柄。GET 再核对主体、AccountKey、UIDVALIDITY 和部件清单，按服务器生成的 section 以最多 64 KiB 的 `BODY.PEEK[section]<offset.count>` 读取目标编码字节。每条命令核对 UID、section、origin、必需属性和唯一片段，等待匹配 tagged OK 后才推进偏移；完整编码长度来自已核对的清单，末尾空片段探针确认结束。空附件也执行命令及完成状态验证。命令期 literal 限额在 parser 请求更多字节或分配前执行，超限终止连接；默认 raw reader 的连接与缓冲预算保持一致。依据 [RFC 3501 §6.4.5](https://www.rfc-editor.org/rfc/rfc3501#section-6.4.5)。
+
+增量解码器保存跨块 Base64/quoted-printable 状态，每步写入最多 64 KiB 输出；解码累计上限为 32 MiB，连接累计上限为 128 MiB。整封邮件超过 raw 上限时，已验证映射的小附件仍可按部件读取；需要整体解析的结构继续只在 raw 大小上限内回退一次。既有内联 Base64 保持 raw 路径和输出预算。`read_diagnostics` 继续描述列表/准备阶段的元数据来源。
+
+`mail/attachments/staging` 管理实例共享的四份私密下载文件，每份最多 32 MiB。文件写入、完整解码及所有命令完成后，可信 reader 提供绑定本文件的完成凭据，才生成可交付文件；内容长度与 SHA-256 取自最终文件元数据。异步文件操作将文件和额度交给受控阻塞任务；请求取消时，运行中的任务仍持有资源，完成或失败后清理。响应消费或丢弃后释放传输许可并删除文件；清理失败保留占用并停止新文件写入。启动时取得专属目录锁，只清理可识别的残留文件。配置及恢复见[部署指南](deployment.md#准备目录与配置)。
+
+下载从创建暂存文件开始固定一个期限，等待邮箱槽位、协议读取、解码、写入和最终校验均使用剩余时间。邮箱队列仍保留 10 秒等待上限；超时发生在实际网络读取阶段时记入账户退避，暂存或队列阶段的超时保持各自状态。暂存创建超时返回 HTTP 504、`phase:staging`，运行中的文件任务继续持有许可直到结束。文件开始发送后，响应消费继续持有下载与文件额度，邮箱执行槽已释放。
+
+HTTP 内容固定为 octet-stream，带 no-store/nosniff、`X-Content-SHA256` 和 `Content-Digest`。响应头发出前的错误使用[附件契约](capabilities.md#附件与兼容性)中的小型 JSON；文件传输中的读取失败终止流，由客户端校验长度和摘要。仅完成命令且未出现目标 UID 才判为消息不存在；目标 UID 缺必需属性、大小不一致及命令失败返回后端错误。
 
 `mail/insights.rs` 提供有界标识符图会话、精确 Message-ID 定位、严格 STATUS 统计、脱敏诊断与正文展示。头部缓存最多 256 项/16 MiB、60 秒，只保存不可变头部并以新 UIDVALIDITY 失效；正文共用 `mime`/`html` 选择器。统计用 `imap_text::status_counts` 验证完整字段和命令完成。批量修改使用明确 UID、总体期限和逐项结果，失败项保守为 unknown、后续 unprocessed；没有持久化修改日志，重试前必须检查邮箱。范围与限制见 [能力说明](capabilities.md)。
 
@@ -166,6 +174,8 @@ SMTPUTF8 需求与确定拒绝对应 D3/D4：`mime::requires_smtputf8`、`smtp::
 R06 parser 基础对应 D2/D3/D5：`tests/body_structure_budget.rs` 在默认根测试中覆盖结构预算、分配记账、正常响应分段、typed 错误及 Client 终止；`scripts/test-audit-dependencies.sh` 核对两个 path 包的上游审计视图与失败清理，`scripts/test-docker-context.sh` 核对两个允许的 vendor 目录。原完成状态、字节预算和邮件回归继续执行。解析器的预算限制与流式附件/PartManifest 功能分工作包交付。
 
 R06 附件映射对应 D2/D3/D5：`mail::parts` 的 mapping/raw 差分与 reader 回归核对原 DFS 索引、每节点头证据、特殊 multipart 和头预算；`server::output_tests::structure` 使用本地 TLS IMAP 与认证 HTTP MCP 核对实际命令、一次新连接回退、世代变化和协议失败。账户测试继续检查同 UID 的引用隔离；`imap_text` 回归覆盖 ASCII/Unicode 搜索及 STATUS 的结构预算错误分类。
+
+R07 附件部件读取对应 D2/D3/D5：`tests/part_fetch_budget.rs` 验证命令期 literal 预算、完整 section 语法和每个合法前缀、quoted 逻辑字节、typed 错误隐私及完成后的默认解析恢复；`mail::parts::transfer_decode` 与原整段解码做跨块差分；`mail::attachments::staging` 验证私密文件、四份额度、跨进程锁、重启清理及真实阻塞任务取消。`server::output_tests::parts` 通过认证 HTTP 核对大邮件中的小附件、64 KiB 边界、末端探针、坏编码、协议失败、权限重查及慢消费清理。`download_begin_timeout_keeps_transfer_permit_until_blocking_io_finishes` 覆盖下载入口的暂存超时与实际资源释放。
 
 R05 的 D1/D3/D4/D5 回归入口：`accounts/catalog/tests` 与 `config/account_config/tests` 覆盖显式 ACL、默认账户、世代、秘密引用、v1/v2 迁移、发布失败恢复和原 Journal 字节保留；`mail/scheduler/tests` 覆盖全局额度、公平借槽、取消和超时。`server/output_tests/accounts` 通过真实 HTTP/JWT 与双模拟邮箱核对同 UID 隔离、按主体发现、默认读取与旧写目标、历史发送查询、附件撤权、账户独立退避及完整响应预算。`cancelled_http_reads_release_admission_backend_slots_and_connections` 验证 4 个运行/16 个排队读取的取消释放，`in_flight_attachment_gets_stop_on_disconnect_revocation_and_account_removal` 验证下载断连及账户取消释放。
 

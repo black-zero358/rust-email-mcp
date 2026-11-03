@@ -123,6 +123,15 @@ where
 fn read_imap_error(error: async_imap::error::Error) -> MailError {
     if async_imap::error::body_structure_limit(&error).is_some() {
         MailError::limit_kind(crate::error::LimitKind::MimeStructure)
+    } else if let Some(limit) = async_imap::error::body_section_literal_limit(&error) {
+        MailError::limit_with(
+            crate::error::LimitKind::PartFetchBytes,
+            limit.limit,
+            limit.actual,
+        )
+    } else if matches!(&error, async_imap::error::Error::Io(error) if error.get_ref().is_some_and(|cause| cause.is::<crate::error::ConnectionBudgetExceeded>()))
+    {
+        MailError::limit_kind(crate::error::LimitKind::ConnectionBytes)
     } else {
         MailError::backend()
     }
