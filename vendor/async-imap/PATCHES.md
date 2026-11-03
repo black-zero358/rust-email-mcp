@@ -1,5 +1,10 @@
 # Local protocol and allocation patches
 
+The existing `types::ResponseData` reexport is public so the bounded MIME
+manifest reader can retain one response owner without cloning its AST and inspect
+the exact UID, section, origin and duplicate attributes. The type layout and
+existing response parsing behavior are unchanged.
+
 Source: crates.io `async-imap` 0.12.0, upstream commit
 `31fde98fceb5b9bde726807419992f8d84b1f193`.
 Archive SHA256: `f97b87216c9f0ccc63c516263169085fa34bba25633f6d96c6a9b9ca1fd5f70a`.

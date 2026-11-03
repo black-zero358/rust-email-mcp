@@ -408,23 +408,20 @@ fn body_type_text<'a>(i: &'a [u8], budget: &Budget<'_>) -> IResult<&'a [u8], Bod
 }
 
 fn body_type_message<'a>(i: &'a [u8], budget: &Budget<'_>) -> IResult<&'a [u8], BodyStructure<'a>> {
-    map(
-        (
-            tag_no_case("\"MESSAGE\" \"RFC822\""),
-            tag(" "),
-            |i| BodyFields::parse_with_budget(i, budget),
-            tag(" "),
-            |i| Envelope::parse_with_budget(i, budget),
-            tag(" "),
-            |i| {
-                budget.boxed::<BodyStructure>(i)?;
-                BodyStructure::parse_with_budget(i, budget)
-            },
-            tag(" "),
-            number,
-            |i| BodyExt1Part::parse_with_budget(i, budget),
-        ),
-        |(_, _, fields, _, envelope, _, body, _, lines, ext)| BodyStructure::Message {
+    let (i, _) = tag_no_case("\"MESSAGE\" \"RFC822\"")(i)?;
+    let (i, _) = tag(" ")(i)?;
+    let (i, fields) = BodyFields::parse_with_budget(i, budget)?;
+    let (i, _) = tag(" ")(i)?;
+    let (i, envelope) = Envelope::parse_with_budget(i, budget)?;
+    let (i, _) = tag(" ")(i)?;
+    budget.boxed::<BodyStructure>(i)?;
+    let (i, body) = BodyStructure::parse_with_budget(i, budget)?;
+    let (i, _) = tag(" ")(i)?;
+    let (i, lines) = number(i)?;
+    let (i, ext) = BodyExt1Part::parse_with_budget(i, budget)?;
+    Ok((
+        i,
+        BodyStructure::Message {
             common: BodyContentCommon {
                 ty: ContentType {
                     ty: Cow::Borrowed("MESSAGE"),
@@ -447,22 +444,20 @@ fn body_type_message<'a>(i: &'a [u8], budget: &Budget<'_>) -> IResult<&'a [u8], 
             lines,
             extension: ext.extension,
         },
-    )
-    .parse(i)
+    ))
 }
 
 fn body_type_multipart<'a>(
     i: &'a [u8],
     budget: &Budget<'_>,
 ) -> IResult<&'a [u8], BodyStructure<'a>> {
-    map(
-        (
-            |i| budget.adjacent_list(i, |i| BodyStructure::parse_with_budget(i, budget)),
-            tag(" "),
-            |i| budget.string_utf8(i),
-            |i| BodyExtMPart::parse_with_budget(i, budget),
-        ),
-        |(bodies, _, subtype, ext)| BodyStructure::Multipart {
+    let (i, bodies) = budget.adjacent_list(i, |i| BodyStructure::parse_with_budget(i, budget))?;
+    let (i, _) = tag(" ")(i)?;
+    let (i, subtype) = budget.string_utf8(i)?;
+    let (i, ext) = BodyExtMPart::parse_with_budget(i, budget)?;
+    Ok((
+        i,
+        BodyStructure::Multipart {
             common: BodyContentCommon {
                 ty: ContentType {
                     ty: Cow::Borrowed("MULTIPART"),
@@ -476,8 +471,7 @@ fn body_type_multipart<'a>(
             bodies,
             extension: ext.extension,
         },
-    )
-    .parse(i)
+    ))
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -518,13 +512,23 @@ impl<'a> BodyStructure<'a> {
     pub(crate) fn parse_with_budget(i: &'a [u8], budget: &Budget<'_>) -> IResult<&'a [u8], Self> {
         let (i, _) = tag("(")(i)?;
         let _guard = budget.enter(i)?;
-        let (i, value) = alt((
-            |i| budget.attempt(i, |i| body_type_text(i, budget)),
-            |i| budget.attempt(i, |i| body_type_message(i, budget)),
-            |i| budget.attempt(i, |i| body_type_basic(i, budget)),
-            |i| budget.attempt(i, |i| body_type_multipart(i, budget)),
-        ))
-        .parse(i)?;
+        // Dispatch before constructing large recursive alternative results.
+        // A special type that fails recoverably retains the legacy basic fallback.
+        let (i, value) = if i.first() == Some(&b'(') {
+            body_type_multipart(i, budget)
+        } else if type_prefix(i, b"\"TEXT\" ")? {
+            match budget.attempt(i, |i| body_type_text(i, budget)) {
+                Err(nom::Err::Error(_)) => body_type_basic(i, budget),
+                result => result,
+            }
+        } else if type_prefix(i, b"\"MESSAGE\" \"RFC822\" ")? {
+            match budget.attempt(i, |i| body_type_message(i, budget)) {
+                Err(nom::Err::Error(_)) => body_type_basic(i, budget),
+                result => result,
+            }
+        } else {
+            body_type_basic(i, budget)
+        }?;
         let (i, _) = tag(")")(i)?;
         Ok((i, value))
     }
@@ -576,6 +580,20 @@ impl<'a> BodyStructure<'a> {
                 extension: extension.map(|v| v.into_owned()),
             },
         }
+    }
+}
+
+// A partial special-type label must remain Incomplete. Parsing it as a basic
+// type would charge temporary strings that the complete special variant borrows
+// statically, and could falsely exhaust an otherwise exact string budget.
+fn type_prefix<'a>(
+    input: &'a [u8],
+    prefix: &'static [u8],
+) -> Result<bool, nom::Err<nom::error::Error<&'a [u8]>>> {
+    match tag_no_case(prefix)(input) {
+        Ok(_) => Ok(true),
+        Err(nom::Err::Error(_)) => Ok(false),
+        Err(error) => Err(error),
     }
 }
 

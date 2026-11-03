@@ -26,6 +26,79 @@ fn account_message(marker: &str) -> Vec<u8> {
     };
     format!("Message-ID: <same@example.test>\r\nSubject: {subject}\r\nContent-Type: multipart/mixed; boundary=account\r\n\r\n--account\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{marker}\r\n--account\r\nContent-Type: text/csv\r\nContent-Disposition: attachment; filename=same.csv\r\n\r\n{marker}\r\n--account--\r\n").into_bytes()
 }
+
+#[tokio::test]
+async fn attachment_structure_discovery_preserves_same_uid_account_namespaces_and_live_acl() {
+    let h = MultiAccount::new(64 * 1024).await;
+    for backend in [&h.a, &h.b] {
+        let body = r#"(("TEXT" "PLAIN" ("CHARSET" "utf-8") NIL NIL "7BIT" 9 1 NIL NIL NIL NIL)("TEXT" "CSV" NIL NIL NIL "7BIT" 9 1 NIL ("ATTACHMENT" ("FILENAME" "same.csv")) NIL NIL) "MIXED" ("BOUNDARY" "account") NIL NIL NIL)"#;
+        backend.structure.structures.lock().unwrap().insert(
+            7,
+            super::structure::Reply::Data(
+                format!("* 1 FETCH (UID 7 BODYSTRUCTURE {body})\r\n").into_bytes(),
+            ),
+        );
+        backend.structure.headers.lock().unwrap().extend([
+            ((7, "1.MIME".into()), super::structure::Evidence::Bytes(b"Content-Type: text/plain; charset=utf-8\r\n\r\n".to_vec())),
+            ((7, "2.MIME".into()), super::structure::Evidence::Bytes(b"Content-Type: text/csv\r\nContent-Disposition: attachment; filename=same.csv\r\n\r\n".to_vec())),
+        ]);
+    }
+    let a = h
+        .call(
+            "both",
+            "list_attachments",
+            json!({"account_id":"default","uid":7,"uid_validity":9}),
+        )
+        .await;
+    let b = h
+        .call(
+            "both",
+            "list_attachments",
+            json!({"account_id":"billing-B","uid":7,"uid_validity":9}),
+        )
+        .await;
+    for value in [&a, &b] {
+        assert_eq!(value["data"]["read_diagnostics"]["source"], "bodystructure");
+    }
+    assert_eq!(a["data"]["account_id"], "default");
+    assert_eq!(b["data"]["account_id"], "billing-B");
+    assert_ne!(
+        a["data"]["attachments"][0]["attachment_id"],
+        b["data"]["attachments"][0]["attachment_id"]
+    );
+    let before = h.connections();
+    assert_eq!(
+        h.call(
+            "alice",
+            "list_attachments",
+            json!({"account_id":"billing-B","uid":7,"uid_validity":9})
+        )
+        .await["error"]["code"],
+        "ACCOUNT_UNAVAILABLE"
+    );
+    h.catalog.revoke_read_for_test("billing-B", "both").unwrap();
+    assert_eq!(
+        h.call(
+            "both",
+            "list_attachments",
+            json!({"account_id":"billing-B","uid":7,"uid_validity":9})
+        )
+        .await["error"]["code"],
+        "ACCOUNT_UNAVAILABLE"
+    );
+    assert_eq!(h.connections(), before);
+    for backend in [&h.a, &h.b] {
+        assert!(
+            !backend
+                .structure
+                .commands
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, command)| command.contains("BODY.PEEK[]"))
+        );
+    }
+}
 struct MultiAccount {
     a: Harness,
     b: Harness,

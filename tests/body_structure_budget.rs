@@ -472,6 +472,28 @@ fn all_proper_prefixes_match_the_unmodified_registry_oracle() {
 }
 
 #[test]
+fn special_type_prefixes_preserve_incomplete_with_exact_small_string_budgets() {
+    for (body, string_bytes) in [
+        ("(\"TEXT\" \"X\" NIL NIL NIL \"7BIT\" 1 1)".to_owned(), 1),
+        (message(1), 5),
+    ] {
+        let raw = fetch(&body);
+        let limits = BodyStructureLimits {
+            string_bytes,
+            ..BodyStructureLimits::default()
+        };
+        Response::parse_bounded(&raw, &limits).unwrap();
+        for length in 0..raw.len() {
+            assert!(
+                matches!(Response::parse_bounded(&raw[..length], &limits),
+                Err(ParseError::Syntax(error)) if error.is_incomplete()),
+                "prefix {length}, string budget {string_bytes}"
+            );
+        }
+    }
+}
+
+#[test]
 fn successful_lossy_strings_account_for_their_retained_capacities() {
     use async_imap::imap_proto::{AttributeValue, BodyStructure};
     fn input(count: usize) -> Vec<u8> {

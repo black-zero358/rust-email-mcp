@@ -448,13 +448,13 @@ impl<'l> Budget<'l> {
     pub(crate) fn adjacent_list<'a, T>(
         &self,
         i: &'a [u8],
-        mut parser: impl Parser<&'a [u8], Output = T, Error = Error<&'a [u8]>>,
+        mut parser: impl FnMut(&'a [u8]) -> IResult<&'a [u8], T>,
     ) -> IResult<&'a [u8], Vec<T>> {
-        let (mut rest, item) = self.attempt(i, |i| parser.parse(i))?;
+        let (mut rest, item) = self.attempt(i, |i| parser(i))?;
         let mut items = Vec::new();
         self.push(i, &mut items, item)?;
         loop {
-            match self.attempt(rest, |i| parser.parse(i)) {
+            match self.attempt(rest, |i| parser(i)) {
                 Ok((next, item)) => {
                     if next.len() == rest.len() {
                         return Err(nom::Err::Error(Error::new(rest, ErrorKind::Many1)));

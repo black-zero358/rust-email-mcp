@@ -195,6 +195,13 @@ fn attachment_descriptor() -> Value {
     }).as_object().unwrap().clone());
     all_required(properties)
 }
+fn read_diagnostics() -> Value {
+    all_required(json!({
+        "source":enumeration(&["bodystructure","raw"]),
+        "fallback_reason":nullable(enumeration(&["structure_limit","structure_rejected","mapping_unverified","metadata_conflict","whole_multipart_attachment","header_budget"])),
+        "limit_kind":nullable(enumeration(&["mime_structure"]))
+    }))
+}
 
 fn accounts() -> Value {
     let capabilities = all_required(json!({
@@ -271,16 +278,22 @@ fn data(name: &str) -> Value {
             properties.as_object_mut().unwrap().extend(json!({"content_type":string(),"size":count(),"base64":{"type":"string","contentEncoding":"base64"},"checksum":checksum()}).as_object().unwrap().clone());
             all_required(properties)
         }
-        "list_attachments" => all_required(
-            json!({"account_id":account_id(),"mailbox":string(),"uid":uid(),"uid_validity":uid(),"attachments":array(attachment_descriptor()),"next_attachment_offset":nullable(json!({"type":"integer","minimum":0,"maximum":MAX_ATTACHMENT_INDEX})),"content_trust":trust}),
-        ),
+        "list_attachments" => {
+            let mut schema = all_required(
+                json!({"account_id":account_id(),"mailbox":string(),"uid":uid(),"uid_validity":uid(),"attachments":array(attachment_descriptor()),"next_attachment_offset":nullable(json!({"type":"integer","minimum":0,"maximum":MAX_ATTACHMENT_INDEX})),"content_trust":trust}),
+            );
+            schema["properties"]["read_diagnostics"] = read_diagnostics();
+            schema
+        }
         "prepare_attachment_download" => {
             let mut properties = attachment_reference();
             properties.as_object_mut().unwrap().extend(json!({"download_url":{"type":"string","format":"uri"},"method":{"const":"GET"},
                 "required_headers":all_required(json!({"Authorization":{"const":"Bearer <access_token>"}})),"expires_in_seconds":{"const":600},
                 "metadata":attachment_descriptor(),"delivery":delivery(),"content_trust":trust
             }).as_object().unwrap().clone());
-            all_required(properties)
+            let mut schema = all_required(properties);
+            schema["properties"]["read_diagnostics"] = read_diagnostics();
+            schema
         }
         "get_operation" => all_required(json!({"operation":nullable(reference("operation"))})),
         "read_conversation" => all_required(json!({

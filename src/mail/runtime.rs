@@ -197,7 +197,7 @@ pub(super) fn admission_error(error: AdmissionError) -> MailError {
     }
 }
 
-fn account_read(name: &str) -> bool {
+pub(super) fn account_read(name: &str) -> bool {
     matches!(
         name,
         "list_mailboxes"

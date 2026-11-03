@@ -328,13 +328,13 @@ pub fn tools(mode: &str) -> Vec<Tool> {
         ),
         (
             "prepare_attachment_download",
-            "Prepare an authenticated attachment URL using attachment_id or the original index. delivery.client_delivery_required directs a supported client to download the complete file with its own Bearer token and read its content. After expiry prepare again; keep distinct references for repeated filenames.",
+            "Prepare an authenticated attachment URL using bounded structure and necessary MIME headers, with one controlled whole-message fallback when needed. delivery.client_delivery_required directs a supported client to download the complete file with its own Bearer token and read its content. Use attachment_id or the original index; after expiry prepare again and keep distinct references for repeated filenames.",
             json!({"mailbox":mailbox,"uid":uid,"uid_validity":uid,"attachment_index":{"type":"integer","minimum":0,"maximum":MAX_ATTACHMENT_INDEX},"attachment_id":{"type":"string","minLength":71,"maxLength":71,"pattern":"^att_v1_[0-9a-f]{64}$","x-maxUtf8Bytes":71}}),
             vec!["uid", "uid_validity"],
         ),
         (
             "list_attachments",
-            "List stable attachment references, original indices, filenames, size accuracy, encoding availability and delivery actions using the bounded whole-message reader. Follow next_attachment_offset for remaining parts; use attachment_id to distinguish repeated filenames.",
+            "List stable attachment references, original indices, filenames, size accuracy, encoding availability and delivery actions using bounded structure and necessary MIME headers. read_diagnostics reports a controlled whole-message fallback when needed. Follow next_attachment_offset for remaining parts; use attachment_id to distinguish repeated filenames.",
             json!({"mailbox":mailbox,"uid":uid,"uid_validity":uid,"attachment_offset":{"type":"integer","minimum":0,"maximum":MAX_ATTACHMENT_INDEX}}),
             vec!["uid", "uid_validity"],
         ),
