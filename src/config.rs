@@ -33,6 +33,7 @@ pub struct Config {
     pub bind: String,
     pub database: String,
     pub account_registry: Option<PathBuf>,
+    pub attachment_staging_dir: Option<PathBuf>,
 }
 
 #[cfg(test)]
@@ -59,6 +60,7 @@ pub(crate) fn fixture() -> Arc<Config> {
         bind: "127.0.0.1:0".into(),
         database: ":memory:".into(),
         account_registry: None,
+        attachment_staging_dir: None,
     })
 }
 impl Config {
@@ -125,6 +127,7 @@ impl Config {
             bind: value("BIND", "127.0.0.1:18590")?,
             database: value("DATABASE_PATH", "data/operations.sqlite")?,
             account_registry: lookup("ACCOUNT_REGISTRY_PATH").map(PathBuf::from),
+            attachment_staging_dir: lookup("ATTACHMENT_STAGING_DIR").map(PathBuf::from),
         };
         anyhow::ensure!(
             ["read", "draft", "send", "full"].contains(&c.mode.as_str()),

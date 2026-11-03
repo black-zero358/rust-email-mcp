@@ -19,7 +19,7 @@ pub(in crate::mail) struct ManifestDiagnostics {
     limit_kind: Option<&'static str>,
 }
 #[derive(Clone, Copy)]
-enum Fallback {
+pub(super) enum Fallback {
     StructureLimit,
     StructureRejected,
     MappingUnverified,
@@ -28,7 +28,7 @@ enum Fallback {
     HeaderBudget,
 }
 impl Fallback {
-    fn diagnostics(self) -> ManifestDiagnostics {
+    pub(super) fn diagnostics(self) -> ManifestDiagnostics {
         ManifestDiagnostics {
             source: "raw",
             fallback_reason: Some(match self {
@@ -50,25 +50,31 @@ pub(in crate::mail) enum ManifestSource {
 pub(in crate::mail) struct LoadedManifest {
     pub source: ManifestSource,
     pub validity: u32,
+    pub whole_size: usize,
     pub diagnostics: ManifestDiagnostics,
 }
 
 pub(in crate::mail) fn map_read_imap_error(error: ImapError) -> MailError {
     if async_imap::error::body_structure_limit(&error).is_some() {
         MailError::limit_kind(LimitKind::MimeStructure)
+    } else if let Some(limit) = async_imap::error::body_section_literal_limit(&error) {
+        MailError::limit_with(LimitKind::PartFetchBytes, limit.limit, limit.actual)
+    } else if matches!(&error, ImapError::Io(error) if error.get_ref().is_some_and(|cause| cause.is::<ConnectionBudgetExceeded>()))
+    {
+        MailError::limit_kind(LimitKind::ConnectionBytes)
     } else {
         MailError::backend()
     }
 }
 
-enum FetchFailure {
+pub(super) enum FetchFailure {
     Imap(ImapError),
     Backend,
     Missing,
     Fallback(Fallback),
 }
 impl FetchFailure {
-    fn mail(self) -> MailError {
+    pub(super) fn mail(self) -> MailError {
         match self {
             Self::Imap(error) => map_read_imap_error(error),
             Self::Missing => not_found(),
@@ -163,7 +169,7 @@ fn matches_uid(attrs: &[AttributeValue<'_>], uid: u32) -> std::result::Result<bo
     Ok(first == Some(uid))
 }
 
-async fn size<S>(
+pub(super) async fn size<S>(
     session: &mut async_imap::Session<S>,
     uid: u32,
 ) -> std::result::Result<usize, FetchFailure>
@@ -326,7 +332,7 @@ where
         .collect()
 }
 
-async fn manifest<S>(
+pub(super) async fn manifest<S>(
     session: &mut async_imap::Session<S>,
     uid: u32,
 ) -> std::result::Result<PartManifest, FetchFailure>
@@ -403,13 +409,11 @@ impl MailService {
             .config
             .max_message
             .min(crate::config::DEFAULT_MAX_MESSAGE);
-        if known_size > max {
-            return Err(raw_limit(InputLimits::Read, max, known_size));
-        }
         match manifest(&mut session, uid).await {
             Ok(manifest) => Ok(LoadedManifest {
                 source: ManifestSource::Structured(manifest),
                 validity,
+                whole_size: known_size,
                 diagnostics: ManifestDiagnostics {
                     source: "bodystructure",
                     fallback_reason: None,
@@ -417,6 +421,9 @@ impl MailService {
                 },
             }),
             Err(FetchFailure::Fallback(reason)) => {
+                if known_size > max {
+                    return Err(raw_limit(InputLimits::Read, max, known_size));
+                }
                 let diagnostics = reason.diagnostics();
                 tracing::info!(
                     event = "mime_manifest_fallback",
@@ -437,6 +444,7 @@ impl MailService {
                 Ok(LoadedManifest {
                     source: ManifestSource::Raw(raw),
                     validity,
+                    whole_size: known_size,
                     diagnostics,
                 })
             }

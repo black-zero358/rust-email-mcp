@@ -39,12 +39,12 @@ JSON-RPC id 的序列化 JSON（包括引号、转义和 UTF-8 字节）最多 1
 
 读取查询及文件夹参数最多 512 个 Unicode 码点、2048 UTF-8 字节；组合字符分别计数，emoji 按实际码点计数。文件夹编码后另受 8192 modified UTF-7 字节限制。输入 Schema 同时公开字符与字节预算。错误可附最多八项字段详情，包含 JSON Pointer、限制单位和修正动作；详情过大时保留基础错误。旧写工具及其配置目录继续使用原有字节限制，`get_operation` 的操作键仍为最多 128 UTF-8 字节。
 
-MIME 在构建结构时限制为 1024 个节点、32 层嵌套，头部每段最多 128 KiB，累计最多 1 MiB、8192 行（含折行）。正文解码前按编码字节数的四倍预留共享的 32 MiB 预算，覆盖字符集转为 UTF-8 的放大；附件解码也先限制编码输入。超限返回 `LIMIT_EXCEEDED`，因此部分原始大小合规的复杂邮件或长正文仍会被拒绝。回复和草稿发送只解析有界头部，保留草稿正文原始字节。边界分隔行按完整 boundary 匹配，接受尾部空格和制表符；不再把仅具有相同前缀的行当作分隔符。
+MIME 在构建结构时限制为 1024 个节点、32 层嵌套，头部每段最多 128 KiB，累计最多 1 MiB、8192 行（含折行）。正文解码前按编码字节数的四倍预留共享的 32 MiB 预算，覆盖字符集转为 UTF-8 的放大；整封 MIME 附件解码先限制编码输入，按部件下载逐块计量编码和解码字节。超限返回 `LIMIT_EXCEEDED`，因此部分原始大小合规的复杂邮件或长正文仍会被拒绝。回复和草稿发送只解析有界头部，保留草稿正文原始字节。边界分隔行按完整 boundary 匹配，接受尾部空格和制表符；不再把仅具有相同前缀的行当作分隔符。
 
 文件夹名称在工具参数、LIST 返回值和 DRAFTS_MAILBOX/TRASH_MAILBOX 配置中使用 Unicode；返回的 name 可直接传给读取、移动或重命名工具。连接采用 IMAP4rev1，线路上的名称使用 modified UTF-7，包含 & 的名称也会正确转换。非规范或无法安全往返的服务端名称返回 MAIL_BACKEND，避免误引用其他文件夹。ASCII 搜索继续使用 US-ASCII；中文等非 ASCII 查询使用 CHARSET UTF-8 和同步 literal。服务器返回 BADCHARSET 时报告 UNSUPPORTED_CHARSET，不降级为含义不同的查询；未协商 UTF8=ACCEPT 或 IMAP4rev2。
 搜索支持日期、发件人、收件人、主题、已读、星标、已回复、附件和大小组合。会话根据关联头组织；跨文件夹定位使用精确 Message-ID。批量整理最多 50 个明确 UID，保留逐项结果，批量删除必须确认。
 
-正文支持完整或去引用模式、长度设置及省略提示。`get_email` 在正文长度上限内，按完整 JSON-RPC 响应预算返回可容纳的最长 UTF-8 正文前缀；额外截断设置 `body_truncated=true`。`body_byte_limit` 表示正文配置上限，实际正文可能因 JSON 转义、元数据和调用 id 而更短；元数据本身超限仍返回 `LIMIT_EXCEEDED`。单封 MIME 邮件上限 32 MiB，单次工具输出上限 2 MiB。附件发现和下载准备优先读取邮件结构及必要 MIME 头，并核对原有附件索引；需要整体解析时，在大小上限内回退一次整封读取。实际下载继续通过有界整封 MIME 读取，每封原始邮件和解码后的附件分别受 32 MiB 限制。新邮件支持文本；现有草稿发送保留原 MIME 附件。转发工具发送原邮件的纯文本内容。
+正文支持完整或去引用模式、长度设置及省略提示。`get_email` 在正文长度上限内，按完整 JSON-RPC 响应预算返回可容纳的最长 UTF-8 正文前缀；额外截断设置 `body_truncated=true`。`body_byte_limit` 表示正文配置上限，实际正文可能因 JSON 转义、元数据和调用 id 而更短；元数据本身超限仍返回 `LIMIT_EXCEEDED`。单封 MIME 邮件上限 32 MiB，单次工具输出上限 2 MiB。附件发现和下载准备优先读取邮件结构及必要 MIME 头，并核对原有附件索引；需要整体解析时，在大小上限内回退一次整封读取。认证 HTTP 下载按 64 KiB 分块读取所选附件，完整解码并校验后提供文件；解码附件上限 32 MiB，连接累计读取上限 128 MiB，因此可下载超过整封上限的邮件中的小附件。内联 Base64 及需要整体解析的回退仍受整封 32 MiB 限制。新邮件支持文本；现有草稿发送保留原 MIME 附件。转发工具发送原邮件的纯文本内容。
 
 `download_attachment` 保留原有内联 Base64 返回格式及输出预算。附件支持稳定 `attachment_id` 或原有 `attachment_index` 选择；`list_attachments` 返回安全文件名、大小精度、可下载状态及交付方式，`prepare_attachment_download` 返回同主体 Bearer 认证的短期 URL。下载响应提供 SHA-256，客户端可核对文件完整性。仓库提供[标准客户端适配器](scripts/attachment-client-adapter/README.md)，用于认证下载、校验及本地落盘。当前仅用模拟邮箱和合成文件离线测试下载及内容读取，ChatGPT 实际连接测试放到后续阶段。参数与范围限制见 [邮件能力扩展](docs/capabilities.md)。
 
@@ -56,7 +56,7 @@ MIME 在构建结构时限制为 1024 个节点、32 层嵌套，头部每段最
 
 HTML 在本地提取纯文本，保留实体、Unicode、段落换行和图片 alt 文本，忽略文档元数据、脚本、样式、模板及内嵌框架；不执行脚本、不加载资源，也不保留 CSS 可见性和表格排版。转换前限制解码后的 HTML 为 1 MiB、ASCII 空白、单/双引号、斜杠和等号合计最多 65536 个，以保守限制标记属性复杂度；流式处理最多 32768 个 token、1 MiB 输出，并受共享 MIME 解码预算约束。超限返回 `LIMIT_EXCEEDED`；SVG/MathML 外来命名空间与非空但无法完整解释的内联正文（包括未知或替换型字符集）整段返回 `UNSUPPORTED_BODY`，转发在记录发送意图与 SMTP 前拒绝不完整原文。真正为空的正文仍可读取和转发。所有新构建的纯文本邮件（包括转发）显式声明 `text/plain; charset=utf-8`。
 
-Content-Transfer-Encoding 缺省为 7bit，叶子解码支持 7bit、8bit、binary、Base64 和 quoted-printable，名称不区分大小写。未知或显式空编码的非空内联实体返回 `UNSUPPORTED_BODY`，alternative 可改选其他完整受支持表示；未知编码的 multipart 保持不透明，不按原始字节解释子树。显式附件仍可发现，但未知编码无法按已解码附件下载：内联下载拒绝，二进制 GET 沿既有后端失败路径返回 HTTP 502；不提供未标明的原始编码数据。
+Content-Transfer-Encoding 缺省为 7bit，叶子解码支持 7bit、8bit、binary、Base64 和 quoted-printable，名称不区分大小写。未知或显式空编码的非空内联实体返回 `UNSUPPORTED_BODY`，alternative 可改选其他完整受支持表示；未知编码的 multipart 保持不透明，不按原始字节解释子树。显式附件仍可发现，但未知编码无法按已解码附件下载：内联下载拒绝，二进制 GET 返回 HTTP 422；不提供未标明的原始编码数据。
 
 发送前由客户端向用户展示收件人和内容，并获得明确授权。所有发送工具必须提供 `operation_key`，同一发送意图重试时复用该值。
 
@@ -121,6 +121,7 @@ JWKS 暂不可用时认证返回 HTTP 503 和 `Retry-After: 10`，客户端可�
 | `OIDC_SUBJECTS` | 服务全局准入的用户 subject ID，逗号分隔；多账户还需匹配对应账户 ACL |
 | `OIDC_SCOPE` | 必需权限，默认 `email:mcp` |
 | `BIND`、`DATABASE_PATH` | 监听地址与 SQLite 文件位置 |
+| `ATTACHMENT_STAGING_DIR` | 可选的私密附件暂存目录；默认数据库父目录下的 `mail-downloads`，内存数据库需显式指定 |
 | `ACCOUNT_REGISTRY_PATH` | 可选账户注册库路径；默认位于操作库同目录的 `accounts.sqlite` |
 | `ACCOUNT_CONFIG_PATH` | 可选多账户 JSON 路径；省略时保留原单账户配置 |
 | `MAIL_SECRET_ROOT` | 多账户 JSON 中密码文件引用的根目录；文件路径必须相对于此目录 |

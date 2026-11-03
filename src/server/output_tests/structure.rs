@@ -146,6 +146,7 @@ fn body_structure() -> String {
     r#"(("TEXT" "PLAIN" NIL NIL NIL "7BIT" 5 1 NIL NIL NIL NIL)("APPLICATION" "OCTET-STREAM" ("NAME" "same.txt") NIL NIL "BASE64" 4 NIL NIL NIL NIL) "MIXED" ("BOUNDARY" "r06") NIL NIL NIL)"#.into()
 }
 fn install(h: &Harness) {
+    h.parts.install_body(7, "2", b"YWJj");
     h.structure.structures.lock().unwrap().insert(
         7,
         Reply::Data(
@@ -276,7 +277,18 @@ async fn signed_structure_fast_path_reads_only_metadata_and_keeps_raw_attachment
         axum::body::to_bytes(get.into_body(), 1024).await.unwrap(),
         b"abc".as_slice()
     );
-    assert_eq!(raw_fetches(&h), 2);
+    assert_eq!(raw_fetches(&h), 1);
+    let commands = h.structure.commands();
+    assert!(
+        commands
+            .iter()
+            .any(|(_, command)| command == "UID FETCH 7 (UID BODY.PEEK[2]<0.65536>)")
+    );
+    assert!(
+        commands
+            .iter()
+            .any(|(_, command)| command == "UID FETCH 7 (UID BODY.PEEK[2]<4.1>)")
+    );
     assert_eq!(
         h.call("list_accounts", json!({})).await["data"]["accounts"][0]["capabilities"]["part_fetch"],
         false
@@ -355,7 +367,13 @@ async fn protocol_failures_and_unknown_or_oversized_size_never_fall_back() {
             .call("list_attachments", json!({"uid":7,"uid_validity":9}))
             .await;
         assert!(result.get("error").is_some());
-        assert_eq!(structure_fetches(&h), 0);
+        assert_eq!(structure_fetches(&h), usize::from(size.is_some()));
+        if size.is_some() {
+            assert_eq!(
+                result["error"]["details"]["limit_kind"],
+                "raw_message_bytes"
+            );
+        }
         assert_eq!(raw_fetches(&h), 0);
         assert_eq!(h.connections.load(std::sync::atomic::Ordering::SeqCst), 1);
     }

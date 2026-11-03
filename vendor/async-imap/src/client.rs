@@ -1401,6 +1401,26 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
         Ok(id)
     }
 
+    /// Run one command with a BODY section literal cap until its matching completion.
+    /// Consume every response through that completion before issuing another command.
+    pub async fn run_command_with_limits<S: AsRef<str>>(
+        &mut self,
+        command: S,
+        limits: CommandReadLimits,
+    ) -> Result<RequestId> {
+        let id = self.conn.request_ids.next().unwrap();
+        self.conn.stream.set_command_limits(id.clone(), limits)?;
+        self.conn
+            .stream
+            .encode(Request(
+                Some(id.clone()),
+                command.as_ref().as_bytes().into(),
+            ))
+            .await?;
+        self.conn.stream.flush().await?;
+        Ok(id)
+    }
+
     /// Runs an arbitrary command, without adding a tag to it.
     pub async fn run_command_untagged<S: AsRef<str>>(&mut self, command: S) -> Result<()> {
         self.conn.run_command_untagged(command.as_ref()).await?;

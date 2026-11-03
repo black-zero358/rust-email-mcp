@@ -30,19 +30,21 @@
 
 `download_attachment` 保持原有 `content_type`、`size`、`base64` 返回字段和工具输出预算，新增 SHA-256 校验值。`list_attachments` 提供与 `get_email` 一致的原遍历索引（0–1023）及稳定的 `attachment_id`；`prepare_attachment_download` 和 `download_attachment` 接受 id 或索引，至少提供一个，同时提供时必须指向同一部件。这三个工具与其余账户读取工具共用可选 `account_id`，省略时选择配置默认读取账户并检查当前主体权限。稳定 id 绑定账户身份、文件夹、UIDVALIDITY、UID、遍历位置及 MIME 引用版本；下载授权由请求主体及短期句柄决定。
 
-附件描述保留原字段，增加 `safe_filename`、`declared_content_type`、`detected_content_type`、`decoded_size`、`size_accuracy`、`disposition`、`content_id`、`downloadable`、`unavailable_reason`、`delivery` 和 `checksum`。类型检测及准备阶段摘要当前为 null；identity 编码大小为 exact，Base64 为 estimate，其他为 unknown。未知传输编码列为不可下载，完整解码后才生成摘要。`delivery` 指出可用方式、认证、过期及下一动作，`client_delivery_required` 提醒客户端把下载字节交给文件解析工具。
+附件描述保留原字段，增加 `safe_filename`、`declared_content_type`、`detected_content_type`、`decoded_size`、`size_accuracy`、`disposition`、`content_id`、`downloadable`、`unavailable_reason`、`delivery` 和 `checksum`。类型检测及准备阶段摘要当前为 null；identity 编码大小为 exact，Base64 为 estimate，其他为 unknown。仅 exact 解码大小用于提前判定解码超限，估算值保留为提示。未知传输编码列为不可下载，编码部件本身达到连接累计预算时标记 `connection_bytes`；完整解码后才生成摘要。整封大小超过 raw reader 上限时不列出 `inline_base64`，符合部件预算的附件仍可使用认证 HTTP 下载。`delivery` 指出可用方式、认证、过期及下一动作，`client_delivery_required` 提醒客户端把下载字节交给文件解析工具。
 
-`list_attachments` 和 `prepare_attachment_download` 先确认邮件大小，再读取 BODYSTRUCTURE，并逐节点核对完整 MIME 头，建立与原 MIME 遍历一致的附件清单。结构超限、服务器明确拒绝结构读取或映射需要完整 MIME 时，仅在已确认整封大小不超过 32 MiB 的情况下，关闭原连接并新建连接回退一次整封读取。SIZE、必要头和 raw 命令的协议故障直接返回错误。所有步骤共用原操作期限，实际 GET 和内联下载继续整封读取、核对 UIDVALIDITY 和消息大小。
+`list_attachments` 和 `prepare_attachment_download` 先确认邮件大小，再读取 BODYSTRUCTURE，并逐节点核对完整 MIME 头，建立与原 MIME 遍历一致的附件清单。结构超限、服务器明确拒绝结构读取或映射需要完整 MIME 时，仅在已确认整封大小不超过 32 MiB 的情况下，关闭原连接并新建连接回退一次整封读取。SIZE、必要头和 raw 命令的协议故障直接返回错误。所有步骤共用原操作期限。GET 重新核对 UIDVALIDITY 和清单，分块读取所选附件；内联下载继续整封读取。
 
 两项工具可返回 `read_diagnostics`：`source` 为 `bodystructure` 或 `raw`；`fallback_reason` 为 null 或 `structure_limit`、`structure_rejected`、`mapping_unverified`、`metadata_conflict`、`whole_multipart_attachment`、`header_budget`；`limit_kind` 为 null 或 `mime_structure`。原因是固定类别，保留成功回退的依据。必要 MIME 头每命令最多 16 个 section、最多 64 个命令，单头最多 128 KiB、总证据最多 1 MiB。
 
-既有附件分类、RFC2231 文件名、原索引及整体 multipart 附件语义共用 PartManifest；附加 `.eml` 作为整体附件。每封原始邮件及解码附件仍受 32 MiB 限制，`part_fetch` 保持 false；按部件下载由 R07 接入。元数据和筛选共用单连接响应预算，超过预算明确失败。
+既有附件分类、RFC2231 文件名、原索引及整体 multipart 附件语义共用 PartManifest；附加 `.eml` 作为整体附件。整封 raw 读取及解码附件分别受 32 MiB 限制；按部件下载可读取更大邮件中的小附件，每块最多 64 KiB，连接累计最多 128 MiB。当前 R07 第一批已接入附件部件读取，局部正文在第二批交付，`part_fetch` 在两批完成后更新。元数据和筛选共用连接响应预算，超过预算明确失败。
 
 返回的 `download_url` 需要同一用户的有效 OAuth Bearer 令牌。句柄有效期 600 秒，每实例最多保存 64 个描述符，不缓存附件字节；重启后失效。它不能作为公共分享链接。最多四个二进制下载并发，响应被消费或丢弃后释放传输名额；IMAP 读取还使用共享邮箱槽位。附件列表使用 `next_attachment_offset` 分页。
 
 公开路由为 `MCP_RESOURCE/attachments/{token}`，需转发至内部 `/mcp/attachments/{token}` 并关闭包含句柄的访问日志。响应使用 `application/octet-stream`、`no-store`、`nosniff` 和安全文件名的 attachment disposition，`X-Content-SHA256` 与 `Content-Digest` 校验最终交付字节。客户端负责安全解析文件内容；[标准适配器](../scripts/attachment-client-adapter/README.md)使用独立授权会话完成下载、校验和落盘。[ChatGPT 适配设计](attachment-client-adapter-design.md)记录宿主文件接口及待验收步骤，分析请求由用户发起。
 
-附件 GET 的失败响应为带 `request_id`、固定 `phase` 和 `action` 的小型 JSON：401 重新认证，503 等待认证服务恢复；未知、过期或其他主体的句柄统一 404 并提示重新准备；UIDVALIDITY 变化返回 409；消息或部件删除返回 404；未知编码返回 422；资源超限返回 413 及限制类别；下载满额返回 429 和 `Retry-After`；后端失败/坏编码返回 502，超时返回 504。确认 IMAP tagged OK 后才判定消息缺失；缺必需属性、NO 或断连按后端失败处理。
+附件 GET 的失败响应为带 `request_id`、固定 `phase` 和 `action` 的小型 JSON：401 重新认证；认证服务暂不可用时返回 503；未知、过期或其他主体的句柄统一 404 并提示重新准备；UIDVALIDITY 变化返回 409；消息或部件删除返回 404；未知编码返回 422；资源超限返回 413 及限制类别；下载满额返回 429 和 `Retry-After`；后端失败/坏编码返回 502，超时返回 504。`connection_bytes` 指连接累计读取预算，`part_fetch_bytes` 指单次部件 FETCH 的编码 literal 预算，`decoded_attachment_bytes` 指最终解码内容预算。确认 IMAP tagged OK 后才判定消息缺失；缺必需属性、NO 或断连按后端失败处理。
+
+私密暂存目录不可用或文件操作失败时，准备/下载返回 `ATTACHMENT_STORAGE_UNAVAILABLE`，GET 使用 HTTP 503、`phase:staging`、`action:contact_operator`；管理员按[部署说明](deployment.md#准备目录与配置)检查目录和存储。文件传输开始后若读取失败，响应流结束，客户端校验长度和摘要后重新发起下载。暂存文件最多四份、每份 32 MiB，响应消费或取消后删除；运行中的文件操作完成前继续占用相应名额。
 
 
 ## 批量整理

@@ -18,6 +18,21 @@ async fn wait_for(mut condition: impl FnMut() -> bool) {
     .expect("fixture state did not settle");
 }
 
+async fn wait_for_cancel_test_connections(harness: &Harness, expected: usize, phase: &str) {
+    let result = tokio::time::timeout(Duration::from_secs(2), async {
+        while harness.active_connections.load(Ordering::SeqCst) != expected {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "phase={phase}; expected_active={expected}; active={}; accepted={}",
+        harness.active_connections.load(Ordering::SeqCst),
+        harness.connections.load(Ordering::SeqCst)
+    );
+}
+
 fn account_message(marker: &str) -> Vec<u8> {
     let subject = if marker.len() <= 128 && !marker.contains(['\r', '\n']) {
         marker
@@ -107,6 +122,7 @@ struct MultiAccount {
     journal: Arc<Journal>,
     credentials: Credentials,
     app: Router,
+    _staging: tempfile::TempDir,
 }
 impl MultiAccount {
     async fn new(max_output: usize) -> Self {
@@ -143,6 +159,8 @@ impl MultiAccount {
         )
         .await;
         let mut configuration = (**a.service.config()).clone();
+        let staging = tempfile::tempdir().unwrap();
+        configuration.attachment_staging_dir = Some(staging.path().join("mail-downloads"));
         configuration.subjects = ["alice", "bob", "both", "journal_only"]
             .map(str::to_owned)
             .to_vec();
@@ -194,6 +212,7 @@ impl MultiAccount {
             journal,
             credentials,
             app,
+            _staging: staging,
         }
     }
     fn token(&self, principal: &str) -> String {
@@ -264,7 +283,7 @@ async fn cancelled_http_reads_release_admission_backend_slots_and_connections() 
             .await
         }));
     }
-    wait_for(|| h.a.active_connections.load(Ordering::SeqCst) == 4).await;
+    wait_for_cancel_test_connections(&h.a, 4, "admission_four_running").await;
     // All four connections are blocked at the greeting. The remaining sixteen
     // calls must occupy queue admission before the overflow call is rejected.
     let overflow = tokio::time::timeout(
@@ -285,7 +304,7 @@ async fn cancelled_http_reads_release_admission_backend_slots_and_connections() 
     for request in requests {
         assert!(request.await.unwrap_err().is_cancelled());
     }
-    wait_for(|| h.a.active_connections.load(Ordering::SeqCst) == 0).await;
+    wait_for_cancel_test_connections(&h.a, 0, "cancel_all_connections").await;
     // Cancelled waiters must never start a replacement connection after one of
     // the original running calls releases a backend slot.
     tokio::time::sleep(Duration::from_millis(30)).await;

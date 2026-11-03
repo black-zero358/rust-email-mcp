@@ -26,6 +26,7 @@ use tower::ServiceExt;
 
 mod accounts;
 mod attachments;
+mod parts;
 mod structure;
 
 fn validator(name: &str) -> jsonschema::Validator {
@@ -73,7 +74,9 @@ struct Harness {
     active_connections: Arc<std::sync::atomic::AtomicUsize>,
     reject_login: Arc<std::sync::atomic::AtomicBool>,
     structure: Arc<structure::Protocol>,
+    parts: Arc<parts::Protocol>,
     imap: tokio::task::JoinHandle<()>,
+    _staging: tempfile::TempDir,
 }
 struct ActiveConnection(Arc<std::sync::atomic::AtomicUsize>);
 impl Drop for ActiveConnection {
@@ -109,6 +112,24 @@ impl Harness {
         stall_greeting: bool,
         resource: Option<String>,
     ) -> Self {
+        Self::with_limits(
+            messages,
+            fatal_uid,
+            max_output,
+            stall_greeting,
+            resource,
+            None,
+        )
+        .await
+    }
+    async fn with_limits(
+        messages: BTreeMap<u32, Vec<u8>>,
+        fatal_uid: Option<u32>,
+        max_output: usize,
+        stall_greeting: bool,
+        resource: Option<String>,
+        max_message: Option<usize>,
+    ) -> Self {
         let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let cert = certified.cert.der().clone();
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
@@ -122,9 +143,14 @@ impl Harness {
         roots.add(cert).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut configuration = (*config::fixture()).clone();
+        let staging = tempfile::tempdir().unwrap();
+        configuration.attachment_staging_dir = Some(staging.path().join("mail-downloads"));
         configuration.imap_host = "localhost".into();
         configuration.imap_port = listener.local_addr().unwrap().port();
         configuration.max_output = max_output;
+        if let Some(max_message) = max_message {
+            configuration.max_message = max_message;
+        }
         if let Some(resource) = resource {
             configuration.resource = resource;
         }
@@ -157,6 +183,8 @@ impl Harness {
         let login_rejected = reject_login.clone();
         let structure = Arc::new(structure::Protocol::default());
         let structure_protocol = structure.clone();
+        let parts = Arc::new(parts::Protocol::default());
+        let parts_protocol = parts.clone();
         let imap = tokio::spawn(async move {
             let acceptor = TlsAcceptor::from(Arc::new(tls));
             loop {
@@ -170,6 +198,7 @@ impl Harness {
                 let active = active.clone();
                 let login_rejected = login_rejected.clone();
                 let structure_protocol = structure_protocol.clone();
+                let parts_protocol = parts_protocol.clone();
                 tokio::spawn(async move {
                     let Ok(stream) = acceptor.accept(stream).await else {
                         return;
@@ -274,7 +303,10 @@ impl Harness {
                             write_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             response.extend_from_slice(b"* 1 FETCH (UID 7 FLAGS ())\r\n");
                         } else if let Some(fetch) = command.strip_prefix("UID FETCH ") {
-                            if let Some(reply) = structure_protocol.fetch(fetch, &messages) {
+                            if let Some(reply) = parts_protocol
+                                .fetch(fetch)
+                                .or_else(|| structure_protocol.fetch(fetch, &messages))
+                            {
                                 match reply {
                                     structure::Reply::Data(data) => {
                                         response.extend_from_slice(&data)
@@ -306,6 +338,11 @@ impl Harness {
                                             .await;
                                         return;
                                     }
+                                }
+                                if let Some(completion) = parts_protocol.completion(fetch, tag) {
+                                    response.extend_from_slice(&completion);
+                                    let _ = stream.write_all(&response).await;
+                                    return;
                                 }
                             } else {
                                 let (set, attrs) = fetch.split_once(' ').unwrap();
@@ -388,7 +425,9 @@ impl Harness {
             active_connections,
             reject_login,
             structure,
+            parts,
             imap,
+            _staging: staging,
         }
     }
     async fn call(&self, name: &str, args: Value) -> Value {
