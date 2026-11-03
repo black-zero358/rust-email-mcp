@@ -98,36 +98,39 @@ impl AttachmentStore {
     }
 }
 
+fn from_manifest(part: &parts::ManifestPart, hint: Option<(Option<usize>, &'static str)>) -> Part {
+    let wire_size = part.encoded_size.map_or(0, |v| v as usize);
+    let (decoded_size, size_accuracy) =
+        hint.unwrap_or_else(|| match part.transfer_encoding.as_str() {
+            "7bit" | "8bit" | "binary" => (Some(wire_size), "exact"),
+            "base64" => (Some(wire_size / 4 * 3 + wire_size % 4 * 3 / 4), "estimate"),
+            _ => (None, "unknown"),
+        });
+    Part {
+        index: part.attachment_index,
+        wire_size,
+        content_type: part.content_type.clone(),
+        filename: part
+            .filename
+            .as_ref()
+            .map(|v| v.chars().take(255).collect()),
+        attachment: part.is_attachment,
+        decoded_size,
+        size_accuracy,
+        disposition: part.disposition.clone(),
+        content_id: part.content_id.clone(),
+        encoding_supported: part.downloadable,
+    }
+}
 fn entries(raw: &[u8]) -> Result<Vec<Part>> {
     let parsed = mime::parse(raw)?;
-    let mut all = Vec::new();
-    leaves(&parsed, &mut all, 0)?;
-    Ok(all
+    let manifest = parts::from_raw(&parsed)?;
+    Ok(manifest
+        .manifest
+        .parts
         .iter()
-        .enumerate()
-        .map(|(index, part)| {
-            let (decoded_size, size_accuracy) = part.attachment_size_hint();
-            let disposition = part.get_content_disposition();
-            let disposition = match disposition.disposition {
-                mailparse::DispositionType::Inline => Some("inline".into()),
-                mailparse::DispositionType::Attachment => Some("attachment".into()),
-                mailparse::DispositionType::FormData => Some("form-data".into()),
-                mailparse::DispositionType::Extension(value) if !value.is_empty() => Some(value),
-                _ => None,
-            };
-            Part {
-                index,
-                wire_size: part.encoded_len(),
-                content_type: part.ctype.mimetype.clone(),
-                filename: part.filename().map(|v| v.chars().take(255).collect()),
-                attachment: part.is_attachment(),
-                decoded_size,
-                size_accuracy,
-                disposition,
-                content_id: part.headers.get_first_value("Content-ID"),
-                encoding_supported: part.attachment_encoding_supported(),
-            }
-        })
+        .zip(manifest.entities)
+        .map(|(metadata, entity)| from_manifest(metadata, Some(entity.attachment_size_hint())))
         .collect())
 }
 
@@ -143,17 +146,19 @@ impl MailService {
         principal: &str,
     ) -> Result<Value> {
         metadata::ensure_account(a, &self.alias)?;
-        let mut session = self.connect().await?;
         let mailbox = folder(a, InputLimits::Read)?;
         let uid = uid(a)?;
-        let state = session
-            .examine(mailbox_name(mailbox, InputLimits::Read)?)
-            .await
-            .map_err(|_| MailError::backend())?;
-        check_validity(a, state.uid_validity)?;
-        let validity = state.uid_validity.ok_or_else(MailError::backend)?;
-        let raw = self.raw_attachment(&mut session, uid).await?;
-        let entries = entries(&raw)?;
+        let loaded = self.attachment_manifest(a).await?;
+        let validity = loaded.validity;
+        let diagnostics = loaded.diagnostics;
+        let entries = match loaded.source {
+            parts::ManifestSource::Structured(manifest) => manifest
+                .parts
+                .iter()
+                .map(|part| from_manifest(part, None))
+                .collect(),
+            parts::ManifestSource::Raw(raw) => entries(&raw)?,
+        };
         let reference = AttachmentReference {
             alias: &self.alias,
             account: &self.account,
@@ -185,7 +190,7 @@ impl MailService {
                 metadata.push(item);
             }
             return Ok(
-                json!({"account_id":self.alias,"mailbox":mailbox,"uid":uid,"uid_validity":validity,"attachments":metadata,"next_attachment_offset":next,"content_trust":"untrusted"}),
+                json!({"account_id":self.alias,"mailbox":mailbox,"uid":uid,"uid_validity":validity,"attachments":metadata,"next_attachment_offset":next,"read_diagnostics":diagnostics,"content_trust":"untrusted"}),
             );
         }
         let index = select_part(&entries, a, &reference)?;
@@ -219,28 +224,28 @@ impl MailService {
             })
             .await?;
         Ok(
-            json!({"account_id":self.alias,"mailbox":mailbox,"uid":uid,"uid_validity":validity,"attachment_id":attachment_id,"attachment_index":index,"download_url":download_url(&self.config.resource,&token)?,"method":"GET","required_headers":{"Authorization":"Bearer <access_token>"},"expires_in_seconds":HANDLE_TTL.as_secs(),"delivery":metadata["delivery"],"metadata":metadata,"content_trust":"untrusted"}),
+            json!({"account_id":self.alias,"mailbox":mailbox,"uid":uid,"uid_validity":validity,"attachment_id":attachment_id,"attachment_index":index,"download_url":download_url(&self.config.resource,&token)?,"method":"GET","required_headers":{"Authorization":"Bearer <access_token>"},"expires_in_seconds":HANDLE_TTL.as_secs(),"delivery":metadata["delivery"],"metadata":metadata,"read_diagnostics":diagnostics,"content_trust":"untrusted"}),
         )
     }
     async fn fetch_attachment(&self, transfer: &Transfer) -> Result<Vec<u8>> {
         if transfer.account != self.account {
             return Err(MailError::account_unavailable());
         }
-        let mut session = self.connect().await?;
+        let mut session = self.connect_read().await?;
         let state = session
             .examine(mailbox_name(&transfer.mailbox, InputLimits::Read)?)
             .await
-            .map_err(|_| MailError::backend())?;
+            .map_err(map_read_imap_error)?;
         check_validity(
             &json!({"uid_validity":transfer.validity}),
             state.uid_validity,
         )?;
         let raw = self.raw_attachment(&mut session, transfer.uid).await?;
         let parsed = mime::parse(&raw)?;
-        let mut parts = Vec::new();
-        leaves(&parsed, &mut parts, 0)?;
+        let manifest = parts::from_raw(&parsed)?;
         decode_part(
-            parts
+            manifest
+                .entities
                 .get(transfer.part.index)
                 .ok_or_else(attachment_missing)?,
             self.config.max_message,
@@ -304,9 +309,14 @@ pub(super) fn inline_download(
     };
     let index = select_part(&entries, args, &reference)?;
     let parsed = mime::parse(raw)?;
-    let mut parts = Vec::new();
-    leaves(&parsed, &mut parts, 0)?;
-    let bytes = decode_part(parts.get(index).ok_or_else(attachment_missing)?, max)?;
+    let manifest = parts::from_raw(&parsed)?;
+    let bytes = decode_part(
+        manifest
+            .entities
+            .get(index)
+            .ok_or_else(attachment_missing)?,
+        max,
+    )?;
     Ok(json!({
         "account_id":reference.alias, "mailbox":mailbox, "uid":uid, "uid_validity":validity,
         "attachment_id":reference.id(index), "attachment_index":index,

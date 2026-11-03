@@ -32,7 +32,11 @@
 
 附件描述保留原字段，增加 `safe_filename`、`declared_content_type`、`detected_content_type`、`decoded_size`、`size_accuracy`、`disposition`、`content_id`、`downloadable`、`unavailable_reason`、`delivery` 和 `checksum`。类型检测及准备阶段摘要当前为 null；identity 编码大小为 exact，Base64 为 estimate，其他为 unknown。未知传输编码列为不可下载，完整解码后才生成摘要。`delivery` 指出可用方式、认证、过期及下一动作，`client_delivery_required` 提醒客户端把下载字节交给文件解析工具。
 
-附件发现、URL 准备和实际 GET 均使用已有有界整封读取及 MIME 解析；GET 会重新核对 UIDVALIDITY 并读取同一消息。当前不会发起 BODYSTRUCTURE 或单部分 FETCH，不能发现或下载超出整封邮件上限的内容。这样保持既有附件分类、RFC2231 文件名意图和整体 multipart 附件语义；附加 `.eml` 作为整体附件，不枚举其内部附件。每封原始邮件及解码附件均受 32 MiB 限制；元数据和筛选还共用单连接响应预算，超过预算明确失败。
+`list_attachments` 和 `prepare_attachment_download` 先确认邮件大小，再读取 BODYSTRUCTURE，并逐节点核对完整 MIME 头，建立与原 MIME 遍历一致的附件清单。结构超限、服务器明确拒绝结构读取或映射需要完整 MIME 时，仅在已确认整封大小不超过 32 MiB 的情况下，关闭原连接并新建连接回退一次整封读取。SIZE、必要头和 raw 命令的协议故障直接返回错误。所有步骤共用原操作期限，实际 GET 和内联下载继续整封读取、核对 UIDVALIDITY 和消息大小。
+
+两项工具可返回 `read_diagnostics`：`source` 为 `bodystructure` 或 `raw`；`fallback_reason` 为 null 或 `structure_limit`、`structure_rejected`、`mapping_unverified`、`metadata_conflict`、`whole_multipart_attachment`、`header_budget`；`limit_kind` 为 null 或 `mime_structure`。原因是固定类别，保留成功回退的依据。必要 MIME 头每命令最多 16 个 section、最多 64 个命令，单头最多 128 KiB、总证据最多 1 MiB。
+
+既有附件分类、RFC2231 文件名、原索引及整体 multipart 附件语义共用 PartManifest；附加 `.eml` 作为整体附件。每封原始邮件及解码附件仍受 32 MiB 限制，`part_fetch` 保持 false；按部件下载由 R07 接入。元数据和筛选共用单连接响应预算，超过预算明确失败。
 
 返回的 `download_url` 需要同一用户的有效 OAuth Bearer 令牌。句柄有效期 600 秒，每实例最多保存 64 个描述符，不缓存附件字节；重启后失效。它不能作为公共分享链接。最多四个二进制下载并发，响应被消费或丢弃后释放传输名额；IMAP 读取还使用共享邮箱槽位。附件列表使用 `next_attachment_offset` 分页。
 

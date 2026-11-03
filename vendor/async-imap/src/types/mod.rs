@@ -210,7 +210,7 @@ mod id_generator;
 pub(crate) use self::id_generator::IdGenerator;
 
 mod response_data;
-pub(crate) use self::response_data::ResponseData;
+pub use self::response_data::ResponseData;
 
 mod request;
 pub(crate) use self::request::Request;

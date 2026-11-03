@@ -120,6 +120,14 @@ where
     uid_field_search(session, start, end, "TEXT", text).await
 }
 
+fn read_imap_error(error: async_imap::error::Error) -> MailError {
+    if async_imap::error::body_structure_limit(&error).is_some() {
+        MailError::limit_kind(crate::error::LimitKind::MimeStructure)
+    } else {
+        MailError::backend()
+    }
+}
+
 pub(crate) async fn uid_field_search<S>(
     session: &mut async_imap::Session<S>,
     start: u32,
@@ -152,7 +160,7 @@ where
                     .filter(|uid| *uid >= start && *uid <= end)
                     .collect()
             })
-            .map_err(|_| MailError::backend());
+            .map_err(read_imap_error);
     }
     // A rev1 quoted string cannot carry UTF-8 octets. Use a synchronizing
     // literal, and send its bytes only after the server requests continuation.
@@ -162,12 +170,12 @@ where
             text.len()
         ))
         .await
-        .map_err(|_| MailError::backend())?;
+        .map_err(read_imap_error)?;
     loop {
         let response = session
             .read_response()
             .await
-            .map_err(|_| MailError::backend())?
+            .map_err(|error| read_imap_error(error.into()))?
             .ok_or_else(MailError::backend)?;
         match response.parsed() {
             Response::Continue(_) => break,
@@ -193,23 +201,23 @@ where
         .get_mut()
         .write_all(text.as_bytes())
         .await
-        .map_err(|_| MailError::backend())?;
+        .map_err(|error| read_imap_error(error.into()))?;
     session
         .get_mut()
         .write_all(b"\r\n")
         .await
-        .map_err(|_| MailError::backend())?;
+        .map_err(|error| read_imap_error(error.into()))?;
     session
         .get_mut()
         .flush()
         .await
-        .map_err(|_| MailError::backend())?;
+        .map_err(|error| read_imap_error(error.into()))?;
     let mut ids = HashSet::new();
     loop {
         let response = session
             .read_response()
             .await
-            .map_err(|_| MailError::backend())?
+            .map_err(|error| read_imap_error(error.into()))?
             .ok_or_else(MailError::backend)?;
         match response.parsed() {
             Response::MailboxData(MailboxDatum::Search(found)) => {
@@ -260,14 +268,14 @@ where
             "STATUS \"{quoted}\" (MESSAGES UNSEEN RECENT UIDNEXT UIDVALIDITY)"
         ))
         .await
-        .map_err(|_| MailError::backend())?;
+        .map_err(read_imap_error)?;
     let mut value = async_imap::types::Mailbox::default();
     let mut present = 0_u8;
     loop {
         let response = session
             .read_response()
             .await
-            .map_err(|_| MailError::backend())?
+            .map_err(|error| read_imap_error(error.into()))?
             .ok_or_else(MailError::backend)?;
         match response.parsed() {
             Response::MailboxData(MailboxDatum::Status {
@@ -393,6 +401,59 @@ mod tests {
 
     use super::*;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+
+    #[tokio::test]
+    async fn read_search_and_status_preserve_typed_structure_limits() {
+        for (text, after_continuation, statistics) in [
+            ("ascii", false, false),
+            ("中文", false, false),
+            ("中文", true, false),
+            ("", false, true),
+        ] {
+            let (client, server) = tokio::io::duplex(2048);
+            let backend = tokio::spawn(async move {
+                let mut server = BufReader::new(server);
+                let mut line = String::new();
+                server.read_line(&mut line).await.unwrap();
+                let tag = line.split_whitespace().next().unwrap();
+                server
+                    .write_all(format!("{tag} OK login\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                line.clear();
+                server.read_line(&mut line).await.unwrap();
+                if after_continuation {
+                    server.write_all(b"+ ready\r\n").await.unwrap();
+                    let mut literal = vec![0; text.len() + 2];
+                    server.read_exact(&mut literal).await.unwrap();
+                    assert_eq!(&literal[..text.len()], text.as_bytes());
+                }
+                server
+                    .write_all(
+                        b"* 1 FETCH (BODYSTRUCTURE (\"TEXT\" \"PLAIN\" (\"name\" {4294967295}\r\n",
+                    )
+                    .await
+                    .unwrap();
+            });
+            let mut session = async_imap::Client::new(client)
+                .login("synthetic", "test-only")
+                .await
+                .unwrap();
+            let error = if statistics {
+                status_counts(&mut session, "INBOX").await.err().unwrap()
+            } else {
+                uid_field_search(&mut session, 1, 500, "TEXT", text)
+                    .await
+                    .unwrap_err()
+            };
+            assert_eq!(error.code, "LIMIT_EXCEEDED");
+            assert_eq!(
+                serde_json::to_value(error).unwrap()["details"]["limit_kind"],
+                "mime_structure"
+            );
+            backend.await.unwrap();
+        }
+    }
 
     #[test]
     fn read_mailbox_unicode_and_wire_budgets_keep_legacy_writes_frozen() {

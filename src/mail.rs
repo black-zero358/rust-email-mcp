@@ -10,11 +10,13 @@ use crate::{
 };
 pub mod attachments;
 pub mod insights;
+mod parts;
 mod runtime;
 pub(crate) mod scheduler;
 use futures::TryStreamExt;
 use lettre::{address::Envelope, message::Mailbox};
 use mailparse::MailHeaderMap;
+use parts::map_read_imap_error;
 pub use runtime::MailRuntime;
 use scheduler::{ADMISSION_REQUESTS, EXECUTION_SLOTS};
 use serde_json::{Value, json};
@@ -195,7 +197,13 @@ impl MailService {
     }
 
     async fn connect(&self) -> Result<Session> {
-        let result = self.connect_inner().await;
+        self.connect_for(false).await
+    }
+    async fn connect_read(&self) -> Result<Session> {
+        self.connect_for(true).await
+    }
+    async fn connect_for(&self, read: bool) -> Result<Session> {
+        let result = self.connect_inner(read).await;
         if result
             .as_ref()
             .is_err_and(|error| error.code == "MAIL_BACKEND")
@@ -205,7 +213,7 @@ impl MailService {
         result
     }
 
-    async fn connect_inner(&self) -> Result<Session> {
+    async fn connect_inner(&self, read: bool) -> Result<Session> {
         let tls = ClientConfig::builder()
             .with_root_certificates(self.imap_roots())
             .with_no_client_auth();
@@ -221,14 +229,23 @@ impl MailService {
         let budget = self.config.max_message * 4;
         let (stream, _) = BudgetStream::new(stream, budget);
         let mut client = async_imap::Client::with_buffer_limit(stream, budget);
-        client
-            .read_response()
-            .await
-            .map_err(|_| MailError::backend())?;
+        client.read_response().await.map_err(|error| {
+            if read {
+                map_read_imap_error(error.into())
+            } else {
+                MailError::backend()
+            }
+        })?;
         client
             .login(&self.config.address, &self.config.password)
             .await
-            .map_err(|_| MailError::backend())
+            .map_err(|(error, _)| {
+                if read {
+                    map_read_imap_error(error)
+                } else {
+                    MailError::backend()
+                }
+            })
     }
 
     fn account_discovery(&self) -> Value {
@@ -318,7 +335,11 @@ impl MailService {
             .map_err(|_| self.backend_timeout())?
     }
     async fn imap_operation(&self, name: &str, a: &Value) -> Result<Value> {
-        let mut s = self.connect().await?;
+        let mut s = if runtime::account_read(name) {
+            self.connect_read().await?
+        } else {
+            self.connect().await?
+        };
         let result = self.with_session(&mut s, name, a).await;
         // Dropping the connection avoids CLOSE/EXPUNGE side effects and bounds logout latency.
         result
@@ -333,6 +354,13 @@ impl MailService {
         S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
     {
         validate_legacy_write_inputs(name, a, &self.config)?;
+        let imap_error = |error| {
+            if runtime::account_read(name) {
+                map_read_imap_error(error)
+            } else {
+                MailError::backend()
+            }
+        };
         match name {
             "read_conversation" | "locate_message" | "get_mailbox_statistics" => {
                 self.insight_operation(s, name, a).await
@@ -341,10 +369,10 @@ impl MailService {
                 let list = s
                     .list(Some(""), Some("*"))
                     .await
-                    .map_err(|_| MailError::backend())?
+                    .map_err(imap_error)?
                     .try_collect::<Vec<_>>()
                     .await
-                    .map_err(|_| MailError::backend())?;
+                    .map_err(imap_error)?;
                 if list.len() > 200 {
                     return Err(MailError::limit_with(LimitKind::ScanItems, 200, list.len()));
                 }
@@ -361,7 +389,7 @@ impl MailService {
                 let state = s
                     .examine(mailbox_name(folder, InputLimits::Read)?)
                     .await
-                    .map_err(|_| MailError::backend())?;
+                    .map_err(imap_error)?;
                 check_validity(a, state.uid_validity)?;
                 if name == "get_email_status" {
                     return email_status(s, uid, state.uid_validity).await;
@@ -404,7 +432,7 @@ impl MailService {
                         InputLimits::Read,
                     )?)
                     .await
-                    .map_err(|_| MailError::backend())?;
+                    .map_err(imap_error)?;
                 check_validity(a, state.uid_validity)?;
                 let mut items = Vec::new();
                 let mut stopped = false;
@@ -447,7 +475,7 @@ impl MailService {
             "create_mailbox" => {
                 s.create(mailbox_name(text(a, "name")?, InputLimits::LegacyWrite)?)
                     .await
-                    .map_err(|_| MailError::backend())?;
+                    .map_err(imap_error)?;
                 Ok(json!({"status":"created"}))
             }
             "rename_mailbox" => {
@@ -456,7 +484,7 @@ impl MailService {
                     mailbox_name(text(a, "new_name")?, InputLimits::LegacyWrite)?,
                 )
                 .await
-                .map_err(|_| MailError::backend())?;
+                .map_err(imap_error)?;
                 Ok(json!({"status":"renamed"}))
             }
             "delete_mailbox" => {
@@ -465,7 +493,7 @@ impl MailService {
                 }
                 s.delete(mailbox_name(text(a, "name")?, InputLimits::LegacyWrite)?)
                     .await
-                    .map_err(|_| MailError::backend())?;
+                    .map_err(imap_error)?;
                 Ok(json!({"status":"deleted"}))
             }
             "move_email" | "delete_email" | "mark_email" => {
@@ -475,7 +503,7 @@ impl MailService {
                         InputLimits::LegacyWrite,
                     )?)
                     .await
-                    .map_err(|_| MailError::backend())?;
+                    .map_err(imap_error)?;
                 check_validity(a, state.uid_validity)?;
                 let uid = uid(a)?.to_string();
                 match name {
@@ -493,16 +521,16 @@ impl MailService {
                         };
                         s.uid_store(uid, format!("{op} ({flag})"))
                             .await
-                            .map_err(|_| MailError::backend())?
+                            .map_err(imap_error)?
                             .try_collect::<Vec<_>>()
                             .await
-                            .map_err(|_| MailError::backend())?;
+                            .map_err(imap_error)?;
                     }
                     "delete_email" if a["permanent"] == true => {
                         if a["confirm"] != true {
                             return Err(MailError::input());
                         }
-                        let caps = s.capabilities().await.map_err(|_| MailError::backend())?;
+                        let caps = s.capabilities().await.map_err(imap_error)?;
                         if !caps.has_str("UIDPLUS") {
                             return Err(MailError {
                                 code: "UNSUPPORTED",
@@ -513,16 +541,16 @@ impl MailService {
                         }
                         s.uid_store(&uid, "+FLAGS.SILENT (\\Deleted)")
                             .await
-                            .map_err(|_| MailError::backend())?
+                            .map_err(imap_error)?
                             .try_collect::<Vec<_>>()
                             .await
-                            .map_err(|_| MailError::backend())?;
+                            .map_err(imap_error)?;
                         s.uid_expunge(&uid)
                             .await
-                            .map_err(|_| MailError::backend())?
+                            .map_err(imap_error)?
                             .try_collect::<Vec<_>>()
                             .await
-                            .map_err(|_| MailError::backend())?;
+                            .map_err(imap_error)?;
                     }
                     _ => {
                         let dest = if name == "delete_email" {
@@ -530,7 +558,7 @@ impl MailService {
                         } else {
                             text(a, "destination")?
                         };
-                        let caps = s.capabilities().await.map_err(|_| MailError::backend())?;
+                        let caps = s.capabilities().await.map_err(imap_error)?;
                         if !caps.has_str("MOVE") {
                             return Err(MailError {
                                 code: "UNSUPPORTED",
@@ -541,7 +569,7 @@ impl MailService {
                         }
                         s.uid_mv(&uid, mailbox_name(dest, InputLimits::LegacyWrite)?)
                             .await
-                            .map_err(|_| MailError::backend())?;
+                            .map_err(imap_error)?;
                     }
                 }
                 Ok(json!({"status":"updated"}))
@@ -608,13 +636,17 @@ impl MailService {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
     {
+        let imap_error = |error| match limits {
+            InputLimits::Read => map_read_imap_error(error),
+            InputLimits::LegacyWrite => MailError::backend(),
+        };
         let metadata = s
             .uid_fetch(uid.to_string(), "(UID RFC822.SIZE)")
             .await
-            .map_err(|_| MailError::backend())?
+            .map_err(imap_error)?
             .try_collect::<Vec<_>>()
             .await
-            .map_err(|_| MailError::backend())?;
+            .map_err(imap_error)?;
         let size = metadata
             .iter()
             .filter(|f| f.uid == Some(uid))
@@ -631,10 +663,10 @@ impl MailService {
                 format!("(UID BODY.PEEK[]<0.{}>)", self.config.max_message + 1),
             )
             .await
-            .map_err(|_| MailError::backend())?
+            .map_err(imap_error)?
             .try_collect::<Vec<_>>()
             .await
-            .map_err(|_| MailError::backend())?;
+            .map_err(imap_error)?;
         let body = f
             .iter()
             .filter(|f| f.uid == Some(uid))
@@ -667,7 +699,7 @@ impl MailService {
                 InputLimits::Read,
             )?)
             .await
-            .map_err(|_| MailError::backend())?;
+            .map_err(map_read_imap_error)?;
         check_validity(a, m.uid_validity)?;
         let limit = number(a, "limit", 20, 1, LIST_PAGE_ITEMS as u64)? as usize;
         let before = number(
@@ -698,11 +730,7 @@ impl MailService {
         let mut found = if has_text && query == format!("UID {start}:{end}") {
             None
         } else {
-            Some(
-                s.uid_search(query)
-                    .await
-                    .map_err(|_| MailError::backend())?,
-            )
+            Some(s.uid_search(query).await.map_err(map_read_imap_error)?)
         };
         if search {
             for (field, key) in [
@@ -762,10 +790,10 @@ impl MailService {
         let fetched = s
             .uid_fetch(set, "(UID FLAGS RFC822.SIZE BODY.PEEK[HEADER]<0.8192>)")
             .await
-            .map_err(|_| MailError::backend())?
+            .map_err(map_read_imap_error)?
             .try_collect::<Vec<_>>()
             .await
-            .map_err(|_| MailError::backend())?;
+            .map_err(map_read_imap_error)?;
         #[derive(Default)]
         struct Summary<'a> {
             header: Option<&'a [u8]>,
@@ -1338,10 +1366,10 @@ where
     let fetched = s
         .uid_fetch(uid.to_string(), "(UID FLAGS)")
         .await
-        .map_err(|_| MailError::backend())?
+        .map_err(map_read_imap_error)?
         .try_collect::<Vec<_>>()
         .await
-        .map_err(|_| MailError::backend())?;
+        .map_err(map_read_imap_error)?;
     // FETCH may also contain unsolicited updates for other messages. A target
     // update replaces its previous flags, so use the last matching response.
     let target = fetched
@@ -1530,22 +1558,13 @@ fn forward_body(raw: &[u8], note: &str) -> Result<String> {
     ))
 }
 
+#[cfg(test)]
 fn leaves<'a, 'b>(
     p: &'a mime::Part<'b>,
     out: &mut Vec<&'a mime::Part<'b>>,
     depth: usize,
 ) -> Result<()> {
-    if depth > mime::MAX_DEPTH || out.len() >= mime::MAX_PARTS {
-        return Err(MailError::limit());
-    }
-    if p.subparts.is_empty() || p.is_attachment() {
-        out.push(p);
-    } else {
-        for part in &p.subparts {
-            leaves(part, out, depth + 1)?;
-        }
-    }
-    Ok(())
+    parts::raw_leaves(p, out, depth)
 }
 #[cfg(test)]
 fn parsed(raw: &[u8], uid: u32, validity: Option<u32>, max: usize) -> Result<Value> {
@@ -1566,9 +1585,8 @@ fn parsed(raw: &[u8], uid: u32, validity: Option<u32>, max: usize) -> Result<Val
 }
 
 fn parsed_metadata(p: &mime::Part<'_>, uid: u32, validity: Option<u32>) -> Result<Value> {
-    let mut parts = Vec::new();
-    leaves(p, &mut parts, 0)?;
-    let attachments=parts.iter().enumerate().filter(|(_,p)|p.is_attachment()).map(|(i,p)|json!({"attachment_index":i,"content_type":p.ctype.mimetype,"filename":p.filename()})).collect::<Vec<_>>();
+    let manifest = parts::from_raw(p)?;
+    let attachments = manifest.manifest.parts.iter().filter(|part| part.is_attachment).map(|part| json!({"attachment_index":part.attachment_index,"content_type":part.content_type,"filename":part.filename})).collect::<Vec<_>>();
     Ok(
         json!({"uid":uid,"uid_validity":validity,"subject":p.headers.get_first_value("Subject"),"from":p.headers.get_first_value("From"),"to":p.headers.get_first_value("To"),"attachments":attachments,"content_trust":"untrusted"}),
     )

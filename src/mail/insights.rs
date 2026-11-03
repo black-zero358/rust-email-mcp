@@ -122,10 +122,10 @@ impl MailService {
                 format!("(UID BODY.PEEK[HEADER]<0.{}>)", HEADER_LIMIT + 1),
             )
             .await
-            .map_err(|_| MailError::backend())?
+            .map_err(map_read_imap_error)?
             .try_collect::<Vec<_>>()
             .await
-            .map_err(|_| MailError::backend())?;
+            .map_err(map_read_imap_error)?;
         let bytes = items
             .iter()
             .filter(|f| f.uid == Some(uid))
@@ -180,7 +180,7 @@ impl MailService {
             let state = s
                 .examine(mailbox_name(mailbox, InputLimits::Read)?)
                 .await
-                .map_err(|_| MailError::backend())?;
+                .map_err(map_read_imap_error)?;
             require_reference(&state)?;
             let (start, end) = window(a, state.uid_next)?;
             let mut ids = if state.exists == 0 || end == 0 {
@@ -191,7 +191,7 @@ impl MailService {
                     quote(&target)?
                 ))
                 .await
-                .map_err(|_| MailError::backend())?
+                .map_err(map_read_imap_error)?
                 .into_iter()
                 .filter(|id| *id >= start && *id <= end)
                 .collect::<Vec<_>>()
@@ -232,7 +232,7 @@ impl MailService {
         let state = s
             .examine(mailbox_name(mailbox, InputLimits::Read)?)
             .await
-            .map_err(|_| MailError::backend())?;
+            .map_err(map_read_imap_error)?;
         require_reference(&state)?;
         check_validity(a, state.uid_validity)?;
         let candidate_limit = number(a, "candidate_limit", 100, 1, 200)? as usize;
@@ -247,7 +247,7 @@ impl MailService {
         } else {
             s.uid_search(format!("UID {start}:{end}"))
                 .await
-                .map_err(|_| MailError::backend())?
+                .map_err(map_read_imap_error)?
                 .into_iter()
                 .filter(|id| *id >= start && *id <= end && *id != seed)
                 .collect::<Vec<_>>()
@@ -365,7 +365,7 @@ impl MailService {
             let state = s
                 .examine(mailbox_name(mailbox, InputLimits::Read)?)
                 .await
-                .map_err(|_| MailError::backend())?;
+                .map_err(map_read_imap_error)?;
             require_reference(&state)?;
             let (lower, upper) = window(a, state.uid_next)?;
             let mut day = start;
@@ -381,7 +381,7 @@ impl MailService {
                         next.imap()
                     ))
                     .await
-                    .map_err(|_| MailError::backend())?
+                    .map_err(map_read_imap_error)?
                     .iter()
                     .filter(|id| **id >= lower && **id <= upper)
                     .count()
@@ -401,7 +401,7 @@ impl MailService {
         let mut stages = vec![json!({"stage":"mcp_auth","status":"passed"})];
         let failed_backend = |stages: &mut Vec<Value>, phase: &str| {
             self.record_backend_failure();
-            diagnostic_failure(stages, phase)
+            Ok::<Value, MailError>(diagnostic_failure(stages, phase))
         };
         let diagnose = async {
             let tcp =
@@ -415,7 +415,7 @@ impl MailService {
                 .with_no_client_auth();
             let name = match ServerName::try_from(self.config.imap_host.clone()) {
                 Ok(name) => name,
-                Err(_) => return diagnostic_failure(&mut stages, "tls"),
+                Err(_) => return Ok(diagnostic_failure(&mut stages, "tls")),
             };
             let stream = match TlsConnector::from(Arc::new(tls)).connect(name, tcp).await {
                 Ok(stream) => stream,
@@ -424,21 +424,25 @@ impl MailService {
             stages.push(json!({"stage":"tls","status":"passed"}));
             let (stream, _) = BudgetStream::new(stream, 128 * 1024);
             let mut client = async_imap::Client::with_buffer_limit(stream, 128 * 1024);
-            if !client
-                .read_response()
-                .await
-                .ok()
-                .flatten()
-                .is_some_and(|response| {
-                    matches!(
-                        response.parsed(),
-                        imap_proto::Response::Data {
-                            status: imap_proto::Status::Ok,
-                            ..
-                        }
-                    )
-                })
-            {
+            let greeting = match client.read_response().await {
+                Ok(response) => response,
+                Err(error) => {
+                    let error = async_imap::error::Error::Io(error);
+                    if async_imap::error::body_structure_limit(&error).is_some() {
+                        return Err(map_read_imap_error(error));
+                    }
+                    return failed_backend(&mut stages, "greeting");
+                }
+            };
+            if !greeting.is_some_and(|response| {
+                matches!(
+                    response.parsed(),
+                    imap_proto::Response::Data {
+                        status: imap_proto::Status::Ok,
+                        ..
+                    }
+                )
+            }) {
                 return failed_backend(&mut stages, "greeting");
             }
             stages.push(json!({"stage":"greeting","status":"passed"}));
@@ -447,19 +451,31 @@ impl MailService {
                 .await
             {
                 Ok(session) => session,
-                Err(_) => return failed_backend(&mut stages, "login"),
+                Err((error, _)) => {
+                    if async_imap::error::body_structure_limit(&error).is_some() {
+                        return Err(map_read_imap_error(error));
+                    }
+                    return failed_backend(&mut stages, "login");
+                }
             };
             stages.push(json!({"stage":"login","status":"passed"}));
             let capabilities = match session.capabilities().await {
                 Ok(caps) => json!({"move":caps.has_str("MOVE"),"uidplus":caps.has_str("UIDPLUS"),
                     "imap4rev1":caps.has_str("IMAP4rev1"),"imap4rev2":caps.has_str("IMAP4rev2")}),
-                Err(_) => return diagnostic_failure(&mut stages, "capability"),
+                Err(error) => {
+                    if async_imap::error::body_structure_limit(&error).is_some() {
+                        return Err(map_read_imap_error(error));
+                    }
+                    return Ok(diagnostic_failure(&mut stages, "capability"));
+                }
             };
             stages.push(json!({"stage":"capability","status":"passed"}));
-            json!({"ok":true,"stages":stages,"capabilities":capabilities,"service":"imap","smtp_tested":false})
+            Ok(
+                json!({"ok":true,"stages":stages,"capabilities":capabilities,"service":"imap","smtp_tested":false}),
+            )
         };
         match tokio::time::timeout(self.config.timeout, diagnose).await {
-            Ok(value) => Ok(value),
+            Ok(value) => value,
             Err(_) => {
                 self.record_backend_failure();
                 Ok(

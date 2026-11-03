@@ -26,6 +26,7 @@ use tower::ServiceExt;
 
 mod accounts;
 mod attachments;
+mod structure;
 
 fn validator(name: &str) -> jsonschema::Validator {
     let tool = tools("full").into_iter().find(|t| t.name == name).unwrap();
@@ -71,6 +72,7 @@ struct Harness {
     stall_greeting: Arc<std::sync::atomic::AtomicBool>,
     active_connections: Arc<std::sync::atomic::AtomicUsize>,
     reject_login: Arc<std::sync::atomic::AtomicBool>,
+    structure: Arc<structure::Protocol>,
     imap: tokio::task::JoinHandle<()>,
 }
 struct ActiveConnection(Arc<std::sync::atomic::AtomicUsize>);
@@ -153,11 +155,13 @@ impl Harness {
         let active = active_connections.clone();
         let reject_login = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let login_rejected = reject_login.clone();
+        let structure = Arc::new(structure::Protocol::default());
+        let structure_protocol = structure.clone();
         let imap = tokio::spawn(async move {
             let acceptor = TlsAcceptor::from(Arc::new(tls));
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
-                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let connection = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                 let acceptor = acceptor.clone();
                 let messages = messages.clone();
                 let write_count = write_count.clone();
@@ -165,6 +169,7 @@ impl Harness {
                 let stall = stall.clone();
                 let active = active.clone();
                 let login_rejected = login_rejected.clone();
+                let structure_protocol = structure_protocol.clone();
                 tokio::spawn(async move {
                     let Ok(stream) = acceptor.accept(stream).await else {
                         return;
@@ -195,6 +200,7 @@ impl Harness {
                             panic!("invalid fixture command");
                         };
                         let mut response = Vec::new();
+                        structure_protocol.record(connection, command);
                         if command.starts_with("LOGIN ") {
                             if login_rejected.swap(false, std::sync::atomic::Ordering::SeqCst) {
                                 let _ = stream
@@ -214,7 +220,8 @@ impl Harness {
                                 write_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             }
                             let next = messages.keys().next_back().copied().unwrap_or(0) + 1;
-                            response.extend_from_slice(format!("* {} EXISTS\r\n* OK [UIDVALIDITY 9] stable\r\n* OK [UIDNEXT {next}] next\r\n",messages.len()).as_bytes());
+                            let validity = structure_protocol.validity(connection);
+                            response.extend_from_slice(format!("* {} EXISTS\r\n* OK [UIDVALIDITY {validity}] stable\r\n* OK [UIDNEXT {next}] next\r\n",messages.len()).as_bytes());
                         } else if command.starts_with("LIST ") {
                             response.extend_from_slice(b"* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n* LIST (\\NoSelect) NIL \"Group\"\r\n* LIST (\\Sent) \"/\" \"Sent\"\r\n");
                         } else if command.starts_with("STATUS ") {
@@ -267,39 +274,76 @@ impl Harness {
                             write_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             response.extend_from_slice(b"* 1 FETCH (UID 7 FLAGS ())\r\n");
                         } else if let Some(fetch) = command.strip_prefix("UID FETCH ") {
-                            let (set, attrs) = fetch.split_once(' ').unwrap();
-                            for uid in set.split(',').map(|id| id.parse::<u32>().unwrap()) {
-                                let Some(raw) = messages.get(&uid) else {
-                                    continue;
-                                };
-                                if fatal_uid == Some(uid) && attrs.contains("BODY.PEEK[]") {
-                                    stream
-                                        .write_all(
-                                            format!("{tag} NO synthetic failure\r\n").as_bytes(),
-                                        )
-                                        .await
-                                        .unwrap();
-                                    return;
+                            if let Some(reply) = structure_protocol.fetch(fetch, &messages) {
+                                match reply {
+                                    structure::Reply::Data(data) => {
+                                        response.extend_from_slice(&data)
+                                    }
+                                    structure::Reply::No => {
+                                        let _ = stream
+                                            .write_all(
+                                                format!("{tag} NO synthetic structure refusal\r\n")
+                                                    .as_bytes(),
+                                            )
+                                            .await;
+                                        continue;
+                                    }
+                                    structure::Reply::Bad => {
+                                        let _ = stream
+                                            .write_all(
+                                                format!(
+                                                    "{tag} BAD synthetic structure refusal\r\n"
+                                                )
+                                                .as_bytes(),
+                                            )
+                                            .await;
+                                        continue;
+                                    }
+                                    structure::Reply::Eof => return,
+                                    structure::Reply::WrongTag => {
+                                        let _ = stream
+                                            .write_all(b"wrong-tag OK synthetic completion\r\n")
+                                            .await;
+                                        return;
+                                    }
                                 }
-                                if attrs == "(UID FLAGS)" {
-                                    response.extend_from_slice(
-                                        format!("* 1 FETCH (UID {uid} FLAGS ())\r\n").as_bytes(),
-                                    );
-                                } else if attrs == "(UID RFC822.SIZE)" {
-                                    response.extend_from_slice(
-                                        format!(
-                                            "* 1 FETCH (UID {uid} RFC822.SIZE {})\r\n",
-                                            raw.len()
-                                        )
-                                        .as_bytes(),
-                                    );
-                                } else {
-                                    let is_header = attrs.contains("HEADER");
-                                    let bytes = if is_header { header(raw) } else { raw };
-                                    let section = if is_header { "HEADER" } else { "" };
-                                    response.extend_from_slice(format!("* 1 FETCH (UID {uid} FLAGS () RFC822.SIZE {} BODY[{section}] {{{}}}\r\n",raw.len(),bytes.len()).as_bytes());
-                                    response.extend_from_slice(bytes);
-                                    response.extend_from_slice(b")\r\n");
+                            } else {
+                                let (set, attrs) = fetch.split_once(' ').unwrap();
+                                for uid in set.split(',').map(|id| id.parse::<u32>().unwrap()) {
+                                    let Some(raw) = messages.get(&uid) else {
+                                        continue;
+                                    };
+                                    if fatal_uid == Some(uid) && attrs.contains("BODY.PEEK[]") {
+                                        stream
+                                            .write_all(
+                                                format!("{tag} NO synthetic failure\r\n")
+                                                    .as_bytes(),
+                                            )
+                                            .await
+                                            .unwrap();
+                                        return;
+                                    }
+                                    if attrs == "(UID FLAGS)" {
+                                        response.extend_from_slice(
+                                            format!("* 1 FETCH (UID {uid} FLAGS ())\r\n")
+                                                .as_bytes(),
+                                        );
+                                    } else if attrs == "(UID RFC822.SIZE)" {
+                                        response.extend_from_slice(
+                                            format!(
+                                                "* 1 FETCH (UID {uid} RFC822.SIZE {})\r\n",
+                                                raw.len()
+                                            )
+                                            .as_bytes(),
+                                        );
+                                    } else {
+                                        let is_header = attrs.contains("HEADER");
+                                        let bytes = if is_header { header(raw) } else { raw };
+                                        let section = if is_header { "HEADER" } else { "" };
+                                        response.extend_from_slice(format!("* 1 FETCH (UID {uid} FLAGS () RFC822.SIZE {} BODY[{section}] {{{}}}\r\n",raw.len(),bytes.len()).as_bytes());
+                                        response.extend_from_slice(bytes);
+                                        response.extend_from_slice(b")\r\n");
+                                    }
                                 }
                             }
                         } else {
@@ -343,6 +387,7 @@ impl Harness {
             stall_greeting,
             active_connections,
             reject_login,
+            structure,
             imap,
         }
     }

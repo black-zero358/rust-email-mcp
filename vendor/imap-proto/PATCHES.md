@@ -62,8 +62,15 @@ R06 manifest work package.
 
 ## Verification
 
+Recursive multipart and message parsing uses sequential field parsing and
+special-type prefix dispatch to keep debug-build parser frames small. Streaming
+prefix probes preserve `Incomplete` before selecting a variant, including exact
+small string budgets where TEXT/MESSAGE labels use static AST strings. This
+retains the recoverable basic-type fallback without constructing a recursive
+four-way alternative result at every MIME level.
+
 The root `tests/body_structure_budget.rs` suite runs under the normal locked CI
-tests. Its 20 cases cover exact/overflow boundaries, multiple structures sharing
+tests. Its cases cover exact/overflow boundaries, multiple structures sharing
 one response budget, nested messages/envelopes, optional fields, incomplete
 literals/quotes, lossy text, container accounting, grammar rollback and unchanged
 ordinary FETCH/BODY behavior. Run `cargo test --locked --test body_structure_budget`.

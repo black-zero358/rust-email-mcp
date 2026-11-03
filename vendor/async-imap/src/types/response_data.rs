@@ -5,6 +5,7 @@ use imap_proto::{RequestId, Response};
 use self_cell::self_cell;
 
 self_cell!(
+    /// An owned response buffer and its parsed, borrowing protocol value.
     pub struct ResponseData {
         owner: BytesMut,
 
@@ -31,6 +32,7 @@ impl fmt::Debug for ResponseData {
 }
 
 impl ResponseData {
+    /// The tag of a completed command, if this is a tagged response.
     pub fn request_id(&self) -> Option<&RequestId> {
         match self.borrow_dependent() {
             Response::Done { tag, .. } => Some(tag),
@@ -38,6 +40,7 @@ impl ResponseData {
         }
     }
 
+    /// Borrow the protocol value while retaining its backing response buffer.
     pub fn parsed(&self) -> &Response<'_> {
         self.borrow_dependent()
     }

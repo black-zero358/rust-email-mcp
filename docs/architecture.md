@@ -17,6 +17,7 @@
 | `mail` | IMAP 会话、邮件操作编排、发送意图与结果记录 | 调用 `imap_text`、`mime`、`smtp`、`journal`，持有执行槽位 |
 | `mail/runtime`、`mail/scheduler` | 按主体和账户路由、全局准入及公平调度 | 授权先于队列、缓存和连接；固定原写账户，保持发送生命周期 |
 | `mail/attachments`、`mail/insights` | 附件交付及有界读取扩展 | 由 `mail` 编排，共用 MIME、协议、槽位与预算 |
+| `mail/parts` | BODYSTRUCTURE、必要 MIME 头和 raw MIME 的统一附件清单 | 核对原 DFS 索引后发布引用；读回退有独立大小证据、次数及总期限边界 |
 | `imap_text` | rev1 邮箱名、非 ASCII 搜索与严格统计 STATUS | 处理编码、literal 和命令终结；不承担 MCP 授权 |
 | `mime`、`html` | 有界 MIME 解析、正文选择、附件分类、HTML 文本提取 | `mime` 调用 `html`；不执行网络请求、不发送邮件 |
 | `smtp` | 经验证 TLS/AUTH 的提交事务及独立清理 | 返回事务结果；由 `mail` 调用 `journal` 持久化，不在适配器中自动重试 |
@@ -70,7 +71,7 @@ default 的 `AccountKey` 包含持久 UUID 与配置世代（v1 为 1），存�
 
 R06 的协议基础在本地 `imap-proto` 中增加 `Response::parse_bounded`，async-imap 的 decode 默认使用该入口；原 `Response::parse` 继续作为上游兼容接口。每个完整响应中的 BODYSTRUCTURE 共用深度 32、节点 1024、单字符串 128 KiB、单节点参数对 256、总参数对 8192 和累计结构记账 1 MiB 的预算。嵌套 message/envelope、扩展列表、参数、语言和地址均纳入预算，literal 声明在请求更多输入前检查，字符串转换和容器容量在分配路径核算。可恢复的解析分支回溯恢复相应计数；预算耗尽沿不可恢复 Failure 传播。
 
-预算错误仅携带固定类别、上限和单位。async-imap 通过 `error::body_structure_limit` 识别该类型，预算错误路径直接返回静态信息；原连接字节/缓冲限制与 tagged completion 规则继续生效。该协议基础子包先交付解析器与 typed helper，当前工具继续使用有界整封读取；后续 R06 PartManifest 工作包负责工具层 `LIMIT_EXCEEDED/mime_structure` 映射、必要 MIME 头核对及受控整封回退。来源和维护规则见 [imap-proto 补丁记录](../vendor/imap-proto/PATCHES.md)。
+预算错误仅携带固定类别、上限和单位。async-imap 通过 `error::body_structure_limit` 识别该类型，预算错误路径直接返回静态信息；读取路径使用统一错误映射生成 `LIMIT_EXCEEDED/mime_structure`。原连接字节/缓冲限制与 tagged completion 规则继续生效。来源和维护规则见 [imap-proto 补丁记录](../vendor/imap-proto/PATCHES.md)。
 
 IMAP 文本模式固定为 rev1：所有邮箱参数编码为 modified UTF-7，LIST 名称解码为 Unicode 后验证规范往返。不得直接把 UTF-8 字节放入 quoted search；非 ASCII 查询使用 `CHARSET UTF-8` 与同步 literal，等待 continuation 和对应命令的 tagged OK。`BADCHARSET` 返回 `UNSUPPORTED_CHARSET`，不降级为含义不同的查询。当前未协商 `UTF8=ACCEPT` 或 IMAP4rev2。
 
@@ -78,9 +79,11 @@ async-imap 0.12 的 APPEND flags 原样序列化，必须传入 `(\Draft)` 这�
 
 APPEND 等待同步 literal continuation 时，先将合法 untagged 通知交给现有有界 unsolicited 队列，再继续读取；只有 `Continue` 才发送正文。continuation 前任何 tagged 结果（包括提前 OK 和错误 tag）、BYE、EOF 或读取错误均失败且不发送 literal，拒绝后排队的 continuation 不能恢复命令。完整 literal 后仍等待匹配 tag 的 OK。`save_draft_waits_for_continuation_after_notifications` 和 `save_draft_append_protocol` 覆盖这一 D2 协议边界；不改变草稿 flags/MIME 或发送策略。
 
-`mail/attachments.rs` 编排有界整封读取和下载生命周期，`mail/attachments/metadata.rs` 负责稳定引用、索引选择及描述。`get_email`、列表、内联 Base64 和二进制下载共用原 MIME 遍历索引（0–1023）与附件子树边界。`att_v1_` 引用用带域分离的 SHA-256 绑定 AccountKey 命名空间、文件夹、UIDVALIDITY、UID、索引和 MIME 引用版本；同时传入 id/index 时核对一致性。描述中的原文件名保留展示用途，安全文件名另行约束路径字符、控制字符、长度及保留设备名。
+`mail/parts` 负责有界 BODYSTRUCTURE/必要 MIME 头与原 raw MIME 的统一 PartManifest；`mail/attachments.rs` 编排附件清单、准备和下载生命周期，`mail/attachments/metadata.rs` 负责稳定引用、索引选择及描述。`get_email`、列表、内联 Base64 和二进制下载共用原 MIME 遍历索引（0–1023）与附件子树边界。`att_v1_` 引用用带域分离的 SHA-256 绑定 AccountKey 命名空间、文件夹、UIDVALIDITY、UID、索引和 MIME 引用版本；同时传入 id/index 时核对一致性。描述中的原文件名保留展示用途，安全文件名另行约束路径字符、控制字符、长度及保留设备名。
 
-`prepare_attachment_download` 保存最多 64 个主体绑定、600 秒有效的元数据句柄。GET 再核对主体、AccountKey、UIDVALIDITY 并重新读取整封邮件；不引入 BODYSTRUCTURE 或单部分 FETCH。四份二进制传输许可持有至响应消费或丢弃，邮箱连接共用原槽位与预算。附件路径按 [RFC 3501 §6.4.5](https://www.rfc-editor.org/rfc/rfc3501#section-6.4.5) 核对完整 BODY[] 长度与 RFC822.SIZE 一致；完整解码并通过匹配 tagged OK 后计算 `X-Content-SHA256` 和 `Content-Digest`。HTTP 内容固定为 octet-stream，带 no-store/nosniff。错误映射见[附件契约](capabilities.md#附件与兼容性)，认证错误同样返回带 request_id 的小型 JSON。仅完成命令且未出现目标 UID 才判为消息不存在；目标 UID 缺必需属性、大小不一致及命令失败返回后端错误。
+附件列表和准备先以独立 UID FETCH 命令取得 RFC822.SIZE 并等待 tagged OK，再取得 BODYSTRUCTURE，逐条筛选目标 UID 和必需属性。只有确认原始大小不超过配置/32 MiB 上限后，才允许结构超限、明确结构拒绝或映射待核对触发一次新连接 raw 回退。发布索引前，逐个核对实际 DFS 节点的完整 MIME 头；确认整体附件或 message/rfc822 后停止展开该子树。重复 MIME 元数据、Base64/QP multipart 或缺少 boundary 的 multipart 进入受控整封回退，保持与 raw 解析的索引一致。必要头 section 由服务器端生成，每命令最多 16 个、最多 64 命令、单头 128 KiB、合计 1 MiB；按 UID、section、origin 和必需属性核对，并等待每个命令完成。协议失败直接返回；头证据超出预算允许一次 raw 回退。第二连接重新 EXAMINE 并核对 UIDVALIDITY，沿用原操作 deadline，raw 失败直接结束。成功结果通过固定 `read_diagnostics` 保留来源和回退原因。
+
+`prepare_attachment_download` 保存最多 64 个主体绑定、600 秒有效的元数据句柄。GET 再核对主体、AccountKey、UIDVALIDITY 并重新读取整封邮件，部件下载由 R07 接入。四份二进制传输许可持有至响应消费或丢弃，邮箱连接共用原槽位与预算。附件路径按 [RFC 3501 §6.4.5](https://www.rfc-editor.org/rfc/rfc3501#section-6.4.5) 核对完整 BODY[] 长度与 RFC822.SIZE 一致；完整解码并通过匹配 tagged OK 后计算 `X-Content-SHA256` 和 `Content-Digest`。HTTP 内容固定为 octet-stream，带 no-store/nosniff。错误映射见[附件契约](capabilities.md#附件与兼容性)，认证错误同样返回带 request_id 的小型 JSON。仅完成命令且未出现目标 UID 才判为消息不存在；目标 UID 缺必需属性、大小不一致及命令失败返回后端错误。
 
 `mail/insights.rs` 提供有界标识符图会话、精确 Message-ID 定位、严格 STATUS 统计、脱敏诊断与正文展示。头部缓存最多 256 项/16 MiB、60 秒，只保存不可变头部并以新 UIDVALIDITY 失效；正文共用 `mime`/`html` 选择器。统计用 `imap_text::status_counts` 验证完整字段和命令完成。批量修改使用明确 UID、总体期限和逐项结果，失败项保守为 unknown、后续 unprocessed；没有持久化修改日志，重试前必须检查邮箱。范围与限制见 [能力说明](capabilities.md)。
 
@@ -161,6 +164,8 @@ SMTPUTF8 需求与确定拒绝对应 D3/D4：`mime::requires_smtputf8`、`smtp::
 ## Decision records
 
 R06 parser 基础对应 D2/D3/D5：`tests/body_structure_budget.rs` 在默认根测试中覆盖结构预算、分配记账、正常响应分段、typed 错误及 Client 终止；`scripts/test-audit-dependencies.sh` 核对两个 path 包的上游审计视图与失败清理，`scripts/test-docker-context.sh` 核对两个允许的 vendor 目录。原完成状态、字节预算和邮件回归继续执行。解析器的预算限制与流式附件/PartManifest 功能分工作包交付。
+
+R06 附件映射对应 D2/D3/D5：`mail::parts` 的 mapping/raw 差分与 reader 回归核对原 DFS 索引、每节点头证据、特殊 multipart 和头预算；`server::output_tests::structure` 使用本地 TLS IMAP 与认证 HTTP MCP 核对实际命令、一次新连接回退、世代变化和协议失败。账户测试继续检查同 UID 的引用隔离；`imap_text` 回归覆盖 ASCII/Unicode 搜索及 STATUS 的结构预算错误分类。
 
 R05 的 D1/D3/D4/D5 回归入口：`accounts/catalog/tests` 与 `config/account_config/tests` 覆盖显式 ACL、默认账户、世代、秘密引用、v1/v2 迁移、发布失败恢复和原 Journal 字节保留；`mail/scheduler/tests` 覆盖全局额度、公平借槽、取消和超时。`server/output_tests/accounts` 通过真实 HTTP/JWT 与双模拟邮箱核对同 UID 隔离、按主体发现、默认读取与旧写目标、历史发送查询、附件撤权、账户独立退避及完整响应预算。`cancelled_http_reads_release_admission_backend_slots_and_connections` 验证 4 个运行/16 个排队读取的取消释放，`in_flight_attachment_gets_stop_on_disconnect_revocation_and_account_removal` 验证下载断连及账户取消释放。
 
