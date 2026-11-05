@@ -130,21 +130,7 @@ impl Cache {
             return Err(CacheError::OutOfScope);
         }
         self.update_message(reference, |tx, id| {
-            let updated = tx.execute(
-                "UPDATE messages SET header=?2,complete_header=?3,index_text=?4
-                 WHERE id=?1 AND (?3 OR NOT complete_header)",
-                params![id, header, complete, index_text],
-            )?;
-            if updated != 0 {
-                tx.execute("DELETE FROM message_index WHERE rowid=?1", [id])?;
-                if let Some(text) = index_text {
-                    tx.execute(
-                        "INSERT INTO message_index(rowid,text) VALUES(?1,?2)",
-                        params![id, text],
-                    )?;
-                }
-            }
-            Ok(())
+            write_headers(tx, id, complete, header, index_text)
         })
     }
 
@@ -465,7 +451,35 @@ impl Cache {
     }
 }
 
-fn mark_tombstone(tx: &Transaction<'_>, id: i64, full_schema: bool) -> Result<(), CacheError> {
+pub(super) fn write_headers(
+    tx: &Transaction<'_>,
+    id: i64,
+    complete: bool,
+    header: &[u8],
+    index_text: Option<&str>,
+) -> Result<(), CacheError> {
+    let updated = tx.execute(
+        "UPDATE messages SET header=?2,complete_header=?3,index_text=?4
+         WHERE id=?1 AND (?3 OR NOT complete_header)",
+        params![id, header, complete, index_text],
+    )?;
+    if updated != 0 {
+        tx.execute("DELETE FROM message_index WHERE rowid=?1", [id])?;
+        if let Some(text) = index_text {
+            tx.execute(
+                "INSERT INTO message_index(rowid,text) VALUES(?1,?2)",
+                params![id, text],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn mark_tombstone(
+    tx: &Transaction<'_>,
+    id: i64,
+    full_schema: bool,
+) -> Result<(), CacheError> {
     if full_schema {
         tx.execute("DELETE FROM artifacts WHERE message_id=?1", [id])?;
     }

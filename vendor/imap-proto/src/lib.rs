@@ -113,6 +113,16 @@ impl<'a> Response<'a> {
         bounded::parse_response_with_search_limit(msg, limits, max_uids)
     }
 
+    /// Parse bounded mailbox notifications and UID FETCH metadata without
+    /// entering the SEARCH or BODYSTRUCTURE grammars.
+    pub fn parse_bounded_mailbox_metadata(
+        msg: &'a [u8],
+        limits: &bounded::BodyStructureLimits,
+        max_header_bytes: usize,
+    ) -> bounded::ParseResult<'a> {
+        bounded::parse_mailbox_metadata(msg, limits, max_header_bytes)
+    }
+
     pub fn into_owned(self) -> Response<'static> {
         match self {
             Response::Capabilities(capabilities) => Response::Capabilities(

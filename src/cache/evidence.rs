@@ -1,7 +1,7 @@
 //! Attribute and LIST snapshots obtained from completed IMAP observations.
 use super::{Cache, CacheError, DirtyStamp, Ref, ScopeSnapshot, thread_index::current_scope};
 use crate::accounts::AccountKey;
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use serde::{Deserialize, Serialize};
 
 const FLAGS_BYTES: usize = 8192;
@@ -74,25 +74,7 @@ impl Cache {
         }
         let flags = evidence.flags.map(encode_flags).transpose()?;
         self.update_message(reference, |tx, id| {
-            tx.execute(
-                "INSERT INTO listing_evidence VALUES(
-                    ?1,?2,CASE WHEN ?2 IS NOT NULL THEN ?5 END,
-                    ?3,CASE WHEN ?3 IS NOT NULL THEN ?5 END,
-                    ?4,CASE WHEN ?4 IS NOT NULL THEN ?5 END,?5)
-                 ON CONFLICT(message_id) DO UPDATE SET
-                   flags=CASE WHEN excluded.flags_checked_at_ms>=coalesce(flags_checked_at_ms,-1)
-                              THEN excluded.flags ELSE flags END,
-                   flags_checked_at_ms=coalesce(max(flags_checked_at_ms,excluded.flags_checked_at_ms),flags_checked_at_ms,excluded.flags_checked_at_ms),
-                   internal_date=CASE WHEN excluded.date_checked_at_ms>=coalesce(date_checked_at_ms,-1)
-                              THEN excluded.internal_date ELSE internal_date END,
-                   date_checked_at_ms=coalesce(max(date_checked_at_ms,excluded.date_checked_at_ms),date_checked_at_ms,excluded.date_checked_at_ms),
-                   size=CASE WHEN excluded.size_checked_at_ms>=coalesce(size_checked_at_ms,-1)
-                              THEN excluded.size ELSE size END,
-                   size_checked_at_ms=coalesce(max(size_checked_at_ms,excluded.size_checked_at_ms),size_checked_at_ms,excluded.size_checked_at_ms),
-                   observed_at_ms=max(observed_at_ms,excluded.observed_at_ms)",
-                params![id, flags, evidence.internal_date, evidence.size, evidence.observed_at_ms],
-            )?;
-            Ok(())
+            write_listing(tx, id, evidence, flags.as_deref())
         })
     }
 
@@ -336,6 +318,33 @@ impl Cache {
     }
 }
 
+pub(super) fn write_listing(
+    tx: &Transaction<'_>,
+    id: i64,
+    evidence: ListingEvidence<'_>,
+    flags: Option<&[u8]>,
+) -> Result<(), CacheError> {
+    tx.execute(
+        "INSERT INTO listing_evidence VALUES(
+            ?1,?2,CASE WHEN ?2 IS NOT NULL THEN ?5 END,
+            ?3,CASE WHEN ?3 IS NOT NULL THEN ?5 END,
+            ?4,CASE WHEN ?4 IS NOT NULL THEN ?5 END,?5)
+         ON CONFLICT(message_id) DO UPDATE SET
+           flags=CASE WHEN excluded.flags_checked_at_ms>=coalesce(flags_checked_at_ms,-1)
+                      THEN excluded.flags ELSE flags END,
+           flags_checked_at_ms=coalesce(max(flags_checked_at_ms,excluded.flags_checked_at_ms),flags_checked_at_ms,excluded.flags_checked_at_ms),
+           internal_date=CASE WHEN excluded.date_checked_at_ms>=coalesce(date_checked_at_ms,-1)
+                      THEN excluded.internal_date ELSE internal_date END,
+           date_checked_at_ms=coalesce(max(date_checked_at_ms,excluded.date_checked_at_ms),date_checked_at_ms,excluded.date_checked_at_ms),
+           size=CASE WHEN excluded.size_checked_at_ms>=coalesce(size_checked_at_ms,-1)
+                      THEN excluded.size ELSE size END,
+           size_checked_at_ms=coalesce(max(size_checked_at_ms,excluded.size_checked_at_ms),size_checked_at_ms,excluded.size_checked_at_ms),
+           observed_at_ms=max(observed_at_ms,excluded.observed_at_ms)",
+        params![id, flags, evidence.internal_date, evidence.size, evidence.observed_at_ms],
+    )?;
+    Ok(())
+}
+
 pub(super) fn cached_message(
     db: &Connection,
     reference: Ref<'_>,
@@ -399,7 +408,7 @@ fn valid_flags(flags: &[String]) -> bool {
         && flags.iter().map(String::len).sum::<usize>() <= 3072
 }
 
-fn encode_flags(flags: &[String]) -> Result<Vec<u8>, CacheError> {
+pub(super) fn encode_flags(flags: &[String]) -> Result<Vec<u8>, CacheError> {
     if !valid_flags(flags) {
         return Err(CacheError::OutOfScope);
     }

@@ -316,116 +316,41 @@ impl<'a> BodyReadSession<'a> {
             uid,
             &manifest,
         );
-        let selected = loop {
-            // A probe can interrupt an alternative after collecting fragments.
-            // Every retry starts at the root with a fresh transaction.
-            let mut selected = Vec::new();
-            match mime::selection::select(
-                Node {
-                    manifest: &manifest,
-                    index: 0,
-                },
-                &mut selected,
-                true,
-            ) {
-                Ok(true) => return Err(ReadFault::local(crate::html::unsupported())),
-                Ok(false) => {
-                    break selected
-                        .into_iter()
-                        .map(|node| node.index)
-                        .collect::<Vec<_>>();
-                }
-                Err(node) => {
-                    let index = node.index;
-                    let section = match &manifest.body.nodes[index].kind {
-                        BodyKind::Leaf(part) => &manifest.parts[*part].section,
-                        BodyKind::Container { section, .. } => section,
-                    };
-                    let bytes = fetch::section_chunk(session, uid, section, 0, 1, None)
-                        .await
-                        .map_err(command_fault)?;
-                    let nonempty = Some(!bytes.is_empty());
-                    manifest.body.nodes[index].nonempty = nonempty;
-                }
-            }
-        };
-        let mut remaining = 32usize * 1024 * 1024;
+        let selected = selected_leaves(session, uid, &mut manifest)
+            .await
+            .map_err(|fault| fault.read_fault(command_fault))?;
+        let mut remaining = cached_body::LIMIT;
         let mut context = DisplayContext::new(format);
         let mut text = String::new();
         let capture = self.service.content_capture(&self.mailbox);
         let mut complete = cached_body::Record::default();
         // Match the raw reader's validation order across the chosen leaves.
         // A failure discards the result without changing the selection.
-        for node in selected {
-            let BodyKind::Leaf(index) = manifest.body.nodes[node].kind else {
-                return Err(ReadFault::local(MailError::backend()));
+        for index in selected {
+            let (leaf, html, reserve) = match decoded_leaf(
+                session,
+                uid,
+                &manifest.parts[index],
+                &mut remaining,
+                capture.is_some(),
+            )
+            .await
+            {
+                Ok(leaf) => leaf,
+                Err(StructuredFault::RawFallback) => {
+                    return self
+                        .raw_fallback(
+                            uid,
+                            size,
+                            hard_limit,
+                            args,
+                            reader::Fallback::CharsetUtf7,
+                            true,
+                        )
+                        .await;
+                }
+                Err(fault) => return Err(fault.read_fault(command_fault)),
             };
-            let part = &manifest.parts[index];
-            let encoded = part
-                .encoded_size
-                .ok_or_else(|| ReadFault::local(MailError::backend()))?
-                as usize;
-            let reserve = encoded.saturating_mul(4);
-            let charset = match charset_decode::CharsetDecoder::new(
-                part.charset.as_bytes(),
-                encoded != 0,
-                reserve,
-            ) {
-                Ok(decoder) => Some(decoder),
-                Err(charset_decode::DecodeError::RawFallbackUtf7) => None,
-                Err(error) => return Err(ReadFault::local(charset_error(error))),
-            };
-            remaining = remaining
-                .checked_sub(reserve)
-                .ok_or_else(|| ReadFault::local(body_limit()))?;
-            let Some(mut charset) = charset else {
-                return self
-                    .raw_fallback(
-                        uid,
-                        size,
-                        hard_limit,
-                        args,
-                        reader::Fallback::CharsetUtf7,
-                        true,
-                    )
-                    .await;
-            };
-            let encoding = match part.transfer_encoding.as_str() {
-                "7bit" | "8bit" | "binary" => transfer_decode::Encoding::Identity,
-                "base64" => transfer_decode::Encoding::Base64,
-                "quoted-printable" => transfer_decode::Encoding::QuotedPrintable,
-                _ => return Err(ReadFault::local(crate::html::unsupported())),
-            };
-            let mut transfer = transfer_decode::Decoder::new(encoding, reserve);
-            let mut leaf = if capture.is_some() {
-                String::with_capacity(reserve)
-            } else {
-                String::new()
-            };
-            let mut offset = 0;
-            while offset < encoded {
-                let expected = (encoded - offset).min(transfer_decode::OUTPUT_CHUNK);
-                let bytes = fetch::section_chunk(
-                    session,
-                    uid,
-                    &part.section,
-                    offset,
-                    transfer_decode::OUTPUT_CHUNK,
-                    Some(expected),
-                )
-                .await
-                .map_err(command_fault)?;
-                decode_transfer(&mut transfer, &mut charset, &bytes, false, &mut leaf)
-                    .map_err(ReadFault::local)?;
-                offset += expected;
-            }
-            fetch::section_chunk(session, uid, &part.section, encoded, 1, Some(0))
-                .await
-                .map_err(command_fault)?;
-            decode_transfer(&mut transfer, &mut charset, &[], true, &mut leaf)
-                .map_err(ReadFault::local)?;
-            decode_charset(&mut charset, &[], true, &mut leaf).map_err(ReadFault::local)?;
-            let html = part.content_type == "text/html";
             let displayed = if html {
                 std::borrow::Cow::Owned(
                     crate::html::render_selected(&leaf, &mut context).map_err(ReadFault::local)?,
@@ -550,6 +475,141 @@ impl<'a> BodyReadSession<'a> {
             .map_err(|_| ReadFault::local(MailError::backend()))?;
         Ok(value)
     }
+}
+
+pub(in crate::mail) enum StructuredFault {
+    Command(MailError),
+    Local(MailError),
+    RawFallback,
+}
+
+impl StructuredFault {
+    fn read_fault(self, command: impl FnOnce(MailError) -> ReadFault) -> ReadFault {
+        match self {
+            Self::Command(error) => command(error),
+            Self::Local(error) => ReadFault::local(error),
+            Self::RawFallback => ReadFault::local(crate::html::unsupported()),
+        }
+    }
+}
+
+async fn selected_leaves<S>(
+    session: &mut async_imap::Session<S>,
+    uid: u32,
+    manifest: &mut PartManifest,
+) -> std::result::Result<Vec<usize>, StructuredFault>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
+{
+    loop {
+        // Restart selection from the root after a probe. Fragments from an
+        // incomplete alternative never enter the next attempt.
+        let mut selected = Vec::new();
+        match mime::selection::select(Node { manifest, index: 0 }, &mut selected, true) {
+            Ok(true) => return Err(StructuredFault::Local(crate::html::unsupported())),
+            Ok(false) => {
+                return selected
+                    .into_iter()
+                    .map(|node| match manifest.body.nodes[node.index].kind {
+                        BodyKind::Leaf(index) => Ok(index),
+                        BodyKind::Container { .. } => {
+                            Err(StructuredFault::Local(MailError::backend()))
+                        }
+                    })
+                    .collect();
+            }
+            Err(node) => {
+                let index = node.index;
+                let section = match &manifest.body.nodes[index].kind {
+                    BodyKind::Leaf(part) => &manifest.parts[*part].section,
+                    BodyKind::Container { section, .. } => section,
+                };
+                let bytes = fetch::section_chunk(session, uid, section, 0, 1, None)
+                    .await
+                    .map_err(StructuredFault::Command)?;
+                manifest.body.nodes[index].nonempty = Some(!bytes.is_empty());
+            }
+        }
+    }
+}
+
+async fn decoded_leaf<S>(
+    session: &mut async_imap::Session<S>,
+    uid: u32,
+    part: &ManifestPart,
+    remaining: &mut usize,
+    reserve_capacity: bool,
+) -> std::result::Result<(String, bool, usize), StructuredFault>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
+{
+    let encoded = part
+        .encoded_size
+        .ok_or_else(|| StructuredFault::Local(MailError::backend()))? as usize;
+    let reserve = encoded.saturating_mul(4);
+    let charset =
+        match charset_decode::CharsetDecoder::new(part.charset.as_bytes(), encoded != 0, reserve) {
+            Ok(decoder) => Some(decoder),
+            Err(charset_decode::DecodeError::RawFallbackUtf7) => None,
+            Err(error) => return Err(StructuredFault::Local(charset_error(error))),
+        };
+    *remaining = remaining
+        .checked_sub(reserve)
+        .ok_or_else(|| StructuredFault::Local(body_limit()))?;
+    let Some(mut charset) = charset else {
+        return Err(StructuredFault::RawFallback);
+    };
+    let encoding = transfer_decode::Encoding::for_label(&part.transfer_encoding)
+        .ok_or_else(|| StructuredFault::Local(crate::html::unsupported()))?;
+    let mut transfer = transfer_decode::Decoder::new(encoding, reserve);
+    let mut leaf = if reserve_capacity {
+        String::with_capacity(reserve)
+    } else {
+        String::new()
+    };
+    let mut offset = 0;
+    while offset < encoded {
+        let expected = (encoded - offset).min(transfer_decode::OUTPUT_CHUNK);
+        let bytes = fetch::section_chunk(
+            session,
+            uid,
+            &part.section,
+            offset,
+            transfer_decode::OUTPUT_CHUNK,
+            Some(expected),
+        )
+        .await
+        .map_err(StructuredFault::Command)?;
+        decode_transfer(&mut transfer, &mut charset, &bytes, false, &mut leaf)
+            .map_err(StructuredFault::Local)?;
+        offset += expected;
+    }
+    fetch::section_chunk(session, uid, &part.section, encoded, 1, Some(0))
+        .await
+        .map_err(StructuredFault::Command)?;
+    decode_transfer(&mut transfer, &mut charset, &[], true, &mut leaf)
+        .map_err(StructuredFault::Local)?;
+    decode_charset(&mut charset, &[], true, &mut leaf).map_err(StructuredFault::Local)?;
+    Ok((leaf, part.content_type == "text/html", reserve))
+}
+
+#[cfg(test)]
+pub(in crate::mail) async fn canonical_structured<S>(
+    session: &mut async_imap::Session<S>,
+    uid: u32,
+    manifest: &mut PartManifest,
+) -> std::result::Result<cached_body::Record, StructuredFault>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
+{
+    let mut record = cached_body::Record::default();
+    let mut remaining = cached_body::LIMIT;
+    for index in selected_leaves(session, uid, manifest).await? {
+        let (text, html, reserve) =
+            decoded_leaf(session, uid, &manifest.parts[index], &mut remaining, true).await?;
+        record.push(text, html, reserve);
+    }
+    Ok(record)
 }
 
 fn body_limit() -> MailError {

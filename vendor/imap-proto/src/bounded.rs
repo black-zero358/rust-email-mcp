@@ -701,13 +701,13 @@ pub(crate) fn parse_response_with_search_limit<'a>(
     let mut rest = match tag_no_case::<_, _, Error<&[u8]>>("* SEARCH")(i) {
         Ok((rest, _)) => rest,
         Err(error @ nom::Err::Incomplete(_)) => return Err(ParseError::Syntax(error)),
-        Err(_) => return parse_search_side_response(i, limits),
+        Err(_) => return parse_mailbox_side_response(i, limits, None),
     };
     if rest
         .first()
         .is_some_and(|byte| !matches!(byte, b' ' | b'\r'))
     {
-        return parse_search_side_response(i, limits);
+        return parse_mailbox_side_response(i, limits, None);
     }
     let limit = max_uids.min(MAX_SEARCH_UIDS);
     // Retry on fragmentation without allocating a result vector. Only a
@@ -732,6 +732,19 @@ pub(crate) fn parse_response_with_search_limit<'a>(
         }
         let (remaining, uid) = search_u32(value).map_err(ParseError::Syntax)?;
         if count == limit {
+            // Keep partial-line parsing linear. Only when reaching the
+            // count boundary do we need to distinguish a malformed result
+            // from a genuine overflow that a caller can narrow and retry.
+            let prefix = &mut uids[..count];
+            prefix.sort_unstable();
+            if prefix.binary_search(&uid).is_ok()
+                || prefix.windows(2).any(|pair| pair[0] == pair[1])
+            {
+                return Err(ParseError::Syntax(nom::Err::Error(Error::new(
+                    value,
+                    ErrorKind::Verify,
+                ))));
+            }
             return Err(ParseError::SearchLimit(SearchLimitError {
                 kind: SearchLimitKind::UidCount,
                 limit,
@@ -750,7 +763,19 @@ pub(crate) fn parse_response_with_search_limit<'a>(
 }
 /// Parse mailbox updates without entering unrelated response grammars. Their
 /// nested lists share a bounded allocation ledger, including capacity.
-fn parse_search_side_response<'a>(i: &'a [u8], limits: &BodyStructureLimits) -> ParseResult<'a> {
+pub(crate) fn parse_mailbox_metadata<'a>(
+    i: &'a [u8],
+    limits: &BodyStructureLimits,
+    max_header_bytes: usize,
+) -> ParseResult<'a> {
+    parse_mailbox_side_response(i, limits, Some(max_header_bytes))
+}
+
+fn parse_mailbox_side_response<'a>(
+    i: &'a [u8],
+    limits: &BodyStructureLimits,
+    metadata_header_bytes: Option<usize>,
+) -> ParseResult<'a> {
     let mut limits = *limits;
     limits.aggregate_bytes = limits.aggregate_bytes.min(MAX_SEARCH_RESPONSE_BYTES);
     let budget = Budget::new(&limits);
@@ -767,7 +792,13 @@ fn parse_search_side_response<'a>(i: &'a [u8], limits: &BodyStructureLimits) -> 
                         preceded(tag_no_case("FLAGS "), |i| search_flags(i, &budget)),
                         |flags| Response::MailboxData(MailboxDatum::Flags(flags)),
                     ),
-                    |i| search_numeric_notification(i, &budget),
+                    |i| {
+                        bounded_numeric_notification(
+                            i,
+                            &budget,
+                            metadata_header_bytes.unwrap_or(MAX_SEARCH_RESPONSE_BYTES),
+                        )
+                    },
                 ))
                 .parse(rest)?
             }
@@ -800,11 +831,15 @@ fn parse_search_side_response<'a>(i: &'a [u8], limits: &BodyStructureLimits) -> 
     })();
     response.map_err(|error| {
         if let Some(limit) = budget.fetch_failure.get() {
-            ParseError::SearchLimit(SearchLimitError {
-                kind: SearchLimitKind::ResponseBytes,
-                limit: limit.limit,
-                actual: limit.actual,
-            })
+            if metadata_header_bytes.is_some() {
+                ParseError::FetchLiteralLimit(limit)
+            } else {
+                ParseError::SearchLimit(SearchLimitError {
+                    kind: SearchLimitKind::ResponseBytes,
+                    limit: limit.limit,
+                    actual: limit.actual,
+                })
+            }
         } else if budget.failure.get().is_some() {
             ParseError::SearchLimit(SearchLimitError {
                 kind: SearchLimitKind::ParserBytes,
@@ -848,9 +883,10 @@ fn search_u32(i: &[u8]) -> IResult<&[u8], u32> {
     core::number(i)
 }
 
-fn search_numeric_notification<'a>(
+fn bounded_numeric_notification<'a>(
     i: &'a [u8],
     budget: &Budget<'_>,
+    max_header_bytes: usize,
 ) -> IResult<&'a [u8], Response<'a>> {
     let (rest, sequence) = search_u32(i)?;
     alt((
@@ -865,7 +901,7 @@ fn search_numeric_notification<'a>(
         }),
         map(
             preceded(tag_no_case(" FETCH "), |i| {
-                budget.list(i, |i| search_fetch_attribute(i, budget))
+                budget.list(i, |i| bounded_fetch_attribute(i, budget, max_header_bytes))
             }),
             move |attrs| Response::Fetch(sequence, attrs),
         ),
@@ -873,9 +909,10 @@ fn search_numeric_notification<'a>(
     .parse(rest)
 }
 
-fn search_fetch_attribute<'a>(
+fn bounded_fetch_attribute<'a>(
     i: &'a [u8],
     budget: &Budget<'_>,
+    max_header_bytes: usize,
 ) -> IResult<&'a [u8], AttributeValue<'a>> {
     alt((
         map(
@@ -886,10 +923,26 @@ fn search_fetch_attribute<'a>(
             preceded(tag_no_case("FLAGS "), |i| search_flags(i, budget)),
             AttributeValue::Flags,
         ),
+        map(
+            preceded(tag_no_case("RFC822.SIZE "), search_u32),
+            AttributeValue::Rfc822Size,
+        ),
+        metadata_internal_date,
         crate::rfc4551::msg_att_mod_seq,
-        |i| budget.fetch_body_section(i, MAX_SEARCH_RESPONSE_BYTES),
+        |i| budget.fetch_body_section(i, max_header_bytes),
     ))
     .parse(i)
+}
+
+fn metadata_internal_date(i: &[u8]) -> IResult<&[u8], AttributeValue<'_>> {
+    let (rest, _) = tag_no_case("INTERNALDATE \"")(i)?;
+    let (rest, value) = take_while_m_n(1, 64, |byte| {
+        (b' '..=b'~').contains(&byte) && !matches!(byte, b'"' | b'\\')
+    })(rest)?;
+    let (rest, _) = tag("\"")(rest)?;
+    let value = std::str::from_utf8(value)
+        .map_err(|_| nom::Err::Error(Error::new(i, ErrorKind::MapRes)))?;
+    Ok((rest, AttributeValue::InternalDate(Cow::Borrowed(value))))
 }
 
 pub(crate) fn parse_response_with_usage<'a>(

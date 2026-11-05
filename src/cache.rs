@@ -23,6 +23,7 @@ mod evidence;
 mod full_tests;
 mod metadata;
 mod schema;
+pub mod sync_state;
 #[cfg(all(test, unix))]
 mod tests;
 mod thread_index;

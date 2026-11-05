@@ -108,6 +108,20 @@ UID filtering, unique list limits and tagged completion. These regressions run
 in the root locked test suite; audit advisory matching does not validate this
 local accessor. Preserve or replace this API when upgrading the vendored crate.
 
+## Bounded mailbox synchronization (R12)
+
+The bounded SEARCH stream rejects a second SEARCH response before parsing its
+UID count, including split response prefixes. Only an oversized first result
+can report a UID-count overflow. The ordinary SEARCH path retains its behavior.
+
+`CommandReadLimits::mailbox_metadata` uses the existing bounded mailbox
+notification machinery for UID FETCH metadata. It has independent limits on
+total command response bytes and each header literal, and never enters
+SEARCH or BODYSTRUCTURE parsing. `Fetch::parse_internal_date` exposes the
+same date conversion used by ordinary FETCH so the strict collector can
+validate UID and attribute presence before persisting observations.
+Root protocol regressions run in `tests/thread_search_budget.rs`.
+
 ## Application parser allocation limit (issue #24)
 
 The upstream archive, version, licenses and checksum above remain unchanged.

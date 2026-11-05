@@ -9,6 +9,7 @@ const APPLICATION_ID: u32 = 0x454d4343;
 const METADATA_VERSION: u32 = 1;
 const FULL_VERSION: u32 = 2;
 const CONTENT_VERSION: u32 = 3;
+const SYNC_VERSION: u32 = 4;
 
 pub(super) fn open(path: &Path) -> Result<Connection, CacheError> {
     let connection = Connection::open_with_flags(
@@ -60,7 +61,7 @@ pub(super) fn initialize(
             tx.pragma_update(None, "application_id", APPLICATION_ID)?;
             tx.commit()?;
         }
-        (METADATA_VERSION | FULL_VERSION | CONTENT_VERSION, APPLICATION_ID) => {}
+        (METADATA_VERSION | FULL_VERSION | CONTENT_VERSION | SYNC_VERSION, APPLICATION_ID) => {}
         _ => return Err(CacheError::Corrupt),
     }
     let saved_epoch: i64 = connection
@@ -90,6 +91,12 @@ pub(super) fn initialize(
         tx.pragma_update(None, "user_version", CONTENT_VERSION)?;
         tx.commit()?;
     }
+    if full && version < SYNC_VERSION {
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(V4)?;
+        tx.pragma_update(None, "user_version", SYNC_VERSION)?;
+        tx.commit()?;
+    }
     if (saved_epoch as u64) < restore_epoch {
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         restore(&tx, restore_epoch, full_schema)?;
@@ -101,6 +108,64 @@ pub(super) fn initialize(
     }
     Ok(full_schema)
 }
+
+const V4: &str = "
+CREATE TABLE sync_checkpoints (
+    mailbox TEXT NOT NULL,
+    kind INTEGER NOT NULL CHECK(kind BETWEEN 0 AND 2),
+    scan_id BLOB NOT NULL CHECK(length(scan_id)=16),
+    uid_validity INTEGER NOT NULL CHECK(uid_validity BETWEEN 1 AND 4294967295),
+    high_uid INTEGER NOT NULL CHECK(high_uid BETWEEN 0 AND 4294967294),
+    revision INTEGER NOT NULL CHECK(revision>0),
+    restore_epoch INTEGER NOT NULL CHECK(restore_epoch>=0),
+    dirty_revision INTEGER NOT NULL CHECK(dirty_revision>=0),
+    presence_revision INTEGER NOT NULL CHECK(presence_revision>=0),
+    proof_presence_revision INTEGER NOT NULL CHECK(proof_presence_revision>=0),
+    next_low INTEGER CHECK(next_low BETWEEN 1 AND high_uid),
+    width_hint INTEGER NOT NULL CHECK(width_hint BETWEEN 1 AND 4294967295),
+    known_after INTEGER NOT NULL CHECK(known_after BETWEEN 0 AND high_uid),
+    checked_at_ms INTEGER NOT NULL CHECK(checked_at_ms>=0),
+    completed_at_ms INTEGER CHECK(completed_at_ms>=checked_at_ms),
+    PRIMARY KEY(mailbox,kind)
+) STRICT;
+CREATE TRIGGER sync_presence_insert AFTER INSERT ON messages WHEN NOT new.tombstone BEGIN
+    UPDATE sync_checkpoints SET presence_revision=presence_revision+1
+    WHERE mailbox=new.mailbox AND uid_validity=new.uid_validity AND kind=2 AND new.uid<=high_uid;
+END;
+CREATE TRIGGER sync_presence_update AFTER UPDATE OF tombstone ON messages
+WHEN old.tombstone<>new.tombstone BEGIN
+    UPDATE sync_checkpoints SET presence_revision=presence_revision+1
+    WHERE mailbox=new.mailbox AND uid_validity=new.uid_validity AND kind=2 AND new.uid<=high_uid;
+END;
+CREATE TABLE sync_work (
+    mailbox TEXT NOT NULL,
+    uid_validity INTEGER NOT NULL,
+    uid INTEGER NOT NULL,
+    layer INTEGER NOT NULL CHECK(layer BETWEEN 0 AND 5),
+    part INTEGER NOT NULL CHECK(part BETWEEN 0 AND 1023),
+    state INTEGER NOT NULL CHECK(state BETWEEN 0 AND 4),
+    reason INTEGER CHECK(reason BETWEEN 1 AND 8),
+    not_before_ms INTEGER NOT NULL DEFAULT 0 CHECK(not_before_ms>=0),
+    revision INTEGER NOT NULL DEFAULT 1 CHECK(revision>0),
+    PRIMARY KEY(mailbox,uid_validity,uid,layer,part)
+) STRICT;
+CREATE INDEX sync_due_work ON sync_work(mailbox,uid_validity,state,not_before_ms,uid,layer,part);
+CREATE TRIGGER sync_tombstone_work AFTER UPDATE OF tombstone ON messages WHEN new.tombstone BEGIN
+    DELETE FROM sync_work WHERE mailbox=new.mailbox AND uid_validity=new.uid_validity AND uid=new.uid;
+END;
+CREATE TRIGGER sync_artifact_lost AFTER UPDATE OF state,blob_id ON artifacts
+WHEN old.state=1 AND (new.state<>1 OR old.blob_id IS NOT new.blob_id)
+  AND (old.kind=0 OR (old.mime_version=1 AND (old.kind=2 OR old.html_version=1))) BEGIN
+    UPDATE sync_work SET state=0,reason=NULL,not_before_ms=0,revision=revision+1
+    WHERE (mailbox,uid_validity,uid)=(SELECT mailbox,uid_validity,uid FROM messages WHERE id=old.message_id)
+      AND layer=CASE old.kind WHEN 0 THEN 2 WHEN 1 THEN 3 ELSE 5 END
+      AND part=old.part AND state=1;
+    UPDATE sync_work SET state=4,reason=NULL,not_before_ms=0,revision=revision+1
+    WHERE old.kind=1 AND layer=4 AND part=0 AND state IN(0,1)
+      AND (mailbox,uid_validity,uid)=(SELECT mailbox,uid_validity,uid FROM messages WHERE id=old.message_id);
+END;
+CREATE INDEX sync_message_uid ON messages(mailbox,uid_validity,uid) WHERE NOT tombstone;
+";
 
 const V3: &str = "
 CREATE TABLE listing_evidence (
@@ -281,6 +346,11 @@ pub(super) fn restore(
     full_schema: bool,
 ) -> Result<(), CacheError> {
     tx.execute("DELETE FROM conversation_cursors", [])?;
+    let version: u32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version >= SYNC_VERSION {
+        tx.execute("DELETE FROM sync_checkpoints", [])?;
+        tx.execute("DELETE FROM sync_work", [])?;
+    }
     flag_unclean(tx, full_schema)?;
     tx.execute(
         "UPDATE cache_owner SET restore_epoch=?1 WHERE id=1",
