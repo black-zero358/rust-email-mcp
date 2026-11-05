@@ -38,6 +38,12 @@
 
 同一 ACK 控制条件下，分块命令间隔中位数由 68 ms 降至 1 ms，读至 EOF 由 5.062 秒降至 0.414 秒。四 CPU 加每块 55 ms 人工延迟的额外压力实验中，两种配置均触及原期限，NODELAY 多完成 6–9 块；该实验用于定位等待来源。精确源码快照使用独立 target 通过 fmt、**540 单元 + 53 集成**（2 项默认忽略）、all-target Clippy、release、显式 Node 八文件下载与内容读取以及 V6 隔离恢复；单元 26.72 秒、Clippy 12.55 秒、release 94 秒、八文件 4.07 秒。新 release SHA-256 为 `a3571a23c2fbbd60a84d79d524a2c74d9c4fcc8c7956cea0bfbf40a64f97972c`。恢复验证覆盖代次 1/2/3、运行见证、损坏见证先于 Journal 拒绝、操作库哨兵和 0700/0600。独立补丁审阅通过，最终 CI 随新 head 重新执行。
 
+### 缓存就绪与软期限回归
+
+head `e26184bb800f2875aa43157373d1176945de0c11` 的 [CI 42043024618](https://github.com/black-zero358/rust-email-mcp/actions/runs/42043024618) 已通过原三项失败用例；一项旧缓存测试在合法的 100 ms 软缓存探测回退时过早要求命中缓存。测试修复 `e77e9880403efb1d0ccc52e212aac160ed712574` 先等待指定 UID 和正文真正可离线读取，再在原 2 秒观察窗口内验证实际缓存命中；只有正文完全相同的 bodystructure 回退允许重试，其他错误立即失败。最终命中请求必须恰好新建一条连接并发送 EXAMINE 与目标 UID 的 SIZE，两者之后没有正文 FETCH。相邻三封预热逐封等待可读，避免超过最佳努力写回的两个 payload 许可；删除、tombstone、零网络及局部错误断言继续保留。
+
+该提交仅修改测试文件。独立审阅通过；四 CPU、八测试线程的缓存组 13 项通过，精确快照 fmt、540 单元 + 53 集成（2 项默认忽略）、all-target Clippy 通过，单元 27.13 秒、Clippy 13.90 秒。生产源码与 `c8daed4` 相同，沿用其 release、八文件与 V6 恢复证据，最终提交重新执行三项 CI。
+
 ## 2026-11-05 R12 后台同步与有界回收
 
 [PR #79](https://github.com/black-zero358/rust-email-mcp/pull/79) 最终 head `80fd706f7852982dcc99f010eabe94d81213b7c7` 的 [CI 42030094273](https://github.com/black-zero358/rust-email-mcp/actions/runs/42030094273) 中 check、audit、container 全部通过。精确源码及最终文档 head 的独立交叉审阅完成；GitHub 自动审阅遇到账户限流，已核对评论和空 review threads。合并提交为 `68b32353c2214b238c6f4ed33768316254d1275e`，本地 main、开发分支及对应远端引用已同步；R12C 工作区改动保留。
