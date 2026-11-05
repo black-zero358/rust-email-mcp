@@ -131,11 +131,13 @@
 
 默认内存头缓存保存完整邮件头，全实例所有账户合计最多 256 项、16 MiB，TTL 为 60 秒。键包含内部账户身份与世代、文件夹、UIDVALIDITY 和 UID；每次会话先获取当前 UIDVALIDITY，只失效相应账户和文件夹的旧缓存。正文、附件、可变标记和统计结果不进入缓存。
 
-持久缓存由管理员通过 `CACHE_CONFIG_PATH` 选择账户和目录，模式为 off、metadata 或 full。在线读取完成后，有界后台队列记录邮件头、已核对部件清单与索引；部分头保留完整性标记。full 另保存完整正文、原始邮件及附件。`get_cache_status({"account_id":"work"})` 先授权，再查询本地状态，返回 off、ready 或 unavailable，以及该账户的磁盘额度、当前目录世代、检查时间、dirty、邮件数、完整头数、索引头数及已核对清单数。full 还提供 content_pending 和各目录 raw/full_body/attachments 层的物化、可派生、缺失、省略及不支持计数。当前收集范围随实际在线调用逐步增长。
+持久缓存由管理员通过 `CACHE_CONFIG_PATH` 选择账户和目录，模式为 off、metadata 或 full。在线读取完成后，有界后台队列记录邮件头、已核对部件清单与索引；部分头保留完整性标记。full 另保存完整正文、原始邮件及附件。`get_cache_status({"account_id":"work"})` 先授权，再查询本地状态，返回 off、ready 或 unavailable，以及该账户的磁盘额度、当前目录世代、检查时间、dirty、邮件数、完整头数、索引头数及已核对清单数。full 还提供 content_pending 和各目录 raw/full_body/attachments 层的物化、可派生、缺失、省略及不支持计数。
+
+full 显式启用 `sync.enabled:true` 后后台回填选定范围的全部历史，并周期发现新增及核对标记/删除；旧配置省略 sync 保持暂停。`get_cache_status` 的 sync 返回策略、运行状态和 folders；每目录的 progress 包含独立 history/tail/reconciliation、冻结水位与历史/当前覆盖，runtime 给出固定最后失败类别及配额暂停标记。查询状态本身失败时 error 为 quota/storage，账户仍为 ready、目录失效证据待持久化时为 verification_pending，这些情况下 progress 为 null；跨 UIDVALIDITY 的旧账户快照先返回 unavailable，sync.folders 为 null。各层 complete 结合该范围的发现、存在性核对及对应内容证据；可从 raw 派生的内容同时保留物化缺口。参数、时间字段及管理步骤见[缓存状态](cache-design.md#查询状态)和[后台同步管理](deployment.md#后台同步管理)。
 
 `write_health` 记录当前进程的失败证据任务数 `failed_writes`、最后固定原因 `last_error`（quota、queue_full、storage 或 null）及粘滞额度标记 `quota_blocked`。一批证据写入计一个任务；重启后重新评估。额度不足时仍可读取已保存的覆盖和额度信息，普通在线邮件读取继续返回其实际结果。
 
-跨文件夹会话的冻结范围全部被缓存配置选中时，`cursor_storage` 为 persistent，保存检查点和最近输入的重放快照；关闭缓存或包含未选目录时为 memory。持久范围遇存储故障返回固定游标错误，修复后可重试原已提交 token；已确认的世代变化使旧 token 失效。后台元数据写入失败保留已完成的普通在线读取结果。配置与恢复见[缓存设计](cache-design.md)，全量历史回填由 R12 接入。
+跨文件夹会话的冻结范围全部被缓存配置选中时，`cursor_storage` 为 persistent，保存检查点和最近输入的重放快照；关闭缓存或包含未选目录时为 memory。持久范围遇存储故障返回固定游标错误，修复后可重试原已提交 token；已确认的世代变化使旧 token 失效。后台元数据写入失败保留已完成的普通在线读取结果。配置与恢复见[缓存设计](cache-design.md)。
 
 full 支持以下显式来源参数，默认值沿用在线行为：
 

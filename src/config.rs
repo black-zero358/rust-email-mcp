@@ -6,10 +6,10 @@ pub use account_config::{
     AccountConfigSource, ValidatedAccountConfig, ValidatedAccountSet, load_runtime,
 };
 mod cache_config;
-pub(crate) use cache_config::Mode as CacheMode;
 #[cfg(test)]
 pub(crate) use cache_config::load_cache_file;
 pub use cache_config::{CacheSettings, load_cache_configuration};
+pub(crate) use cache_config::{Mode as CacheMode, SyncPolicy};
 
 pub const DEFAULT_MAX_MESSAGE: usize = 32 * 1024 * 1024;
 pub const DEFAULT_MAX_OUTPUT: usize = 2 * 1024 * 1024;

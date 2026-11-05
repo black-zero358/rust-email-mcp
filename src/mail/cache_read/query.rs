@@ -275,6 +275,16 @@ impl CachedReader {
                 preview::from_displayed(&record.display(crate::html::HtmlDisplay::Legacy)?.text)
             };
             lease.revalidate().map_err(cache_error)?;
+            lease.touch();
+            lease.revalidate().map_err(cache_error)?;
+            if !self.persistent.offline_current(
+                reference.account,
+                reference.mailbox,
+                reference.uid_validity,
+                Some(reference.uid),
+            ) {
+                return Err(cache_error(CacheError::NeedsVerification));
+            }
             Ok(Some(value))
         })();
         item["preview_status"] = json!(match result {

@@ -178,7 +178,6 @@ where
     body_slice(session, uid, "", None, 0, request, Some(expected)).await
 }
 
-#[cfg(test)]
 pub(in crate::mail) async fn raw_chunk<S>(
     session: &mut async_imap::Session<S>,
     uid: u32,
@@ -192,7 +191,6 @@ where
     body_slice(session, uid, "", None, offset, count, Some(expected)).await
 }
 
-#[cfg(test)]
 pub(in crate::mail) async fn attachment_chunk<S>(
     session: &mut async_imap::Session<S>,
     uid: u32,

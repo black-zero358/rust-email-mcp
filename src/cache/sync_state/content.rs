@@ -103,7 +103,7 @@ pub struct SyncFacts<'a> {
     pub size: u32,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
 pub struct SyncProgress {
     pub pending: u64,
     pub completed: u64,
@@ -262,6 +262,25 @@ impl Cache {
     }
 
     pub fn resume_sync_quota(&self, stamp: &ScanStamp, limit: usize) -> Result<usize, SyncError> {
+        self.resume_sync_quota_inner(stamp, limit, true)
+    }
+
+    /// Retry capacity failures after freeing physical bytes, without
+    /// rematerializing the copies deliberately reclaimed to free them.
+    pub fn resume_sync_quota_after_reclaim(
+        &self,
+        stamp: &ScanStamp,
+        limit: usize,
+    ) -> Result<usize, SyncError> {
+        self.resume_sync_quota_inner(stamp, limit, false)
+    }
+
+    fn resume_sync_quota_inner(
+        &self,
+        stamp: &ScanStamp,
+        limit: usize,
+        include_reclaimed: bool,
+    ) -> Result<usize, SyncError> {
         if !(1..=PAGE_UIDS).contains(&limit) || stamp.kind == ScanKind::Reconcile {
             return Err(SyncError::Invalid);
         }
@@ -270,10 +289,34 @@ impl Cache {
             .get_mut(&stamp.namespace)
             .ok_or(CacheError::OutOfScope)?;
         checked_scan(self, &database.connection, stamp)?;
+        let ready: bool = database.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_work WHERE mailbox=?1 AND uid_validity=?2 AND uid<=?3
+              AND (state=3 OR (?4 AND state=4 AND reason=3)))",
+            params![
+                stamp.mailbox,
+                stamp.uid_validity,
+                stamp.high_uid,
+                include_reclaimed
+            ],
+            |row| row.get(0),
+        )?;
+        if !ready {
+            return Ok(0);
+        }
         self.write(stamp.namespace, database, |tx| {
-            Ok(tx.execute("UPDATE sync_work SET state=0,reason=NULL,revision=revision+1 WHERE rowid IN (
-                SELECT rowid FROM sync_work WHERE mailbox=?1 AND uid_validity=?2 AND uid<=?3 AND state=3 LIMIT ?4)",
-                params![stamp.mailbox,stamp.uid_validity,stamp.high_uid,limit as u32])?)
+            Ok(tx.execute(
+                "UPDATE sync_work SET state=0,reason=NULL,revision=revision+1 WHERE rowid IN (
+                SELECT rowid FROM sync_work WHERE mailbox=?1 AND uid_validity=?2 AND uid<=?3
+                  AND (state=3 OR (?5 AND state=4 AND reason=3))
+                ORDER BY state,uid,layer,part LIMIT ?4)",
+                params![
+                    stamp.mailbox,
+                    stamp.uid_validity,
+                    stamp.high_uid,
+                    limit as u32,
+                    include_reclaimed
+                ],
+            )?)
         })
     }
 
@@ -313,14 +356,23 @@ impl Cache {
             .connection;
         checked_scan(self, db, stamp)?;
         Ok(db.query_row(
-            "SELECT count(*) FILTER(WHERE state IN(0,4)),count(*) FILTER(WHERE state=1),count(*) FILTER(WHERE state=2),
-                    count(*) FILTER(WHERE state=3), count(*) FILTER(WHERE state=0 AND reason IS NOT NULL),
+            "SELECT count(*) FILTER(WHERE state=0 OR (state=4 AND reason IS NULL)),
+                    count(*) FILTER(WHERE state=1),count(*) FILTER(WHERE state=2),
+                    count(*) FILTER(WHERE state=3 OR (state=4 AND reason=3)),
+                    count(*) FILTER(WHERE state=0 AND reason IS NOT NULL),
                     min(not_before_ms) FILTER(WHERE state=0 AND reason IS NOT NULL)
              FROM sync_work WHERE mailbox=?1 AND uid_validity=?2 AND uid<=?3",
-            params![stamp.mailbox,stamp.uid_validity,stamp.high_uid],
-            |row| Ok(SyncProgress { pending: row.get::<_, i64>(0)? as u64, completed: row.get::<_, i64>(1)? as u64,
-                terminal: row.get::<_, i64>(2)? as u64, quota_blocked: row.get::<_, i64>(3)? as u64,
-                retrying: row.get::<_, i64>(4)? as u64, next_due_ms: row.get(5)? }),
+            params![stamp.mailbox, stamp.uid_validity, stamp.high_uid],
+            |row| {
+                Ok(SyncProgress {
+                    pending: row.get::<_, i64>(0)? as u64,
+                    completed: row.get::<_, i64>(1)? as u64,
+                    terminal: row.get::<_, i64>(2)? as u64,
+                    quota_blocked: row.get::<_, i64>(3)? as u64,
+                    retrying: row.get::<_, i64>(4)? as u64,
+                    next_due_ms: row.get(5)?,
+                })
+            },
         )?)
     }
 }

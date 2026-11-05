@@ -317,6 +317,9 @@ impl MailService {
                 let mut bytes = vec![0; info.decoded_size];
                 data.read_exact(&mut bytes).map_err(|_| cache_error(CacheError::Storage))?;
                 data.lease().revalidate().map_err(cache_error)?;
+                reader.verify(&scope, Some(uid))?;
+                data.lease().touch();
+                data.lease().revalidate().map_err(cache_error)?;
                 use base64::Engine;
                 json!({
                     "account_id":reader.alias,"mailbox":mailbox,"uid":uid,"uid_validity":scope.uid_validity,
@@ -378,6 +381,7 @@ struct Stream {
     transfer: Transfer,
     cancellation: tokio_util::sync::CancellationToken,
     _permit: tokio::sync::OwnedSemaphorePermit,
+    remaining: Option<usize>,
 }
 
 impl Stream {
@@ -409,6 +413,18 @@ impl Stream {
         self.data.lease().revalidate().map_err(|_| denied())?;
         if !allowed() {
             return Err(denied());
+        }
+        if let Some(remaining) = self.remaining {
+            if count >= remaining {
+                self.remaining = None;
+                self.data.lease().touch();
+                self.data.lease().revalidate().map_err(|_| denied())?;
+                if !allowed() {
+                    return Err(denied());
+                }
+            } else {
+                self.remaining = Some(remaining - count);
+            }
         }
         bytes.truncate(count);
         Ok(bytes)
@@ -458,6 +474,7 @@ pub(super) async fn download(
                         transfer,
                         cancellation,
                         _permit: permit,
+                        remaining: Some(metadata.decoded_size),
                     },
                     metadata,
                 ))

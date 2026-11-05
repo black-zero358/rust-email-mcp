@@ -1,7 +1,8 @@
 //! One bounded backend queue shared by accounts, legacy writes and downloads.
+#[cfg(test)]
+use std::future::Future;
 use std::{
     collections::{HashMap, VecDeque},
-    future::Future,
     sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
@@ -57,33 +58,20 @@ impl State {
     }
 
     fn next_waiter(&self) -> Option<usize> {
-        // First restore accounts below their basic share. Within the same
-        // priority tier foreground work wins, then FIFO order is preserved.
+        // Foreground owns first choice of a free slot. Within its class,
+        // restore accounts' basic shares before making new loans.
         for class in [WorkClass::Foreground, WorkClass::Background] {
-            if let Some(index) = self.queue.iter().position(|waiter| {
-                !waiter.granted
-                    && waiter.class == class
-                    && self.class_available(class)
-                    && self.account_running(&waiter.account) < ACCOUNT_BASE_SLOTS
-            }) {
-                return Some(index);
-            }
-        }
-        // Existing loans are not preempted. New loans stop while another
-        // runnable account below its basic share has work waiting. Background
-        // waiters blocked by the global background cap cannot use an idle slot.
-        for class in [WorkClass::Foreground, WorkClass::Background] {
-            if let Some(index) = self.queue.iter().position(|candidate| {
-                !candidate.granted
-                    && candidate.class == class
-                    && self.class_available(class)
-                    && !self.queue.iter().any(|waiter| {
-                        !waiter.granted
-                            && waiter.account != candidate.account
-                            && self.class_available(waiter.class)
-                            && self.account_running(&waiter.account) < ACCOUNT_BASE_SLOTS
-                    })
-            }) {
+            let runnable = |waiter: &Waiter| {
+                !waiter.granted && waiter.class == class && self.class_available(class)
+            };
+            if let Some(index) = self
+                .queue
+                .iter()
+                .position(|waiter| {
+                    runnable(waiter) && self.account_running(&waiter.account) < ACCOUNT_BASE_SLOTS
+                })
+                .or_else(|| self.queue.iter().position(runnable))
+            {
                 return Some(index);
             }
         }
@@ -174,7 +162,8 @@ impl Scheduler {
         let (wake, receiver) = oneshot::channel();
         let id = {
             let mut state = self.state();
-            if state.closed || state.admitted >= ADMISSION_REQUESTS {
+            let capacity = ADMISSION_REQUESTS - usize::from(class == WorkClass::Background);
+            if state.closed || state.admitted >= capacity {
                 return Err(AdmissionError::Capacity);
             }
             let id = state.next_id;
@@ -224,6 +213,7 @@ impl Scheduler {
         })
     }
 
+    #[cfg(test)]
     /// Cancel-safe reads/background work. Writes instead hold acquire()'s permit
     /// until their durable send outcome is known; revocation must not cut SMTP.
     pub(crate) async fn run<T, F>(
@@ -446,7 +436,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_basic_share_precedes_another_accounts_foreground_loan() {
+    async fn foreground_loan_precedes_another_accounts_background_share() {
         let scheduler = Scheduler::new();
         let cancellation = CancellationToken::new();
         let mut permits = full(&scheduler, &cancellation).await;
@@ -456,12 +446,13 @@ mod tests {
         assert!(poll(loan.as_mut()).is_pending());
         assert!(poll(background.as_mut()).is_pending());
         permits.pop();
-        let background = background.await.unwrap();
-        assert!(poll(loan.as_mut()).is_pending());
-        assert_eq!(scheduler.state().background, 1);
-        drop(background);
         let loan = loan.await.unwrap();
-        drop((permits, loan));
+        assert!(poll(background.as_mut()).is_pending());
+        assert_eq!(scheduler.state().background, 0);
+        drop(loan);
+        let background = background.await.unwrap();
+        assert_eq!(scheduler.state().background, 1);
+        drop((permits, background));
         assert_eq!(counts(&scheduler), (0, 0, 0, 0));
     }
 

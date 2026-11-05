@@ -132,6 +132,18 @@ impl AccountCatalog {
             })
             .unwrap_or_default()
     }
+
+    pub(crate) fn sync_account(&self, alias: &str, key: &AccountKey) -> Option<AccountLease> {
+        let accounts = self.accounts.read().ok()?;
+        let account = accounts.get(alias)?;
+        (&account.lease.key == key
+            && !account.lease.cancellation.is_cancelled()
+            && account
+                .read_subjects
+                .iter()
+                .any(|subject| self.global(subject)))
+        .then(|| account.lease.clone())
+    }
     #[cfg(test)]
     pub(crate) fn from_test_accounts(set: ValidatedAccountSet) -> anyhow::Result<Arc<Self>> {
         set.validate()?;

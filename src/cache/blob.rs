@@ -25,6 +25,10 @@ impl BlobId {
     pub(super) fn bytes(self) -> [u8; 16] {
         *self.0.as_bytes()
     }
+
+    pub(super) fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(Uuid::from_bytes(bytes))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -110,7 +114,7 @@ pub enum ArtifactLayer {
 
 /// Coverage of locally observed messages and attachment indices. A future
 /// synchronized scan supplies the separate scope-wide completion evidence.
-#[derive(Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize)]
 pub struct LayerCoverage {
     pub materialized: u64,
     pub materialized_bytes: u64,
@@ -412,8 +416,32 @@ impl Cache {
         expected: BlobId,
         raw: BlobId,
     ) -> Result<bool, CacheError> {
+        self.evict_derived_inner(reference, kind, expected, raw, None)
+    }
+
+    pub(super) fn evict_derived_inner(
+        self: &Arc<Self>,
+        reference: Ref<'_>,
+        kind: ArtifactKey,
+        expected: BlobId,
+        raw: BlobId,
+        expected_recency: Option<i64>,
+    ) -> Result<bool, CacheError> {
         let (kind_code, part, mime, html) = kind.sql()?;
         if !self.full || kind_code == 0 {
+            return Err(CacheError::OutOfScope);
+        }
+        let sync_layer = match kind {
+            ArtifactKey::FullBody {
+                mime_version: 1,
+                html_version: 1,
+            } => Some(3),
+            ArtifactKey::Attachment {
+                mime_version: 1, ..
+            } => Some(5),
+            _ => None,
+        };
+        if expected_recency.is_some() && sync_layer.is_none() {
             return Err(CacheError::OutOfScope);
         }
         let _raw = self.open_blob(reference, ArtifactKey::Raw, Access::LiveVerified, Some(raw))?;
@@ -436,12 +464,29 @@ impl Cache {
             {
                 return Ok(false);
             }
+            if let Some(seq) = expected_recency {
+                let unchanged: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM blob_recency WHERE blob_id=?1 AND seq=?2)",
+                    params![expected.bytes(),seq],
+                    |row| row.get(0),
+                )?;
+                if !unchanged {
+                    return Ok(false);
+                }
+            }
             let message = present_message(tx, reference)?;
             tx.execute(
                 "UPDATE artifacts SET state=2,blob_id=NULL,raw_id=?6
                  WHERE message_id=?1 AND kind=?2 AND part=?3 AND mime_version=?4 AND html_version=?5",
                 params![message, kind_code, part, mime, html, raw.0.as_bytes()],
             )?;
+            if let Some(layer) = sync_layer.filter(|_| expected_recency.is_some()) {
+                tx.execute(
+                    "UPDATE sync_work SET state=4,reason=?6,not_before_ms=0,revision=revision+1
+                     WHERE mailbox=?1 AND uid_validity=?2 AND uid=?3 AND layer=?4 AND part=?5 AND state=0",
+                    params![reference.mailbox, reference.uid_validity, reference.uid, layer, part, Omission::Quota as u8],
+                )?;
+            }
             Ok(true)
         })
     }
@@ -456,47 +501,17 @@ impl Cache {
         if !self.full {
             return Err(CacheError::OutOfScope);
         }
-        let key = match layer {
-            ArtifactLayer::Raw => ArtifactKey::Raw,
-            ArtifactLayer::FullBody {
-                mime_version,
-                html_version,
-            } => ArtifactKey::FullBody {
-                mime_version,
-                html_version,
-            },
-            ArtifactLayer::Attachments { mime_version } => ArtifactKey::Attachment {
-                original_index: 0,
-                mime_version,
-            },
-        };
-        let (kind, _, mime, html) = key.sql()?;
         let namespace = self.scope(account, mailbox)?;
         let databases = self.lock()?;
         let database = databases.get(&namespace).ok_or(CacheError::OutOfScope)?;
-        Ok(database.connection.query_row(
-            "SELECT count(*) FILTER(WHERE a.state=1),coalesce(sum(b.bytes),0),
-                    count(*) FILTER(WHERE a.state=2),
-                    count(*) FILTER(WHERE coalesce(a.state,0)=0),
-                    count(*) FILTER(WHERE a.state=3),count(*) FILTER(WHERE a.state=4)
-             FROM messages AS m JOIN mailboxes AS f USING(mailbox,uid_validity)
-             LEFT JOIN artifacts AS a ON a.message_id=m.id AND a.kind=?3
-                  AND a.mime_version=?4 AND a.html_version=?5
-             LEFT JOIN blobs AS b ON b.id=a.blob_id
-             WHERE m.mailbox=?1 AND m.uid_validity=?2 AND NOT m.tombstone
-               AND (?3<>2 OR a.kind IS NOT NULL)",
-            params![mailbox, uid_validity, kind, mime, html],
-            |row| {
-                Ok(LayerCoverage {
-                    materialized: row.get::<_, i64>(0)? as u64,
-                    materialized_bytes: row.get::<_, i64>(1)? as u64,
-                    derivable_from_raw: row.get::<_, i64>(2)? as u64,
-                    missing: row.get::<_, i64>(3)? as u64,
-                    omitted: row.get::<_, i64>(4)? as u64,
-                    unsupported: row.get::<_, i64>(5)? as u64,
-                })
-            },
-        )?)
+        layer_coverage_at(
+            &database.connection,
+            mailbox,
+            uid_validity,
+            u32::MAX,
+            layer,
+            false,
+        )
     }
 
     pub(super) fn recover_blobs(
@@ -605,7 +620,7 @@ impl Cache {
         let database = databases
             .get_mut(&namespace)
             .ok_or(CacheError::OutOfScope)?;
-        self.write(namespace, database, |tx| {
+        let retired = self.write(namespace, database, |tx| {
             tx.execute(
                 "DELETE FROM artifacts WHERE rowid IN (
                     SELECT a.rowid FROM artifacts AS a JOIN messages AS m ON m.id=a.message_id
@@ -639,7 +654,15 @@ impl Cache {
                 [MAX_GC_ROWS],
             )?;
             Ok::<_, CacheError>(())
-        })?;
+        });
+        // Already-unreferenced files can free physical space even when a
+        // different partition left too little global room for this journal.
+        // Keep their DB rows until after unlink, so recovery can finish it.
+        let lacked_journal_room = match retired {
+            Ok(()) => false,
+            Err(CacheError::Quota) => true,
+            Err(error) => return Err(error),
+        };
         let candidates = {
             let mut query = database.connection.prepare(
                 "SELECT id FROM blobs
@@ -651,7 +674,7 @@ impl Cache {
                 .query_map([MAX_GC_ROWS], |row| row.get::<_, [u8; 16]>(0))?
                 .collect::<Result<Vec<_>, _>>()?
         };
-        let mut collected = 0;
+        let mut removed = Vec::new();
         for id in candidates {
             let blob = BlobId(Uuid::from_bytes(id));
             if self
@@ -665,13 +688,21 @@ impl Cache {
             let path = self.disk.blob_path(&database.name, blob.0, false)?;
             let bytes = self.disk.remove_blob(&path)?;
             self.disk.forget_blob(&database.name, bytes)?;
-            self.write(namespace, database, |tx| {
-                tx.execute("DELETE FROM blobs WHERE id=?1", [id])?;
-                Ok::<_, CacheError>(())
-            })?;
-            collected += 1;
+            removed.push(id);
         }
-        Ok(collected)
+        if removed.is_empty() {
+            return if lacked_journal_room {
+                Err(CacheError::Quota)
+            } else {
+                Ok(0)
+            };
+        }
+        self.write(namespace, database, |tx| {
+            for id in &removed {
+                tx.execute("DELETE FROM blobs WHERE id=?1", [id])?;
+            }
+            Ok(removed.len())
+        })
     }
 }
 
@@ -948,6 +979,36 @@ impl BlobLease {
         self.info
     }
 
+    /// Record successful foreground use of a verified derived copy. A
+    /// recency write failure leaves the caller's already-verified read valid.
+    pub fn touch(&self) {
+        if self.kind != ArtifactKey::Raw && !self.invalidated {
+            let _ = self.touch_inner();
+        }
+    }
+
+    fn touch_inner(&self) -> Result<(), CacheError> {
+        let namespace = self.reference.account.reference_namespace();
+        let mut databases = self.cache.lock()?;
+        if self.restore_epoch != self.cache.disk.restore_epoch() {
+            return Ok(());
+        }
+        let database = databases
+            .get_mut(&namespace)
+            .ok_or(CacheError::OutOfScope)?;
+        let id = self.info.id.bytes();
+        self.cache.write(namespace, database, |tx| {
+            tx.execute(
+                "INSERT OR REPLACE INTO blob_recency
+                 (blob_id,mailbox,uid_validity,message_id,kind,part,mime_version,html_version)
+                 SELECT blob_id,mailbox,uid_validity,message_id,kind,part,mime_version,html_version
+                 FROM blob_recency WHERE blob_id=?1",
+                [id],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn body_metadata(&self) -> Option<&[u8]> {
         self.body_metadata.as_deref()
     }
@@ -1064,6 +1125,64 @@ impl Drop for BlobLease {
             }
         }
     }
+}
+
+pub(super) fn layer_coverage_at(
+    db: &Connection,
+    mailbox: &str,
+    uid_validity: u32,
+    high_uid: u32,
+    layer: ArtifactLayer,
+    require_body_metadata: bool,
+) -> Result<LayerCoverage, CacheError> {
+    let key = match layer {
+        ArtifactLayer::Raw => ArtifactKey::Raw,
+        ArtifactLayer::FullBody {
+            mime_version,
+            html_version,
+        } => ArtifactKey::FullBody {
+            mime_version,
+            html_version,
+        },
+        ArtifactLayer::Attachments { mime_version } => ArtifactKey::Attachment {
+            original_index: 0,
+            mime_version,
+        },
+    };
+    let (kind, _, mime, html) = key.sql()?;
+    Ok(db.query_row(
+        "SELECT count(*) FILTER(WHERE a.state=1),coalesce(sum(b.bytes),0),
+                count(*) FILTER(WHERE a.state=2),
+                count(*) FILTER(WHERE coalesce(a.state,0)=0),
+                count(*) FILTER(WHERE a.state=3),count(*) FILTER(WHERE a.state=4)
+         FROM messages AS m JOIN mailboxes AS f USING(mailbox,uid_validity)
+         LEFT JOIN artifacts AS a ON a.message_id=m.id AND a.kind=?3
+              AND a.mime_version=?4 AND a.html_version=?5
+              AND (NOT ?7 OR a.kind<>1 OR a.state<>1 OR EXISTS(
+                  SELECT 1 FROM body_leaf_metadata d WHERE d.blob_id=a.blob_id))
+         LEFT JOIN blobs AS b ON b.id=a.blob_id
+         WHERE m.mailbox=?1 AND m.uid_validity=?2 AND NOT m.tombstone AND m.uid<=?6
+           AND (?3<>2 OR a.kind IS NOT NULL)",
+        params![
+            mailbox,
+            uid_validity,
+            kind,
+            mime,
+            html,
+            high_uid,
+            require_body_metadata
+        ],
+        |row| {
+            Ok(LayerCoverage {
+                materialized: row.get::<_, i64>(0)? as u64,
+                materialized_bytes: row.get::<_, i64>(1)? as u64,
+                derivable_from_raw: row.get::<_, i64>(2)? as u64,
+                missing: row.get::<_, i64>(3)? as u64,
+                omitted: row.get::<_, i64>(4)? as u64,
+                unsupported: row.get::<_, i64>(5)? as u64,
+            })
+        },
+    )?)
 }
 
 pub(super) fn present_message(

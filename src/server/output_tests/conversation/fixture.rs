@@ -2,10 +2,19 @@
 use super::super::{attachments::Credentials, attachments::router, *};
 use crate::config::{AccountConfigSource, Config, ValidatedAccountConfig};
 use mailparse::MailHeaderMap;
-use std::sync::{
-    Mutex,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    borrow::Cow,
+    ops::RangeInclusive,
+    pin::Pin,
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    task::{Context, Poll},
 };
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+type GenerateRaw = fn(u32) -> Vec<u8>;
 
 pub(in crate::server::output_tests) struct Folder {
     pub flags: &'static str,
@@ -13,9 +22,11 @@ pub(in crate::server::output_tests) struct Folder {
     pub next: Option<u32>,
     pub report_uid_next: bool,
     pub messages: BTreeMap<u32, Vec<u8>>,
+    pub message_flags: BTreeMap<u32, &'static str>,
     pub sizes: BTreeMap<u32, u32>,
     pub structures: BTreeMap<u32, String>,
     pub sections: BTreeMap<(u32, String), Vec<u8>>,
+    generated: Option<(RangeInclusive<u32>, GenerateRaw)>,
 }
 
 impl Folder {
@@ -30,15 +41,60 @@ impl Folder {
             next: None,
             report_uid_next: true,
             messages: messages.into(),
+            message_flags: BTreeMap::new(),
             sizes: BTreeMap::new(),
             structures: BTreeMap::new(),
             sections: BTreeMap::new(),
+            generated: None,
         }
     }
 
+    pub fn generate(&mut self, uids: RangeInclusive<u32>, raw: GenerateRaw) {
+        assert!(!uids.is_empty() && *uids.start() > 0 && *uids.end() < u32::MAX);
+        self.generated = Some((uids, raw));
+    }
+
+    fn raw(&self, uid: u32) -> Option<Cow<'_, [u8]>> {
+        if let Some(bytes) = self.messages.get(&uid) {
+            return Some(Cow::Borrowed(bytes));
+        }
+        let (range, raw) = self.generated.as_ref()?;
+        range.contains(&uid).then(|| Cow::Owned(raw(uid)))
+    }
+
+    fn uids(&self, range: RangeInclusive<u32>) -> impl Iterator<Item = u32> + '_ {
+        let generated = self.generated.as_ref().and_then(|(generated, _)| {
+            let start = (*generated.start()).max(*range.start());
+            let end = (*generated.end()).min(*range.end());
+            (start <= end).then_some(start..=end)
+        });
+        self.messages.range(range).map(|(uid, _)| *uid).chain(
+            generated
+                .into_iter()
+                .flatten()
+                .filter(|uid| !self.messages.contains_key(uid)),
+        )
+    }
+
+    fn exists(&self) -> usize {
+        let generated = self.generated.as_ref().map_or(0, |(range, _)| {
+            (*range.end() - *range.start() + 1) as usize
+                - self.messages.range(range.clone()).count()
+        });
+        self.messages.len() + generated
+    }
+
     fn high_water(&self) -> u32 {
-        self.next
-            .unwrap_or_else(|| self.messages.keys().next_back().copied().unwrap_or(0) + 1)
+        self.next.unwrap_or_else(|| {
+            let last_generated = self.generated.as_ref().map_or(0, |(range, _)| *range.end());
+            self.messages
+                .keys()
+                .next_back()
+                .copied()
+                .unwrap_or(0)
+                .max(last_generated)
+                + 1
+        })
     }
 }
 
@@ -88,7 +144,7 @@ pub(in crate::server::output_tests) struct Command {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(super) struct Search<'a> {
+pub(in crate::server::output_tests) struct Search<'a> {
     pub start: u32,
     pub end: u32,
     pub field: Option<&'a str>,
@@ -127,9 +183,110 @@ fn unquote(wire: &str) -> Option<String> {
 struct Imap {
     folders: Mutex<BTreeMap<String, Folder>>,
     faults: Mutex<BTreeMap<(String, String), Fault>>,
+    holds: Mutex<BTreeMap<(String, String), Arc<CommandHold>>>,
     commands: Mutex<Vec<Command>>,
     connections: AtomicUsize,
+    commands_total: AtomicUsize,
+    completions: AtomicUsize,
+    received_bytes: AtomicUsize,
+    sent_bytes: AtomicUsize,
+    active: AtomicUsize,
+    max_active: AtomicUsize,
     changed: tokio::sync::Notify,
+}
+
+#[derive(Debug)]
+pub(in crate::server::output_tests) struct ImapMetrics {
+    pub commands: usize,
+    pub completions: usize,
+    pub received_bytes: usize,
+    pub sent_bytes: usize,
+    pub active: usize,
+    pub max_active: usize,
+}
+
+struct Metered<S> {
+    inner: S,
+    protocol: Arc<Imap>,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Metered<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(result, Poll::Ready(Ok(()))) {
+            self.protocol
+                .received_bytes
+                .fetch_add(buf.filled().len() - before, Ordering::Relaxed);
+        }
+        result
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Metered<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let result = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(bytes)) = result {
+            self.protocol.sent_bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+struct ActiveConnection(Arc<Imap>);
+
+impl Drop for ActiveConnection {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+pub(in crate::server::output_tests) struct CommandHold {
+    entered: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+    closed: tokio::sync::Semaphore,
+}
+
+impl CommandHold {
+    pub fn is_waiting(&self) -> bool {
+        self.entered.available_permits() != 0
+    }
+
+    pub async fn entered(&self) {
+        tokio::time::timeout(Duration::from_secs(10), self.entered.acquire())
+            .await
+            .expect("fixture command did not reach its hold")
+            .unwrap()
+            .forget();
+    }
+
+    pub fn release(&self) {
+        self.release.add_permits(1);
+    }
+
+    pub async fn disconnected(&self) {
+        tokio::time::timeout(Duration::from_secs(10), self.closed.acquire())
+            .await
+            .expect("fixture did not observe the held connection close")
+            .unwrap()
+            .forget();
+    }
 }
 
 pub(in crate::server::output_tests) struct Harness {
@@ -236,8 +393,15 @@ impl Harness {
                     .collect(),
             ),
             faults: Mutex::default(),
+            holds: Mutex::default(),
             commands: Mutex::default(),
             connections: AtomicUsize::new(0),
+            commands_total: AtomicUsize::new(0),
+            completions: AtomicUsize::new(0),
+            received_bytes: AtomicUsize::new(0),
+            sent_bytes: AtomicUsize::new(0),
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
             changed: tokio::sync::Notify::new(),
         });
         let protocol = imap.clone();
@@ -247,10 +411,18 @@ impl Harness {
                 let (socket, _) = listener.accept().await.unwrap();
                 socket.set_nodelay(true).unwrap();
                 let id = protocol.connections.fetch_add(1, Ordering::SeqCst) + 1;
+                let active = protocol.active.fetch_add(1, Ordering::SeqCst) + 1;
+                protocol.max_active.fetch_max(active, Ordering::SeqCst);
+                let connection = ActiveConnection(protocol.clone());
                 let tls = tls.clone();
                 let protocol = protocol.clone();
                 tokio::spawn(async move {
+                    let _connection = connection;
                     if let Ok(stream) = tls.accept(socket).await {
+                        let stream = Metered {
+                            inner: stream,
+                            protocol: protocol.clone(),
+                        };
                         serve(protocol, id, stream).await;
                     }
                 });
@@ -273,6 +445,17 @@ impl Harness {
         self.imap.connections.load(Ordering::SeqCst)
     }
 
+    pub fn metrics(&self) -> ImapMetrics {
+        ImapMetrics {
+            commands: self.imap.commands_total.load(Ordering::Relaxed),
+            completions: self.imap.completions.load(Ordering::Relaxed),
+            received_bytes: self.imap.received_bytes.load(Ordering::Relaxed),
+            sent_bytes: self.imap.sent_bytes.load(Ordering::Relaxed),
+            active: self.imap.active.load(Ordering::SeqCst),
+            max_active: self.imap.max_active.load(Ordering::SeqCst),
+        }
+    }
+
     pub fn stop_imap(&self) {
         self.backend.abort();
     }
@@ -291,6 +474,22 @@ impl Harness {
             .lock()
             .unwrap()
             .insert((mailbox.into(), command.into()), fault);
+    }
+
+    pub fn hold(&self, mailbox: &str, command: &str) -> Arc<CommandHold> {
+        let hold = Arc::new(CommandHold {
+            entered: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+            closed: tokio::sync::Semaphore::new(0),
+        });
+        let previous = self
+            .imap
+            .holds
+            .lock()
+            .unwrap()
+            .insert((mailbox.into(), command.into()), hold.clone());
+        assert!(previous.is_none(), "overlapping fixture command hold");
+        hold
     }
 
     pub async fn wait_for(&self, matches: impl Fn(&Command) -> bool) {
@@ -487,6 +686,7 @@ async fn serve(
             return;
         }
         let (tag, command) = line.trim_end_matches("\r\n").split_once(' ').unwrap();
+        protocol.commands_total.fetch_add(1, Ordering::Relaxed);
         if command.starts_with("LOGIN ") {
             if stream
                 .write_all(format!("{tag} OK login\r\n").as_bytes())
@@ -495,6 +695,7 @@ async fn serve(
             {
                 return;
             }
+            protocol.completions.fetch_add(1, Ordering::Relaxed);
             continue;
         }
         if let Some(mailbox) = command
@@ -503,12 +704,35 @@ async fn serve(
         {
             selected = unquote(mailbox).unwrap_or_else(|| mailbox.to_owned());
         }
-        protocol.commands.lock().unwrap().push(Command {
-            connection,
-            mailbox: selected.clone(),
-            text: command.into(),
-        });
+        {
+            // Preserve existing small-scenario traces without retaining the
+            // entire command stream during long synthetic load runs.
+            let mut commands = protocol.commands.lock().unwrap();
+            if commands.len() < 65_536 {
+                commands.push(Command {
+                    connection,
+                    mailbox: selected.clone(),
+                    text: command.into(),
+                });
+            }
+        }
         protocol.changed.notify_waiters();
+        let hold = protocol
+            .holds
+            .lock()
+            .unwrap()
+            .remove(&(selected.clone(), command.into()));
+        if let Some(hold) = hold {
+            hold.entered.add_permits(1);
+            tokio::select! {
+                result = stream.read_u8() => {
+                    assert!(result.is_err(), "another command arrived while a reply was held");
+                    hold.closed.add_permits(1);
+                    return;
+                }
+                released = hold.release.acquire() => released.unwrap().forget(),
+            }
+        }
         let fault = protocol
             .faults
             .lock()
@@ -536,6 +760,7 @@ async fn serve(
         if stream.write_all(&reply).await.is_err() {
             return;
         }
+        protocol.completions.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -562,7 +787,7 @@ fn respond(folders: &BTreeMap<String, Folder>, selected: &str, command: &str) ->
         return Some(
             format!(
                 "* {} EXISTS\r\n* OK [UIDVALIDITY {}] valid\r\n{next}",
-                folder.messages.len(),
+                folder.exists(),
                 folder.validity
             )
             .into_bytes(),
@@ -573,11 +798,12 @@ fn respond(folders: &BTreeMap<String, Folder>, selected: &str, command: &str) ->
     }
     if let Some(search) = Search::parse(command) {
         let mut reply = "* SEARCH".to_owned();
-        for (uid, raw) in folder.messages.range(search.start..=search.end) {
-            if search
-                .field
-                .is_none_or(|field| header_matches(raw, field, &search.anchor))
-            {
+        for uid in folder.uids(search.start..=search.end) {
+            if search.field.is_none_or(|field| {
+                folder
+                    .raw(uid)
+                    .is_some_and(|raw| header_matches(&raw, field, &search.anchor))
+            }) {
                 reply.push_str(&format!(" {uid}"));
             }
         }
@@ -587,15 +813,17 @@ fn respond(folders: &BTreeMap<String, Folder>, selected: &str, command: &str) ->
     let (ids, attrs) = command.strip_prefix("UID FETCH ")?.split_once(' ')?;
     let mut reply = Vec::new();
     for uid in ids.split(',').map(|id| id.parse::<u32>().unwrap()) {
-        let Some(raw) = folder.messages.get(&uid) else {
+        let Some(raw) = folder.raw(uid) else {
             continue;
         };
+        let raw = raw.as_ref();
         let headers = header(raw);
         let encoded = &raw[headers.len()..];
         let size = folder
             .sizes
             .get(&uid)
             .map_or(raw.len(), |size| *size as usize);
+        let flags = folder.message_flags.get(&uid).copied().unwrap_or("\\Seen");
         if attrs.contains("BODYSTRUCTURE") {
             let default = || {
                 format!(
@@ -612,7 +840,8 @@ fn respond(folders: &BTreeMap<String, Folder>, selected: &str, command: &str) ->
                 format!("* 1 FETCH (UID {uid} RFC822.SIZE {size})\r\n").as_bytes(),
             );
         } else if attrs == "(UID FLAGS)" {
-            reply.extend_from_slice(format!("* 1 FETCH (UID {uid} FLAGS (\\Seen))\r\n").as_bytes());
+            reply
+                .extend_from_slice(format!("* 1 FETCH (UID {uid} FLAGS ({flags}))\r\n").as_bytes());
         } else {
             let (selector, range) = attrs.split_once("BODY.PEEK[")?.1.split_once(']')?;
             let bytes = if let Some(bytes) = folder.sections.get(&(uid, selector.into())) {
@@ -639,7 +868,7 @@ fn respond(folders: &BTreeMap<String, Folder>, selected: &str, command: &str) ->
             };
             let mut evidence = String::new();
             if attrs.contains("FLAGS") {
-                evidence.push_str(" FLAGS (\\Seen)");
+                evidence.push_str(&format!(" FLAGS ({flags})"));
             }
             if attrs.contains("RFC822.SIZE") {
                 evidence.push_str(&format!(" RFC822.SIZE {size}"));

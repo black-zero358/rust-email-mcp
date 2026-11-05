@@ -9,9 +9,15 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use uuid::Uuid;
 
 mod content;
+mod gc;
+mod status;
+mod sweep;
 pub use content::{
     ContentLayer, ContentOutcome, ContentWork, FailureReason, SyncFacts, SyncProgress,
 };
+pub use gc::{SyncReclaimCandidate, SyncReclaimPage, SyncReclaimPosition};
+pub use status::{SyncCoverage, SyncGapCount, SyncLayerStatus, SyncScanStatus, SyncScopeStatus};
+pub use sweep::{SyncGcPage, SyncGcPosition};
 
 #[cfg(all(test, unix))]
 mod tests;

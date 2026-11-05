@@ -20,7 +20,6 @@ mod persistence;
 pub(crate) mod read_source;
 mod runtime;
 pub(crate) mod scheduler;
-#[cfg(test)]
 mod sync;
 use futures::TryStreamExt;
 use lettre::{address::Envelope, message::Mailbox};

@@ -13,10 +13,11 @@ pub struct MailRuntime {
     services: HashMap<AccountKey, MailService>,
     pub attachments: Arc<attachments::AttachmentStore>,
     conversations: conversation::CursorStore,
+    sync: sync::worker::Supervisor,
 }
 
 tokio::task_local! {
-    static READ_ADMISSION: Arc<BackendPermit>;
+    pub(super) static READ_ADMISSION: Arc<BackendPermit>;
 }
 
 pub(super) fn read_admission() -> Option<Arc<BackendPermit>> {
@@ -80,6 +81,7 @@ impl MailRuntime {
             services,
             attachments,
             conversations: cache.cursor_store(),
+            sync: sync::worker::Supervisor::new(cache),
         })
     }
 
@@ -93,15 +95,24 @@ impl MailRuntime {
     }
 
     pub async fn finish_cache(&self, cache: PreparedCache) {
+        let sync_finished = self.sync.finish().await;
         let writes_finished = self
             .write_guards
             .seal_and_drain(std::time::Duration::from_secs(10))
             .await;
         let reads_finished = self.scheduler.stop_admission();
         let transfers_finished = self.attachments.stop_transfers();
-        if writes_finished && reads_finished && transfers_finished {
+        if sync_finished && writes_finished && reads_finished && transfers_finished {
             cache.finish().await;
         }
+    }
+
+    pub fn start_sync(self: &Arc<Self>) {
+        self.sync.start(self);
+    }
+
+    pub fn stop_sync(&self) {
+        self.sync.stop();
     }
 
     pub fn has_read_access(&self, principal: &str) -> bool {
@@ -177,15 +188,12 @@ impl MailRuntime {
             let service = self.service_for(&lease.key)?;
             if name == "get_cache_status" {
                 return self
-                    .scheduler
-                    .run(
-                        lease.key.reference_namespace(),
-                        WorkClass::Foreground,
-                        &lease.cancellation,
-                        || service.persistent.status(&lease.key, &lease.alias),
-                    )
-                    .await
-                    .map_err(admission_error);
+                    .run_cached(&lease, async {
+                        let mut value = service.persistent.status(&lease.key, &lease.alias).await;
+                        self.sync.add_health(&lease.key, &mut value);
+                        Ok(value)
+                    })
+                    .await;
             }
             let mut selected = args.clone();
             selected
