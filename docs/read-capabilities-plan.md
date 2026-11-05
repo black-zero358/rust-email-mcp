@@ -399,7 +399,7 @@ UIDVALIDITY 改变立即停用旧世代数据、句柄和游标，后台清理�
 | R09 | 已完成；应用层源码 `4e499e4` 的 385 单元 + 44 集成、20 组会话 HTTP、fmt/clippy/release、8 文件离线联调、审计、实际镜像及独立审阅通过 | 搜索基础 [PR #73](https://github.com/black-zero358/rust-email-mcp/pull/73) 合并为 `2a07f31`；应用 [PR #74](https://github.com/black-zero358/rust-email-mcp/pull/74) 最终 head `21cc661` 的 check/audit/container 全通过，合并为 `3aeb3e2`；见[会话验证](validation.md#2026-11-05-r09-跨文件夹会话) |
 | R10 | 已完成；源码 `4516c1a` 的 420 单元 + 44 集成、fmt/clippy/release、8 文件联调、审计、断网恢复烟测及实际镜像通过，独立审阅闭环 | [PR #75](https://github.com/black-zero358/rust-email-mcp/pull/75) 最终 head `1b31464` 的 check/audit/container 全通过，合并为 `f422cbb`；[缓存设计](cache-design.md)、[验证记录](validation.md#2026-11-05-r10-持久元数据与会话游标) |
 | R11 | 基础 [PR #76](https://github.com/black-zero358/rust-email-mcp/pull/76) 已通过最终 CI 并合并为 `f403187`。应用源码 `4a14cfe` 已接入 full、V3 存储、完整离线工具矩阵、运行见证与既有写入口失效；482 单元 + 44 集成、fmt/clippy/release、8 文件联调及隔离恢复烟测通过，独立审阅问题已修复 | [实施设计](cache-content-design.md)、[应用验证](validation.md#2026-11-05-r11-完整离线读取)；应用 [PR #77](https://github.com/black-zero358/rust-email-mcp/pull/77) 最终 head `485232e` 的 check/audit/container 全部通过，独立审阅闭环，合并为 `5e45e59`；R11 全部完成 |
-| R12 | A 批 V4 检查点、有界扫描/核对和内容回填内部基础已实现；500 单元 + 47 集成、fmt/clippy/release、8 文件联调、V4 恢复烟测及专用审计通过，交叉审阅闭环 | [同步实施设计](cache-sync-design.md)；完成实际镜像与 PR 后继续 B 批生产后台接线、状态和同步验收，协议加速另行分批 |
+| R12 | A 批源码 `331775f` 实现 V4 检查点、有界扫描/核对和内容回填内部基础；500 单元 + 47 集成、fmt/clippy/release、8 文件联调、V4 恢复烟测、专用审计及实际镜像通过，精确提交交叉审阅闭环 | [同步实施设计](cache-sync-design.md)、[基础验证](validation.md#2026-11-05-r12-可恢复同步基础)；A 批进入 PR，B 批生产后台接线、状态和同步验收实施中，协议加速另行分批 |
 | R13 | 待实施 | 完整离线与发布验收；至少 10,000 封合成邮件、30 分钟持续负载 |
 
 ## 对照实现
