@@ -317,6 +317,7 @@ pub(in crate::mail) async fn download(
         .network(session.examine(mailbox_name(reference.mailbox, InputLimits::Read)?))
         .await
         .map_err(map_read_imap_error)?;
+    service.observe_mailbox(reference.mailbox, &state);
     check_validity(
         &json!({"uid_validity":reference.validity}),
         state.uid_validity,
@@ -346,6 +347,7 @@ pub(in crate::mail) async fn download(
                 .network(fresh.examine(mailbox_name(reference.mailbox, InputLimits::Read)?))
                 .await
                 .map_err(map_read_imap_error)?;
+            service.observe_mailbox(reference.mailbox, &state);
             check_validity(
                 &json!({"uid_validity":reference.validity}),
                 state.uid_validity,
@@ -359,6 +361,12 @@ pub(in crate::mail) async fn download(
                 }
                 let parsed = mime::parse(&raw)?;
                 let manifest = from_raw(&parsed)?;
+                service.persist_manifest(
+                    reference.mailbox,
+                    Some(reference.validity),
+                    reference.uid,
+                    &manifest.manifest,
+                );
                 attachments::decode_part(
                     manifest
                         .entities
@@ -388,6 +396,12 @@ pub(in crate::mail) async fn download(
         }
         Err(error) => return Err(error.mail()),
     };
+    service.persist_manifest(
+        reference.mailbox,
+        Some(reference.validity),
+        reference.uid,
+        &manifest,
+    );
     let part = manifest
         .parts
         .get(reference.index)

@@ -148,6 +148,17 @@ impl MailService {
             .lock()
             .map_err(|_| parts::body::ReadFault::local(MailError::backend()))?
             .insert(&self.account, mailbox, validity, uid, headers.clone());
+        if self.persists(mailbox)
+            && let Ok(parsed) = mime::headers(&headers)
+        {
+            self.persist_headers(
+                mailbox,
+                validity,
+                vec![persistence::HeaderObservation::new(
+                    uid, &headers, true, &parsed,
+                )],
+            );
+        }
         Ok(headers)
     }
 
@@ -182,6 +193,7 @@ impl MailService {
                 .examine(mailbox_name(mailbox, InputLimits::Read)?)
                 .await
                 .map_err(map_read_imap_error)?;
+            self.observe_mailbox(mailbox, &state);
             require_reference(&state)?;
             let (start, end) = window(a, state.uid_next)?;
             let mut ids = if state.exists == 0 || end == 0 {
@@ -354,6 +366,7 @@ impl MailService {
                 .examine(mailbox_name(mailbox, InputLimits::Read)?)
                 .await
                 .map_err(map_read_imap_error)?;
+            self.observe_mailbox(mailbox, &state);
             require_reference(&state)?;
             let (lower, upper) = window(a, state.uid_next)?;
             let mut day = start;
@@ -611,9 +624,19 @@ pub(super) fn parsed_with_options(
     a: &Value,
 ) -> Result<Value> {
     let p = mime::parse(raw)?;
+    parsed_with_part(&p, uid, validity, hard_limit, a)
+}
+
+pub(super) fn parsed_with_part(
+    p: &mime::Part<'_>,
+    uid: u32,
+    validity: Option<u32>,
+    hard_limit: usize,
+    a: &Value,
+) -> Result<Value> {
     let displayed = p.display_body(display_format(a)?)?;
     with_displayed(
-        parsed_metadata(&p, uid, validity)?,
+        parsed_metadata(p, uid, validity)?,
         &p.headers,
         displayed,
         hard_limit,

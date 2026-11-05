@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "mode": "metadata",
+  "directory": "cache",
+  "max_bytes": 268435456,
+  "accounts": [
+    {
+      "account_id": "default",
+      "mailboxes": ["INBOX"],
+      "max_bytes": 134217728
+    }
+  ]
+}

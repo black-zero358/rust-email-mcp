@@ -24,6 +24,8 @@
 | `mime`、`html` | 有界 MIME 解析、正文选择、附件分类、HTML 文本提取 | `mime` 调用 `html`；不执行网络请求、不发送邮件 |
 | `smtp` | 经验证 TLS/AUTH 的提交事务及独立清理 | 返回事务结果；由 `mail` 调用 `journal` 持久化，不在适配器中自动重试 |
 | `journal` | SQLite 操作键、参数摘要、状态持久化及重启恢复 | 不调用邮件后端；数据库事务不跨 SMTP/IMAP 网络请求 |
+| `cache` | 私有账户分区、物理额度、版本化元数据/索引和持久游标字节流 | 使用内部 AccountKey 和类型化证据，不依赖 MCP/邮箱凭据；短事务和流式 BLOB 接口 |
+| `mail/persistence` | 管理员范围、在线观察、即时世代隔离、有界写队列及状态屏障 | 复用当前账户授权；缓存故障保留普通在线读取结果，持久提交使用明确错误 |
 | `error` | 脱敏的错误结构与基础错误构造 | 供上层使用；不得把底层协议错误原文透传给用户或日志 |
 
 维护时保留上述依赖方向：协议、解析和存储模块不得反向依赖 `server` 或 HTTP 认证上下文。跨边界新增能力应先说明职责、兼容性和验证方法；当前文档不要求把现有模块重构为多 crate 或引入额外抽象。
@@ -47,15 +49,15 @@
 
 输入错误可附 `details`：首项包含字段 JSON Pointer、稳定原因、预期类型/范围、长度单位和修正动作，`additional_violations` 最多七项，合计最多八项。未知字段指向所属对象，错误不回显字段值或任意未知键。读取资源错误通过 `limit_kind` 区分预算类型；完整响应容纳不下详情时先移除详情，保留基础错误与 request_id，再执行原有有界降级。
 
-`server/output` 定义 15 个读取工具的 `outputSchema`，按真实成功、错误、逐项失败和完整响应降级分支描述封装；对象字段、可空值和状态分支均显式声明。`server/output_tests` 通过真实 HTTP MCP handler、隔离 TLS IMAP 与 jsonschema 验证器核验结果，覆盖旧调用、空页、错误和降级；写工具沿用原 Schema。
+`server/output` 定义 16 个读取工具的 `outputSchema`，按真实成功、错误、逐项失败和完整响应降级分支描述封装；对象字段、可空值和状态分支均显式声明。`server/output_tests` 通过真实 HTTP MCP handler、隔离 TLS IMAP 与 jsonschema 验证器核验结果，覆盖旧调用、空页、错误和降级；写工具沿用原 Schema。
 
 default 的 `AccountKey` 包含持久 UUID 与配置世代（v1 为 1），存放于独立 `accounts.sqlite`。注册库绑定 IMAP 登录身份/端点及规范化操作库路径，摘要域区分文件操作库与内存操作库；修改绑定拒绝启动。初始化在文件锁下清理固定暂存文件、构建完整 SQLite、同步并原子无覆盖发布，再加载正式路径核验。未知版本、损坏或权限不符返回脱敏错误；初始化成功后才打开 Journal。附件句柄携带 AccountKey，GET 再核对，重启继续使原内存句柄失效。
 
 显式账户配置使用注册库 v2，保留原 default 的 UUID、世代与绑定。追加账户按稳定 `registration_key` 登记，别名/显示名变化保留身份；登录身份或端点变化、删除后重新加入均递增世代。删除保留 tombstone。注册库最多 1 MiB、256 个历史键，升级保留 v1-backup 和最近完整 previous 副本，持久锁覆盖多账户运行期。配置、秘密、迁移全部成功后才打开 Journal。配置格式、迁移事务与故障恢复见[多账户设计](multi-account-design.md)。
 
-13 个账户读取工具接受可选 `account_id`，省略时选择配置默认读取账户再授权。`list_accounts` 仅显示当前主体可读账户，隐藏默认项时 `default_account_id=null`。全局 subject 准入与账户 ACL 取交集；未知、未授权、已删除或旧世代统一 `ACCOUNT_UNAVAILABLE`，附件 GET 统一 404。工具发现按当前主体过滤，直接调用读取工具仍执行账户授权。旧写工具始终选择原 default、拒绝 `account_id`，受原模式及写 ACL 共同控制。`get_operation` 保留原参数与 principal + operation_key 语义，全局已准入主体即使失去邮箱权限，仍可检查自己的历史发送结果。
+14 个账户读取工具接受可选 `account_id`，省略时选择配置默认读取账户再授权。`list_accounts` 仅显示当前主体可读账户，隐藏默认项时 `default_account_id=null`。全局 subject 准入与账户 ACL 取交集；未知、未授权、已删除或旧世代统一 `ACCOUNT_UNAVAILABLE`，附件 GET 统一 404。工具发现按当前主体过滤，直接调用读取工具仍执行账户授权。旧写工具始终选择原 default、拒绝 `account_id`，受原模式及写 ACL 共同控制。`get_operation` 保留原参数与 principal + operation_key 语义，全局已准入主体即使失去邮箱权限，仍可检查自己的历史发送结果。
 
-共享 MIME 解析器的可选预算分类也适用于原有写操作，错误码和发送状态顺序保留。`raw_message_bytes`、`decoded_attachment_bytes`、`decoded_body_bytes`、`mime_structure`、`header_bytes`、`wire_response_bytes`、`scan_items` 按实际失败来源报告；数值单位使用 bytes 或 items。缓存额度分类随缓存工作包接入。
+共享 MIME 解析器的可选预算分类也适用于原有写操作，错误码和发送状态顺序保留。`raw_message_bytes`、`decoded_attachment_bytes`、`decoded_body_bytes`、`mime_structure`、`header_bytes`、`wire_response_bytes`、`scan_items` 按实际失败来源报告；数值单位使用 bytes 或 items。持久会话提交额度拒绝使用 `cache_quota`。
 
 ## MCP and mail
 
@@ -170,7 +172,23 @@ JWKS 的硬缓存期限为 300 秒，不因刷新失败延长。刷新 I/O 使�
 
 部署时保留 WebAuthn origin 的显式 `:443`，ChatGPT callback 精确复制客户端当前设置界面值。Rauthy 0.37.2 的 discovery 遗漏其支持的 public-client `none`，按 [deployment](deployment.md) 修正；升级或变更域名、端点、scope 时重新导出核对。登录限流不覆盖静态 asset/theme；验收全部登录页脚本/样式及突发加载，HTML 200 本身不代表登录页可用。
 
+## Persistent metadata cache
+
+`CACHE_CONFIG_PATH` 在 Journal 恢复前解析严格版本化配置，省略或显式 off 不打开缓存。metadata 只接受已登记账户的明确文件夹列表，使用内部 AccountKey 命名空间分库。每账户 `cache.sqlite` 保持 application_id、schema v1、namespace 和恢复世代，元数据键包含 mailbox/UIDVALIDITY/UID。目录权限、根清单、符号链接、硬链接与保留路径冲突先核对，未知非空目录不接管；根锁在所有连接关闭后释放。
+
+全局与每账户额度按物理文件占用计算，包含主库、DELETE 回滚日志、清单、暂存及旧分区。事务前预留日志与主库增长，限制 SQLite page_count，避免用逻辑行长度代替磁盘用量。短事务内更新元数据、部件证据和索引。提交成功后保留返回值及 revision，后置磁盘诊断失败只阻止后续写入并报告故障。原操作库与账户注册库保持独立。
+
+在线读取成功完成相应 tagged 命令后才登记证据。`mail/persistence` 使用 16 项/8 MiB 的单 FIFO 队列，任务和 active worker 均持有容量许可。成功 EXAMINE 的世代观察先更新共享隔离状态，再排队持久化；旧世代消息、状态和游标立即被过滤。完整头、部分头和已核对部件清单分别计数；索引只使用完整、版本一致的输入。长词 FTS5 trigram 先有界取得至多 201 个 posting 再过滤范围，短词最多检查 200 条并保留续查位置，空页也可续查。
+
+会话 codec 采用固定版本和宽度、长度/计数前置检查、命名空间与摘要校验，所有 owned capacity 和验重索引 scratch 在创建及增长时计入持久 reservation。恢复时验证图索引、目标/候选/位置唯一性、水位、已交付状态和 replay。休眠磁盘记录、内存状态、恢复过程和执行租约共用 64 项/8 MiB。完整 wire fit 后，在一个 SQLite CAS 事务中提交 state 投影、active token 和最近 replay；执行中 blocking job 继续拥有租约，取消与数据库失败保留未交付项。持久期限为原绝对到期时间，重启不刷新。
+
+`cursor_storage` 反映实际 memory/persistent 模式。仅整个冻结范围都被管理员配置选中时使用持久模式；选中但不可用的范围明确失败，已存在持久 token 不转入内存。`get_cache_status` 先授权，只返回当前账户的配置、覆盖、配额及故障；本地读屏障最多等待 2 秒，不连接邮箱。备份恢复命令 `--cache-restored` 在 Journal 前执行，原子提升根恢复世代、清除游标、标记 dirty，未启用分区以后打开时也应用该世代。单次 EXAMINE 更新目录世代，完整存在性核对负责清除 dirty。
+
+当前公共能力为持久元数据、部件证据、索引基础和在线会话续查。R11 接入原始邮件/派生内容、显式离线读取及写操作 dirty 范围通知，R12 接入全量扫描和受影响范围的只读收敛。D1/D2/D3/D5 验证位置为 `src/cache/tests.rs`、`src/config/cache_config.rs`、`src/mail/conversation/tests/durable.rs` / `persist.rs` 和 `src/server/output_tests/cache.rs`；配置/运维入口见[缓存设计](cache-design.md)。
+
 ## Local operation store
+
+发送操作数据库由 `journal` 独立管理。下面的 SQLite/WAL/FULL 契约专用于发送意图和结果；持久邮件元数据采用前述独立 cache 分区。
 
 SQLite 仅保存主体、发送键、参数摘要、Message-ID、时间戳和结果，不保存邮件正文或收件人列表。WAL 允许读写并行，FULL 同步使发送意图在网络提交前落盘；事务保持短小且不跨网络调用。数据库位于本地文件系统，只由一个服务进程拥有，避免另一个进程在启动恢复时改写正在发送的记录。
 

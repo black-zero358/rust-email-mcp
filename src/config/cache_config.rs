@@ -1,0 +1,342 @@
+//! Explicit metadata cache configuration, validated before opening any database.
+use super::ValidatedAccountSet;
+use crate::{
+    accounts::valid_account_id,
+    cache::{MAX_BYTES, MAX_FOLDERS_PER_ACCOUNT, MIN_BYTES},
+    imap_text::mailbox_name,
+    input_limits::InputLimits,
+};
+use serde::Deserialize;
+use std::{
+    collections::HashSet,
+    fs::{self, File},
+    io::{ErrorKind, Read},
+    path::{Component, Path, PathBuf},
+};
+
+const CONFIG_ERROR: &str =
+    "Cache configuration is invalid. Check its mode, paths, accounts, folders and byte quotas.";
+const MAX_CONFIG_BYTES: u64 = 256 * 1024;
+
+#[derive(Debug, thiserror::Error)]
+#[error("Cache mode full is unavailable in this version. Use metadata or off.")]
+struct FullMode;
+
+#[derive(Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+enum Document {
+    Off {
+        version: u32,
+    },
+    Metadata {
+        version: u32,
+        directory: PathBuf,
+        max_bytes: u64,
+        accounts: Vec<AccountSettings>,
+    },
+    Full {
+        #[serde(rename = "version")]
+        _version: u32,
+        #[serde(rename = "directory")]
+        _directory: Option<PathBuf>,
+        #[serde(rename = "max_bytes")]
+        _max_bytes: Option<u64>,
+        #[serde(rename = "accounts")]
+        _accounts: Option<Vec<AccountSettings>>,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AccountSettings {
+    pub(crate) account_id: String,
+    pub(crate) mailboxes: Vec<String>,
+    pub(crate) max_bytes: u64,
+}
+
+pub struct CacheSettings {
+    pub(crate) directory: PathBuf,
+    pub(crate) max_bytes: u64,
+    pub(crate) accounts: Vec<AccountSettings>,
+    pub(crate) reserved: Vec<PathBuf>,
+}
+
+pub fn load_cache_configuration(
+    accounts: &ValidatedAccountSet,
+) -> anyhow::Result<Option<CacheSettings>> {
+    let path = std::env::var_os("CACHE_CONFIG_PATH");
+    match path {
+        Some(path) => load_cache_file(Path::new(&path), accounts),
+        None => Ok(None),
+    }
+}
+
+pub(crate) fn load_cache_file(
+    path: &Path,
+    registered: &ValidatedAccountSet,
+) -> anyhow::Result<Option<CacheSettings>> {
+    load(path, registered).map_err(|error| {
+        if error.is::<FullMode>() {
+            error
+        } else {
+            anyhow::anyhow!(CONFIG_ERROR)
+        }
+    })
+}
+
+fn load(path: &Path, registered: &ValidatedAccountSet) -> anyhow::Result<Option<CacheSettings>> {
+    anyhow::ensure!(fs::metadata(path)?.is_file());
+    let file = File::open(path)?;
+    anyhow::ensure!(file.metadata()?.is_file());
+    let mut bytes = Vec::new();
+    file.take(MAX_CONFIG_BYTES + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len() as u64 <= MAX_CONFIG_BYTES);
+    let (version, directory, max_bytes, mut accounts) = match serde_json::from_slice(&bytes)? {
+        Document::Off { version } => {
+            anyhow::ensure!(version == 1);
+            return Ok(None);
+        }
+        Document::Full { .. } => return Err(FullMode.into()),
+        Document::Metadata {
+            version,
+            directory,
+            max_bytes,
+            accounts,
+        } => (version, directory, max_bytes, accounts),
+    };
+    anyhow::ensure!(version == 1 && !directory.as_os_str().is_empty());
+    anyhow::ensure!((MIN_BYTES..=MAX_BYTES).contains(&max_bytes));
+    anyhow::ensure!(!accounts.is_empty() && accounts.len() <= registered.accounts.len());
+
+    let mut selected = HashSet::with_capacity(accounts.len());
+    for scope in &mut accounts {
+        anyhow::ensure!(
+            valid_account_id(&scope.account_id)
+                && registered
+                    .accounts
+                    .iter()
+                    .any(|account| account.alias == scope.account_id)
+                && selected.insert(scope.account_id.as_str())
+        );
+        anyhow::ensure!((MIN_BYTES..=max_bytes).contains(&scope.max_bytes));
+        anyhow::ensure!((1..=MAX_FOLDERS_PER_ACCOUNT).contains(&scope.mailboxes.len()));
+        let mut mailboxes = HashSet::with_capacity(scope.mailboxes.len());
+        for mailbox in &mut scope.mailboxes {
+            anyhow::ensure!(!mailbox.is_empty() && !mailbox.chars().any(char::is_control));
+            mailbox_name(mailbox, InputLimits::Read)?;
+            if mailbox.eq_ignore_ascii_case("INBOX") {
+                *mailbox = "INBOX".into();
+            }
+            anyhow::ensure!(mailboxes.insert(mailbox.as_str()));
+        }
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    let directory = normalize(&parent.join(directory), true)?;
+    anyhow::ensure!(directory.parent().is_some());
+    if directory.exists() {
+        anyhow::ensure!(directory.is_dir());
+    }
+
+    let service = &registered.service_config;
+    let operation = (service.database != ":memory:")
+        .then(|| normalize(Path::new(&service.database), false))
+        .transpose()?;
+    let database_parent = operation.as_deref().and_then(Path::parent);
+    let registry = match &service.account_registry {
+        Some(path) => normalize(path, false)?,
+        None => normalize(
+            &database_parent
+                .unwrap_or_else(|| Path::new("data"))
+                .join("accounts.sqlite"),
+            false,
+        )?,
+    };
+    let staging = match &service.attachment_staging_dir {
+        Some(path) if !path.as_os_str().is_empty() => Some(normalize(path, false)?),
+        Some(_) => None,
+        None => database_parent.map(|parent| parent.join("mail-downloads")),
+    };
+    let mut reserved = Vec::new();
+    if let Some(operation) = &operation {
+        reserve_paths(&mut reserved, operation, &["", "-journal", "-wal", "-shm"])?;
+    }
+    reserve_paths(
+        &mut reserved,
+        &registry,
+        &[
+            "",
+            "-journal",
+            "-wal",
+            "-shm",
+            ".lock",
+            ".staging",
+            ".staging-journal",
+            ".staging-wal",
+            ".staging-shm",
+            ".v1-backup",
+            ".previous",
+            ".previous-staging",
+        ],
+    )?;
+    reserved.extend(staging);
+    anyhow::ensure!(
+        !reserved
+            .iter()
+            .any(|path| { directory.starts_with(path) || path.starts_with(&directory) })
+    );
+    Ok(Some(CacheSettings {
+        directory,
+        max_bytes,
+        accounts,
+        reserved,
+    }))
+}
+
+fn reserve_paths(paths: &mut Vec<PathBuf>, base: &Path, suffixes: &[&str]) -> anyhow::Result<()> {
+    for suffix in suffixes {
+        let mut path = base.as_os_str().to_owned();
+        path.push(suffix);
+        paths.push(normalize(Path::new(&path), false)?);
+    }
+    Ok(())
+}
+
+/// Canonicalize each existing ancestor without creating missing paths. Cache
+/// locations reject symlinks, and protected locations resolve them for overlap.
+fn normalize(path: &Path, reject_symlinks: bool) -> anyhow::Result<PathBuf> {
+    anyhow::ensure!(!path.as_os_str().is_empty());
+    let absolute = std::path::absolute(path)?;
+    let mut result = PathBuf::new();
+    for part in absolute.components() {
+        match part {
+            Component::ParentDir => anyhow::bail!(CONFIG_ERROR),
+            Component::CurDir => continue,
+            part => result.push(part),
+        }
+        if matches!(part, Component::Normal(_)) {
+            match fs::symlink_metadata(&result) {
+                Ok(metadata) => {
+                    anyhow::ensure!(!reject_symlinks || !metadata.file_type().is_symlink());
+                    result = fs::canonicalize(&result)?;
+                }
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn settings() -> Value {
+        json!({
+            "version":1, "mode":"metadata", "directory":"metadata",
+            "max_bytes":8 * MIN_BYTES,
+            "accounts":[{"account_id":"default","mailboxes":["inbox","已归档"],"max_bytes":4 * MIN_BYTES}]
+        })
+    }
+
+    fn write(path: &Path, value: &Value) {
+        fs::write(path, serde_json::to_vec(value).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn metadata_configuration_is_strict_and_does_not_create_storage() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("cache.json");
+        let registered = ValidatedAccountSet::legacy(crate::config::fixture());
+        write(&path, &settings());
+        let loaded = load_cache_file(&path, &registered).unwrap().unwrap();
+        assert_eq!(
+            loaded.directory,
+            fs::canonicalize(root.path()).unwrap().join("metadata")
+        );
+        assert_eq!(loaded.accounts[0].mailboxes, ["INBOX", "已归档"]);
+        assert!(!loaded.directory.exists());
+
+        for (key, value) in [
+            ("version", json!(2)),
+            ("mode", json!("off")),
+            ("directory", json!("nested/../metadata")),
+            ("max_bytes", json!(MIN_BYTES - 1)),
+            ("unknown", json!(true)),
+            ("accounts", json!([])),
+        ] {
+            let mut invalid = settings();
+            invalid[key] = value;
+            write(&path, &invalid);
+            assert_eq!(
+                load_cache_file(&path, &registered)
+                    .err()
+                    .unwrap()
+                    .to_string(),
+                CONFIG_ERROR
+            );
+        }
+        let mut full = settings();
+        full["mode"] = json!("full");
+        write(&path, &full);
+        assert!(
+            load_cache_file(&path, &registered)
+                .err()
+                .unwrap()
+                .is::<FullMode>()
+        );
+        write(&path, &json!({"version":1,"mode":"off"}));
+        assert!(load_cache_file(&path, &registered).unwrap().is_none());
+        write(&path, &json!({"version":2,"mode":"off"}));
+        assert!(load_cache_file(&path, &registered).is_err());
+        for (key, value) in [
+            ("account_id", json!("unknown")),
+            ("mailboxes", json!(["inbox", "INBOX"])),
+            ("mailboxes", json!([""])),
+            ("mailboxes", json!(["private\tname"])),
+            ("max_bytes", json!(9 * MIN_BYTES)),
+        ] {
+            let mut invalid = settings();
+            invalid["accounts"][0][key] = value;
+            write(&path, &invalid);
+            assert!(load_cache_file(&path, &registered).is_err());
+        }
+        assert!(!loaded.directory.exists());
+    }
+
+    #[test]
+    fn metadata_paths_cannot_overlap_databases_or_attachment_staging() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("cache.json");
+        let mut config = (*crate::config::fixture()).clone();
+        config.database = root
+            .path()
+            .join("mail/operations.sqlite")
+            .to_str()
+            .unwrap()
+            .into();
+        config.attachment_staging_dir = Some(root.path().join("downloads"));
+        let registered = ValidatedAccountSet::legacy(std::sync::Arc::new(config));
+        for directory in [
+            "mail",
+            "mail/accounts.sqlite",
+            "mail/operations.sqlite-wal",
+            "downloads/metadata",
+        ] {
+            let mut invalid = settings();
+            invalid["directory"] = json!(directory);
+            write(&path, &invalid);
+            assert!(load_cache_file(&path, &registered).is_err(), "{directory}");
+        }
+        assert!(!root.path().join("mail").exists());
+        #[cfg(unix)]
+        {
+            let target = root.path().join("elsewhere");
+            fs::create_dir(&target).unwrap();
+            std::os::unix::fs::symlink(&target, root.path().join("metadata")).unwrap();
+            write(&path, &settings());
+            assert!(load_cache_file(&path, &registered).is_err());
+        }
+    }
+}

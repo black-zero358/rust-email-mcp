@@ -115,6 +115,7 @@ pub(super) struct Reference<'a> {
 
 pub(super) struct State {
     namespace: [u8; 32],
+    durable: bool,
     folders: Box<[Folder]>,
     seed: RefKey,
     options: Options,
@@ -184,6 +185,7 @@ impl State {
         }
         let mut state = Self {
             namespace,
+            durable: false,
             folders: folders.into_boxed_slice(),
             seed,
             options,
@@ -203,6 +205,14 @@ impl State {
 
     pub(super) fn namespace(&self) -> &[u8; 32] {
         &self.namespace
+    }
+
+    pub(super) fn durable(&self) -> bool {
+        self.durable
+    }
+
+    pub(super) fn reserve_restore_scratch(&mut self) {
+        self.durable = true;
     }
     pub(super) fn version(&self) -> u16 {
         STATE_VERSION
@@ -356,7 +366,12 @@ impl State {
             .clone()
             .filter(|reference| !self.graph.contains(*reference))
             .count();
-        self.check_growth(growth(&self.pending, count), limit)?;
+        let restore_growth = self.restore_growth(
+            self.targets.len(),
+            self.pending.len() + count,
+            self.graph.count(),
+        );
+        self.check_growth(growth(&self.pending, count) + restore_growth, limit)?;
         reserve(&mut self.pending, count)?;
         for reference in refs.filter(|reference| !self.graph.contains(*reference)) {
             let blocked = self.pending.iter().any(|pending| {
@@ -502,7 +517,12 @@ impl State {
         let added = self.graph.growth(&add)
             + growth(&self.targets, new_ids.len())
             + new_ids.iter().map(|id| id.as_str().len()).sum::<usize>()
-            + new_ids.len() * self.folders.len() * size_of::<[Position; 3]>();
+            + new_ids.len() * self.folders.len() * size_of::<[Position; 3]>()
+            + self.restore_growth(
+                self.targets.len() + new_ids.len(),
+                self.pending.len(),
+                self.graph.count() + 1,
+            );
         self.check_growth(added, limit)?;
         self.graph.reserve(&add)?;
         reserve(&mut self.targets, new_ids.len())?;
@@ -688,6 +708,7 @@ impl State {
             + capacity_bytes(&self.targets)
             + capacity_bytes(&self.pending)
             + self.graph.allocated_bytes()
+            + self.restore_scratch(self.targets.len(), self.pending.len(), self.graph.count())
             + self
                 .targets
                 .iter()
@@ -695,6 +716,22 @@ impl State {
                     target.id.as_str().len() + target.positions.len() * size_of::<[Position; 3]>()
                 })
                 .sum::<usize>()
+    }
+
+    /// Restore sorts one index vector at a time. Reserving its peak from
+    /// creation and before each growth keeps committed states decodable even
+    /// when every other cursor consumes its full reservation.
+    fn restore_scratch(&self, targets: usize, pending: usize, locations: usize) -> usize {
+        if self.durable {
+            targets.max(pending).max(locations) * size_of::<u32>()
+        } else {
+            0
+        }
+    }
+
+    fn restore_growth(&self, targets: usize, pending: usize, locations: usize) -> usize {
+        self.restore_scratch(targets, pending, locations)
+            - self.restore_scratch(self.targets.len(), self.pending.len(), self.graph.count())
     }
 
     fn check_growth(&self, additional: usize, limit: usize) -> Result<(), StateError> {
@@ -705,6 +742,9 @@ impl State {
             .ok_or(StateError::Capacity)
     }
 }
+
+#[path = "persist/state.rs"]
+pub(super) mod persist;
 
 #[cfg(test)]
 #[path = "tests/state.rs"]

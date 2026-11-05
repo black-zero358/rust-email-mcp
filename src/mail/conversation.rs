@@ -48,22 +48,32 @@ impl MailService {
         cancellation: &CancellationToken,
         fits: impl Fn(&Value) -> bool,
     ) -> Result<Value> {
-        let deadline = Deadline::now()
-            + self
-                .config
-                .timeout
-                .min(Duration::from_secs(MAX_PAGE_SECONDS));
+        let budget = self
+            .config
+            .timeout
+            .min(Duration::from_secs(MAX_PAGE_SECONDS));
+        let deadline = Deadline::now() + budget;
+        let durable = self.persistent.durable_account(&self.account);
+        // Leave time for the durable commit after assembling the exact page.
+        let network_deadline = if durable {
+            deadline - (budget / 8).min(Duration::from_secs(1))
+        } else {
+            deadline
+        };
         let namespace = self.account.reference_namespace();
         let binding = Binding::new(namespace, principal);
-        let mut backend = Backend::new(self, deadline);
+        let mut backend = Backend::new(self, network_deadline);
         let (mut lease, replay) = if let Some(cursor) = args["cursor"].as_str() {
-            match store
-                .checkout(
+            match timed(
+                deadline,
+                store.checkout_async(
                     binding,
                     cursor.parse().map_err(store_error)?,
                     Deadline::now().into_std(),
-                )
-                .map_err(store_error)?
+                ),
+            )
+            .await?
+            .map_err(store_error)?
             {
                 Checkout::Advance(lease) => (lease, false),
                 Checkout::Replay(lease) => (lease, true),
@@ -71,7 +81,17 @@ impl MailService {
         } else {
             let options = options(args)?;
             let (folders, seed, facts) = backend.freeze(args).await?;
-            let capacity = unavailable_start(&self.alias, &folders, seed)?;
+            let durable_scope = store.durable_scope(&namespace, &folders);
+            if !durable_scope
+                && folders.iter().all(|folder| {
+                    self.persistent
+                        .configured_folder(&self.account, &folder.name)
+                })
+            {
+                return Err(MailError::cursor_unavailable());
+            }
+            let capacity =
+                unavailable_start(&self.alias, &folders, seed, cursor_storage(durable_scope))?;
             let lease = match store.open_lease(binding, Deadline::now().into_std(), |limit| {
                 State::new(namespace, folders, seed, options, facts, limit)
             }) {
@@ -127,7 +147,7 @@ impl MailService {
                     .as_ref()
                     .is_err_and(|error| error.code == "STALE_UID")
                 {
-                    lease.invalidate().map_err(store_error)?;
+                    let _ = timeout_at(deadline, lease.invalidate_async()).await;
                     return Err(stale_uid());
                 }
                 if replay {
@@ -150,6 +170,10 @@ impl MailService {
             }
         }
 
+        let storage = cursor_storage(lease.durable_mode());
+        if !lease.persistence_available() {
+            return Err(MailError::cursor_unavailable());
+        }
         let capacity_reached = if replay {
             false
         } else {
@@ -157,7 +181,7 @@ impl MailService {
                 Ok(capacity) => capacity,
                 Err(error) => {
                     if error.code == "STALE_UID" {
-                        lease.invalidate().map_err(store_error)?;
+                        let _ = timeout_at(deadline, lease.invalidate_async()).await;
                     }
                     return Err(error);
                 }
@@ -183,12 +207,19 @@ impl MailService {
             match backend.bodies(lease.state(), &delivery).await {
                 Ok(bodies) => bodies,
                 Err(error) => {
-                    lease.invalidate().map_err(store_error)?;
+                    let _ = timeout_at(deadline, lease.invalidate_async()).await;
                     return Err(error);
                 }
             }
         };
         if let Some(view) = lease.replay() {
+            if !lease.generation_matches() {
+                let _ = timeout_at(deadline, lease.invalidate_async()).await;
+                return Err(stale_uid());
+            }
+            if !lease.persistence_available() {
+                return Err(MailError::cursor_unavailable());
+            }
             let snapshot = Snapshot {
                 next: view.next,
                 coverage: view.coverage,
@@ -196,6 +227,7 @@ impl MailService {
                 errors: view.errors,
                 capacity_reached: view.capacity_reached,
                 wire_omitted: view.wire_omitted,
+                cursor_storage: storage,
             };
             let full = render(
                 &self.alias,
@@ -232,29 +264,43 @@ impl MailService {
             let prepared = lease
                 .prepare_with_outcome(delivery.clone(), capacity_reached, drop_bodies)
                 .map_err(store_error)?;
-            let snapshot = Snapshot {
-                next: prepared.next(),
-                coverage: prepared.coverage(),
-                folder: &|index| prepared.folder_coverage(index),
-                errors: prepared.errors(),
-                capacity_reached: prepared.capacity_reached(),
-                wire_omitted: prepared.wire_omitted(),
+            let value = {
+                let snapshot = Snapshot {
+                    next: prepared.next(),
+                    coverage: prepared.coverage(),
+                    folder: &|index| prepared.folder_coverage(index),
+                    errors: prepared.errors(),
+                    capacity_reached: prepared.capacity_reached(),
+                    wire_omitted: prepared.wire_omitted(),
+                    cursor_storage: storage,
+                };
+                render(
+                    &self.alias,
+                    lease.state(),
+                    &delivery,
+                    &snapshot,
+                    &bodies,
+                    drop_bodies,
+                )?
             };
-            let value = render(
-                &self.alias,
-                lease.state(),
-                &delivery,
-                &snapshot,
-                &bodies,
-                drop_bodies,
-            )?;
             if fits(&value) {
                 if cancellation.is_cancelled() {
                     return Err(MailError::account_unavailable());
                 }
-                let committed = lease
-                    .commit(prepared, Deadline::now().into_std())
-                    .map_err(store_error)?;
+                if !lease.persistence_available() {
+                    return Err(MailError::cursor_unavailable());
+                }
+                let commit = Box::pin(lease.commit_async(
+                    prepared,
+                    Deadline::now().into_std(),
+                    cancellation.clone(),
+                ));
+                let committed = if durable {
+                    timed(deadline, commit).await?
+                } else {
+                    commit.await
+                }
+                .map_err(store_error)?;
                 debug_assert_eq!(
                     committed.next.map(|cursor| cursor.to_string()),
                     value["cursor"].as_str().map(str::to_owned)
@@ -437,7 +483,10 @@ impl<'a> Backend<'a> {
         if seed_uid > high_uid {
             return Err(missing());
         }
-        let facts = self.facts(seed_uid).await.map_err(|fault| fault.error)?;
+        let facts = self
+            .facts(seed_mailbox, uid_validity, seed_uid)
+            .await
+            .map_err(|fault| fault.error)?;
         let facts = self.fingerprint(seed_uid, facts).await?;
         let mut folders = Vec::with_capacity(names.len());
         let per_folder =
@@ -530,6 +579,8 @@ impl<'a> Backend<'a> {
 
     async fn facts(
         &mut self,
+        mailbox: &str,
+        validity: u32,
         uid: u32,
     ) -> std::result::Result<ThreadFacts, parts::body::ReadFault> {
         use parts::body::ReadFault;
@@ -559,8 +610,18 @@ impl<'a> Backend<'a> {
             )));
         }
         let headers = mime::headers(&raw).map_err(ReadFault::local)?;
-        ThreadFacts::parse(&headers)
-            .map_err(|_| ReadFault::local(MailError::limit_kind(LimitKind::HeaderBytes)))
+        let facts = ThreadFacts::parse(&headers)
+            .map_err(|_| ReadFault::local(MailError::limit_kind(LimitKind::HeaderBytes)))?;
+        if self.service.persists(mailbox) {
+            self.service.persist_headers(
+                mailbox,
+                Some(validity),
+                vec![persistence::HeaderObservation::new(
+                    uid, &raw, true, &headers,
+                )],
+            );
+        }
+        Ok(facts)
     }
 
     async fn fingerprint(&mut self, uid: u32, mut facts: ThreadFacts) -> Result<ThreadFacts> {
@@ -696,7 +757,7 @@ impl<'a> Backend<'a> {
                 Work::Verify(candidate) => {
                     candidates += 1;
                     let uid = candidate.reference.uid;
-                    let facts = match self.facts(uid).await {
+                    let facts = match self.facts(&mailbox, uid_validity, uid).await {
                         Ok(facts) => {
                             let target = lease
                                 .state()
@@ -822,6 +883,7 @@ struct Snapshot<'a> {
     errors: &'a state::ErrorSnapshot,
     capacity_reached: bool,
     wire_omitted: bool,
+    cursor_storage: &'static str,
 }
 
 fn render(
@@ -925,7 +987,7 @@ fn render(
     }).collect::<Result<Vec<_>>>()?;
     let mut value = json!({
         "mode":"cross_mailbox","account_id":alias,"seed":reference(state.seed())?,"folders":folders,
-        "messages":messages,"cursor":snapshot.next.map(|cursor| cursor.to_string()),
+        "messages":messages,"cursor":snapshot.next.map(|cursor| cursor.to_string()),"cursor_storage":snapshot.cursor_storage,
         "coverage":render_coverage(coverage, returned + omitted.len(), returned),
         "errors":errors,"errors_omitted":snapshot.errors.omitted(),"omitted_refs":omitted,
         "complete":coverage.graph_complete && !coverage.delivery_pending,
@@ -975,7 +1037,16 @@ fn render_coverage(coverage: Coverage, requested: usize, returned: usize) -> Val
         "body_requested":requested,"body_returned":returned})
 }
 
-fn unavailable_start(alias: &str, folders: &[Folder], seed: RefKey) -> Result<Value> {
+fn cursor_storage(durable: bool) -> &'static str {
+    if durable { "persistent" } else { "memory" }
+}
+
+fn unavailable_start(
+    alias: &str,
+    folders: &[Folder],
+    seed: RefKey,
+    storage: &'static str,
+) -> Result<Value> {
     let seed_folder = &folders[seed.folder as usize];
     let Boundary::Frozen { uid_validity, .. } = seed_folder.boundary else {
         return Err(MailError::backend());
@@ -1000,7 +1071,7 @@ fn unavailable_start(alias: &str, folders: &[Folder], seed: RefKey) -> Result<Va
     };
     Ok(json!({
         "mode":"cross_mailbox","account_id":alias,"seed":seed,"folders":folders,
-        "messages":[],"cursor":null,"coverage":render_coverage(coverage, 0, 0),
+        "messages":[],"cursor":null,"cursor_storage":storage,"coverage":render_coverage(coverage, 0, 0),
         "errors":[{"stage":"cursor","error":MailError::limit_kind(LimitKind::CacheQuota)}],
         "errors_omitted":0,"omitted_refs":[seed],"complete":false,"response_budget_omitted":false,
         "content_trust":"untrusted","cursor_action":"restart_later_or_with_narrower_scope",
