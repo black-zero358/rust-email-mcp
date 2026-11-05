@@ -38,7 +38,7 @@ impl MailService {
                     attempted += 1;
                     // A duplicate UID keeps its own result while reusing any
                     // completed raw fallback already represented in this batch.
-                    if reader.fallback_used.contains(&id)
+                    if reader.used_fallback(id)
                         && let Some(previous) = items.iter().rfind(|item| item["uid"] == id)
                     {
                         items.push(previous.clone());
@@ -94,28 +94,94 @@ pub(in crate::mail) struct BodyReadSession<'a> {
     session: Option<Session>,
     pub state: async_imap::types::Mailbox,
     mailbox: String,
-    fallback_used: std::collections::HashSet<u32>,
+    fallback_used: std::collections::HashSet<(String, u32, u32)>,
+    transport: Option<Arc<AtomicUsize>>,
 }
 impl<'a> BodyReadSession<'a> {
     pub(in crate::mail) async fn open(service: &'a MailService, args: &Value) -> Result<Self> {
         let mailbox = folder(args, InputLimits::Read)?.to_owned();
-        let mut session = service.connect_read().await?;
-        let state = session
-            .examine(mailbox_name(&mailbox, InputLimits::Read)?)
+        let session = service.connect_read().await?;
+        let mut reader = Self::from_connection(service, session, None);
+        reader.examine(&mailbox, args).await?;
+        Ok(reader)
+    }
+
+    pub(in crate::mail) fn from_connection(
+        service: &'a MailService,
+        session: Session,
+        transport: Option<Arc<AtomicUsize>>,
+    ) -> Self {
+        Self {
+            service,
+            session: Some(session),
+            state: Default::default(),
+            mailbox: String::new(),
+            fallback_used: Default::default(),
+            transport,
+        }
+    }
+
+    pub(in crate::mail) async fn examine(&mut self, mailbox: &str, args: &Value) -> Result<()> {
+        if self.session.is_none() {
+            self.session = Some(
+                self.service
+                    .connect_for(true, self.transport.clone())
+                    .await?,
+            );
+        }
+        self.examine_checked(mailbox)
             .await
-            .map_err(map_read_imap_error)?;
+            .map_err(|fault| fault.error)?;
+        check_validity(args, self.state.uid_validity)
+    }
+
+    pub(in crate::mail) async fn examine_checked(
+        &mut self,
+        mailbox: &str,
+    ) -> std::result::Result<(), ReadFault> {
+        let encoded = mailbox_name(mailbox, InputLimits::Read).map_err(ReadFault::local)?;
+        let state = self
+            .session()
+            .map_err(ReadFault::stop)?
+            .examine(encoded)
+            .await
+            .map_err(|error| {
+                let reusable = matches!(
+                    error,
+                    async_imap::error::Error::No(_) | async_imap::error::Error::Bad(_)
+                );
+                ReadFault {
+                    error: map_read_imap_error(error),
+                    reusable,
+                }
+            })?;
         state
             .uid_validity
             .filter(|value| *value > 0)
-            .ok_or_else(MailError::backend)?;
-        check_validity(args, state.uid_validity)?;
-        Ok(Self {
-            service,
-            session: Some(session),
-            state,
-            mailbox,
-            fallback_used: Default::default(),
-        })
+            .ok_or_else(|| ReadFault::local(MailError::backend()))?;
+        self.state = state;
+        self.mailbox = mailbox.to_owned();
+        Ok(())
+    }
+
+    pub(in crate::mail) fn disconnect(&mut self) {
+        drop(self.session.take());
+    }
+
+    pub(in crate::mail) fn replace_connection(&mut self, session: Session) {
+        self.session = Some(session);
+    }
+
+    fn fallback_key(&self, uid: u32) -> (String, u32, u32) {
+        (
+            self.mailbox.clone(),
+            self.state.uid_validity.unwrap_or(0),
+            uid,
+        )
+    }
+
+    fn used_fallback(&self, uid: u32) -> bool {
+        self.fallback_used.contains(&self.fallback_key(uid))
     }
     pub(in crate::mail) fn session(&mut self) -> Result<&mut Session> {
         self.session.as_mut().ok_or_else(MailError::backend)
@@ -288,10 +354,10 @@ impl<'a> BodyReadSession<'a> {
         reason: reader::Fallback,
         synchronized: bool,
     ) -> std::result::Result<Value, ReadFault> {
-        if self.fallback_used.contains(&uid) || self.fallback_used.len() >= 20 {
+        if self.used_fallback(uid) || self.fallback_used.len() >= 20 {
             return Err(ReadFault::stop(MailError::backend()));
         }
-        self.fallback_used.insert(uid);
+        self.fallback_used.insert(self.fallback_key(uid));
         let max = self
             .service
             .config
@@ -308,7 +374,11 @@ impl<'a> BodyReadSession<'a> {
         }
         // This is an explicit strategy fallback, never a command retry.
         drop(self.session.take());
-        let mut fresh = self.service.connect_read().await.map_err(ReadFault::stop)?;
+        let mut fresh = self
+            .service
+            .connect_for(true, self.transport.clone())
+            .await
+            .map_err(ReadFault::stop)?;
         let state = fresh
             .examine(mailbox_name(&self.mailbox, InputLimits::Read).map_err(ReadFault::stop)?)
             .await

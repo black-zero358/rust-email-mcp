@@ -23,6 +23,8 @@
 
 删除或改义应先说明替代方式和迁移窗口。发布前用相关旧参数、旧配置或合成旧数据库验证受影响的兼容路径，并记录结果；无关路径不要求重复全量验收。
 
+R09 保留原单目录会话调用和版本 1 账户 JSON。`ARCHIVE_MAILBOX` 与 `folders.archive` 为可选配置，沿用现有数据库格式。回滚到 R09 之前且仍支持当前注册库格式的程序时，使用该程序可解析的账户 JSON，保留当前注册库和最新操作记录。跨目录游标在内存中保存，空闲 10 分钟到期，重启后从种子邮件重新查询。操作步骤见[部署指南](deployment.md#备份与恢复)。
+
 当前操作库没有通用的版本化迁移机制。首次需要改变数据库结构时，必须同时提供格式版本识别、迁移步骤、旧数据回归、失败恢复及回滚边界。迁移和清理不得把 `accepted` 或 `unknown` 变成可重新执行的发送意图。只要仍需要重复发送保护，就必须保留相应操作键和结果。
 
 `0.1.1` 的工作流扩展为兼容新增：旧 `download_attachment` 继续返回内联 Base64，认证 URL 由独立的 `prepare_attachment_download` 提供；无需数据迁移或新增配置。只有支持同主体 Bearer GET 的客户端才能使用新二进制通道。该源码版本号不表示产物已发布或生产已部署。
@@ -52,6 +54,8 @@ R06 将已锁定的 `imap-proto 0.17.0` 纳入本地补丁，以便在 BODYSTRUC
 R07 局部正文读取将已有传递依赖 `encoding_rs 0.8.42` 声明为直接依赖，复用其跨块字符解码状态；Cargo.lock 的包版本保持不变。许可证为 `(Apache-2.0 OR MIT) AND BSD-3-Clause`。替代方案是收齐整个部件后解码，当前采用增量接口以保留有界块处理。小输出缓冲采用固定 64 字节私有暂存，调用状态相关的 `max_utf8_buffer_length` 核对输入前缀的输出上界，再按 UTF-8 边界交付；升级需重跑拆分 BOM、空输入 EOF、ISO-2022-JP 和原 mailparse 字符结果的差分回归。维护入口为[锁定源码](https://github.com/hsivonen/encoding_rs/blob/v0.8.42/src/lib.rs)；UTF-7 继续使用现有有界 raw 读取路径。
 
 R09 搜索基础继续使用现有两份 vendored 版本、许可证及校验和，增加 opt-in 的命令字节、SEARCH UID 数量及异步通知解析分配预算。升级替换时运行 `tests/thread_search_budget.rs`，核对完整 tagged completion、预读隔离、尾部恢复、通知释放和 typed 错误后的读写闭锁，并重跑原 BODYSTRUCTURE/部件 FETCH 回归。接口及补丁范围分别记录在两库 PATCHES.md。
+
+R09 签名 HTTP 回归在 dev-dependencies 中为锁定的 Tokio 版本启用 `test-util`，使用虚拟时钟核对 60 秒请求期限与 10 分钟游标有效期。生产构建沿用原有 Tokio 功能集。
 
 专用审计脚本在同一临时锁文件中恢复 async-imap 与 imap-proto 的精确上游 registry 身份，再运行 cargo-audit；原 Cargo.lock 保持原字节。版本、校验和、缺失/重复记录、意外 source/checksum 及未登记的 path/git 包均触发拒绝。`scripts/test-audit-dependencies.sh` 在 CI 中验证这些边界和失败清理。Docker builder 与上下文仅允许这两个 vendored 目录，context 回归同时验证两个允许项及其他文件拒绝项。
 

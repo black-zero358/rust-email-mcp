@@ -244,6 +244,55 @@ fn structural(value: &Value, schema: &Value, field: &str, out: &mut Vec<InputVio
 }
 
 fn semantic(name: &str, args: &Value, out: &mut Vec<InputViolation>) {
+    if name == "read_conversation" {
+        let conflicting = |field: &str, related: &'static str, out: &mut Vec<InputViolation>| {
+            let mut issue = InputViolation::new(
+                &pointer("", field),
+                "conflicting_field",
+                "remove_conflicting_field",
+            );
+            issue.related_field = Some(related);
+            push(out, issue);
+        };
+        if args.get("cursor").is_some() {
+            for field in [
+                "mailbox",
+                "uid",
+                "uid_validity",
+                "before_uid",
+                "candidate_limit",
+                "limit",
+                "body_mode",
+                "html_display",
+                "max_body_length",
+                "mailboxes",
+                "scope",
+            ] {
+                if args.get(field).is_some() {
+                    conflicting(field, "/cursor", out);
+                }
+            }
+        } else {
+            for field in ["uid", "uid_validity"] {
+                if args.get(field).is_none() {
+                    push(
+                        out,
+                        InputViolation::new(&pointer("", field), "required_field", "provide_field"),
+                    );
+                }
+            }
+            if args.get("scope").is_some() && args.get("mailboxes").is_some() {
+                conflicting("mailboxes", "/scope", out);
+            }
+            if args.get("before_uid").is_some() {
+                if args.get("scope").is_some() {
+                    conflicting("before_uid", "/scope", out);
+                } else if args.get("mailboxes").is_some() {
+                    conflicting("before_uid", "/mailboxes", out);
+                }
+            }
+        }
+    }
     if super::is_account_read(name)
         && args["account_id"]
             .as_str()

@@ -79,6 +79,8 @@ impl ValidatedAccountSet {
             }
         }
         for account in &self.accounts {
+            super::validate_archive(account.config.archive.as_deref())
+                .map_err(|_| anyhow::anyhow!(CONFIG_ERROR))?;
             anyhow::ensure!(
                 valid_account_id(&account.registration_key)
                     && valid_account_id(&account.alias)
@@ -191,7 +193,7 @@ enum Document {
     FileOnly {
         version: u32,
         default_account_id: String,
-        legacy_default: FileLegacy,
+        legacy_default: Box<FileLegacy>,
         accounts: Vec<ExtraAccount>,
     },
 }
@@ -224,12 +226,14 @@ struct Smtp {
 struct Folders {
     drafts: String,
     trash: String,
+    archive: Option<String>,
 }
 impl Default for Folders {
     fn default() -> Self {
         Self {
             drafts: "Drafts".into(),
             trash: "Trash".into(),
+            archive: None,
         }
     }
 }
@@ -427,6 +431,7 @@ fn load_with(lookup: &dyn Fn(&str) -> Option<OsString>) -> anyhow::Result<Valida
                 "SMTP_STARTTLS",
                 "DRAFTS_MAILBOX",
                 "TRASH_MAILBOX",
+                "ARCHIVE_MAILBOX",
                 "MAIL_MODE",
             ] {
                 anyhow::ensure!(lookup(key).is_none(), CONFIG_ERROR);
@@ -457,6 +462,7 @@ fn load_with(lookup: &dyn Fn(&str) -> Option<OsString>) -> anyhow::Result<Valida
                     smtp_starttls: legacy.smtp.as_ref().is_some_and(|smtp| smtp.starttls),
                     drafts: legacy.folders.drafts,
                     trash: legacy.folders.trash,
+                    archive: legacy.folders.archive,
                     mode: legacy.permission_mode,
                 },
                 lookup,
@@ -493,6 +499,7 @@ fn load_with(lookup: &dyn Fn(&str) -> Option<OsString>) -> anyhow::Result<Valida
         read_config.imap_port = account.imap.port;
         read_config.drafts = account.folders.drafts;
         read_config.trash = account.folders.trash;
+        read_config.archive = account.folders.archive;
         read_config.mode = "read".into();
         accounts.push(ValidatedAccountConfig {
             registration_key: account.registration_key,

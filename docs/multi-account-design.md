@@ -12,7 +12,9 @@
 | extend_legacy | 原邮箱身份仍来自旧环境变量；JSON 显式写原邮箱 ACL 与追加只读邮箱 | JSON default_account_id | 始终绑定原 default；追加全局 OIDC 主体不会自动获得原邮箱权限 |
 | file_only | 所有邮箱配置来自 JSON，服务级设置仍来自环境变量 | JSON default_account_id | 必须声明固定 legacy_default 锚点；复用既有记录库时身份/路径必须匹配 |
 
-file_only 遇到任意旧 EMAIL_ADDRESS、EMAIL_PASSWORD、IMAP_HOST/PORT、SMTP_HOST/PORT/STARTTLS、DRAFTS_MAILBOX、TRASH_MAILBOX、MAIL_MODE 变量即拒绝启动，避免隐式优先级。extend_legacy 的 legacy_default 只允许显示名和显式 ACL，不能覆盖原邮箱身份。file_only 的 permission_mode 非 read 时必须声明 SMTP；read 可使用 smtp:null。
+file_only 遇到任意旧 EMAIL_ADDRESS、EMAIL_PASSWORD、IMAP_HOST/PORT、SMTP_HOST/PORT/STARTTLS、DRAFTS_MAILBOX、TRASH_MAILBOX、ARCHIVE_MAILBOX、MAIL_MODE 变量即拒绝启动，避免隐式优先级。extend_legacy 的 legacy_default 只允许显示名和显式 ACL，不能覆盖原邮箱身份。file_only 的 permission_mode 非 read 时必须声明 SMTP；read 可使用 smtp:null。
+
+`read_conversation` 的 `scope: "standard"` 可加入每个账户单独配置的归档目录。纯环境配置和 `extend_legacy` 的原邮箱读取 `ARCHIVE_MAILBOX`，追加邮箱读取各自的 `accounts[].folders.archive`。`file_only` 的原邮箱读取 `legacy_default.folders.archive`，追加邮箱同样读取各自的 `folders.archive`。填写服务端的准确 IMAP 目录名，最多 512 个 Unicode 码点及 2048 个 UTF-8 字节，且须非空、无控制字符。省略该配置即可使用无归档目录的标准范围。若提供 JSON `folders` 对象，仍须填写 `drafts` 和 `trash`。
 
 新 JSON 严格约束名称、秘密引用及 ACL；纯旧环境变量模式保留原解析边界，包括既有重复 OIDC_SUBJECTS，不用新 JSON 规则收紧旧启动方式。
 
@@ -37,7 +39,7 @@ file_only 遇到任意旧 EMAIL_ADDRESS、EMAIL_PASSWORD、IMAP_HOST/PORT、SMTP
     "address": "finance@example.test",
     "imap": {"host": "imap.example.test", "port": 993},
     "password": {"env": "FINANCE_MAIL_PASSWORD"},
-    "folders": {"drafts": "Drafts", "trash": "Trash"},
+    "folders": {"drafts": "Drafts", "trash": "Trash", "archive": "Archive"},
     "read_subjects": ["oidc-finance-user", "oidc-original-user"]
   }]
 }
@@ -56,6 +58,7 @@ file_only 的 legacy_default 另外声明 address、imap、password、smtp、fol
     "imap": {"host": "imap.example.test", "port": 993},
     "password": {"file": "primary.secret"},
     "smtp": null,
+    "folders": {"drafts": "Drafts", "trash": "Trash", "archive": "Archive"},
     "permission_mode": "read",
     "read_subjects": ["oidc-reader"],
     "write_subjects": []
@@ -130,6 +133,8 @@ MailRuntime::list_accounts(principal) -> Value
 Config 保留解析后的原字段兼容视图：service_config 对应固定 legacy default；每个追加邮箱持有覆盖其 IMAP/凭据/目录、mode=read 的独立视图。追加邮箱不构造 SMTP sender；file_only 原邮箱 read + smtp:null 也不构造 SMTP。AccountKey 派生 Hash，继续提供现有 reference_namespace，附件/调度/缓存均用内部键，不用别名当身份。
 
 生产配置先按重启生效。测试专用 from_test_accounts/revoke_read_for_test/remove_account_for_test 复用实际 Catalog 查询，验证每次请求重新授权和旧 token 取消；不提供模型可调用的账户管理或热重载工具。
+
+跨目录会话游标绑定发起主体和账户世代。续页仍须授权该账户，并按原调用传回账户参数（非默认账户须显式指定）。游标保存在当前进程内存，空闲 10 分钟到期。配置重启后，客户端用种子邮件和所需目录范围重新发起查询。
 
 ## 全局调度与资源
 

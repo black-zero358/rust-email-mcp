@@ -15,6 +15,7 @@
 | `server` | MCP 工具目录、权限模式、输入校验、响应封装与预算 | 将已认证主体传给 `mail`；协议适配不直接操作邮箱或数据库 |
 | `server/input`、`input_limits` | 读取字段错误、字符与字节契约、旧写用途限制 | 输入常量供 Schema 与 IMAP 编码共用；协议层不依赖 MCP 请求对象 |
 | `mail` | IMAP 会话、邮件操作编排、发送意图与结果记录 | 调用 `imap_text`、`mime`、`smtp`、`journal`，持有执行槽位 |
+| `mail/conversation` | 跨文件夹会话的读取编排、身份、关联图、分页状态和游标 | 编排复用 `mail/parts`；graph/identity/state/store 不依赖 MCP、HTTP 或网络，完整输出预算由 server 提供判定闭包 |
 | `mail/runtime`、`mail/scheduler` | 按主体和账户路由、全局准入及公平调度 | 授权先于队列、缓存和连接；固定原写账户，保持发送生命周期 |
 | `mail/attachments`、`mail/insights` | 附件交付及有界读取扩展 | 由 `mail` 编排，共用 MIME、协议、槽位与预算 |
 | `mail/listing`、`mail/classification` | 摘要分页、附件筛选、可选预览及固定邮件头分类 | 保留最后已检查 UID 游标；分类只使用完整观察到的头字段，预览失败保留摘要 |
@@ -99,6 +100,20 @@ APPEND 等待同步 literal continuation 时，先将合法 untagged 通知交�
 HTTP 内容固定为 octet-stream，带 no-store/nosniff、`X-Content-SHA256` 和 `Content-Digest`。响应头发出前的错误使用[附件契约](capabilities.md#附件与兼容性)中的小型 JSON；文件传输中的读取失败终止流，由客户端校验长度和摘要。仅完成命令且未出现目标 UID 才判为消息不存在；目标 UID 缺必需属性、大小不一致及命令失败返回后端错误。
 
 `mail/insights.rs` 提供有界标识符图会话、精确 Message-ID 定位、严格 STATUS 统计、脱敏诊断与正文展示。头部缓存最多 256 项/16 MiB、60 秒，只保存不可变头部并以新 UIDVALIDITY 失效；正文共用 `mime`/`html` 选择器。统计用 `imap_text::status_counts` 验证完整字段和命令完成。批量修改使用明确 UID、总体期限和逐项结果，失败项保守为 unknown、后续 unprocessed；没有持久化修改日志，重试前必须检查邮箱。范围与限制见 [能力说明](capabilities.md)。
+
+## Cross-mailbox conversations
+
+`read_conversation` 通过 `mailboxes`、`scope` 或 `cursor` 显式进入跨文件夹模式，旧单文件夹参数与输出保留。账户 ACL 在排队、游标访问和连接之前验证，游标绑定 principal 与 AccountKey 命名空间。standard 范围只采用协议 INBOX、服务端 Sent 与管理员 archive 配置，排除 All/Junk/Trash/Drafts/NoSelect；名称候选不授予范围。首次固定每目录 UIDVALIDITY 和 UIDNEXT−1，初始不可用目录保留错误，需重启查询才能重新冻结。
+
+每个 `(目标标识符, HEADER 字段, 文件夹, UID 数值窗口)` 独立推进，匹配 tagged OK 后保留全部命中并将搜索窗口记为完成；待核验命中单独计入 pending_candidates，核验结束前关联图保持不完整。HEADER 子串筛选后精确解析关联字段；合法非 ASCII/quoted ID 使用稳定 ASCII 搜索锚点或空 HEADER 条件，避免筛选漏掉合法标识符。每页共享 200 次候选头读取、20 个输出位置、256 KiB 展示正文、256 个搜索窗口和配置期限与 60 秒中的较小值。每窗口最多 200 UID、命令及 parser 128 KiB；种子头单独读取。普通及恢复连接最多 8 个，正文 raw 回退按完整 MessageRef 计一次，各连接保留原累计传输预算。身份 raw 核验每页最多 256 KiB、每项至多 2 秒或剩余时间四分之一。
+
+同一 Message-ID 的关键头按固定字段顺序核对各字段原始值，同名字段保留出现次序和长度；RFC2047 显示文本不参与证据归一化。完整 root MIME 正文字节的 SHA-256 使用固定指纹方法版本，raw 身份头还需与已取得的候选头一致。全部关键头与完整指纹一致才折叠；已知头/内容冲突标 collision，指纹缺失或不可比较保留 identity_unverified。缺失、非法或重复自身 ID 按完整引用独立保留。循环和 frontier 的所有增长计入状态容量，跨页输出新实体、新变体和新增位置，原来源始终保留。
+
+全实例游标最多 64 项、8 MiB，实际 owned capacity 与执行中租出的状态均计入；TTL 为 10 分钟，成功推进后刷新。互斥锁只保护租约、配额及提交，不跨网络等待。首次未发布租约取消后释放，已有租约取消可保留已完成搜索进度，但不确认未交付位置。先生成含实际下一 token 的 Prepared 快照并按完整 JSON-RPC 预算裁剪，再同步 CAS 提交位置和重放信息；超限失败保留原 token。容量失败返回覆盖缺口与重启/缩小范围动作。
+
+同 token 重放固定最近已交付的位置、覆盖、错误快照及原响应裁减标记；续查和重放均复核冻结目录的 UIDVALIDITY，任一变化使整个游标失效。复核轮转顺序并分摊期限；正常推进只交付本页已核对目录的来源，副本代表可改选为同变体的健康位置。同页某完整引用的头读取失败后，其他关联搜索命中该引用也保持阻断，下一页再处理。重放目录复核失败返回可重试错误并保留 token，避免交付旧的完整性状态。正文覆盖通过 body_requested/body_returned 和 omitted_refs 单独报告。
+
+对应 D1/D2/D3/D5 的验证入口为 `src/mail/conversation/tests`、`src/server/output_tests/conversation.rs` 与 `tests/thread_search_budget.rs`：覆盖身份碰撞、配额及取消、跨目录关联和固定水位、窗口失败、主体/账户边界、UIDVALIDITY、响应预算、重放和虚拟时间过期。真实 handler 结果用声明的 outputSchema 核验，所有邮件与 IMAP 服务均为本地合成数据。
 
 ## MIME and HTML
 

@@ -27,6 +27,7 @@ use tower::ServiceExt;
 mod accounts;
 mod attachments;
 mod body_parts;
+mod conversation;
 mod listing;
 mod parts;
 mod structure;
@@ -586,7 +587,7 @@ async fn every_read_output_schema_validates_real_handler_success_and_empty_resul
     let accounts = h.call("list_accounts", json!({})).await;
     assert_eq!(
         accounts["data"]["accounts"][0]["capabilities"]["cross_mailbox_conversation"],
-        false
+        true
     );
     assert_eq!(
         accounts["data"]["accounts"][0]["limits"]["text_utf8_bytes"],
