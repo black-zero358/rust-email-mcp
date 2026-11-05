@@ -178,6 +178,35 @@ where
     body_slice(session, uid, "", None, 0, request, Some(expected)).await
 }
 
+#[cfg(test)]
+pub(in crate::mail) async fn raw_chunk<S>(
+    session: &mut async_imap::Session<S>,
+    uid: u32,
+    offset: usize,
+    count: usize,
+    expected: usize,
+) -> Result<Vec<u8>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
+{
+    body_slice(session, uid, "", None, offset, count, Some(expected)).await
+}
+
+#[cfg(test)]
+pub(in crate::mail) async fn attachment_chunk<S>(
+    session: &mut async_imap::Session<S>,
+    uid: u32,
+    part: &ManifestPart,
+    offset: usize,
+    count: usize,
+    expected: usize,
+) -> Result<Vec<u8>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
+{
+    chunk(session, uid, part, offset, count, expected).await
+}
+
 async fn body_slice<S>(
     session: &mut async_imap::Session<S>,
     uid: u32,

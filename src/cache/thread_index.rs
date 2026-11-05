@@ -1,7 +1,7 @@
 //! Exact, versioned header relationships over a frozen local scope.
 use super::{Cache, CacheError, Namespace, Ref};
 use crate::accounts::AccountKey;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::ops::RangeInclusive;
 
 pub const THREAD_INDEX_VERSION: u16 = 1;
@@ -190,66 +190,100 @@ impl Cache {
         expected_header: &[u8],
         ids: &[ThreadId<'_>],
     ) -> Result<(), CacheError> {
-        if !self.full
-            || version != THREAD_INDEX_VERSION
-            || expected_header.len() > MAX_HEADER_BYTES
-            || ids.len() > MAX_IDS
-            || ids.iter().any(|id| !valid_id(id.id))
-            || ids.iter().map(|id| id.id.len()).sum::<usize>() > MAX_INDEX_BYTES
-            || ids
-                .iter()
-                .filter(|id| id.role == ThreadRole::MessageId)
-                .count()
-                > 1
+        if !self.full || version != THREAD_INDEX_VERSION || expected_header.len() > MAX_HEADER_BYTES
         {
             return Err(CacheError::OutOfScope);
         }
-        let mut ids = ids
-            .iter()
-            .map(|id| (id.role as u8, id.id))
-            .collect::<Vec<_>>();
-        ids.sort_unstable();
-        ids.dedup();
+        let ids = prepare_thread_ids(ids)?;
         self.update_message(reference, |tx, message| {
             let header_matches: bool = tx.query_row(
                 "SELECT complete_header AND header=?2 FROM messages WHERE id=?1",
-                params![message, expected_header], |row| row.get(0),
+                params![message, expected_header],
+                |row| row.get(0),
             )?;
             if !header_matches {
                 return Err(CacheError::OutOfScope);
             }
-            let indexed: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM thread_ready WHERE message_id=?1)", [message], |row| row.get(0),
-            )?;
-            if indexed {
-                let mut query = tx.prepare_cached(
-                    "SELECT role,normalized_id FROM thread_ids WHERE message_id=?1 ORDER BY role,normalized_id"
-                )?;
-                let mut rows = query.query([message])?;
-                let mut same = true;
-                for (role, id) in &ids {
-                    let Some(row) = rows.next()? else { same = false; break };
-                    if row.get::<_, u8>(0)? != *role || row.get_ref(1)?.as_str().map_err(|_| CacheError::Corrupt)? != *id {
-                        same = false;
-                        break;
-                    }
-                }
-                if same && rows.next()?.is_none() {
-                    return Ok(());
-                }
-            }
-            tx.execute("DELETE FROM thread_ready WHERE message_id=?1", [message])?;
-            tx.execute(
-                "INSERT INTO thread_ready VALUES(?1,?2,?3,?4)",
-                params![message, reference.mailbox, reference.uid_validity, version],
-            )?;
-            let mut insert = tx.prepare_cached("INSERT INTO thread_ids VALUES(?1,?2,?3,?4,?5,?6)")?;
-            for (role, id) in ids {
-                insert.execute(params![message, role, id, reference.mailbox, reference.uid_validity, reference.uid])?;
-            }
-            Ok(())
+            write_thread_ids(
+                tx,
+                message,
+                reference.mailbox,
+                reference.uid_validity,
+                reference.uid,
+                &ids,
+            )
         })
     }
+}
+
+pub(super) fn prepare_thread_ids<'a>(
+    ids: &[ThreadId<'a>],
+) -> Result<Vec<(u8, &'a str)>, CacheError> {
+    if ids.len() > MAX_IDS
+        || ids.iter().any(|id| !valid_id(id.id))
+        || ids.iter().map(|id| id.id.len()).sum::<usize>() > MAX_INDEX_BYTES
+        || ids
+            .iter()
+            .filter(|id| id.role == ThreadRole::MessageId)
+            .count()
+            > 1
+    {
+        return Err(CacheError::OutOfScope);
+    }
+    let mut ids = ids
+        .iter()
+        .map(|id| (id.role as u8, id.id))
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
+}
+
+pub(super) fn write_thread_ids(
+    tx: &Transaction<'_>,
+    message: i64,
+    mailbox: &str,
+    uid_validity: u32,
+    uid: u32,
+    ids: &[(u8, &str)],
+) -> Result<(), CacheError> {
+    let indexed: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM thread_ready WHERE message_id=?1)",
+        [message],
+        |row| row.get(0),
+    )?;
+    if indexed {
+        let mut query = tx.prepare_cached(
+                    "SELECT role,normalized_id FROM thread_ids WHERE message_id=?1 ORDER BY role,normalized_id"
+                )?;
+        let mut rows = query.query([message])?;
+        let mut same = true;
+        for (role, id) in ids {
+            let Some(row) = rows.next()? else {
+                same = false;
+                break;
+            };
+            if row.get::<_, u8>(0)? != *role
+                || row.get_ref(1)?.as_str().map_err(|_| CacheError::Corrupt)? != *id
+            {
+                same = false;
+                break;
+            }
+        }
+        if same && rows.next()?.is_none() {
+            return Ok(());
+        }
+    }
+    tx.execute("DELETE FROM thread_ready WHERE message_id=?1", [message])?;
+    tx.execute(
+        "INSERT INTO thread_ready VALUES(?1,?2,?3,?4)",
+        params![message, mailbox, uid_validity, THREAD_INDEX_VERSION],
+    )?;
+    let mut insert = tx.prepare_cached("INSERT INTO thread_ids VALUES(?1,?2,?3,?4,?5,?6)")?;
+    for (role, id) in ids {
+        insert.execute(params![message, role, id, mailbox, uid_validity, uid])?;
+    }
+    Ok(())
 }
 
 pub(super) fn current_scope(

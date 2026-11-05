@@ -174,7 +174,7 @@ JWKS 的硬缓存期限为 300 秒，不因刷新失败延长。刷新 I/O 使�
 
 ## Persistent metadata cache
 
-`CACHE_CONFIG_PATH` 在 Journal 恢复前解析严格版本化配置，省略或显式 off 不打开缓存。metadata/full 只接受已登记账户的明确文件夹列表，使用内部 AccountKey 命名空间分库。每账户 `cache.sqlite` 保持 application_id、schema 版本、namespace 和恢复世代，元数据键包含 mailbox/UIDVALIDITY/UID。metadata 默认新建 v1；full 以独立版本事务依次升级为 v2/v3，metadata 入口也可打开已升级的数据库。v3 保存列表观察、角色化精确标识索引及完整正文索引。目录权限、根清单、符号链接、硬链接与保留路径冲突先核对，未知非空目录不接管；根锁在所有连接关闭后显式释放；子进程短暂继承文件描述符时仍可立即重开，活动实例继续互斥。
+`CACHE_CONFIG_PATH` 在 Journal 恢复前解析严格版本化配置，省略或显式 off 不打开缓存。metadata/full 只接受已登记账户的明确文件夹列表，使用内部 AccountKey 命名空间分库。每账户 `cache.sqlite` 保持 application_id、schema 版本、namespace 和恢复世代，元数据键包含 mailbox/UIDVALIDITY/UID。metadata 默认新建 v1；full 以独立版本事务依次升级为 v2/v3/v4，metadata 入口也可打开已升级的数据库。v3 保存列表观察、角色化精确标识索引及完整正文索引；v4 保存历史、新 UID 和存在性核对检查点以及逐层内容任务。目录权限、根清单、符号链接、硬链接与保留路径冲突先核对，未知非空目录不接管；根锁在所有连接关闭后显式释放；子进程短暂继承文件描述符时仍可立即重开，活动实例继续互斥。
 
 全局与每账户额度按物理文件占用计算，包含主库、DELETE 回滚日志、清单、暂存及旧分区。事务前预留日志与主库增长，限制 SQLite page_count，避免用逻辑行长度代替磁盘用量。短事务内更新元数据、部件证据和索引。提交成功后保留返回值及 revision，后置磁盘诊断失败只阻止后续写入并报告故障。原操作库与账户注册库保持独立。
 
@@ -203,6 +203,14 @@ full 配置经 `Cache::open_full_with_run` 绑定运行见证。`cache/blob` 保
 D2/D3/D4/D5 验证入口为 `src/cache/full_tests.rs`、`src/cache/content_tests.rs`、`src/accounts/cache_run/tests.rs` 和 `src/mail/cache_write_guard/tests.rs`；metadata 和持久游标继续运行 R10 回归。显式离线工具矩阵及故障场景见[实施设计](cache-content-design.md#验收矩阵)。
 
 已完成 FETCH 的删除观察绑定原会话 UIDVALIDITY 与 UIDNEXT 上界；范围内未知 UID 留下持久墓碑以封存迟到证据，未来 UID 保持可分配。`fetch_miss_tombstones_only_uids_below_the_observed_uidnext` 和 `live_missing_future_uid_does_not_disable_cache_or_tombstone_later_arrival` 验证持久层和签名 HTTP 路径；`batch_observes_only_confirmed_existing_generation_misses_and_preserves_item_statuses` 覆盖批量写入前的目标存在性检查。协议失败及缺必要属性沿用原错误和停止规则。
+
+### Synchronization foundation
+
+R12A 的 `cache/sync_state` 使用 V4 保存独立历史、新 UID 与存在性/FLAGS 核对检查点，收据绑定命名空间、目录、UIDVALIDITY、冻结上界和恢复/dirty 修订。事实与检查点在同一短事务提交；完整头、头部全文与角色化标识索引共用既有实现。核对先于 EXAMINE 取得范围凭据，完成时 CAS 检查原修订、范围内存在性变化及活跃 claim。文件撤销会重排内容任务；正文索引等待新的完整正文，旧世代任务按每批至多 200 项清理。
+
+内部扫描使用有界 SEARCH，只有合法单条结果的 UID 数量溢出可在新连接缩窗重试。新增 metadata FETCH 入口分别限制完整 wire 与 header literal，在解析分配前核对；Facts 每批至多 8 UID、2 MiB，FLAGS 核对最多 200 UID、128 KiB。重复 SEARCH/UID、缺属性、错误 tag 和协议预算失败保留原进度。共享 MIME 选叶和分块解码继续服务在线正文，内容工作单元只在 tagged completion、完整解码和文件登记后返回持久收据。
+
+R12A 的 `mail/sync` 通过测试入口验证扫描、核对及物化单元；生产后台启停、调度与状态接线由 R12B 完成。D1/D2/D3/D5 对应 `src/cache/sync_state/tests.rs`、`src/mail/sync/tests.rs`、`src/mail/sync/content/tests.rs` 与 `tests/thread_search_budget.rs`。完整分期、恢复及验收条件见[同步设计](cache-sync-design.md)。
 
 ## Local operation store
 

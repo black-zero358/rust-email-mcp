@@ -1,18 +1,29 @@
 //! Resumable attachment transfer decoding; charset conversion belongs to body reads.
 use std::mem;
 
-pub(super) const OUTPUT_CHUNK: usize = 64 * 1024;
+pub(in crate::mail) const OUTPUT_CHUNK: usize = 64 * 1024;
 const MAX_DECODED_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum Encoding {
+pub(in crate::mail) enum Encoding {
     Identity,
     Base64,
     QuotedPrintable,
 }
 
+impl Encoding {
+    pub(in crate::mail) fn for_label(label: &str) -> Option<Self> {
+        match label {
+            "7bit" | "8bit" | "binary" => Some(Self::Identity),
+            "base64" => Some(Self::Base64),
+            "quoted-printable" => Some(Self::QuotedPrintable),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum DecodeError {
+pub(in crate::mail) enum DecodeError {
     InvalidBase64,
     DecodedLimit { limit: usize },
     PendingAllocation,
@@ -22,14 +33,14 @@ pub(super) enum DecodeError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum StepStatus {
+pub(in crate::mail) enum StepStatus {
     NeedInput,
     NeedOutput,
     Finished,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct Step {
+pub(in crate::mail) struct Step {
     pub consumed: usize,
     pub produced: usize,
     pub status: StepStatus,
@@ -236,7 +247,7 @@ enum State {
     QuotedPrintable(QuotedPrintable),
 }
 
-pub(super) struct Decoder {
+pub(in crate::mail) struct Decoder {
     state: State,
     run: Run,
     limit: usize,

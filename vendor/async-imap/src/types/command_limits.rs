@@ -6,7 +6,14 @@ pub struct CommandReadLimits(pub(crate) CommandLimit);
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum CommandLimit {
     BodySectionLiteralBytes(usize),
-    Search { response_bytes: usize, uids: usize },
+    Search {
+        response_bytes: usize,
+        uids: usize,
+    },
+    MailboxMetadata {
+        response_bytes: usize,
+        header_bytes: usize,
+    },
 }
 
 impl CommandReadLimits {
@@ -25,6 +32,15 @@ impl CommandReadLimits {
         Self(CommandLimit::Search {
             response_bytes: max_response_bytes.min(Self::MAX_SEARCH_RESPONSE_BYTES),
             uids: max_uids.min(imap_proto::bounded::MAX_SEARCH_UIDS),
+        })
+    }
+
+    /// Bound a metadata-only FETCH command and its unsolicited notifications.
+    /// Header literals also have an independent per-literal cap.
+    pub fn mailbox_metadata(max_response_bytes: usize, max_header_bytes: usize) -> Self {
+        Self(CommandLimit::MailboxMetadata {
+            response_bytes: max_response_bytes.min(2 * 1024 * 1024),
+            header_bytes: max_header_bytes.min(128 * 1024 + 1),
         })
     }
 }

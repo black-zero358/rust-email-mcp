@@ -1375,7 +1375,7 @@ pub(super) struct ListingObservation {
     pub(super) size: Option<u32>,
 }
 
-fn index_text(headers: &[mailparse::MailHeader<'_>]) -> Option<String> {
+pub(super) fn index_text(headers: &[mailparse::MailHeader<'_>]) -> Option<String> {
     let mut text = String::new();
     for header in headers {
         if [b"Subject".as_slice(), b"From", b"To", b"Cc", b"Message-ID"]
@@ -1393,7 +1393,7 @@ fn index_text(headers: &[mailparse::MailHeader<'_>]) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-fn encode_manifest(manifest: &parts::PartManifest) -> Option<Vec<u8>> {
+pub(super) fn encode_manifest(manifest: &parts::PartManifest) -> Option<Vec<u8>> {
     use serde::Serialize;
     #[derive(Serialize)]
     struct Record<'a> {

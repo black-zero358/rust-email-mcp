@@ -94,6 +94,16 @@ with the candidate's validation evidence.
 
 ## Bounded SEARCH responses (R09 foundation)
 
+R12 reuses the bounded mailbox-notification grammar for metadata FETCH via
+`Response::parse_bounded_mailbox_metadata`. The opt-in grammar accepts UID,
+FLAGS, MODSEQ, RFC822.SIZE, a bounded quoted INTERNALDATE and independently
+capped BODY literals. The metadata entry point rejects SEARCH responses.
+Neither entry point changes the ordinary parser. The root
+`tests/thread_search_budget.rs` covers split FETCH prefixes and rejects an
+oversized header declaration before receiving its payload.
+At the UID-count boundary, fixed scratch space is checked for duplicates
+before reporting a count overflow. Malformed UID lists remain syntax errors.
+
 `Response::parse_bounded_with_search_limit` applies an opt-in ceiling of at
 most 200 UID entries to an untagged SEARCH response. It parses into fixed
 scratch space and creates the exact result vector only after the complete

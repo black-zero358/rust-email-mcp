@@ -28,6 +28,7 @@ struct ActiveCommand {
 struct SearchBudget {
     response_bytes: usize,
     uids: usize,
+    metadata_header_bytes: Option<usize>,
     bytes_used: usize,
     uids_used: usize,
     precommand_bytes: usize,
@@ -103,7 +104,7 @@ impl<R: Read + Write + Unpin> ImapStream<R> {
             }
         }
         if self.search_budget().is_some() {
-            log::trace!("encode: bounded UID SEARCH");
+            log::trace!("encode: bounded mailbox command");
         } else {
             log::trace!(
                 "encode: input: {:?}, {:?}",
@@ -130,27 +131,35 @@ impl<R: Read + Write + Unpin> ImapStream<R> {
         if self.read_closed || self.command_limits.is_some() {
             return Err(io::Error::other("IMAP command is unavailable"));
         }
-        let (fetch_literal_bytes, search) = match limits.0 {
+        let (fetch_literal_bytes, bounded_mailbox) = match limits.0 {
             CommandLimit::BodySectionLiteralBytes(bytes) => (Some(bytes), None),
             CommandLimit::Search {
                 response_bytes,
                 uids,
-            } => {
-                let search = SearchBudget {
-                    response_bytes,
-                    uids,
-                    bytes_used: 0,
-                    uids_used: 0,
-                    precommand_bytes: self.buffer.used(),
-                    seen_search: false,
-                };
-                if let Err(error) = search.ensure_bytes(self.buffer.used()) {
-                    self.read_closed = true;
-                    return Err(error);
-                }
-                self.buffer.set_command_capacity(Some(response_bytes));
-                (None, Some(search))
+            } => (None, Some((response_bytes, uids, None))),
+            CommandLimit::MailboxMetadata {
+                response_bytes,
+                header_bytes,
+            } => (None, Some((response_bytes, 0, Some(header_bytes)))),
+        };
+        let search = if let Some((response_bytes, uids, metadata_header_bytes)) = bounded_mailbox {
+            let search = SearchBudget {
+                response_bytes,
+                uids,
+                metadata_header_bytes,
+                bytes_used: 0,
+                uids_used: 0,
+                precommand_bytes: self.buffer.used(),
+                seen_search: false,
+            };
+            if let Err(error) = search.ensure_bytes(self.buffer.used()) {
+                self.read_closed = true;
+                return Err(error);
             }
+            self.buffer.set_command_capacity(Some(response_bytes));
+            Some(search)
+        } else {
+            None
         };
         self.command_limits = Some(ActiveCommand {
             tag,
@@ -211,11 +220,32 @@ impl<R: Read + Write + Unpin> ImapStream<R> {
             let buf = &buf[..self.buffer.used()];
             let structure_limits = imap_proto::bounded::BodyStructureLimits::default();
             let parsed = if let Some(search) = self.search_budget() {
-                imap_proto::Response::parse_bounded_with_search_limit(
-                    buf,
-                    &structure_limits,
-                    search.uids - search.uids_used,
-                )
+                if let Some(header_bytes) = search.metadata_header_bytes {
+                    imap_proto::Response::parse_bounded_mailbox_metadata(
+                        buf,
+                        &structure_limits,
+                        header_bytes,
+                    )
+                } else {
+                    // A second SEARCH response is a protocol failure even
+                    // when its count would exceed the remaining UID budget.
+                    const PREFIX: &[u8] = b"* SEARCH";
+                    if (search.seen_search || search.precommand_bytes != 0)
+                        && buf
+                            .get(..PREFIX.len())
+                            .is_some_and(|head| head.eq_ignore_ascii_case(PREFIX))
+                        && buf
+                            .get(PREFIX.len())
+                            .is_some_and(|byte| matches!(byte, b' ' | b'\r'))
+                    {
+                        return Err(Some(io::Error::other("Unexpected IMAP SEARCH data")));
+                    }
+                    imap_proto::Response::parse_bounded_with_search_limit(
+                        buf,
+                        &structure_limits,
+                        search.uids - search.uids_used,
+                    )
+                }
             } else if let Some(limit) = self
                 .command_limits
                 .as_ref()
@@ -257,6 +287,14 @@ impl<R: Read + Write + Unpin> ImapStream<R> {
                                 Response::Continue(_) => {
                                     return Err(Some(io::Error::other(
                                         "Unexpected IMAP SEARCH continuation",
+                                    )));
+                                }
+                                Response::Fetch(..)
+                                    if search.metadata_header_bytes.is_some()
+                                        && search.precommand_bytes != 0 =>
+                                {
+                                    return Err(Some(io::Error::other(
+                                        "Unexpected IMAP FETCH before metadata command",
                                     )));
                                 }
                                 Response::MailboxData(MailboxDatum::Search(uids)) => {
@@ -339,7 +377,7 @@ impl<R: Read + Write + Unpin> ImapStream<R> {
                 Err(imap_proto::bounded::ParseError::Syntax(other)) => {
                     self.decode_needs = 0;
                     if self.search_budget().is_some() {
-                        return Err(Some(io::Error::other("Invalid IMAP SEARCH response")));
+                        return Err(Some(io::Error::other("Invalid bounded IMAP response")));
                     }
                     Err(Some(io::Error::other(format!(
                         "{:?} during parsing of {:?}",

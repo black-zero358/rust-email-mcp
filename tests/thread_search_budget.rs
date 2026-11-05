@@ -49,6 +49,16 @@ fn bounded_search_counts_entries_before_allocating_and_preserves_legal_prefixes(
         }),
     );
     assert!(Response::parse(wire.as_bytes()).is_ok());
+    let prefix = search_line(200);
+    for duplicate in [
+        format!("{} 200\r\n", prefix.trim_end()),
+        format!("* SEARCH 1{}", wire.strip_prefix("* SEARCH").unwrap()),
+    ] {
+        assert!(matches!(
+            parse(duplicate.as_bytes(), 200),
+            Err(ParseError::Syntax(error)) if !error.is_incomplete()
+        ));
+    }
     for malformed in [
         b"* SEARCH 0\r\n".as_slice(),
         b"* SEARCH 01\r\n",
@@ -238,6 +248,121 @@ async fn fragmented_entry_limit_is_typed_and_terminal() {
             assert!(!format!("{error:?} {error}").contains("private-marker"));
             assert_closed(&mut session).await;
         }
+        drop(session);
+        backend.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn duplicate_search_is_protocol_failure_before_the_second_count_limit() {
+    let (client, server) = tokio::io::duplex(1024);
+    let backend = tokio::spawn(async move {
+        let mut server = BufReader::new(server);
+        login(&mut server).await;
+        command(&mut server, &format!("UID SEARCH {QUERY}")).await;
+        // The first line leaves only one entry in the parser budget. If the
+        // second line reaches UID parsing, it is misclassified as a shrinkable
+        // response count overflow.
+        server.write_all(search_line(199).as_bytes()).await.unwrap();
+        server.write_all(b"* SeArCh").await.unwrap();
+        tokio::task::yield_now().await;
+        server.write_all(b" 1 2\r\n").await.unwrap();
+        no_more_commands(&mut server).await;
+    });
+    let mut session = async_imap::Client::new(client)
+        .login("synthetic", "test-only")
+        .await
+        .unwrap();
+    let error = session.uid_search_bounded(QUERY, 200).await.unwrap_err();
+    assert!(search_limit(&error).is_none());
+    assert_closed(&mut session).await;
+    drop(session);
+    backend.await.unwrap();
+}
+
+#[test]
+fn bounded_mailbox_metadata_accepts_split_facts_and_rejects_oversized_declarations() {
+    let limits = BodyStructureLimits::default();
+    let wire = b"* 1 FETCH (UID 9 FLAGS () INTERNALDATE \" 7-Feb-2025 09:00:00 +0000\" RFC822.SIZE 13 BODY[HEADER]<0> {8}\r\nX: a\r\n\r\n)\r\n";
+    assert_eq!(
+        Response::parse_bounded_mailbox_metadata(wire, &limits, 8).unwrap(),
+        Response::parse(wire).unwrap(),
+    );
+    for end in 0..wire.len() {
+        assert!(
+            matches!(
+                Response::parse_bounded_mailbox_metadata(&wire[..end], &limits, 8),
+                Err(ParseError::Syntax(error)) if error.is_incomplete()
+            ),
+            "prefix length {end}"
+        );
+    }
+    assert!(matches!(
+        Response::parse_bounded_mailbox_metadata(b"* 1 FETCH (UID 9 BODY[HEADER]<0> {9}\r\n", &limits, 8),
+        Err(ParseError::FetchLiteralLimit(error)) if error.limit == 8 && error.actual == 9
+    ));
+    assert!(matches!(
+        Response::parse_bounded_mailbox_metadata(
+            b"* 1 FETCH (UID 9 INTERNALDATE NIL)\r\n",
+            &limits,
+            8
+        ),
+        Err(ParseError::Syntax(_))
+    ));
+}
+
+#[tokio::test]
+async fn metadata_command_rejects_precommand_fetch_and_bounds_cumulative_wire() {
+    const FETCH: &str = "UID FETCH 7 (UID FLAGS)";
+    for precommand in [true, false] {
+        let (client, server) = tokio::io::duplex(1024);
+        let backend = tokio::spawn(async move {
+            let mut server = BufReader::new(server);
+            let tag = command(&mut server, "LOGIN \"synthetic\" \"test-only\"").await;
+            let prior = if precommand {
+                "* 1 FETCH (UID 7 FLAGS ())\r\n"
+            } else {
+                ""
+            };
+            server
+                .write_all(format!("{tag} OK login\r\n{prior}").as_bytes())
+                .await
+                .unwrap();
+            let tag = command(&mut server, FETCH).await;
+            let notices = if precommand {
+                String::new()
+            } else {
+                "* OK synthetic notice\r\n".repeat(12)
+            };
+            let _ = server
+                .write_all(format!("{notices}{tag} OK done\r\n").as_bytes())
+                .await;
+            no_more_commands(&mut server).await;
+        });
+        let mut session = async_imap::Client::new(client)
+            .login("synthetic", "test-only")
+            .await
+            .unwrap();
+        session
+            .run_command_with_limits(FETCH, CommandReadLimits::mailbox_metadata(256, 0))
+            .await
+            .unwrap();
+        let error = loop {
+            match session.read_response().await {
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("bounded command lost its error"),
+                Err(error) => break Error::from(error),
+            }
+        };
+        if precommand {
+            assert!(search_limit(&error).is_none());
+        } else {
+            assert_eq!(
+                search_limit(&error).unwrap().kind,
+                SearchLimitKind::ResponseBytes,
+            );
+        }
+        assert_closed(&mut session).await;
         drop(session);
         backend.await.unwrap();
     }

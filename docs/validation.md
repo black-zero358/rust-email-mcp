@@ -35,6 +35,8 @@ V3 是独立于已发布 V2 的新事务迁移，完整正文文本与有界叶�
 
 修复从 `git archive ec2ed44` 的隔离源码仅覆盖三份测试相关文件验证：默认线程栈、单 CPU、12 个测试线程的账户组连续两轮各 9 项通过（8.48/8.28 秒）；普通并发全量 482 单元、44 集成通过（38.67 秒）。最后共用截止点微调后，最终三文件快照的 fmt、all-target Clippy 及单 CPU/12 线程账户组 9 项通过（9.47 秒）。独立差异审阅通过；新的最终 PR CI 与合并结果在完成后追加。
 
+最终 head `485232e38051f5f38936b0d241ce702a85858199` 的 [CI 42021538312](https://github.com/black-zero358/rust-email-mcp/actions/runs/42021538312) 中 check/audit/container 全部通过，最终源码与测试修复的独立复核完成。GitHub 自动代码/安全审阅遇到账户额度限制；合并前 reviews/review threads 为空。[PR #77](https://github.com/black-zero358/rust-email-mcp/pull/77) 合并为 `5e45e59af058fafc562d873fa7ad1dce11b2e740`，本地 main、开发分支及对应远端同步，R12 改动保留在工作区。
+
 全历史回填、周期增量/删除核对和运行期自动回收继续由 R12 交付；R13 执行至少 10,000 封合成邮件与 30 分钟负载。附件验收继续采用离线客户端，真实 ChatGPT 接入及生产操作按单独流程安排。此批依赖、Cargo.lock 与 Docker 构建配置保持原值。
 
 ## 2026-11-05 R11 文件缓存与失效基础
