@@ -6,17 +6,26 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
 };
 
+mod blob;
 pub mod cursor;
+mod dirty;
 mod disk;
+#[cfg(all(test, unix))]
+mod full_tests;
 mod metadata;
 mod schema;
 #[cfg(all(test, unix))]
 mod tests;
 
+pub use blob::{
+    Access, ArtifactKey, ArtifactLayer, ArtifactState, BlobId, BlobInfo, BlobLease, BlobStage,
+    LayerCoverage, Omission,
+};
+pub use dirty::{DirtyStamp, DirtyTicket};
 pub use metadata::{AccountStatus, FolderStatus, SearchHit, SearchPage};
 
 const MAX_ACCOUNTS: usize = 16;
@@ -35,6 +44,8 @@ pub enum CacheError {
     Corrupt,
     #[error("Cache storage is unavailable.")]
     Storage,
+    #[error("Cache content needs online verification.")]
+    NeedsVerification,
 }
 
 impl From<rusqlite::Error> for CacheError {
@@ -77,6 +88,7 @@ struct Scope {
 struct Database {
     connection: Connection,
     name: String,
+    full_schema: bool,
 }
 
 pub struct Cache {
@@ -86,6 +98,10 @@ pub struct Cache {
     // Drop every SQLite connection before releasing the instance lock.
     disk: disk::Root,
     startup_unclean: bool,
+    full: bool,
+    instance: uuid::Uuid,
+    offline_disabled: AtomicBool,
+    blob_leases: Mutex<BTreeMap<(Namespace, BlobId), usize>>,
     write_fault: AtomicU8,
     #[cfg(test)]
     fail_post_commit_check: std::sync::atomic::AtomicBool,
@@ -97,6 +113,27 @@ impl Cache {
         max_bytes: u64,
         accounts: Vec<AccountScope>,
         reserved: &[PathBuf],
+    ) -> Result<Arc<Self>, CacheError> {
+        Self::open_mode(directory, max_bytes, accounts, reserved, false)
+    }
+
+    /// Open a full storage instance after administrator and runtime setup.
+    /// Opening includes a durable unclean marker before any offline access.
+    pub fn open_full(
+        directory: &Path,
+        max_bytes: u64,
+        accounts: Vec<AccountScope>,
+        reserved: &[PathBuf],
+    ) -> Result<Arc<Self>, CacheError> {
+        Self::open_mode(directory, max_bytes, accounts, reserved, true)
+    }
+
+    fn open_mode(
+        directory: &Path,
+        max_bytes: u64,
+        accounts: Vec<AccountScope>,
+        reserved: &[PathBuf],
+        full: bool,
     ) -> Result<Arc<Self>, CacheError> {
         if accounts.is_empty()
             || accounts.len() > MAX_ACCOUNTS
@@ -139,6 +176,10 @@ impl Cache {
             scopes,
             databases: Mutex::default(),
             startup_unclean,
+            full,
+            instance: uuid::Uuid::new_v4(),
+            offline_disabled: AtomicBool::new(!full),
+            blob_leases: Mutex::default(),
             write_fault: AtomicU8::new(0),
             #[cfg(test)]
             fail_post_commit_check: std::sync::atomic::AtomicBool::new(false),
@@ -153,14 +194,23 @@ impl Cache {
                 cache
                     .disk
                     .reserve_write(&connection, &name, scope.max_bytes, max_bytes)?;
-                schema::initialize(
+                let full_schema = schema::initialize(
                     &mut connection,
                     namespace,
                     startup_unclean,
                     cache.disk.restore_epoch(),
+                    full,
                 )?;
                 cache.disk.verify_usage(&name, scope.max_bytes, max_bytes)?;
-                databases.insert(*namespace, Database { connection, name });
+                let mut database = Database {
+                    connection,
+                    name,
+                    full_schema,
+                };
+                if full {
+                    cache.recover_blobs(*namespace, &mut database)?;
+                }
+                databases.insert(*namespace, database);
             }
         }
         Ok(cache)
@@ -189,13 +239,18 @@ impl Cache {
     pub fn mark_clean(&self) -> Result<(), CacheError> {
         let databases = self.lock()?;
         self.write_health()?;
+        if self.full
+            && (self.offline_disabled.load(Ordering::Acquire) || self.disk.has_staged_blobs()?)
+        {
+            return Ok(());
+        }
         for database in databases.values() {
             let dirty: bool = database.connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM mailboxes WHERE dirty)",
                 [],
                 |row| row.get(0),
             )?;
-            if dirty {
+            if dirty || (database.full_schema && dirty::has_dirty(&database.connection)?) {
                 return Ok(());
             }
         }
@@ -208,8 +263,9 @@ impl Cache {
         let mut databases = self.lock()?;
         let restore_epoch = self.disk.mark_restored(self.max_bytes)?;
         for (namespace, database) in databases.iter_mut() {
+            let full_schema = database.full_schema;
             self.write(*namespace, database, |tx| {
-                schema::restore(tx, restore_epoch)
+                schema::restore(tx, restore_epoch, full_schema)
             })?;
         }
         Ok(())

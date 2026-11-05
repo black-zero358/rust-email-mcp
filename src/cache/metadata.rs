@@ -65,6 +65,7 @@ impl Cache {
         let database = databases
             .get_mut(&namespace)
             .ok_or(CacheError::OutOfScope)?;
+        let full_schema = database.full_schema;
         self.write(namespace, database, |tx| {
             let previous: Option<u32> = tx.query_row(
                 "SELECT uid_validity FROM mailboxes WHERE mailbox=?1",
@@ -105,7 +106,10 @@ impl Cache {
                    checked_at_ms=CASE WHEN mailboxes.uid_validity=excluded.uid_validity
                                  THEN max(mailboxes.checked_at_ms,excluded.checked_at_ms)
                                  ELSE excluded.checked_at_ms END",
-                params![mailbox, uid_validity, high_uid, checked_at_ms, self.startup_unclean],
+                params![
+                    mailbox, uid_validity, high_uid, checked_at_ms,
+                    self.startup_unclean || (full_schema && super::dirty::scope_dirty(tx, mailbox)?),
+                ],
             )?;
             Ok(())
         })
@@ -173,8 +177,12 @@ impl Cache {
         let database = databases
             .get_mut(&namespace)
             .ok_or(CacheError::OutOfScope)?;
+        let full_schema = database.full_schema;
         self.write(namespace, database, |tx| {
             let id = message_id(tx, reference)?;
+            if full_schema {
+                tx.execute("DELETE FROM artifacts WHERE message_id=?1", [id])?;
+            }
             tx.execute("DELETE FROM message_index WHERE rowid=?1", [id])?;
             tx.execute(
                 "UPDATE messages SET tombstone=1,header=NULL,complete_header=0,index_text=NULL,parts=NULL
@@ -198,6 +206,9 @@ impl Cache {
         let database = databases
             .get_mut(&namespace)
             .ok_or(CacheError::OutOfScope)?;
+        if database.full_schema {
+            return Err(CacheError::NeedsVerification);
+        }
         self.write(namespace, database, |tx| {
             let updated = tx.execute(
                 "UPDATE mailboxes SET dirty=?3 WHERE mailbox=?1 AND uid_validity=?2",
@@ -241,7 +252,7 @@ impl Cache {
                     },
                 )
                 .optional()?;
-            folders.push(observed.unwrap_or_else(|| FolderStatus {
+            let mut folder = observed.unwrap_or_else(|| FolderStatus {
                 mailbox: mailbox.clone(),
                 uid_validity: None,
                 high_uid: None,
@@ -251,7 +262,11 @@ impl Cache {
                 complete_headers: 0,
                 indexed_headers: 0,
                 verified_parts: 0,
-            }));
+            });
+            if database.full_schema {
+                folder.dirty |= super::dirty::scope_dirty(&database.connection, mailbox)?;
+            }
+            folders.push(folder);
         }
         Ok(AccountStatus {
             max_bytes: scope.max_bytes,
@@ -282,6 +297,9 @@ impl Cache {
         let databases = self.lock()?;
         let database = databases.get(&namespace).ok_or(CacheError::OutOfScope)?;
         let db = &database.connection;
+        if database.full_schema && super::dirty::scope_dirty(db, mailbox)? {
+            return Err(CacheError::NeedsVerification);
+        }
         let (indexed, pending) = db
             .query_row(
                 "SELECT indexed_count,message_count-indexed_count
@@ -424,7 +442,7 @@ impl Cache {
     }
 }
 
-fn message_id(tx: &Transaction<'_>, reference: Ref<'_>) -> Result<i64, CacheError> {
+pub(super) fn message_id(tx: &Transaction<'_>, reference: Ref<'_>) -> Result<i64, CacheError> {
     let exists: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM mailboxes WHERE mailbox=?1 AND uid_validity=?2 AND (high_uid IS NULL OR high_uid>=?3))",
         params![reference.mailbox, reference.uid_validity, reference.uid],

@@ -2,6 +2,28 @@
 
 本文件保存带版本与环境边界的证据。每次新增记录注明提交/tag、日期与时区、环境、命令、结果、CI 链接及未覆盖项；保留历史结果，不把其测试数量或部署状态当作当前版本的证明。验证要求见 [贡献指南](../CONTRIBUTING.md#验证与完成标准)。
 
+## 2026-11-05 R11 文件缓存与失效基础
+
+源码 `d2673f7bf6c5e49d768b80be7b5132a56ee3bb44`；WSL Ubuntu / Rust 1.99.1 / Node 24.15.0。R11 第一批提供内部 full 存储 API 和 test-only 写入 guard。用户 full 配置、生产写路径及显式离线工具由后续应用批次接入。
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo +1.99.1 fmt --check` | 通过 |
+| `cargo +1.99.1 test --locked --quiet` | 441 单元、44 集成通过；2 项显式测试默认忽略 |
+| `cargo +1.99.1 clippy --locked --all-targets -- -D warnings` | 通过 |
+| `cargo +1.99.1 build --locked --release` | 通过 |
+| 显式 Rust→Node 附件客户端测试 | 8 文件下载、摘要与内容读取通过 |
+| 存储与写入 guard 专项 | 37 项 cache 测试、5 项真实 crate guard 测试通过，均纳入上方全量结果 |
+| 独立源码与文档复核 | 交叉审阅闭环，60 个本地链接/锚点有效，diff 检查通过 |
+
+新增 16 项真实文件存储回归验证 V1→V2 迁移与 DDL 失败回滚、metadata 重开 v2、原文及派生层状态、跨账户暂存预留与 32 MiB 文件边界、重命名后取消、超长输入、tombstone 与 pin、未观察目录的多 scope dirty、清洁/异常/恢复重启、孤儿/缺文件/坏摘要，以及提交后诊断与清理失败。已知附件索引通过显式 Missing 保留缺口，重复登记保留已知原因；驱逐前验证 raw 并持租约，可重建副本退为 Derivable，坏 raw 保留仍可用的派生文件。
+
+原始邮件的长度与 SHA-256 独立于 blob 引用持久保存；运行时隔离或重启发现文件缺失后，仍拒绝同邮件引用的不同原文，允许校验原始摘要后修复。离线 lease 在 dirty 清除后继续核对原修订，live/离线 lease 及 stage 保留恢复世代；核对 stamp 和 ticket 绑定 Cache 实例，跨实例凭据拒绝使用。
+
+5 项 guard 回归使用真实 cache 和 SQLite，覆盖首个副作用前多目录保护、活跃 claim 阻止取得核对 stamp、过时 stamp 的 CAS 拒绝、容量/期限失败先关闭离线，以及真实 SQLite 写锁阻塞超时后许可由阻塞任务持有至清理完成。生产调用尚未接入。
+
+源码独立复核关闭了并发核对清 dirty、原文损坏后旧派生内容保留、同摘要幂等校验、已知 Missing 覆盖丢失、坏 raw 驱逐、实例/恢复世代绑定及租约释放顺序等问题。现有主库与 journal 联合 max_page_count 上界涵盖初始化的连续短事务。GC 每批最多处理 200 个候选，后续后台调度继续限制扫描工作量。依赖版本、Cargo.lock、生产配置和工具契约保持 R10 值。最终 PR head 的 CI 与合并结果随后登记。
+
 ## 2026-11-05 R10 持久元数据与会话游标
 
 源码 `4516c1adb4f8d93fc610fefefba77fc442643f05`；环境为 WSL Ubuntu、固定 Rust 1.99.1、Node 24.15.0 和 Docker Desktop。缓存、邮箱、身份和附件验证均使用隔离目录及合成数据。
@@ -20,7 +42,9 @@
 
 恢复烟测使用仓库 `deploy/cache.json.example`、合成身份和独立临时目录，在 `unshare --user --map-root-user --net` 内以 `env -i` 运行 release 程序的 `--cache-restored`。两次仅输出固定事件 `cache_restore_marked`，manifest 与 SQLite owner epoch 依次为 1、2，clean=false。缓存目录权限 0700，manifest、数据库、锁和注册库文件 0600。无效 SQLite 操作库哨兵的 SHA-256 两次保持一致，未生成操作库 sidecar 或附件暂存目录。二进制 SHA-256 为 `bb941cd942c440a3fc697a48af89a1ff5fab15fa0734b2f69e3cd6efdc5795d8`。
 
-独立交叉审阅已修复提交后诊断覆盖已知结果、首次并发观察世代倒退、FTS 候选扫描界限、持久解码临时空间计量和额度失败状态可见性。R10 新增的 rusqlite `blob` feature 使用现有锁定版本，Cargo.lock 保持原值。实际镜像、最终 PR head 的 CI 和合并结果随后登记。
+独立交叉审阅已修复提交后诊断覆盖已知结果、首次并发观察世代倒退、FTS 候选扫描界限、持久解码临时空间计量和额度失败状态可见性。R10 新增的 rusqlite `blob` feature 使用现有锁定版本，Cargo.lock 保持原值。实际生产 Dockerfile 对 `git archive 4516c1a` 精确源码快照构建成功，镜像 `rust-email-mcp:r10-metadata-local`，release 步骤 7 分 51 秒，构建引用 `ira7gvgwnvxkw1bb8z1jdq1o8`。
+
+[PR #75](https://github.com/black-zero358/rust-email-mcp/pull/75) 最终 head `1b3146453ac3fe064d9f432664f65542219637bc` 相对源码只追加七份文档，独立审阅通过，75 个本地链接与锚点有效。[CI 42006284171](https://github.com/black-zero358/rust-email-mcp/actions/runs/42006284171) 的 check/audit/container 全部成功。GitHub 自动代码及安全审阅遇到账户额度限制；合并前 reviews/review threads 均为空。PR 合并为 `f422cbb48cec7fbea83b918517cf37ec181b0926`，本地 main、开发分支及对应远端全部同步，R11 改动保留在工作区。
 
 ## 2026-11-05 R09 跨文件夹会话
 

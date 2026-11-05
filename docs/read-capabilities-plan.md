@@ -397,8 +397,9 @@ UIDVALIDITY 改变立即停用旧世代数据、句柄和游标，后台清理�
 | R07 | 已完成；附件部件下载与局部正文均已合并；正文源码 `b4b21da` 的 312 单元 + 34 集成、14 组正文 HTTP、fmt/clippy/release、8 文件联调及审计通过，独立审阅闭环 | 附件 [PR #70](https://github.com/black-zero358/rust-email-mcp/pull/70) 合并为 `7837396`；正文 [PR #71](https://github.com/black-zero358/rust-email-mcp/pull/71) 最终 head `0c07455` 的 check/audit/container 全通过，合并为 `f5e7877`，见[正文离线验证](validation.md#2026-11-05-r07-局部正文读取) |
 | R08 | 已完成；源码 `cc55dca` 的 339 单元 + 34 集成、13 项列表专项、fmt/clippy/release、8 文件联调通过；最终源码独立审阅闭环 | [PR #72](https://github.com/black-zero358/rust-email-mcp/pull/72) 最终 head `93ec230` 的 check/audit/container 全通过，合并为 `d853737`；见[离线验证](validation.md#2026-11-05-r08-正文预览与邮件头分类) |
 | R09 | 已完成；应用层源码 `4e499e4` 的 385 单元 + 44 集成、20 组会话 HTTP、fmt/clippy/release、8 文件离线联调、审计、实际镜像及独立审阅通过 | 搜索基础 [PR #73](https://github.com/black-zero358/rust-email-mcp/pull/73) 合并为 `2a07f31`；应用 [PR #74](https://github.com/black-zero358/rust-email-mcp/pull/74) 最终 head `21cc661` 的 check/audit/container 全通过，合并为 `3aeb3e2`；见[会话验证](validation.md#2026-11-05-r09-跨文件夹会话) |
-| R10 | 源码 `4516c1a` 已完成；420 单元 + 44 集成、fmt/clippy/release、8 文件联调、审计和断网恢复烟测通过，独立审阅闭环 | [缓存设计](cache-design.md)、[验证记录](validation.md#2026-11-05-r10-持久元数据与会话游标)；等待实际镜像、PR 最终 CI 及合并 |
-| R11–R13 | 待实施 | 正文附件缓存、完整回填与增量同步、离线及发布验收 |
+| R10 | 已完成；源码 `4516c1a` 的 420 单元 + 44 集成、fmt/clippy/release、8 文件联调、审计、断网恢复烟测及实际镜像通过，独立审阅闭环 | [PR #75](https://github.com/black-zero358/rust-email-mcp/pull/75) 最终 head `1b31464` 的 check/audit/container 全通过，合并为 `f422cbb`；[缓存设计](cache-design.md)、[验证记录](validation.md#2026-11-05-r10-持久元数据与会话游标) |
+| R11 | 第一批源码 `d2673f7` 完成内部文件存储/dirty 基础；441 单元 + 44 集成、fmt/clippy/release、8 文件联调及独立审阅通过，待 PR 最终 CI/合并；应用批次实施中 | [实施设计](cache-content-design.md)、[基础验证](validation.md#2026-11-05-r11-文件缓存与失效基础)；继续 full 配置、完整正文/附件缓存、离线列表/搜索/定位/会话及既有写路径失效 |
+| R12–R13 | 待实施 | 完整回填与增量同步、离线及发布验收 |
 
 ## 对照实现
 

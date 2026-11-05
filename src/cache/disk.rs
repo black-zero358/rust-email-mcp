@@ -7,13 +7,19 @@ use std::{
     fs::{self, File, Metadata, OpenOptions},
     io::{ErrorKind, Read, Write},
     path::{Component, Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 const LOCK: &str = ".cache-lock";
 const MANIFEST: &str = "manifest.json";
 const STAGE: &str = ".manifest-next";
 const DB: &str = "cache.sqlite";
+const BLOBS: &str = "blobs";
+const STAGED_BLOB: &str = ".stage-";
+const FINAL_BLOB: &str = ".blob";
 const MAX_PARTITIONS: usize = 256;
 const MANIFEST_BYTES: u64 = 32 * 1024;
 // SQLite rollback journals use at most 64 KiB sectors. With cache_spill
@@ -37,6 +43,13 @@ pub(super) struct Root {
     _lock: File,
     was_unclean: bool,
     restore_epoch: AtomicU64,
+    blobs: Mutex<BTreeMap<String, BlobUsage>>,
+}
+
+struct BlobUsage {
+    stored: u64,
+    reserved: u64,
+    identity: Identity,
 }
 
 struct Usage {
@@ -66,6 +79,7 @@ impl Root {
             _lock: lock,
             was_unclean: false,
             restore_epoch: AtomicU64::new(0),
+            blobs: Mutex::default(),
         };
         let usage = root.usage()?;
         let manifest = root.manifest()?;
@@ -204,6 +218,216 @@ impl Root {
         Ok(())
     }
 
+    pub(super) fn has_staged_blobs(&self) -> Result<bool, CacheError> {
+        Ok(self
+            .blobs
+            .lock()
+            .map_err(|_| CacheError::Storage)?
+            .values()
+            .any(|usage| usage.reserved != 0))
+    }
+
+    pub(super) fn prepare_blobs(
+        &self,
+        name: &str,
+        account_limit: u64,
+        global_limit: u64,
+    ) -> Result<(), CacheError> {
+        let path = self.blob_root(name)?;
+        if !path.try_exists()? {
+            let (total, own) = self.bytes(name)?;
+            if own.saturating_add(PAGE_BYTES) > account_limit
+                || total.saturating_add(PAGE_BYTES) > global_limit
+            {
+                return Err(CacheError::Quota);
+            }
+            ensure_directory(&path, Some(self.identity))?;
+            File::open(path.parent().ok_or(CacheError::Storage)?)?.sync_all()?;
+        }
+        self.verify_usage(name, account_limit, global_limit)
+    }
+
+    pub(super) fn reserve_blob(&self, name: &str, amount: u64) -> Result<(), CacheError> {
+        let mut blobs = self.blobs.lock().map_err(|_| CacheError::Storage)?;
+        let usage = blobs.get_mut(name).ok_or(CacheError::Storage)?;
+        usage.reserved = usage
+            .reserved
+            .checked_add(amount)
+            .ok_or(CacheError::Quota)?;
+        Ok(())
+    }
+
+    pub(super) fn settle_blob(
+        &self,
+        name: &str,
+        amount: u64,
+        stored: u64,
+    ) -> Result<(), CacheError> {
+        let mut blobs = self.blobs.lock().map_err(|_| CacheError::Storage)?;
+        let usage = blobs.get_mut(name).ok_or(CacheError::Storage)?;
+        let reserved = usage
+            .reserved
+            .checked_sub(amount)
+            .ok_or(CacheError::Storage)?;
+        usage.stored = usage.stored.checked_add(stored).ok_or(CacheError::Quota)?;
+        usage.reserved = reserved;
+        Ok(())
+    }
+
+    pub(super) fn forget_blob(&self, name: &str, bytes: u64) -> Result<(), CacheError> {
+        let mut blobs = self.blobs.lock().map_err(|_| CacheError::Storage)?;
+        let usage = blobs.get_mut(name).ok_or(CacheError::Storage)?;
+        usage.stored = usage.stored.checked_sub(bytes).ok_or(CacheError::Storage)?;
+        Ok(())
+    }
+
+    pub(super) fn blob_root(&self, name: &str) -> Result<PathBuf, CacheError> {
+        self.validate()?;
+        let partition = self.path.join(name);
+        self.check_private_dir(&fs::symlink_metadata(&partition)?)?;
+        let dir = partition.join(BLOBS);
+        match fs::symlink_metadata(&dir) {
+            Ok(metadata) => {
+                self.check_private_dir(&metadata)?;
+                let blobs = self.blobs.lock().map_err(|_| CacheError::Storage)?;
+                if blobs
+                    .get(name)
+                    .is_some_and(|usage| usage.identity != identity(&metadata))
+                {
+                    return Err(CacheError::Storage);
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                let blobs = self.blobs.lock().map_err(|_| CacheError::Storage)?;
+                if blobs.contains_key(name) {
+                    return Err(CacheError::Storage);
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+        Ok(dir)
+    }
+
+    pub(super) fn blob_path(
+        &self,
+        name: &str,
+        id: uuid::Uuid,
+        staged: bool,
+    ) -> Result<PathBuf, CacheError> {
+        let dir = self.blob_root(name)?;
+        let file = if staged {
+            format!("{STAGED_BLOB}{}", id.simple())
+        } else {
+            format!("{}{FINAL_BLOB}", id.simple())
+        };
+        Ok(dir.join(file))
+    }
+
+    pub(super) fn create_blob(&self, path: &Path) -> Result<File, CacheError> {
+        private_file_options()
+            .create_new(true)
+            .open(path)
+            .map_err(Into::into)
+    }
+
+    pub(super) fn open_blob_file(&self, path: &Path) -> Result<File, CacheError> {
+        let before = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Err(CacheError::Corrupt),
+            Err(error) => return Err(error.into()),
+        };
+        validate_file(&before, self.identity)?;
+        let file = File::open(path)?;
+        let after = file.metadata()?;
+        validate_file(&after, self.identity)?;
+        if identity(&before) != identity(&after) {
+            return Err(CacheError::Storage);
+        }
+        Ok(file)
+    }
+
+    pub(super) fn blob_file_bytes(&self, path: &Path) -> Result<u64, CacheError> {
+        let metadata = fs::symlink_metadata(path)?;
+        validate_file(&metadata, self.identity)?;
+        Ok(blob_allocated(&metadata))
+    }
+
+    pub(super) fn rename_blob(&self, source: &Path, target: &Path) -> Result<(), CacheError> {
+        // A stage is uniquely created with O_EXCL in this private root. Its
+        // destination uses the same id, and the instance lock excludes
+        // other publishers for this root.
+        match fs::symlink_metadata(target) {
+            Ok(_) => return Err(CacheError::Corrupt),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        fs::rename(source, target)?;
+        Ok(())
+    }
+
+    pub(super) fn sync_blob_directory(&self, file: &Path) -> Result<(), CacheError> {
+        File::open(file.parent().ok_or(CacheError::Storage)?)?.sync_all()?;
+        Ok(())
+    }
+
+    /// The caller releases the allocation only after durable deletion.
+    pub(super) fn remove_blob(&self, path: &Path) -> Result<u64, CacheError> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error.into()),
+        };
+        validate_file(&metadata, self.identity)?;
+        fs::remove_file(path)?;
+        File::open(path.parent().ok_or(CacheError::Storage)?)?.sync_all()?;
+        Ok(blob_allocated(&metadata))
+    }
+
+    fn check_private_dir(&self, metadata: &Metadata) -> Result<(), CacheError> {
+        let current = identity(metadata);
+        if !private_directory(metadata)
+            || current.owner != self.identity.owner
+            || current.device != self.identity.device
+        {
+            return Err(CacheError::Storage);
+        }
+        Ok(())
+    }
+
+    fn blob_directory_bytes(
+        &self,
+        name: &str,
+        path: &Path,
+        metadata: &Metadata,
+    ) -> Result<u64, CacheError> {
+        self.check_private_dir(metadata)?;
+        let mut blobs = self.blobs.lock().map_err(|_| CacheError::Storage)?;
+        let usage = match blobs.entry(name.to_owned()) {
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                if entry.get().identity != identity(metadata) {
+                    return Err(CacheError::Storage);
+                }
+                entry.into_mut()
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let mut stored = 0u64;
+                for file in fs::read_dir(path)? {
+                    let file = file?;
+                    parse_blob_name(&file.file_name()).ok_or(CacheError::Corrupt)?;
+                    stored = stored.saturating_add(self.blob_file_bytes(&file.path())?);
+                }
+                entry.insert(BlobUsage {
+                    stored,
+                    reserved: 0,
+                    identity: identity(metadata),
+                })
+            }
+        };
+        Ok(allocated(metadata)
+            .saturating_add(usage.stored)
+            .saturating_add(usage.reserved))
+    }
+
     fn validate(&self) -> Result<(), CacheError> {
         checked_path(&self.path)?;
         let metadata = fs::symlink_metadata(&self.path)?;
@@ -238,6 +462,15 @@ impl Root {
                     let mut bytes = allocated(&metadata);
                     for file in fs::read_dir(entry.path())? {
                         let file = file?;
+                        if file.file_name() == BLOBS {
+                            let metadata = fs::symlink_metadata(file.path())?;
+                            bytes = bytes.saturating_add(self.blob_directory_bytes(
+                                name,
+                                &file.path(),
+                                &metadata,
+                            )?);
+                            continue;
+                        }
                         if !matches!(
                             file.file_name().to_str(),
                             Some(
@@ -322,6 +555,26 @@ impl Root {
         }
         result
     }
+}
+
+pub(super) fn parse_blob_name(name: &std::ffi::OsStr) -> Option<(uuid::Uuid, bool)> {
+    let name = name.to_str()?;
+    let (digits, staged) = match name.strip_prefix(STAGED_BLOB) {
+        Some(digits) => (digits, true),
+        None => (name.strip_suffix(FINAL_BLOB)?, false),
+    };
+    if digits.len() != 32
+        || !digits
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    Some((uuid::Uuid::parse_str(digits).ok()?, staged))
+}
+
+fn blob_allocated(metadata: &Metadata) -> u64 {
+    allocated(metadata).max(PAGE_BYTES)
 }
 
 pub(super) fn namespace_name(namespace: &Namespace) -> String {

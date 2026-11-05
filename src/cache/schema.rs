@@ -6,7 +6,8 @@ use rusqlite::{
 use std::path::Path;
 
 const APPLICATION_ID: u32 = 0x454d4343;
-const VERSION: u32 = 1;
+const METADATA_VERSION: u32 = 1;
+const FULL_VERSION: u32 = 2;
 
 pub(super) fn open(path: &Path) -> Result<Connection, CacheError> {
     let connection = Connection::open_with_flags(
@@ -34,7 +35,8 @@ pub(super) fn initialize(
     namespace: &Namespace,
     unclean: bool,
     restore_epoch: u64,
-) -> Result<(), CacheError> {
+    full: bool,
+) -> Result<bool, CacheError> {
     let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     let app: u32 = connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
     match (version, app) {
@@ -53,11 +55,11 @@ pub(super) fn initialize(
                 "INSERT INTO cache_owner VALUES(1,?1,?2)",
                 params![&namespace[..], restore_epoch as i64],
             )?;
-            tx.pragma_update(None, "user_version", VERSION)?;
+            tx.pragma_update(None, "user_version", METADATA_VERSION)?;
             tx.pragma_update(None, "application_id", APPLICATION_ID)?;
             tx.commit()?;
         }
-        (VERSION, APPLICATION_ID) => {}
+        (METADATA_VERSION | FULL_VERSION, APPLICATION_ID) => {}
         _ => return Err(CacheError::Corrupt),
     }
     let saved_epoch: i64 = connection
@@ -74,25 +76,96 @@ pub(super) fn initialize(
     if !clean || saved_epoch < 0 || saved_epoch as u64 > restore_epoch {
         return Err(CacheError::Corrupt);
     }
+    let full_schema = full || version == FULL_VERSION;
+    if full && version != FULL_VERSION {
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(V2)?;
+        tx.pragma_update(None, "user_version", FULL_VERSION)?;
+        tx.commit()?;
+    }
     if (saved_epoch as u64) < restore_epoch {
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        restore(&tx, restore_epoch)?;
+        restore(&tx, restore_epoch, full_schema)?;
         tx.commit()?;
     } else if unclean {
-        connection.execute("UPDATE mailboxes SET dirty=1 WHERE NOT dirty", [])?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        flag_unclean(&tx, full_schema)?;
+        tx.commit()?;
+    }
+    Ok(full_schema)
+}
+
+fn flag_unclean(tx: &Transaction<'_>, full_schema: bool) -> Result<(), CacheError> {
+    tx.execute("UPDATE mailboxes SET dirty=1 WHERE NOT dirty", [])?;
+    if full_schema {
+        tx.execute("UPDATE scope_fences SET dirty=1 WHERE NOT dirty", [])?;
+        tx.execute("DELETE FROM mutation_claims", [])?;
     }
     Ok(())
 }
 
-pub(super) fn restore(tx: &Transaction<'_>, restore_epoch: u64) -> Result<(), CacheError> {
+pub(super) fn restore(
+    tx: &Transaction<'_>,
+    restore_epoch: u64,
+    full_schema: bool,
+) -> Result<(), CacheError> {
     tx.execute("DELETE FROM conversation_cursors", [])?;
-    tx.execute("UPDATE mailboxes SET dirty=1 WHERE NOT dirty", [])?;
+    flag_unclean(tx, full_schema)?;
     tx.execute(
         "UPDATE cache_owner SET restore_epoch=?1 WHERE id=1",
         [restore_epoch as i64],
     )?;
     Ok(())
 }
+
+const V2: &str = "
+CREATE TABLE blobs (
+    id BLOB PRIMARY KEY CHECK(length(id)=16),
+    bytes INTEGER NOT NULL CHECK(bytes BETWEEN 0 AND 33554432),
+    sha256 BLOB NOT NULL CHECK(length(sha256)=32)
+) STRICT;
+CREATE TABLE raw_fingerprints (
+    message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+    bytes INTEGER NOT NULL CHECK(bytes BETWEEN 0 AND 33554432),
+    sha256 BLOB NOT NULL CHECK(length(sha256)=32)
+) STRICT;
+CREATE TABLE artifacts (
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    kind INTEGER NOT NULL CHECK(kind BETWEEN 0 AND 2),
+    part INTEGER NOT NULL,
+    mime_version INTEGER NOT NULL,
+    html_version INTEGER NOT NULL,
+    state INTEGER NOT NULL CHECK(state BETWEEN 0 AND 4),
+    blob_id BLOB REFERENCES blobs(id),
+    raw_id BLOB REFERENCES blobs(id),
+    reason INTEGER,
+    CHECK((state=0 AND blob_id IS NULL AND raw_id IS NULL AND reason IS NULL)
+       OR (state=1 AND blob_id IS NOT NULL AND raw_id IS NULL AND reason IS NULL)
+       OR (state=2 AND blob_id IS NULL AND raw_id IS NOT NULL AND reason IS NULL AND kind<>0)
+       OR (state=3 AND blob_id IS NULL AND raw_id IS NULL AND reason IS NOT NULL AND reason BETWEEN 1 AND 3)
+       OR (state=4 AND blob_id IS NULL AND raw_id IS NULL AND reason IS NOT NULL AND reason BETWEEN 4 AND 5)),
+    CHECK((kind=0 AND part=0 AND mime_version=0 AND html_version=0)
+       OR (kind=1 AND part=0 AND mime_version BETWEEN 1 AND 65535 AND html_version BETWEEN 1 AND 65535)
+       OR (kind=2 AND part BETWEEN 0 AND 4294967295 AND mime_version BETWEEN 1 AND 65535 AND html_version=0)),
+    PRIMARY KEY(message_id,kind,part,mime_version,html_version)
+) STRICT;
+CREATE INDEX artifacts_blob ON artifacts(blob_id);
+CREATE INDEX artifacts_raw ON artifacts(raw_id);
+CREATE TABLE scope_fences (
+    mailbox TEXT PRIMARY KEY,
+    revision INTEGER NOT NULL CHECK(revision>0),
+    dirty INTEGER NOT NULL CHECK(dirty IN (0,1))
+) STRICT;
+CREATE TABLE mutation_claims (
+    id BLOB PRIMARY KEY CHECK(length(id)=16)
+) STRICT;
+CREATE TABLE mutation_scopes (
+    claim_id BLOB NOT NULL REFERENCES mutation_claims(id) ON DELETE CASCADE,
+    mailbox TEXT NOT NULL REFERENCES scope_fences(mailbox),
+    PRIMARY KEY(claim_id,mailbox)
+) STRICT;
+CREATE INDEX mutation_scopes_mailbox ON mutation_scopes(mailbox);
+";
 
 const V1: &str = "
 CREATE TABLE cache_owner (

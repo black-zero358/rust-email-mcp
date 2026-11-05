@@ -76,6 +76,7 @@ impl From<CacheError> for CursorError {
     fn from(error: CacheError) -> Self {
         match error {
             CacheError::OutOfScope => Self::Unavailable,
+            CacheError::NeedsVerification => Self::Unavailable,
             CacheError::Quota => Self::Quota,
             CacheError::Corrupt => Self::Corrupt,
             CacheError::Storage => Self::Storage,

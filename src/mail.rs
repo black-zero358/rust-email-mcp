@@ -9,6 +9,8 @@ use crate::{
     smtp::SmtpSender,
 };
 pub mod attachments;
+#[cfg(test)]
+mod cache_write_guard;
 mod classification;
 pub(crate) mod conversation;
 pub mod insights;
