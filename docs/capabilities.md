@@ -36,7 +36,7 @@
 
 两项工具可返回 `read_diagnostics`：`source` 为 `bodystructure` 或 `raw`；`fallback_reason` 为 null 或 `structure_limit`、`structure_rejected`、`mapping_unverified`、`metadata_conflict`、`whole_multipart_attachment`、`header_budget`；`limit_kind` 为 null 或 `mime_structure`。原因是固定类别，保留成功回退的依据。必要 MIME 头每命令最多 16 个 section、最多 64 个命令，单头最多 128 KiB、总证据最多 1 MiB。
 
-既有附件分类、RFC2231 文件名、原索引及整体 multipart 附件语义共用 PartManifest；附加 `.eml` 作为整体附件。整封 raw 读取及解码附件分别受 32 MiB 限制；按部件下载可读取更大邮件中的小附件，每块最多 64 KiB，连接累计最多 128 MiB。当前 R07 第一批已接入附件部件读取，局部正文在第二批交付，`part_fetch` 在两批完成后更新。元数据和筛选共用连接响应预算，超过预算明确失败。
+既有附件分类、RFC2231 文件名、原索引及整体 multipart 附件语义共用 PartManifest；附加 `.eml` 作为整体附件。整封 raw 读取及解码附件分别受 32 MiB 限制；按部件下载可读取更大邮件中的小附件，每块最多 64 KiB，连接累计最多 128 MiB。`part_fetch:true` 表示附件下载和正文读取均支持按部件获取。元数据和筛选共用连接响应预算，超过预算明确失败。
 
 返回的 `download_url` 需要同一用户的有效 OAuth Bearer 令牌。句柄有效期 600 秒，每实例最多保存 64 个描述符，不缓存附件字节；重启后失效。它不能作为公共分享链接。最多四个二进制下载并发，响应被消费或丢弃后释放传输名额；IMAP 读取还使用共享邮箱槽位。附件列表使用 `next_attachment_offset` 分页。
 
@@ -55,7 +55,11 @@
 
 ## 会话、定位和正文
 
-`read_conversation` 从指定 `uid` 和 `uid_validity` 出发，按 Message-ID、References 和 In-Reply-To 的精确标识符关联同一文件夹的邮件，不使用相同主题作为关联依据。默认检查 100 个候选头，最多 200 个；默认返回 10 封，最多 20 封，累计正文最多 256 KiB。扫描范围、候选上限、遗漏邮件和后续 UID 游标均随结果返回。`next_before_uid` 仅推进候选扫描；`omitted_uids` 列出本次已关联但因数量或响应预算未返回的 UID，可用 `get_emails` 分批读取。跨窗口关联需要客户端继续查询并结合已有结果；不保证单次返回全邮箱内的所有往来。
+`get_email`、`get_emails` 和 `read_conversation` 先核对邮件结构及 MIME 头，再分块读取完整的所选正文；大附件邮件中的小正文可独立读取。正文与原整封解析共用 alternative/related 选择规则，所有所选部件共用 32 MiB 解码预留和 HTML 展示预算，字符集状态跨块保留。`max_body_length:0` 和显示截断仍先完成正文校验。
+
+需要完整 MIME 或 UTF-7 解码时，在已确认的整封大小上限内，每 UID 最多回退一次新连接 raw 读取，重新核对 UIDVALIDITY 并沿用原期限。正文结果增加 `read_diagnostics`，字段与附件诊断一致，额外回退原因 `charset_utf7` 表示 UTF-7。批量中已完成命令后的局部正文错误只影响当前项；协议、目标数据或连接失败停止后续读取，后续项标记 `unprocessed`。重复 UID 按输入顺序保留逐项结果。
+
+`read_conversation` 从指定 `uid` 和 `uid_validity` 出发，按 Message-ID、References 和 In-Reply-To 的精确标识符关联同一文件夹的邮件，不使用相同主题作为关联依据。默认检查 100 个候选头，最多 200 个；默认返回 10 封，最多 20 封，累计正文最多 256 KiB。扫描范围、候选上限、遗漏邮件和后续 UID 游标均随结果返回。`next_before_uid` 仅推进候选扫描；`omitted_uids` 列出本次已关联但因数量、响应预算、正文错误或连接终止未返回的 UID，具体失败保存在 `message_errors`。可根据逐项错误处理后用 `get_emails` 分批读取。跨窗口关联由客户端继续查询并结合已有结果。
 
 `locate_message` 接受 `message_id` 和显式 `mailboxes` 列表，最多 20 个文件夹。先以服务端 HEADER 搜索缩小候选，再验证完整 Message-ID，避免子串误匹配。每个文件夹分别返回搜索范围及下一页游标；继续某个文件夹时应单独传入该文件夹和它自己的游标。
 

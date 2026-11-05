@@ -1,5 +1,6 @@
 //! Bounded BODYSTRUCTURE mapping confirmed by the original MIME header semantics.
 //! The protocol parser must enforce its own allocation budget before this stage.
+use super::body_tree::{BodyKind, BodyNode, BodyTree};
 use imap_proto::{
     BodyContentCommon, BodyContentSinglePart, BodyExtension, BodyParams, BodyStructure,
     ContentEncoding,
@@ -54,6 +55,9 @@ pub enum ManifestOutcome {
 #[derive(Debug, Eq, PartialEq)]
 pub struct PartManifest {
     pub parts: Vec<ManifestPart>,
+    pub(super) body: BodyTree,
+    #[cfg(test)]
+    pub(super) accounted_bytes: usize,
 }
 #[derive(Debug, Eq, PartialEq)]
 pub struct ManifestPart {
@@ -63,6 +67,7 @@ pub struct ManifestPart {
     pub attachment_ordinal: Option<usize>,
     pub is_attachment: bool,
     pub content_type: String,
+    pub(super) charset: String,
     pub transfer_encoding: String,
     pub encoded_size: Option<u32>,
     pub disposition: Option<String>,
@@ -88,6 +93,48 @@ impl Budget {
             return Err(MapError::StructureLimit);
         }
         Ok(())
+    }
+    fn grow<T>(&mut self, values: &mut Vec<T>, additional: usize) -> Result<(), MapError> {
+        let needed = values
+            .len()
+            .checked_add(additional)
+            .ok_or(MapError::StructureLimit)?;
+        if needed <= values.capacity() {
+            return Ok(());
+        }
+        let old = values.capacity();
+        let requested = needed
+            .checked_sub(old)
+            .and_then(|n| n.checked_mul(size_of::<T>()))
+            .ok_or(MapError::StructureLimit)?;
+        self.charge(requested)?;
+        values
+            .try_reserve_exact(additional)
+            .map_err(|_| MapError::StructureLimit)?;
+        let actual = values
+            .capacity()
+            .checked_sub(needed)
+            .and_then(|n| n.checked_mul(size_of::<T>()))
+            .ok_or(MapError::StructureLimit)?;
+        self.charge(actual)
+    }
+    fn owned(&mut self, value: &String) -> Result<(), MapError> {
+        self.charge(value.capacity())
+    }
+    fn owned_optional(&mut self, value: &Option<String>) -> Result<(), MapError> {
+        if let Some(value) = value {
+            self.owned(value)?;
+        }
+        Ok(())
+    }
+    fn section(&mut self, section: &Section) -> Result<(), MapError> {
+        self.charge(
+            section
+                .0
+                .capacity()
+                .checked_mul(size_of::<u32>())
+                .ok_or(MapError::StructureLimit)?,
+        )
     }
     fn string(&mut self, value: &str) -> Result<(), MapError> {
         if value.len() > MAX_STRING {
@@ -327,6 +374,8 @@ struct Metadata {
     filename: Option<String>,
     cid: Option<String>,
     attachment: bool,
+    charset: String,
+    start: Option<String>,
 }
 fn ast_metadata(
     common: &BodyContentCommon<'_>,
@@ -362,6 +411,8 @@ fn ast_metadata(
         filename,
         cid: single.and_then(|v| v.id.as_deref()).map(str::to_owned),
         attachment,
+        charset: "us-ascii".into(),
+        start: None,
     }
 }
 
@@ -374,6 +425,7 @@ pub fn map(
     let mut budget = Budget::default();
     budget.tree(root, 1)?;
     let mut header_bytes = 0usize;
+    let mut header_lines = 0;
     for (i, item) in evidence.iter().enumerate() {
         if item.bytes.len() > MAX_STRING {
             return Err(MapError::HeaderLimit);
@@ -382,6 +434,10 @@ pub fn map(
             .checked_add(item.bytes.len())
             .ok_or(MapError::HeaderLimit)?;
         if header_bytes > MAX_BYTES || evidence.len() > MAX_NODES {
+            return Err(MapError::HeaderLimit);
+        }
+        header_lines += item.bytes.split_inclusive(|byte| *byte == b'\n').count();
+        if header_lines > crate::mime::MAX_HEADER_LINES {
             return Err(MapError::HeaderLimit);
         }
         if item.section.0.len() > MAX_DEPTH + 1 || item.section.0.contains(&0) {
@@ -409,8 +465,10 @@ pub fn map(
         needed: vec![],
         fallback: None,
         attachments: 0,
+        body: BodyTree::default(),
+        budget: Budget::default(),
     };
-    builder.visit(root, root_section, true, false)?;
+    builder.visit(root, root_section, true, false, None)?;
     if let Some(reason) = builder.fallback {
         return Ok(ManifestOutcome::RawFallback { reason });
     }
@@ -419,6 +477,9 @@ pub fn map(
     }
     Ok(ManifestOutcome::Ready(PartManifest {
         parts: builder.parts,
+        body: builder.body,
+        #[cfg(test)]
+        accounted_bytes: builder.budget.bytes,
     }))
 }
 struct Builder<'a> {
@@ -427,6 +488,8 @@ struct Builder<'a> {
     needed: Vec<HeaderRequest>,
     fallback: Option<&'static str>,
     attachments: usize,
+    body: BodyTree,
+    budget: Budget,
 }
 impl Builder<'_> {
     fn visit(
@@ -435,6 +498,7 @@ impl Builder<'_> {
         section: Section,
         root: bool,
         parent_digest: bool,
+        parent: Option<usize>,
     ) -> Result<(), MapError> {
         if self.fallback.is_some() {
             return Ok(());
@@ -519,13 +583,11 @@ impl Builder<'_> {
                         return false;
                     }
                     let key = key.to_ascii_lowercase();
-                    part.ctype.params.get(&key).is_none_or(|actual| {
-                        if key == "charset" {
-                            !actual.eq_ignore_ascii_case(value)
-                        } else {
-                            actual != value
-                        }
-                    })
+                    if key == "charset" {
+                        !part.ctype.charset.eq_ignore_ascii_case(value)
+                    } else {
+                        part.ctype.params.get(&key).map(String::as_str) != Some(value.as_ref())
+                    }
                 })
             });
             if conflicting_params
@@ -547,6 +609,12 @@ impl Builder<'_> {
             meta.filename = filename;
             meta.disposition = disposition;
             meta.cid = cid;
+            meta.charset = std::mem::take(&mut part.ctype.charset);
+            meta.start = part.ctype.params.remove("start");
+            if root {
+                self.budget.grow(&mut self.body.root_headers, raw.len())?;
+                self.body.root_headers.extend_from_slice(raw);
+            }
         } else {
             self.needed.push(HeaderRequest {
                 section,
@@ -558,6 +626,18 @@ impl Builder<'_> {
                 },
             });
             return Ok(());
+        }
+        let node_id = self.body.nodes.len();
+        self.budget.grow(&mut self.body.nodes, 1)?;
+        self.body.nodes.push(BodyNode {
+            parent,
+            children: vec![],
+            kind: BodyKind::Leaf(self.parts.len()),
+            nonempty: None,
+        });
+        if let Some(parent) = parent {
+            self.budget.grow(&mut self.body.nodes[parent].children, 1)?;
+            self.body.nodes[parent].children.push(node_id);
         }
         if let BodyStructure::Multipart { bodies, .. } = node {
             if meta.attachment {
@@ -573,12 +653,28 @@ impl Builder<'_> {
                     self.fallback = Some("empty_multipart_shape");
                     return Ok(());
                 }
+                self.budget.section(&section)?;
+                self.budget.owned(&meta.content_type)?;
+                self.budget.owned(&meta.encoding)?;
+                self.budget.owned_optional(&meta.cid)?;
+                self.budget.owned_optional(&meta.start)?;
+                self.body.nodes[node_id].kind = BodyKind::Container {
+                    section,
+                    media_type: meta.content_type,
+                    encoding: meta.encoding,
+                    content_id: meta.cid,
+                    related_start: meta.start,
+                };
                 for (i, child) in bodies.iter().enumerate() {
                     self.visit(
                         child,
-                        section.child(i)?,
+                        match &self.body.nodes[node_id].kind {
+                            BodyKind::Container { section, .. } => section.child(i)?,
+                            _ => return Err(MapError::StructureLimit),
+                        },
                         false,
-                        meta.content_type == "multipart/digest",
+                        common.ty.subtype.eq_ignore_ascii_case("digest"),
+                        Some(node_id),
                     )?;
                 }
                 return Ok(());
@@ -594,21 +690,35 @@ impl Builder<'_> {
         } else {
             None
         };
+        for text in [&meta.content_type, &meta.encoding, &meta.charset] {
+            self.budget.owned(text)?;
+        }
+        for text in [&meta.disposition, &meta.filename, &meta.cid] {
+            self.budget.owned_optional(text)?;
+        }
+        self.budget.section(&section)?;
+        self.budget.grow(&mut self.parts, 1)?;
+        let downloadable = supported(&meta.encoding);
         self.parts.push(ManifestPart {
             section,
             attachment_index: self.parts.len(),
             attachment_ordinal: ordinal,
             is_attachment: meta.attachment,
             content_type: meta.content_type,
-            transfer_encoding: meta.encoding.clone(),
+            charset: meta.charset,
+            transfer_encoding: meta.encoding,
             encoded_size: single.map(|value| value.octets),
             disposition: meta.disposition,
             filename: meta.filename,
             content_id: meta.cid,
-            downloadable: supported(&meta.encoding),
+            downloadable,
         });
         Ok(())
     }
 }
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "mapping/body_selection_tests.rs"]
+mod body_selection_tests;

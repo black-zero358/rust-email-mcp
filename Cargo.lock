@@ -2089,6 +2089,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "charset",
+ "encoding_rs",
  "futures",
  "html5ever",
  "imap-proto",

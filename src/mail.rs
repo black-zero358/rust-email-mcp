@@ -259,7 +259,7 @@ impl MailService {
                 "id":"default", "address":self.config.address, "mode":self.config.mode, "default":true,
                 "capabilities":{
                     "attachment_delivery_modes":["inline_base64","authenticated_http"],
-                    "part_fetch":false, "cross_mailbox_conversation":false, "cache_modes":["off"]
+                    "part_fetch":true, "cross_mailbox_conversation":false, "cache_modes":["off"]
                 },
                 "limits":{
                     "mailbox_characters":ReadInputLimits::MAILBOX_CHARACTERS,
@@ -339,6 +339,9 @@ impl MailService {
             .map_err(|_| self.backend_timeout())?
     }
     async fn imap_operation(&self, name: &str, a: &Value) -> Result<Value> {
+        if matches!(name, "get_email" | "get_emails" | "read_conversation") {
+            return self.body_operation(name, a).await;
+        }
         let mut s = if runtime::account_read(name) {
             self.connect_read().await?
         } else {
@@ -366,9 +369,7 @@ impl MailService {
             }
         };
         match name {
-            "read_conversation" | "locate_message" | "get_mailbox_statistics" => {
-                self.insight_operation(s, name, a).await
-            }
+            "locate_message" | "get_mailbox_statistics" => self.insight_operation(s, name, a).await,
             "list_mailboxes" => {
                 let list = s
                     .list(Some(""), Some("*"))
@@ -387,7 +388,7 @@ impl MailService {
                 Ok(json!({"mailboxes":mailboxes}))
             }
             "list_emails" | "search_emails" => self.list(s, a, name == "search_emails").await,
-            "get_email" | "get_email_status" | "download_attachment" => {
+            "get_email_status" | "download_attachment" => {
                 let folder = folder(a, InputLimits::Read)?;
                 let uid = uid(a)?;
                 let state = s
@@ -398,81 +399,15 @@ impl MailService {
                 if name == "get_email_status" {
                     return email_status(s, uid, state.uid_validity).await;
                 }
-                let raw = if name == "download_attachment" {
-                    self.raw_attachment(s, uid).await?
-                } else {
-                    self.raw(s, uid).await?
-                };
-                if name == "download_attachment" {
-                    return attachments::inline_download(
-                        &raw,
-                        a,
-                        &self.account,
-                        folder,
-                        uid,
-                        state.uid_validity.ok_or_else(MailError::backend)?,
-                        self.config.max_output / 4,
-                    );
-                }
-                insights::parsed_with_options(
+                let raw = self.raw_attachment(s, uid).await?;
+                attachments::inline_download(
                     &raw,
-                    uid,
-                    state.uid_validity,
-                    (self.config.max_output / 2).min(crate::config::MAX_DISPLAY_BODY),
                     a,
-                )
-            }
-            "get_emails" => {
-                let ids = a
-                    .get("uids")
-                    .and_then(Value::as_array)
-                    .ok_or_else(MailError::input)?;
-                if ids.is_empty() || ids.len() > BATCH_READ_ITEMS {
-                    return Err(MailError::input());
-                }
-                let state = s
-                    .examine(mailbox_name(
-                        folder(a, InputLimits::Read)?,
-                        InputLimits::Read,
-                    )?)
-                    .await
-                    .map_err(imap_error)?;
-                check_validity(a, state.uid_validity)?;
-                let mut items = Vec::new();
-                let mut stopped = false;
-                let mut attempted = 0;
-                for id in ids {
-                    let id = id
-                        .as_u64()
-                        .filter(|n| *n > 0 && *n <= u32::MAX as u64)
-                        .ok_or_else(MailError::input)? as u32;
-                    if stopped {
-                        items.push(json!({"uid":id,"ok":false,"status":"unprocessed"}));
-                        continue;
-                    }
-                    attempted += 1;
-                    let raw = match self.raw(s, id).await {
-                        Ok(raw) => raw,
-                        Err(error) => {
-                            // The FETCH may be incomplete or its transport budget
-                            // exhausted. Preserve the conservative stop boundary.
-                            items.push(json!({"uid":id,"ok":false,"error":error}));
-                            stopped = true;
-                            continue;
-                        }
-                    };
-                    // Both FETCH commands completed successfully. Local MIME
-                    // failures affect this message, not the synchronized session.
-                    match insights::parsed_with_options(&raw, id, state.uid_validity, 64 * 1024, a)
-                    {
-                        Ok(value) => items.push(json!({"uid":id,"ok":true,"email":value})),
-                        Err(error) => {
-                            items.push(json!({"uid":id,"ok":false,"error":error}));
-                        }
-                    }
-                }
-                Ok(
-                    json!({"items":items,"requested":ids.len(),"completed":attempted,"uid_validity":state.uid_validity}),
+                    &self.account,
+                    folder,
+                    uid,
+                    state.uid_validity.ok_or_else(MailError::backend)?,
+                    self.config.max_output / 4,
                 )
             }
             "save_draft" => save_draft(s, &self.config, a).await,
@@ -1590,10 +1525,12 @@ fn parsed(raw: &[u8], uid: u32, validity: Option<u32>, max: usize) -> Result<Val
 
 fn parsed_metadata(p: &mime::Part<'_>, uid: u32, validity: Option<u32>) -> Result<Value> {
     let manifest = parts::from_raw(p)?;
-    let attachments = manifest.manifest.parts.iter().filter(|part| part.is_attachment).map(|part| json!({"attachment_index":part.attachment_index,"content_type":part.content_type,"filename":part.filename})).collect::<Vec<_>>();
-    Ok(
-        json!({"uid":uid,"uid_validity":validity,"subject":p.headers.get_first_value("Subject"),"from":p.headers.get_first_value("From"),"to":p.headers.get_first_value("To"),"attachments":attachments,"content_trust":"untrusted"}),
-    )
+    Ok(insights::manifest_metadata(
+        &p.headers,
+        &manifest.manifest,
+        uid,
+        validity,
+    ))
 }
 #[cfg(test)]
 fn attachment(raw: &[u8], index: usize, max: usize) -> Result<Value> {
@@ -1694,7 +1631,7 @@ mod tests {
         assert_eq!(account["address"], config.address);
         assert_eq!(account["mode"], config.mode);
         assert_eq!(account["default"], true);
-        assert_eq!(account["capabilities"]["part_fetch"], false);
+        assert_eq!(account["capabilities"]["part_fetch"], true);
         assert_eq!(account["capabilities"]["cross_mailbox_conversation"], false);
         assert_eq!(account["capabilities"]["cache_modes"], json!(["off"]));
         assert_eq!(account["limits"]["raw_message_bytes"], config.max_message);
@@ -1917,173 +1854,6 @@ mod tests {
         }
         drop(session);
         backend.await.unwrap();
-    }
-
-    async fn batch_read_result(
-        messages: Vec<(u32, String)>,
-        failure: Option<&'static str>,
-        budget: usize,
-    ) -> Value {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        let dir = tempfile::tempdir().unwrap();
-        let service = MailService::new(
-            crate::config::fixture(),
-            Arc::new(Journal::open(&dir.path().join("db")).unwrap()),
-        )
-        .unwrap();
-        let uids = messages.iter().map(|(uid, _)| *uid).collect::<Vec<_>>();
-        let body_limit = service.config.max_message + 1;
-        let (client, server) = tokio::io::duplex(131072);
-        let backend = tokio::spawn(async move {
-            let mut script = vec![
-                (
-                    "LOGIN \"synthetic\" \"test-only\"".to_owned(),
-                    String::new(),
-                    "OK",
-                ),
-                (
-                    "EXAMINE \"INBOX\"".to_owned(),
-                    "* 3 EXISTS\r\n* OK [UIDVALIDITY 9] valid\r\n".to_owned(),
-                    "OK",
-                ),
-            ];
-            for (uid, raw) in messages {
-                script.push((
-                    format!("UID FETCH {uid} (UID RFC822.SIZE)"),
-                    format!("* 1 FETCH (UID {uid} RFC822.SIZE {})\r\n", raw.len()),
-                    "OK",
-                ));
-                script.push((
-                    format!("UID FETCH {uid} (UID BODY.PEEK[]<0.{body_limit}>)"),
-                    format!(
-                        "* 1 FETCH (UID {uid} BODY[] {{{}}}\r\n{raw})\r\n",
-                        raw.len()
-                    ),
-                    failure.unwrap_or("OK"),
-                ));
-                if failure.is_some() {
-                    break;
-                }
-            }
-            let mut server = BufReader::new(server);
-            for (expected, rows, status) in script {
-                let mut line = String::new();
-                if server.read_line(&mut line).await.unwrap() == 0 {
-                    return;
-                }
-                let (tag, command) = line.trim_end_matches("\r\n").split_once(' ').unwrap();
-                assert_eq!(command, expected);
-                let completion = match status {
-                    "EOF" => String::new(),
-                    "WRONG_TAG" => "other OK completed\r\n".into(),
-                    status => format!("{tag} {status} completed\r\n"),
-                };
-                server
-                    .write_all(format!("{rows}{completion}").as_bytes())
-                    .await
-                    .unwrap();
-                if ["EOF", "WRONG_TAG"].contains(&status) {
-                    return;
-                }
-            }
-            // After an unsafe FETCH failure the client must not issue another UID.
-            let mut extra = String::new();
-            assert_eq!(
-                server.read_line(&mut extra).await.unwrap(),
-                0,
-                "unexpected command: {extra}"
-            );
-        });
-        let (stream, remaining) = BudgetStream::new(client, 200000);
-        let mut session = async_imap::Client::new(stream)
-            .login("synthetic", "test-only")
-            .await
-            .unwrap();
-        remaining.store(budget, Ordering::Relaxed);
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            service.with_session(
-                &mut session,
-                "get_emails",
-                &json!({"uids":uids,"uid_validity":9}),
-            ),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        drop(session);
-        backend.await.unwrap();
-        result
-    }
-
-    #[tokio::test]
-    async fn batch_read_continues_after_local_content_errors() {
-        for (raw, code) in [
-            (
-                "Content-Type: application/octet-stream\r\n\r\nopaque".to_owned(),
-                "UNSUPPORTED_BODY",
-            ),
-            (
-                format!("Subject: {}\r\n\r\nbody", "x".repeat(129 * 1024)),
-                "LIMIT_EXCEEDED",
-            ),
-            (" orphaned-fold\r\n\r\nbody".to_owned(), "MAIL_BACKEND"),
-        ] {
-            assert_eq!(
-                insights::parsed_with_options(raw.as_bytes(), 7, Some(9), 16000, &json!({}))
-                    .unwrap_err()
-                    .code,
-                code
-            );
-            let result = batch_read_result(
-                vec![(7, raw), (8, "Subject: valid\r\n\r\nbody".into())],
-                None,
-                200000,
-            )
-            .await;
-            assert_eq!(result["requested"], 2);
-            assert_eq!(result["completed"], 2);
-            assert_eq!(result["items"][0]["ok"], false);
-            assert_eq!(result["items"][0]["error"]["code"], code);
-            assert_eq!(result["items"][1]["uid"], 8);
-            assert_eq!(result["items"][1]["ok"], true);
-            assert_eq!(result["items"][1]["email"]["body"], "body");
-        }
-    }
-
-    #[tokio::test]
-    async fn batch_read_stops_after_protocol_failure_or_transport_exhaustion() {
-        for (status, budget) in [
-            (Some("NO"), 200000),
-            (Some("BAD"), 200000),
-            (Some("EOF"), 200000),
-            (Some("WRONG_TAG"), 200000),
-            (None, 300),
-        ] {
-            let raw = format!("Subject: valid\r\n\r\n{}", "x".repeat(2000));
-            let result = batch_read_result(
-                vec![(7, raw), (8, "Subject: untouched\r\n\r\nbody".into())],
-                status,
-                budget,
-            )
-            .await;
-            assert_eq!(result["requested"], 2);
-            assert_eq!(result["completed"], 1);
-            if status.is_none() {
-                assert_eq!(result["items"][0]["error"]["code"], "LIMIT_EXCEEDED");
-                assert_eq!(
-                    result["items"][0]["error"]["details"]["limit_kind"],
-                    "connection_bytes"
-                );
-            } else {
-                assert_eq!(result["items"][0]["error"]["code"], "MAIL_BACKEND");
-                assert!(result["items"][0]["error"].get("details").is_none());
-            }
-            assert_eq!(
-                result["items"][1],
-                json!({"uid":8,"ok":false,"status":"unprocessed"})
-            );
-        }
     }
 
     async fn fetch_script(

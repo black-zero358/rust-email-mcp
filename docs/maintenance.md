@@ -49,6 +49,8 @@ R04 的[客户端适配工具](../scripts/attachment-client-adapter/README.md)�
 
 R06 将已锁定的 `imap-proto 0.17.0` 纳入本地补丁，以便在 BODYSTRUCTURE 解析及容器扩容前执行预算。版本和依赖解析保持原值；归档 SHA-256 为 `5ccf963d57074747b455398a1763d174da80bcaba6f51e3671a82252b531a68b`，许可证 MIT OR Apache-2.0。来源、API、边界和替换条件见[补丁记录](../vendor/imap-proto/PATCHES.md)。根 Cargo patch 同时覆盖直接依赖和 async-imap 的传递依赖。
 
+R07 局部正文读取将已有传递依赖 `encoding_rs 0.8.42` 声明为直接依赖，复用其跨块字符解码状态；Cargo.lock 的包版本保持不变。许可证为 `(Apache-2.0 OR MIT) AND BSD-3-Clause`。替代方案是收齐整个部件后解码，当前采用增量接口以保留有界块处理。小输出缓冲采用固定 64 字节私有暂存，调用状态相关的 `max_utf8_buffer_length` 核对输入前缀的输出上界，再按 UTF-8 边界交付；升级需重跑拆分 BOM、空输入 EOF、ISO-2022-JP 和原 mailparse 字符结果的差分回归。维护入口为[锁定源码](https://github.com/hsivonen/encoding_rs/blob/v0.8.42/src/lib.rs)；UTF-7 继续使用现有有界 raw 读取路径。
+
 专用审计脚本在同一临时锁文件中恢复 async-imap 与 imap-proto 的精确上游 registry 身份，再运行 cargo-audit；原 Cargo.lock 保持原字节。版本、校验和、缺失/重复记录、意外 source/checksum 及未登记的 path/git 包均触发拒绝。`scripts/test-audit-dependencies.sh` 在 CI 中验证这些边界和失败清理。Docker builder 与上下文仅允许这两个 vendored 目录，context 回归同时验证两个允许项及其他文件拒绝项。
 
 - 每周运行 `bash scripts/audit-dependencies.sh`，在没有代码变更时也检查新公开的漏洞；遇到相关安全公告时及时复核。审计失败应记录受影响版本、可达性、处置和验证结果，不能为保持绿色而无说明地忽略。

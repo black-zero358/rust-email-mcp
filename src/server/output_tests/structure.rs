@@ -76,7 +76,8 @@ impl Protocol {
         }
         reply.extend_from_slice(format!("* 1 FETCH (UID {uid}").as_bytes());
         for request in attrs.split("BODY.PEEK[").skip(1) {
-            let section = request.split_once(']')?.0;
+            let (section, range) = request.split_once("]<0.")?;
+            let count = range.split_once('>')?.0.parse::<usize>().ok()?;
             let evidence = self
                 .headers
                 .lock()
@@ -99,11 +100,12 @@ impl Protocol {
                 Evidence::Duplicate(bytes) => (bytes, 2, 0),
                 Evidence::WrongOrigin(bytes) => (bytes, 1, 1),
             };
+            let bytes = &bytes[..bytes.len().min(count)];
             for _ in 0..copies {
                 reply.extend_from_slice(
                     format!(" BODY[{section}]<{origin}> {{{}}}\r\n", bytes.len()).as_bytes(),
                 );
-                reply.extend_from_slice(&bytes);
+                reply.extend_from_slice(bytes);
             }
         }
         reply.extend_from_slice(b")\r\n");
@@ -186,6 +188,7 @@ async fn diagnostics_schema_is_optional_closed_and_specific_to_list_and_prepare(
             json!("metadata_conflict"),
             json!("whole_multipart_attachment"),
             json!("header_budget"),
+            json!("charset_utf7"),
         ] {
             result["data"]["read_diagnostics"] =
                 json!({"source":"raw","fallback_reason":reason,"limit_kind":"mime_structure"});
@@ -289,10 +292,13 @@ async fn signed_structure_fast_path_reads_only_metadata_and_keeps_raw_attachment
             .iter()
             .any(|(_, command)| command == "UID FETCH 7 (UID BODY.PEEK[2]<4.1>)")
     );
+    let mut accounts = attachments::call(&app, &token, "list_accounts", json!({})).await;
     assert_eq!(
-        h.call("list_accounts", json!({})).await["data"]["accounts"][0]["capabilities"]["part_fetch"],
-        false
+        accounts["data"]["accounts"][0]["capabilities"]["part_fetch"],
+        true
     );
+    accounts["data"]["accounts"][0]["capabilities"]["part_fetch"] = json!(false);
+    assert!(!validator("list_accounts").is_valid(&accounts));
 }
 
 #[tokio::test]

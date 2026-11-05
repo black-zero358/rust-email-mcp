@@ -26,6 +26,7 @@ use tower::ServiceExt;
 
 mod accounts;
 mod attachments;
+mod body_parts;
 mod parts;
 mod structure;
 
@@ -377,7 +378,9 @@ impl Harness {
                                         let is_header = attrs.contains("HEADER");
                                         let bytes = if is_header { header(raw) } else { raw };
                                         let section = if is_header { "HEADER" } else { "" };
-                                        response.extend_from_slice(format!("* 1 FETCH (UID {uid} FLAGS () RFC822.SIZE {} BODY[{section}] {{{}}}\r\n",raw.len(),bytes.len()).as_bytes());
+                                        let origin =
+                                            if attrs.contains("]<0.") { "<0>" } else { "" };
+                                        response.extend_from_slice(format!("* 1 FETCH (UID {uid} FLAGS () RFC822.SIZE {} BODY[{section}]{origin} {{{}}}\r\n",raw.len(),bytes.len()).as_bytes());
                                         response.extend_from_slice(bytes);
                                         response.extend_from_slice(b")\r\n");
                                     }

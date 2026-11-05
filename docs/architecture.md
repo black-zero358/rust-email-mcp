@@ -17,7 +17,7 @@
 | `mail` | IMAP 会话、邮件操作编排、发送意图与结果记录 | 调用 `imap_text`、`mime`、`smtp`、`journal`，持有执行槽位 |
 | `mail/runtime`、`mail/scheduler` | 按主体和账户路由、全局准入及公平调度 | 授权先于队列、缓存和连接；固定原写账户，保持发送生命周期 |
 | `mail/attachments`、`mail/insights` | 附件交付及有界读取扩展 | 由 `mail` 编排，共用 MIME、协议、槽位与预算 |
-| `mail/parts` | BODYSTRUCTURE、必要 MIME 头和 raw MIME 的统一附件清单 | 核对原 DFS 索引后发布引用；读回退有独立大小证据、次数及总期限边界 |
+| `mail/parts` | BODYSTRUCTURE、必要 MIME 头、统一部件清单及正文分块读取 | 核对原 DFS 索引后发布引用；正文与 raw MIME 共用候选规则，读回退有独立大小证据、次数及总期限边界 |
 | `imap_text` | rev1 邮箱名、非 ASCII 搜索与严格统计 STATUS | 处理编码、literal 和命令终结；不承担 MCP 授权 |
 | `mime`、`html` | 有界 MIME 解析、正文选择、附件分类、HTML 文本提取 | `mime` 调用 `html`；不执行网络请求、不发送邮件 |
 | `smtp` | 经验证 TLS/AUTH 的提交事务及独立清理 | 返回事务结果；由 `mail` 调用 `journal` 持久化，不在适配器中自动重试 |
@@ -97,7 +97,11 @@ HTTP 内容固定为 octet-stream，带 no-store/nosniff、`X-Content-SHA256` �
 
 ## MIME and HTML
 
-`get_emails` 按阶段区分失败：`raw()` 成功表示 SIZE/BODY 获取已消费并通过匹配 tagged OK，此后 `parsed_with_options` 的本地 MIME/正文错误只记录单项失败并继续；不依据错误码猜测连接状态（本地头部解析同样可能返回 `MAIL_BACKEND`）。`raw()` 失败则保留既有保守停止边界，后续 UID 明确 `unprocessed`，避免在未消费完响应、失效连接或耗尽预算上继续。`completed` 保持已尝试项数的既有含义。依据 [RFC 3501 §2.2.2](https://www.rfc-editor.org/rfc/rfc3501#section-2.2.2) 的命令终结语义；MIME 失败不能代替协议状态判断。
+`get_email`、`get_emails` 和 `read_conversation` 共用 `mail/parts/body` 的正文读取会话。先完成独立 SIZE、BODYSTRUCTURE 和必要 MIME 头核对，再由 `mime/selection` 在 raw 树与已核对部件树上使用同一候选规则。所有选中叶按原 DFS 顺序共享编码长度四倍的 32 MiB 解码预留和 HTML 预算；transfer 与 charset 状态跨 64 KiB 块保留。完整正文验证后应用显示截断，包括 `max_body_length:0`。成功输出增加有界 `read_diagnostics`，UTF-7 的固定 raw 回退原因为 `charset_utf7`。
+
+`get_emails` 按明确的命令完成状态区分失败：匹配 tagged OK 后的本地 MIME、字符集或展示错误只记录单项失败并继续；映射失败且整封大小超限时，同样检查元数据命令是否完成。目标数据不匹配、必要属性缺失、header/body 协议失败或连接预算错误停止后续读取，后续 UID 明确 `unprocessed`。`completed` 保持已尝试输入项数的含义，重复 UID 保留输入顺序及逐项结果。错误码与连接可继续性分别记录。依据 [RFC 3501 §2.2.2](https://www.rfc-editor.org/rfc/rfc3501#section-2.2.2) 的命令终结语义。
+
+需要 raw 策略时，每 UID 最多回退一次，先关闭旧连接，在原操作期限内重新连接、EXAMINE 并核对 UIDVALIDITY。新连接完成精确的目标 UID/section/origin/长度与 tagged OK 核对后，才进入本地解析并用于后续 UID。候选头扫描和部件命令的协议失败直接终止；raw 失败不再次回退。头部证据的字节与 8192 行预算跨整个已核对 MIME 树共享，默认字符集按 MIME 缺省语义比较。
 
 邮件正文、主题、头部和附件均按不可信输入处理。构建 MIME 结构前检查共享的节点、深度和头部预算；transfer/charset 解码前预留预算。不得恢复对不可信输入调用 `mailparse::parse_mail`；回复和草稿发送只需要有界头部。boundary 按完整分隔符匹配，接受允许的尾部空白，不能把相同前缀当作分隔符。
 
@@ -184,6 +188,8 @@ R01 的字符与错误回归入口：`read_lengths_count_unicode_code_points_and
 R04 的 D1/D2/D3/D5 回归入口为 `opaque_ids_bind_every_reference_dimension_and_preserve_all_mime_indices`、`attachment_fetch_reports_absence_only_after_successful_tagged_completion`、`http_failure_classes_are_small_private_and_release_transfer_permits`、`four_slow_consumers_cancel_and_timeout_without_losing_capacity`、`expired_wrong_principal_or_account_handles_return_private_reprepare_errors`，以及真实 JWT MCP/GET 的 `server::output_tests::attachments`。它们核对稳定引用、认证隐私、命令完成、失败分类、许可释放、8 组文件完整字节和输出 Schema。跨运行时的 Node 适配验收作为显式 ignored 测试执行，默认 Cargo 测试仅需 Rust。
 
 R02/R03 的新增验证入口：`accounts/tests.rs` 覆盖 D1/D4 的身份绑定、并发初始化、损坏与恢复；`every_read_output_schema_validates_real_handler_success_and_empty_results` 和其余 `server/output_tests` 覆盖 D3/D5 的正常、局部失败、诊断超时和完整 wire 压缩结果；`readable_reads_use_one_display_policy_while_forward_keeps_legacy_body`、`readable_html_expansion_uses_display_budget_after_bounded_charset_decode` 及 `html/readable` 回归覆盖 MIME 候选、旧转发、显示膨胀与跨部件预算。
+
+R07 正文的 D2/D3/D5 验证入口为 `server::output_tests::body_parts`：14 组认证 HTTP 场景对照 raw 与 parts 的三种正文工具，覆盖 40 MiB 邮件的小正文、隐式 charset、alternative/related、拆块字符、HTML 共享预算、完整 wire 前缀、重复 UID、UTF-7 和 UIDVALIDITY、局部错误继续，以及 raw/HEADER/部件协议失败停止。`mail::parts::charset_decode` 覆盖编码/BOM/输出边界，`mail::parts::body` 对照传输与字符解码，`mail::parts::mapping::body_selection_tests` 核对完整候选、默认字符集和全树头部预算，`mail::parts::reader::tests` 核对 tagged completion 与预算失败阶段。
 
 以下为当前选择的简短追溯记录，状态均为“采用”。新决策记录背景、决定、代价及重审条件；被替代的决策保留并指向后继记录，不以部署状态覆盖设计历史。
 

@@ -56,7 +56,12 @@ pub(in crate::mail) fn raw_leaves<'a, 'b>(
 
 pub(in crate::mail) fn from_raw<'a, 'b>(part: &'a mime::Part<'b>) -> Result<RawManifest<'a, 'b>> {
     let mut result = RawManifest {
-        manifest: PartManifest { parts: vec![] },
+        manifest: PartManifest {
+            parts: vec![],
+            body: Default::default(),
+            #[cfg(test)]
+            accounted_bytes: 0,
+        },
         entities: vec![],
     };
     let mut attachments = 0;
@@ -80,6 +85,7 @@ pub(in crate::mail) fn from_raw<'a, 'b>(part: &'a mime::Part<'b>) -> Result<RawM
             attachment_ordinal: ordinal,
             is_attachment: attachment,
             content_type: part.ctype.mimetype.clone(),
+            charset: part.ctype.charset.clone(),
             transfer_encoding: part
                 .headers
                 .get_first_value("Content-Transfer-Encoding")

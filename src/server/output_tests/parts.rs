@@ -7,8 +7,8 @@ use std::sync::{Mutex, atomic::Ordering};
 
 const CHUNK: usize = 64 * 1024;
 
-#[derive(Clone, Copy)]
-enum Fault {
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Fault {
     WrongOrigin,
     WrongSection,
     Duplicate,
@@ -24,6 +24,7 @@ enum Fault {
     NoAfterData,
     BadAfterData,
     WrongTagAfterData,
+    ByeAfterData,
 }
 
 #[derive(Default)]
@@ -34,6 +35,9 @@ pub(super) struct Protocol {
 }
 
 impl Protocol {
+    pub(super) fn fail_at(&self, offset: usize, fault: Fault) {
+        self.faults.lock().unwrap().insert(offset, fault);
+    }
     pub(super) fn install_body(&self, uid: u32, section: &str, bytes: &[u8]) {
         self.bodies
             .lock()
@@ -59,6 +63,7 @@ impl Protocol {
             Fault::WrongTagAfterData => {
                 Some(b"wrong-tag OK synthetic completion after literal\r\n".to_vec())
             }
+            Fault::ByeAfterData => Some(b"* BYE synthetic disconnect after literal\r\n".to_vec()),
             _ => None,
         }
     }
@@ -66,9 +71,10 @@ impl Protocol {
         let (uid, attrs) = fetch.split_once(' ')?;
         let uid = uid.parse::<u32>().ok()?;
         let (section, range) = attrs.strip_prefix("(UID BODY.PEEK[")?.split_once("]<")?;
-        if !section
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+        if section != "TEXT"
+            && !section
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b'.')
         {
             return None;
         }

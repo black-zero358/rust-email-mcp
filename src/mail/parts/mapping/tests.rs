@@ -2,7 +2,7 @@ use super::*;
 use imap_proto::{AttributeValue, Response};
 use std::borrow::Cow;
 
-fn ast(wire: &str) -> BodyStructure<'static> {
+pub(super) fn ast(wire: &str) -> BodyStructure<'static> {
     let wire = format!("* 1 FETCH (UID 7 BODYSTRUCTURE {wire})\r\n");
     let (rest, response) = Response::parse(wire.as_bytes()).unwrap();
     assert!(rest.is_empty());
@@ -20,7 +20,7 @@ fn ast(wire: &str) -> BodyStructure<'static> {
         })
         .unwrap()
 }
-fn leaf(
+pub(super) fn leaf(
     media: &str,
     subtype: &str,
     params: &str,
@@ -38,16 +38,26 @@ fn leaf(
         "(\"{media}\" \"{subtype}\" {params} {cid} NIL \"{cte}\" {size}{lines} NIL {disposition})"
     )
 }
-fn text() -> String {
+pub(super) fn text() -> String {
     leaf("TEXT", "PLAIN", "NIL", "7BIT", 3, "NIL", "NIL")
 }
-fn multipart(subtype: &str, boundary: &str, children: &[String], disposition: &str) -> String {
+pub(super) fn multipart(
+    subtype: &str,
+    boundary: &str,
+    children: &[String],
+    disposition: &str,
+) -> String {
     format!(
         "({} \"{subtype}\" (\"BOUNDARY\" \"{boundary}\") {disposition})",
         children.join("")
     )
 }
-fn raw_multipart(subtype: &str, boundary: &str, headers: &str, children: &[String]) -> String {
+pub(super) fn raw_multipart(
+    subtype: &str,
+    boundary: &str,
+    headers: &str,
+    children: &[String],
+) -> String {
     let mut raw =
         format!("Content-Type: multipart/{subtype}; boundary={boundary}\r\n{headers}\r\n");
     for child in children {
@@ -56,7 +66,7 @@ fn raw_multipart(subtype: &str, boundary: &str, headers: &str, children: &[Strin
     raw.push_str(&format!("--{boundary}--\r\n"));
     raw
 }
-fn raw_leaf(headers: &str) -> String {
+pub(super) fn raw_leaf(headers: &str) -> String {
     format!("{headers}\r\n\r\nabc")
 }
 fn leaves<'a, 'b>(part: &'a crate::mime::Part<'b>, out: &mut Vec<&'a crate::mime::Part<'b>>) {
@@ -69,7 +79,7 @@ fn leaves<'a, 'b>(part: &'a crate::mime::Part<'b>, out: &mut Vec<&'a crate::mime
         }
     }
 }
-fn evidence(raw: &[u8]) -> Vec<HeaderEvidence> {
+pub(super) fn evidence(raw: &[u8]) -> Vec<HeaderEvidence> {
     fn visit(part: &crate::mime::Part<'_>, section: Section, out: &mut Vec<HeaderEvidence>) {
         let mut bytes = vec![];
         for header in &part.headers {
@@ -99,7 +109,7 @@ fn evidence(raw: &[u8]) -> Vec<HeaderEvidence> {
     visit(&parsed, root, &mut out);
     out
 }
-fn compare(raw: &str, structure: &str) -> PartManifest {
+pub(super) fn compare(raw: &str, structure: &str) -> PartManifest {
     let ast = ast(structure);
     let headers = evidence(raw.as_bytes());
     let ManifestOutcome::Ready(manifest) = map(&ast, &headers).unwrap() else {

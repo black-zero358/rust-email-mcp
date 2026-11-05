@@ -7,6 +7,8 @@ const TEXT: &str = "(\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 3 1 NIL NIL)";
 enum Fixture {
     Duplicates,
     HeaderBytes,
+    HeaderBytesRejected,
+    UnsolicitedStructureLimit,
     CommandCount,
 }
 
@@ -50,10 +52,17 @@ async fn run(
                 .map(|part| part.split(']').next().unwrap().to_owned())
                 .collect::<Vec<_>>();
             assert!(!sections.is_empty() && sections.len() <= SECTIONS_PER_COMMAND);
+            if matches!(fixture, Fixture::UnsolicitedStructureLimit) {
+                let name = "x".repeat(HEADER_BYTES + 1);
+                let body = format!("(\"{name}\" \"PLAIN\" NIL NIL NIL \"7BIT\" 3)");
+                let response = format!("* 2 FETCH (UID 8 BODYSTRUCTURE {body})\r\n");
+                let _ = server.write_all(response.as_bytes()).await;
+                return;
+            }
             for section in sections {
                 let headers = match fixture {
                     Fixture::Duplicates => b"Content-Type: multipart/mixed; boundary=m\r\nContent-Type: application/pdf\r\nContent-Disposition: inline\r\nContent-Disposition: attachment\r\n\r\n".to_vec(),
-                    Fixture::HeaderBytes if section != "HEADER" => {
+                    Fixture::HeaderBytes | Fixture::HeaderBytesRejected if section != "HEADER" => {
                         let mut header = b"Content-Type: text/plain\r\nX-Pad: ".to_vec();
                         header.resize(HEADER_BYTES - 4, b'x');
                         header.extend(b"\r\n\r\n");
@@ -77,8 +86,15 @@ async fn run(
                     return;
                 }
             }
+            let status = if count.load(Ordering::SeqCst) == 2
+                && matches!(fixture, Fixture::HeaderBytesRejected)
+            {
+                "NO"
+            } else {
+                "OK"
+            };
             if server
-                .write_all(format!("{tag} OK complete\r\n").as_bytes())
+                .write_all(format!("{tag} {status} complete\r\n").as_bytes())
                 .await
                 .is_err()
             {
@@ -103,7 +119,10 @@ async fn reader_requires_original_headers_for_a_server_reclassified_basic_attach
     let (result, commands) = run(body, Fixture::Duplicates).await;
     assert!(matches!(
         result,
-        Err(FetchFailure::Fallback(Fallback::MetadataConflict))
+        Err(FetchFailure::Fallback {
+            reason: Fallback::MetadataConflict,
+            synchronized: true
+        })
     ));
     assert_eq!(commands, 1);
 }
@@ -114,9 +133,30 @@ async fn header_evidence_uses_one_shared_mebibyte_across_the_frontier() {
     let (result, commands) = run(body, Fixture::HeaderBytes).await;
     assert!(matches!(
         result,
-        Err(FetchFailure::Fallback(Fallback::HeaderBudget))
+        Err(FetchFailure::Fallback {
+            reason: Fallback::HeaderBudget,
+            synchronized: true
+        })
     ));
     assert_eq!(commands, 2);
+}
+
+#[tokio::test]
+async fn header_budget_requires_matching_ok_before_allowing_raw_fallback() {
+    let body = format!("({} \"MIXED\" (\"BOUNDARY\" \"m\") NIL)", TEXT.repeat(9));
+    let (result, commands) = run(body, Fixture::HeaderBytesRejected).await;
+    assert!(matches!(result, Err(FetchFailure::Imap(ImapError::No(_)))));
+    assert_eq!(commands, 2);
+}
+
+#[tokio::test]
+async fn unsolicited_structure_budget_during_header_fetch_is_terminal() {
+    let (result, commands) = run(TEXT.to_owned(), Fixture::UnsolicitedStructureLimit).await;
+    assert!(matches!(
+        result,
+        Err(FetchFailure::Imap(error)) if async_imap::error::body_structure_limit(&error).is_some()
+    ));
+    assert_eq!(commands, 1);
 }
 
 #[tokio::test]
@@ -128,7 +168,10 @@ async fn nested_header_frontiers_stop_at_the_shared_command_limit() {
     let (result, commands) = run(body, Fixture::CommandCount).await;
     assert!(matches!(
         result,
-        Err(FetchFailure::Fallback(Fallback::HeaderBudget))
+        Err(FetchFailure::Fallback {
+            reason: Fallback::HeaderBudget,
+            synchronized: true
+        })
     ));
     assert_eq!(commands, HEADER_COMMANDS);
 }
