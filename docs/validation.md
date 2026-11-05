@@ -72,7 +72,7 @@
 
 ### 缓存就绪与软期限回归
 
-head `e26184bb800f2875aa43157373d1176945de0c11` 的 [CI 42043024618](https://github.com/black-zero358/rust-email-mcp/actions/runs/42043024618) 已通过原三项失败用例；一项旧缓存测试遇到合法的 bodystructure 回退，却直接要求命中缓存；生产缓存探测仍保留 100 ms 软期限。测试修复 `e77e9880403efb1d0ccc52e212aac160ed712574` 先等待指定 UID 和正文真正可离线读取，再在原 2 秒观察窗口内验证实际缓存命中；只有正文完全相同的 bodystructure 回退允许重试，其他错误立即失败。最终命中请求必须恰好新建一条连接并发送 EXAMINE 与目标 UID 的 SIZE，两者之后没有正文 FETCH。相邻三封预热逐封等待可读，避免超过最佳努力写回的两个 payload 许可；删除、tombstone、零网络及局部错误断言继续保留。
+head `e26184bb800f2875aa43157373d1176945de0c11` 的 [CI 42043024618](https://github.com/black-zero358/rust-email-mcp/actions/runs/42043024618) 已通过原三项失败用例；一项旧缓存测试遇到合法的 bodystructure 回退，却直接要求命中缓存；生产缓存探测仍保留 100 ms 软期限。测试修复 `e77e9880403efb1d0ccc52e212aac160ed712574` 先等待指定 UID 和正文真正可离线读取，再在 2 秒的测试观察窗口内验证实际缓存命中；只有正文完全相同的 bodystructure 回退允许重试，其他错误立即失败。最终命中请求必须恰好新建一条连接并发送 EXAMINE 与目标 UID 的 SIZE，两者之后没有正文 FETCH。相邻三封预热逐封等待可读，避免超过最佳努力写回的两个 payload 许可；删除、tombstone、零网络及局部错误断言继续保留。
 
 该提交仅修改测试文件。独立审阅通过；四 CPU、八测试线程的缓存组 13 项通过，精确快照 fmt、540 单元 + 53 集成（2 项默认忽略）、all-target Clippy 通过，单元 27.13 秒、Clippy 13.90 秒。生产源码与 `c8daed4` 相同，沿用其 release、八文件与 V6 恢复证据，最终提交重新执行三项 CI。
 
