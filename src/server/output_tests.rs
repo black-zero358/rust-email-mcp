@@ -27,6 +27,7 @@ use tower::ServiceExt;
 mod accounts;
 mod attachments;
 mod body_parts;
+mod listing;
 mod parts;
 mod structure;
 
@@ -76,6 +77,9 @@ struct Harness {
     reject_login: Arc<std::sync::atomic::AtomicBool>,
     structure: Arc<structure::Protocol>,
     parts: Arc<parts::Protocol>,
+    summary_flags: Arc<std::sync::Mutex<BTreeMap<u32, &'static str>>>,
+    summary_faults: Arc<std::sync::Mutex<BTreeMap<u32, listing::SummaryFault>>>,
+    stall_structure_uid: Arc<std::sync::atomic::AtomicU32>,
     imap: tokio::task::JoinHandle<()>,
     _staging: tempfile::TempDir,
 }
@@ -186,6 +190,12 @@ impl Harness {
         let structure_protocol = structure.clone();
         let parts = Arc::new(parts::Protocol::default());
         let parts_protocol = parts.clone();
+        let summary_flags = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+        let flags = summary_flags.clone();
+        let summary_faults = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+        let summary_protocol = summary_faults.clone();
+        let stall_structure_uid = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let stall_structure = stall_structure_uid.clone();
         let imap = tokio::spawn(async move {
             let acceptor = TlsAcceptor::from(Arc::new(tls));
             loop {
@@ -200,6 +210,9 @@ impl Harness {
                 let login_rejected = login_rejected.clone();
                 let structure_protocol = structure_protocol.clone();
                 let parts_protocol = parts_protocol.clone();
+                let flags = flags.clone();
+                let summary_protocol = summary_protocol.clone();
+                let stall_structure = stall_structure.clone();
                 tokio::spawn(async move {
                     let Ok(stream) = acceptor.accept(stream).await else {
                         return;
@@ -304,10 +317,20 @@ impl Harness {
                             write_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             response.extend_from_slice(b"* 1 FETCH (UID 7 FLAGS ())\r\n");
                         } else if let Some(fetch) = command.strip_prefix("UID FETCH ") {
-                            if let Some(reply) = parts_protocol
-                                .fetch(fetch)
-                                .or_else(|| structure_protocol.fetch(fetch, &messages))
-                            {
+                            let stalled = stall_structure.load(std::sync::atomic::Ordering::SeqCst);
+                            if stalled != 0 && fetch == format!("{stalled} (UID BODYSTRUCTURE)") {
+                                let _ = stream.read_u8().await;
+                                return;
+                            }
+                            let summary = fetch.contains("(UID FLAGS RFC822.SIZE ");
+                            let reply = if summary {
+                                None
+                            } else {
+                                parts_protocol
+                                    .fetch(fetch)
+                                    .or_else(|| structure_protocol.fetch(fetch, &messages))
+                            };
+                            if let Some(reply) = reply {
                                 match reply {
                                     structure::Reply::Data(data) => {
                                         response.extend_from_slice(&data)
@@ -378,9 +401,32 @@ impl Harness {
                                         let is_header = attrs.contains("HEADER");
                                         let bytes = if is_header { header(raw) } else { raw };
                                         let section = if is_header { "HEADER" } else { "" };
-                                        let origin =
-                                            if attrs.contains("]<0.") { "<0>" } else { "" };
-                                        response.extend_from_slice(format!("* 1 FETCH (UID {uid} FLAGS () RFC822.SIZE {} BODY[{section}]{origin} {{{}}}\r\n",raw.len(),bytes.len()).as_bytes());
+                                        let count = attrs
+                                            .rsplit_once("]<0.")
+                                            .and_then(|(_, range)| range.split_once('>'))
+                                            .and_then(|(count, _)| count.parse::<usize>().ok());
+                                        let origin = if count.is_some() { "<0>" } else { "" };
+                                        let bytes =
+                                            &bytes[..count.unwrap_or(bytes.len()).min(bytes.len())];
+                                        if summary {
+                                            let flags = flags
+                                                .lock()
+                                                .unwrap()
+                                                .get(&uid)
+                                                .copied()
+                                                .unwrap_or("");
+                                            listing::summary_response(
+                                                &mut response,
+                                                uid,
+                                                raw.len(),
+                                                bytes,
+                                                count.unwrap(),
+                                                flags,
+                                                summary_protocol.lock().unwrap().get(&uid).copied(),
+                                            );
+                                            continue;
+                                        }
+                                        response.extend_from_slice(format!("* 1 FETCH (UID {uid} RFC822.SIZE {} BODY[{section}]{origin} {{{}}}\r\n",raw.len(),bytes.len()).as_bytes());
                                         response.extend_from_slice(bytes);
                                         response.extend_from_slice(b")\r\n");
                                     }
@@ -429,6 +475,9 @@ impl Harness {
             reject_login,
             structure,
             parts,
+            summary_flags,
+            summary_faults,
+            stall_structure_uid,
             imap,
             _staging: staging,
         }

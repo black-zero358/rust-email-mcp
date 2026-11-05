@@ -650,18 +650,21 @@ impl Readable {
         tokens: usize,
         parse_error: bool,
         html: &str,
+        complete: bool,
     ) -> Result<(String, Option<DisplayContext>)> {
-        if self.anchor.is_some() {
-            self.malformed();
-            self.close_anchor();
-        }
-        if !self.lists.is_empty()
-            || self.quotes != 0
-            || !self.tables.is_empty()
-            || self.pre != 0
-            || self.code != 0
-        {
-            self.malformed();
+        if complete {
+            if self.anchor.is_some() {
+                self.malformed();
+                self.close_anchor();
+            }
+            if !self.lists.is_empty()
+                || self.quotes != 0
+                || !self.tables.is_empty()
+                || self.pre != 0
+                || self.code != 0
+            {
+                self.malformed();
+            }
         }
         if self.limited {
             return Err(MailError::limit());

@@ -18,7 +18,15 @@
 
 未回复筛选使用 `answered:false`，含义是服务器未设置 `\\Answered` 标记；不能据此断定所有客户端都没有回复过。收件人 `to` 对应 To 头，不包含隐式 BCC 投递关系。
 
-服务先使用 UID SEARCH 过滤日期、文本、地址、大小和标记。IMAP 没有通用的附件搜索条件，`has_attachment` 在有限候选中使用有界整封邮件读取与 MIME 解析检查附件。每页只覆盖有限 UID 窗口；必须持续传入 `next_before_uid` 和返回的 `uid_validity`，直到游标为空。空页不等于没有更早的匹配。
+服务先使用 UID SEARCH 过滤日期、文本、地址、大小和标记。`has_attachment` 在有限候选中核对 BODYSTRUCTURE 和必要 MIME 头，按已验证清单判断附件；需要完整 MIME 时，每页最多一次有界整封回退。回退后可提前返回短页，`next_before_uid` 保留最后一个已检查 UID；新连接复查 UIDVALIDITY 和大小，两条连接共用原传输预算和期限。持续传入游标及返回的 `uid_validity`，直到游标为空，空页同样可以带后续游标。
+
+`list_emails` 和 `search_emails` 增加可选 `preview`，默认 false。启用后先取得整页摘要，再按同一 MIME 候选规则读取正文预览；每封最多 200 个 Unicode 码点、8 KiB 编码取样，每页共用 128 KiB，探针与失败请求也计入申请额度。空白跨部件合并，HTML 使用可读文本策略。截断前缀仅解码完整编码组和字符，未结束的 HTML token 留待完整读取；预览不触发整封回退。附件筛选已成功获取的整封字节可按同一取样预算生成本地预览，用后释放，避免重复结构请求。
+
+预览字段仅在请求时返回：`preview_status` 为 `ok`、`empty`、`budget_skipped`、`error`、`unprocessed` 或 `wire_budget_skipped`。成功或完整空正文附 `preview` 和 `preview_truncated`；错误附脱敏 `preview_error`。UTF-7 和其他不支持的取样字符集返回逐项 `UNSUPPORTED_BODY`，可通过完整正文读取工具读取 UTF-7 邮件。单项本地错误后继续；协议失败或预览子期限结束后，保留摘要并将后续预览标为 unprocessed。预览读取期限设为 5 秒与剩余操作时间一半中的较小值；网络等待按期限取消，同步 MIME 取样受字节和结构预算约束，完成后再次核对期限。完整 JSON-RPC 超限时从页尾移除可选预览，标 wire_budget_skipped；若逐项状态仍放不下，则省略整页的预览字段，保留 UID、摘要、分类和游标。客户端在请求预览后收到无预览字段的摘要时，应按响应预算省略处理；仅基础元数据超限返回 `LIMIT_EXCEEDED`。
+
+列表摘要始终提供 `classification`、`classification_signals`、`classification_rule_version:headers-v1`、`classification_status` 和 `unsubscribe_available`。合法 List-Id、List-Unsubscribe、List-Unsubscribe-Post 或 `Precedence:list` 产生 newsletter；非 no 的合法 Auto-Submitted，或 `Precedence:bulk|junk|auto_reply` 产生 automated。两类可并存，无信号时为 unclassified。signals 仅含固定字段名与类别，按固定顺序去重。摘要头最多 8 KiB；classification_status 为 partial 时，只使用已经完整观察到的字段。
+
+`unsubscribe_available` 表示 List-Unsubscribe 中存在受支持的 http/https/mailto URI；最多 2048 字节，拒绝认证信息及控制字符。服务只检查字段，不访问地址、不退订、不修改邮件。完整正文继续使用 `get_email` 或 `get_emails`。
 
 中文等非 ASCII 筛选词使用 IMAP4rev1 的 `CHARSET UTF-8` 与同步 literal，发送 UTF-8 字节前等待 continuation，命令结束必须收到对应 tag 的 OK。`BADCHARSET` 返回 `UNSUPPORTED_CHARSET`；不协商 `UTF8=ACCEPT` 或依赖 `LITERAL+`。组合文本字段分别在同一 500 UID 窗口搜索并取交集；服务器的字符集与搜索匹配规则仍影响结果。
 
