@@ -34,7 +34,9 @@ impl MailService {
         };
         let remaining = Arc::new(AtomicUsize::new(self.config.max_message * 4));
         let mut session = self.connect_for(true, Some(remaining.clone())).await?;
-        let state = select_list_mailbox(&mut session, &wire_mailbox, args).await?;
+        let state = select_list_mailbox(&mut session, &wire_mailbox).await?;
+        self.observe_mailbox(mailbox, &state);
+        check_validity(args, state.uid_validity)?;
         let Some(scan) = scan_list(&mut session, args, name == "search_emails", &state).await?
         else {
             return Ok(
@@ -53,7 +55,10 @@ impl MailService {
                     .await
                     .map_err(reader::FetchFailure::mail)?;
                 let (attached, used_fallback) = match reader::manifest(&mut session, uid).await {
-                    Ok(manifest) => (manifest.parts.iter().any(|part| part.is_attachment), false),
+                    Ok(manifest) => {
+                        self.persist_manifest(mailbox, state.uid_validity, uid, &manifest);
+                        (manifest.parts.iter().any(|part| part.is_attachment), false)
+                    }
                     Err(reader::FetchFailure::Fallback { .. }) => {
                         let max = self
                             .config
@@ -72,6 +77,7 @@ impl MailService {
                             .examine(&wire_mailbox)
                             .await
                             .map_err(map_read_imap_error)?;
+                        self.observe_mailbox(mailbox, &fresh);
                         check_validity(&json!({"uid_validity":validity}), fresh.uid_validity)?;
                         let size = reader::size(&mut session, uid)
                             .await
@@ -203,6 +209,8 @@ impl MailService {
             },
         ).await.map_err(reader::FetchFailure::mail)?;
         let mut emails = Vec::new();
+        let mut observations = Vec::new();
+        let persistent = self.persists(mailbox);
         for (id, summary) in summaries.into_iter().rev() {
             // FLAGS-only updates cannot create a summary with blank headers.
             let Some(header) = summary.header.as_deref() else {
@@ -236,8 +244,14 @@ impl MailService {
             email["date"] = json!(headers.get_first_value("Date"));
             email["size"] = json!(summary.size);
             email["flags"] = json!(summary.flags);
+            if persistent {
+                observations.push(persistence::HeaderObservation::new(
+                    id, header, complete, &headers,
+                ));
+            }
             emails.push(email);
         }
+        self.persist_headers(mailbox, validity, observations);
         Ok(emails)
     }
 }
@@ -245,17 +259,14 @@ impl MailService {
 pub(super) async fn select_list_mailbox<S>(
     session: &mut async_imap::Session<S>,
     wire_mailbox: &str,
-    args: &Value,
 ) -> Result<async_imap::types::Mailbox>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
 {
-    let state = session
+    session
         .examine(wire_mailbox)
         .await
-        .map_err(map_read_imap_error)?;
-    check_validity(args, state.uid_validity)?;
-    Ok(state)
+        .map_err(map_read_imap_error)
 }
 
 impl ListScan {

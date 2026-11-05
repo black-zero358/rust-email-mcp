@@ -7,7 +7,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-pub(super) struct Folder {
+pub(in crate::server::output_tests) struct Folder {
     pub flags: &'static str,
     pub validity: u32,
     pub next: Option<u32>,
@@ -34,7 +34,7 @@ impl Folder {
     }
 }
 
-pub(super) fn message(
+pub(in crate::server::output_tests) fn message(
     id: Option<&str>,
     refs: &[&str],
     reply: Option<&str>,
@@ -65,13 +65,13 @@ pub(super) fn message(
 }
 
 #[derive(Clone, Copy)]
-pub(super) enum Fault {
+pub(in crate::server::output_tests) enum Fault {
     NoAfterData,
     Hang,
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct Command {
+pub(in crate::server::output_tests) struct Command {
     pub connection: usize,
     pub mailbox: String,
     pub text: String,
@@ -122,11 +122,12 @@ struct Imap {
     changed: tokio::sync::Notify,
 }
 
-pub(super) struct Harness {
+pub(in crate::server::output_tests) struct Harness {
     imap: Arc<Imap>,
     backend: tokio::task::JoinHandle<()>,
     pub catalog: Arc<AccountCatalog>,
     pub runtime: Arc<MailRuntime>,
+    settings: ValidatedAccountSet,
     roots: RootCertStore,
     credentials: Credentials,
     app: Router,
@@ -208,7 +209,7 @@ impl Harness {
             });
             roots.roots.extend(second.roots.roots.iter().cloned());
         }
-        let catalog = AccountCatalog::from_test_accounts(accounts).unwrap();
+        let catalog = AccountCatalog::from_test_accounts(accounts.clone()).unwrap();
         let journal = Arc::new(Journal::open(std::path::Path::new(":memory:")).unwrap());
         let runtime = Arc::new(
             MailRuntime::new(catalog.clone(), journal)
@@ -250,6 +251,7 @@ impl Harness {
             backend,
             catalog,
             runtime,
+            settings: accounts,
             roots,
             credentials,
             app,
@@ -319,10 +321,46 @@ impl Harness {
         self.call_on(&app, principal, args, json!(1)).await.0
     }
 
+    pub fn cache_router(&self, path: &std::path::Path) -> (Router, crate::mail::PreparedCache) {
+        let settings = config::load_cache_file(path, &self.settings).unwrap();
+        let cache = MailRuntime::prepare_cache(&self.catalog, settings).unwrap();
+        let journal = Arc::new(Journal::open(std::path::Path::new(":memory:")).unwrap());
+        let runtime = Arc::new(
+            MailRuntime::with_cache(self.catalog.clone(), journal, cache.clone())
+                .unwrap()
+                .with_test_imap_roots(self.roots.clone()),
+        );
+        (router(runtime, self.credentials.auth.clone()), cache)
+    }
+
+    pub async fn call_tool(
+        &self,
+        app: Option<&Router>,
+        principal: &str,
+        name: &str,
+        args: Value,
+    ) -> Value {
+        self.call_named(app.unwrap_or(&self.app), principal, name, args, json!(1))
+            .await
+            .0
+    }
+
     async fn call_on(
         &self,
         app: &Router,
         principal: &str,
+        args: Value,
+        id: Value,
+    ) -> (Value, usize) {
+        self.call_named(app, principal, "read_conversation", args, id)
+            .await
+    }
+
+    async fn call_named(
+        &self,
+        app: &Router,
+        principal: &str,
+        name: &str,
         args: Value,
         id: Value,
     ) -> (Value, usize) {
@@ -338,7 +376,7 @@ impl Harness {
                     .header("MCP-Protocol-Version", "2025-06-18")
                     .body(Body::from(
                         json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
-                "params":{"name":"read_conversation","arguments":args}})
+                "params":{"name":name,"arguments":args}})
                         .to_string(),
                     ))
                     .unwrap(),
@@ -364,7 +402,7 @@ impl Harness {
         let result = &wire["result"];
         let content = result["structuredContent"].clone();
         assert_eq!(content["request_id"], trace, "{wire}");
-        assert_contract("read_conversation", &content);
+        assert_contract(name, &content);
         let copy: Value =
             serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(copy, content);

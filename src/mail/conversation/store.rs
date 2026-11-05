@@ -1,4 +1,4 @@
-//! Principal- and generation-bound in-memory cursor leases.
+//! Principal- and generation-bound conversation cursor leases.
 use super::{
     graph::{Delivery, MAX_FOLDERS, StateError},
     state::{Coverage, ErrorSnapshot, FolderCoverage, STATE_VERSION, State},
@@ -154,12 +154,25 @@ struct Slot {
     active: Option<Cursor>,
     expires: Instant,
     revision: u64,
+    leased: bool,
     state: Option<Box<State>>,
     state_bytes: usize,
     replay: Option<Arc<Replay>>,
+    durable: Option<durable::CursorRow>,
 }
 
 impl Slot {
+    fn has_token(&self, cursor: Cursor) -> bool {
+        self.active == Some(cursor)
+            || self
+                .replay
+                .as_ref()
+                .is_some_and(|replay| replay.input == cursor)
+            || self
+                .durable
+                .is_some_and(|row| row.replay == Some(*cursor.0.as_bytes()))
+    }
+
     fn charge(&self) -> usize {
         // Reserve one replay allocation upfront, including its Arc counters.
         self.state_bytes + size_of::<Replay>() + 2 * size_of::<usize>()
@@ -176,7 +189,7 @@ impl Inner {
         for slot in &mut *self.slots {
             if slot
                 .as_ref()
-                .is_some_and(|slot| slot.state.is_some() && now >= slot.expires)
+                .is_some_and(|slot| !slot.leased && now >= slot.expires)
                 && let Some(slot) = slot.take()
             {
                 self.used -= slot.charge();
@@ -186,16 +199,19 @@ impl Inner {
 }
 
 #[derive(Clone)]
-pub(in crate::mail) struct CursorStore(Arc<Mutex<Inner>>);
+pub(in crate::mail) struct CursorStore(Arc<Mutex<Inner>>, Option<Arc<durable::Persistence>>);
 
 impl Default for CursorStore {
     fn default() -> Self {
-        Self(Arc::new(Mutex::new(Inner {
-            slots: Box::new(std::array::from_fn(|_| None)),
-            used: size_of::<[Option<Slot>; MAX_CURSORS]>()
-                + size_of::<Mutex<Inner>>()
-                + 2 * size_of::<usize>(),
-        })))
+        Self(
+            Arc::new(Mutex::new(Inner {
+                slots: Box::new(std::array::from_fn(|_| None)),
+                used: size_of::<[Option<Slot>; MAX_CURSORS]>()
+                    + size_of::<Mutex<Inner>>()
+                    + 2 * size_of::<usize>(),
+            })),
+            None,
+        )
     }
 }
 
@@ -219,9 +235,16 @@ impl CursorStore {
         let available = MAX_CURSOR_BYTES
             .checked_sub(inner.used + replay_charge)
             .ok_or(StoreError::Capacity)?;
-        let state = construct(available)?;
+        let mut state = construct(available)?;
         if state.namespace() != &binding.namespace || state.version() != STATE_VERSION {
             return Err(StoreError::Unavailable);
+        }
+        if self
+            .1
+            .as_ref()
+            .is_some_and(|persistence| persistence.configured(&state))
+        {
+            state.reserve_restore_scratch();
         }
         let state_bytes = state.owned_bytes();
         if state_bytes > available {
@@ -233,9 +256,11 @@ impl CursorStore {
             active: None,
             expires: now + CURSOR_TTL,
             revision: 0,
+            leased: true,
             state: None,
             state_bytes,
             replay: None,
+            durable: None,
         };
         inner.used += slot.charge();
         inner.slots[index] = Some(slot);
@@ -258,6 +283,16 @@ impl CursorStore {
         cursor: Cursor,
         now: Instant,
     ) -> Result<Checkout, StoreError> {
+        let acquired = self.acquire(binding, cursor, now)?;
+        acquired.lease.into_checkout(acquired.advancing)
+    }
+
+    fn acquire(
+        &self,
+        binding: Binding,
+        cursor: Cursor,
+        now: Instant,
+    ) -> Result<Acquired, StoreError> {
         let mut inner = self.0.lock().map_err(|_| StoreError::Unavailable)?;
         inner.expire(now);
         let (index, slot) = inner
@@ -266,40 +301,47 @@ impl CursorStore {
             .enumerate()
             .find_map(|(index, slot)| {
                 slot.as_mut()
-                    .filter(|slot| {
-                        slot.active == Some(cursor)
-                            || slot
-                                .replay
-                                .as_ref()
-                                .is_some_and(|replay| replay.input == cursor)
-                    })
+                    .filter(|slot| slot.has_token(cursor))
                     .map(|slot| (index, slot))
             })
             .ok_or(StoreError::Unavailable)?;
-        if slot.binding != binding || slot.version != STATE_VERSION || now >= slot.expires {
+        if slot.binding != binding
+            || slot.version != STATE_VERSION
+            || now >= slot.expires
+            || slot.leased
+        {
             return Err(StoreError::Unavailable);
         }
-        let state = slot.state.take().ok_or(StoreError::Unavailable)?;
+        let state = slot.state.take();
+        slot.leased = true;
         slot.revision = slot.revision.wrapping_add(1);
-        let checkpoint = state.checkpoint();
-        let mut lease = Lease {
+        let checkpoint = state.as_ref().map_or(0, |state| state.checkpoint());
+        let advancing = slot.active == Some(cursor);
+        let lease = Lease {
             store: self.clone(),
             index,
             revision: slot.revision,
             input: cursor,
             checkpoint,
-            state: Some(state),
-            replay: None,
+            state,
+            replay: if advancing { None } else { slot.replay.clone() },
             unpublished: false,
             mutation: 0,
         };
-        if slot.active == Some(cursor) {
-            Ok(Checkout::Advance(lease))
-        } else {
-            lease.replay = slot.replay.clone();
-            Ok(Checkout::Replay(lease))
-        }
+        Ok(Acquired {
+            lease,
+            advancing,
+            row: slot.durable,
+            state_bytes: slot.state_bytes,
+        })
     }
+}
+
+struct Acquired {
+    lease: Lease,
+    advancing: bool,
+    row: Option<durable::CursorRow>,
+    state_bytes: usize,
 }
 
 pub(super) enum Checkout {
@@ -320,6 +362,17 @@ pub(super) struct Lease {
 }
 
 impl Lease {
+    fn into_checkout(self, advancing: bool) -> Result<Checkout, StoreError> {
+        if self.state.is_none() || (!advancing && self.replay.is_none()) {
+            return Err(StoreError::Unavailable);
+        }
+        if advancing {
+            Ok(Checkout::Advance(self))
+        } else {
+            Ok(Checkout::Replay(self))
+        }
+    }
+
     pub(super) fn state(&self) -> &State {
         self.state.as_deref().expect("live cursor lease owns state")
     }
@@ -349,7 +402,7 @@ impl Lease {
         let charged = inner.used;
         let slot = inner.slots[self.index]
             .as_mut()
-            .filter(|slot| slot.revision == self.revision && slot.state.is_none())
+            .filter(|slot| slot.revision == self.revision && slot.leased)
             .ok_or(StoreError::Unavailable)?;
         let previous_bytes = slot.state_bytes;
         let available = MAX_CURSOR_BYTES - charged + previous_bytes;
@@ -421,7 +474,7 @@ impl Lease {
         let mut inner = self.store.0.lock().map_err(|_| StoreError::Unavailable)?;
         let slot = inner.slots[self.index]
             .as_mut()
-            .filter(|slot| slot.revision == self.revision && slot.state.is_none())
+            .filter(|slot| slot.revision == self.revision && slot.leased)
             .ok_or(StoreError::Unavailable)?;
         let state = self.state.as_deref_mut().ok_or(StoreError::Unavailable)?;
         let Prepared {
@@ -461,6 +514,7 @@ impl Lease {
         }
         slot.active = next;
         slot.state = self.state.take();
+        slot.leased = false;
         if self.unpublished && finished {
             let charge = slot.charge();
             inner.slots[self.index] = None;
@@ -475,7 +529,7 @@ impl Lease {
         let mut inner = self.store.0.lock().map_err(|_| StoreError::Unavailable)?;
         let slot = inner.slots[self.index]
             .as_ref()
-            .filter(|slot| slot.revision == self.revision && slot.state.is_none())
+            .filter(|slot| slot.revision == self.revision && slot.leased)
             .ok_or(StoreError::Unavailable)?;
         let charge = slot.charge();
         self.state = None;
@@ -490,9 +544,7 @@ impl Drop for Lease {
     fn drop(&mut self) {
         // Release any replay reference before another lease can replace it.
         self.replay = None;
-        let Some(state) = self.state.take() else {
-            return;
-        };
+        let state = self.state.take();
         let mut inner = self
             .store
             .0
@@ -500,7 +552,7 @@ impl Drop for Lease {
             .unwrap_or_else(|error| error.into_inner());
         if let Some(slot) = &mut inner.slots[self.index]
             && slot.revision == self.revision
-            && slot.state.is_none()
+            && slot.leased
         {
             if self.unpublished {
                 let charge = slot.charge();
@@ -508,11 +560,18 @@ impl Drop for Lease {
                 inner.slots[self.index] = None;
                 inner.used -= charge;
             } else {
-                slot.state = Some(state);
+                slot.state = state;
+                slot.leased = false;
             }
         }
     }
 }
+
+#[path = "persist.rs"]
+pub(super) mod persist;
+
+#[path = "persist/store.rs"]
+mod durable;
 
 #[cfg(test)]
 #[path = "tests/store.rs"]

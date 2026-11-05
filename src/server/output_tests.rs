@@ -27,6 +27,7 @@ use tower::ServiceExt;
 mod accounts;
 mod attachments;
 mod body_parts;
+mod cache;
 mod conversation;
 mod listing;
 mod parts;

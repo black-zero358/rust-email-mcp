@@ -79,7 +79,7 @@ registration_key 是稳定配置键，id 是调用参数 account_id 使用的别
 - 省略 account_id 仍选择配置的默认读取邮箱，然后授权；不自动改选其他邮箱。
 - 所有旧写工具拒绝 account_id，始终选择固定 legacy default，再检查其模式和显式写 ACL。默认读取指向其他邮箱也保持此规则。
 - get_operation 保留原参数，独立按 principal + operation_key 查询原 Journal。没有邮箱权限的全局已准入主体仍可检查自己的旧 unknown/accepted 记录。
-- tools/list 按当前请求主体过滤；无邮箱读 ACL 时隐藏 13 个账户读取工具。直接调用已知账户读取工具仍进入统一账户授权错误；未知工具及禁用写工具使用原协议错误。
+- tools/list 按当前请求主体过滤；无邮箱读 ACL 时隐藏 14 个账户读取工具。直接调用已知账户读取工具仍进入统一账户授权错误；未知工具及禁用写工具使用原协议错误。
 - 未知别名、无权限、账户已移除、旧 AccountKey/世代均返回 ACCOUNT_UNAVAILABLE，固定说明、不回显别名。附件 GET 对账户或句柄不可用统一 404。
 
 Auth 继续只验证 OIDC/JWT 和全局 subject，不承担邮箱授权。账户授权先于缓存、执行队列和 IMAP 连接；不能缓存某次请求的 ACL 结果供以后使用。
@@ -101,7 +101,7 @@ v2 保留原 legacy_default 表与其 UUID、generation=1、身份摘要和原�
 
 在持久锁内建立 staging SQLite，使用独立事务、FULL 同步、完整性/格式核对后原子发布。发布前故障保留原正式库；保留 v1-backup 及最近完整 previous 副本供维护恢复，发布后的目录同步异常也保留完整旧副本。临时/备份/锁文件与操作库及其 sidecar 一并做路径冲突检查。显式多账户运行期持有注册锁，禁止第二进程同时修改此注册库。迁移不打开或恢复 Journal。
 
-已有 v2 注册库时，移除 ACCOUNT_CONFIG_PATH 会拒绝启动；恢复明确的账户配置后再启动。旧二进制回退需要恢复 v1 注册副本，操作记录库保留最新内容；未来持久缓存与注册表恢复联动另按 R11 规程处理。
+已有 v2 注册库时，移除 ACCOUNT_CONFIG_PATH 会拒绝启动；恢复明确的账户配置后再启动。旧二进制回退需要恢复 v1 注册副本，操作记录库保留最新内容；持久缓存与注册表恢复联动按[缓存恢复规程](deployment.md#持久缓存备份与恢复)执行。
 
 ## 固定跨工作者接口
 
@@ -134,7 +134,7 @@ Config 保留解析后的原字段兼容视图：service_config 对应固定 leg
 
 生产配置先按重启生效。测试专用 from_test_accounts/revoke_read_for_test/remove_account_for_test 复用实际 Catalog 查询，验证每次请求重新授权和旧 token 取消；不提供模型可调用的账户管理或热重载工具。
 
-跨目录会话游标绑定发起主体和账户世代。续页仍须授权该账户，并按原调用传回账户参数（非默认账户须显式指定）。游标保存在当前进程内存，空闲 10 分钟到期。配置重启后，客户端用种子邮件和所需目录范围重新发起查询。
+跨目录会话游标绑定发起主体和账户世代。续页仍须授权该账户，并按原调用传回账户参数（非默认账户须显式指定）。`cursor_storage` 标明 memory 或 persistent；范围全部纳入 metadata 配置的持久游标在原 10 分钟期限内可跨重启续查。memory 游标在重启后从种子重新查询。账户注册库或缓存备份恢复按[缓存恢复](deployment.md#持久缓存备份与恢复)执行。
 
 ## 全局调度与资源
 
@@ -150,7 +150,7 @@ Config 保留解析后的原字段兼容视图：service_config 对应固定 leg
 | --- | --- | --- |
 | 配置/登记 | src/config.rs、config/**、accounts.rs、accounts/**、本文件；账户错误 helper 按协调修改 error.rs | 严格 JSON、秘密引用、ACL、身份/世代、原子迁移、故障恢复测试 |
 | 邮件运行时 | mail.rs、mail/** | MailRuntime、共享 Scheduler、账户读路由、固定原写路由、附件/缓存隔离 |
-| 协议接线 | server.rs、server/**、main.rs、auth.rs 的必要接线 | 13 个读取工具 account_id、按主体发现、Schema、启动次序、双账户 HTTP/JWT 验收 |
+| 协议接线 | server.rs、server/**、main.rs、auth.rs 的必要接线 | 14 个读取工具 account_id、按主体发现、Schema、启动次序、双账户 HTTP/JWT 验收 |
 | 主执行者 | 共享 README/架构/维护/AGENTS/.env/部署文档 | 集成审阅、完整验证、发布记录 |
 
 测试继续只用本地模拟邮箱与合成邮件：旧环境启动；旧环境追加只读；file_only；默认读取换邮箱但旧写目标固定；空 ACL 与历史记录；同文件夹/UID/UIDVALIDITY 在双邮箱的正文、头缓存、附件 id 与下载不混用；无权限时后端连接计数为零；身份变化和删除重加的旧引用失败；全局 4/20 与公平借槽；配置/迁移失败原 Journal 字节不变。真实连接、登录和部署不在本阶段执行。

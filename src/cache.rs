@@ -1,0 +1,305 @@
+//! Private, quota-bounded storage for administrator-selected account scopes.
+use crate::accounts::AccountKey;
+use rusqlite::{Connection, ErrorCode, Transaction, TransactionBehavior};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicU8, Ordering},
+    },
+};
+
+pub mod cursor;
+mod disk;
+mod metadata;
+mod schema;
+#[cfg(all(test, unix))]
+mod tests;
+
+pub use metadata::{AccountStatus, FolderStatus, SearchHit, SearchPage};
+
+const MAX_ACCOUNTS: usize = 16;
+const PAGE_BYTES: u64 = 4096;
+pub const MIN_BYTES: u64 = 1024 * 1024;
+pub const MAX_BYTES: u64 = i64::MAX as u64;
+pub const MAX_FOLDERS_PER_ACCOUNT: usize = 64;
+
+#[derive(Debug, thiserror::Error)]
+pub enum CacheError {
+    #[error("Cache scope is unavailable.")]
+    OutOfScope,
+    #[error("Cache disk quota is exhausted.")]
+    Quota,
+    #[error("Cache content or schema is invalid.")]
+    Corrupt,
+    #[error("Cache storage is unavailable.")]
+    Storage,
+}
+
+impl From<rusqlite::Error> for CacheError {
+    fn from(error: rusqlite::Error) -> Self {
+        match error.sqlite_error_code() {
+            Some(ErrorCode::DiskFull) => Self::Quota,
+            Some(ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase) => Self::Corrupt,
+            _ => Self::Storage,
+        }
+    }
+}
+
+impl From<std::io::Error> for CacheError {
+    fn from(_: std::io::Error) -> Self {
+        Self::Storage
+    }
+}
+
+pub struct AccountScope {
+    pub account: AccountKey,
+    pub mailboxes: Vec<String>,
+    pub max_bytes: u64,
+}
+
+#[derive(Clone, Copy)]
+pub struct Ref<'a> {
+    pub account: &'a AccountKey,
+    pub mailbox: &'a str,
+    pub uid_validity: u32,
+    pub uid: u32,
+}
+
+type Namespace = [u8; 32];
+
+struct Scope {
+    mailboxes: Vec<String>,
+    max_bytes: u64,
+}
+
+struct Database {
+    connection: Connection,
+    name: String,
+}
+
+pub struct Cache {
+    max_bytes: u64,
+    scopes: BTreeMap<Namespace, Scope>,
+    databases: Mutex<BTreeMap<Namespace, Database>>,
+    // Drop every SQLite connection before releasing the instance lock.
+    disk: disk::Root,
+    startup_unclean: bool,
+    write_fault: AtomicU8,
+    #[cfg(test)]
+    fail_post_commit_check: std::sync::atomic::AtomicBool,
+}
+
+impl Cache {
+    pub fn open(
+        directory: &Path,
+        max_bytes: u64,
+        accounts: Vec<AccountScope>,
+        reserved: &[PathBuf],
+    ) -> Result<Arc<Self>, CacheError> {
+        if accounts.is_empty()
+            || accounts.len() > MAX_ACCOUNTS
+            || !(MIN_BYTES..=MAX_BYTES).contains(&max_bytes)
+        {
+            return Err(CacheError::OutOfScope);
+        }
+        let mut scopes = BTreeMap::new();
+        for scope in accounts {
+            if !(MIN_BYTES..=max_bytes).contains(&scope.max_bytes)
+                || scope.mailboxes.is_empty()
+                || scope.mailboxes.len() > MAX_FOLDERS_PER_ACCOUNT
+                || scope.mailboxes.iter().any(|name| !valid_mailbox(name))
+            {
+                return Err(CacheError::OutOfScope);
+            }
+            let mut mailboxes = scope.mailboxes;
+            mailboxes.sort_unstable();
+            let count = mailboxes.len();
+            mailboxes.dedup();
+            if mailboxes.len() != count
+                || scopes
+                    .insert(
+                        scope.account.reference_namespace(),
+                        Scope {
+                            mailboxes,
+                            max_bytes: scope.max_bytes,
+                        },
+                    )
+                    .is_some()
+            {
+                return Err(CacheError::OutOfScope);
+            }
+        }
+        let disk = disk::Root::open(directory, reserved, max_bytes)?;
+        let startup_unclean = disk.was_unclean();
+        let cache = Arc::new(Self {
+            disk,
+            max_bytes,
+            scopes,
+            databases: Mutex::default(),
+            startup_unclean,
+            write_fault: AtomicU8::new(0),
+            #[cfg(test)]
+            fail_post_commit_check: std::sync::atomic::AtomicBool::new(false),
+        });
+        {
+            let mut databases = cache.lock()?;
+            for (namespace, scope) in &cache.scopes {
+                let name = disk::namespace_name(namespace);
+                let path = cache.disk.prepare_partition(&name, max_bytes)?;
+                cache.disk.verify_usage(&name, scope.max_bytes, max_bytes)?;
+                let mut connection = schema::open(&path)?;
+                cache
+                    .disk
+                    .reserve_write(&connection, &name, scope.max_bytes, max_bytes)?;
+                schema::initialize(
+                    &mut connection,
+                    namespace,
+                    startup_unclean,
+                    cache.disk.restore_epoch(),
+                )?;
+                cache.disk.verify_usage(&name, scope.max_bytes, max_bytes)?;
+                databases.insert(*namespace, Database { connection, name });
+            }
+        }
+        Ok(cache)
+    }
+
+    pub fn enabled_for(&self, account: &AccountKey) -> bool {
+        self.scopes.contains_key(&account.reference_namespace())
+    }
+
+    pub fn enabled_for_folder(&self, account: &AccountKey, mailbox: &str) -> bool {
+        self.scopes
+            .get(&account.reference_namespace())
+            .is_some_and(|scope| {
+                scope
+                    .mailboxes
+                    .binary_search_by(|name| name.as_str().cmp(mailbox))
+                    .is_ok()
+            })
+    }
+
+    pub fn cursor_backend(self: &Arc<Self>) -> cursor::CursorBackend {
+        cursor::CursorBackend(Arc::clone(self))
+    }
+
+    /// Called after all cache workers and writes have stopped.
+    pub fn mark_clean(&self) -> Result<(), CacheError> {
+        let databases = self.lock()?;
+        self.write_health()?;
+        for database in databases.values() {
+            let dirty: bool = database.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM mailboxes WHERE dirty)",
+                [],
+                |row| row.get(0),
+            )?;
+            if dirty {
+                return Ok(());
+            }
+        }
+        self.disk.mark_clean(self.max_bytes)
+    }
+
+    /// Run on an offline restored copy before reopening it for reads.
+    /// Ordinary restarts retain cursor checkpoints for live revalidation.
+    pub fn mark_restored(&self) -> Result<(), CacheError> {
+        let mut databases = self.lock()?;
+        let restore_epoch = self.disk.mark_restored(self.max_bytes)?;
+        for (namespace, database) in databases.iter_mut() {
+            self.write(*namespace, database, |tx| {
+                schema::restore(tx, restore_epoch)
+            })?;
+        }
+        Ok(())
+    }
+
+    fn lock(&self) -> Result<MutexGuard<'_, BTreeMap<Namespace, Database>>, CacheError> {
+        self.databases.lock().map_err(|_| CacheError::Storage)
+    }
+
+    fn write_health(&self) -> Result<(), CacheError> {
+        match self.write_fault.load(Ordering::Relaxed) {
+            0 => Ok(()),
+            1 => Err(CacheError::Quota),
+            _ => Err(CacheError::Storage),
+        }
+    }
+
+    fn write<T, E>(
+        &self,
+        namespace: Namespace,
+        database: &mut Database,
+        apply: impl FnOnce(&Transaction<'_>) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<CacheError> + From<rusqlite::Error>,
+    {
+        self.write_checked(namespace, database, apply, || Ok(()))
+    }
+
+    fn write_checked<T, E>(
+        &self,
+        namespace: Namespace,
+        database: &mut Database,
+        apply: impl FnOnce(&Transaction<'_>) -> Result<T, E>,
+        before_commit: impl FnOnce() -> Result<(), E>,
+    ) -> Result<T, E>
+    where
+        E: From<CacheError> + From<rusqlite::Error>,
+    {
+        self.write_health()?;
+        let quota = self
+            .scopes
+            .get(&namespace)
+            .ok_or(CacheError::OutOfScope)?
+            .max_bytes;
+        self.disk
+            .reserve_write(&database.connection, &database.name, quota, self.max_bytes)?;
+        let tx = database
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = apply(&tx)?;
+        self.disk
+            .verify_usage(&database.name, quota, self.max_bytes)?;
+        before_commit()?;
+        tx.commit()?;
+        // A fault observed after SQLite has committed cannot revoke a
+        // published checkpoint. Stop subsequent writes and report fixed
+        // health while leaving the committed revision available for replay.
+        let checked = self
+            .disk
+            .verify_usage(&database.name, quota, self.max_bytes);
+        #[cfg(test)]
+        let checked = if self.fail_post_commit_check.swap(false, Ordering::Relaxed) {
+            Err(CacheError::Storage)
+        } else {
+            checked
+        };
+        if let Err(error) = checked {
+            let fault = if matches!(error, CacheError::Quota) {
+                1
+            } else {
+                2
+            };
+            self.write_fault.store(fault, Ordering::Relaxed);
+        }
+        Ok(result)
+    }
+
+    fn scope(&self, account: &AccountKey, mailbox: &str) -> Result<Namespace, CacheError> {
+        if !self.enabled_for_folder(account, mailbox) {
+            return Err(CacheError::OutOfScope);
+        }
+        Ok(account.reference_namespace())
+    }
+}
+
+fn valid_mailbox(mailbox: &str) -> bool {
+    !mailbox.is_empty()
+        && !mailbox.chars().any(char::is_control)
+        && crate::input_limits::InputLimits::Read
+            .mailbox(mailbox, "mailbox")
+            .is_ok()
+}

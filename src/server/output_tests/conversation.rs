@@ -1,7 +1,7 @@
 //! Signed HTTP acceptance for cross-mailbox conversation paging.
 use super::*;
 
-mod fixture;
+pub(super) mod fixture;
 use fixture::{Fault, Folder, Harness as ThreadHarness, Search, message};
 use std::collections::{BTreeSet, HashSet};
 

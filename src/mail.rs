@@ -14,12 +14,14 @@ pub(crate) mod conversation;
 pub mod insights;
 mod listing;
 mod parts;
+mod persistence;
 mod runtime;
 pub(crate) mod scheduler;
 use futures::TryStreamExt;
 use lettre::{address::Envelope, message::Mailbox};
 use mailparse::MailHeaderMap;
 use parts::map_read_imap_error;
+pub use persistence::PreparedCache;
 pub use runtime::MailRuntime;
 use scheduler::{ADMISSION_REQUESTS, EXECUTION_SLOTS};
 use serde_json::{Value, json};
@@ -114,6 +116,7 @@ pub struct MailService {
     pub attachments: Arc<attachments::AttachmentStore>,
     backend_backoff: std::sync::Mutex<Option<std::time::Instant>>,
     metadata_cache: Arc<std::sync::Mutex<insights::MetadataCache>>,
+    persistent: PreparedCache,
     #[cfg(test)]
     test_imap_roots: Option<RootCertStore>,
 }
@@ -157,6 +160,7 @@ impl MailService {
         Ok(Self {
             attachments,
             metadata_cache,
+            persistent: PreparedCache::default(),
             config,
             journal,
             account,
@@ -421,6 +425,7 @@ impl MailService {
                     .examine(mailbox_name(folder, InputLimits::Read)?)
                     .await
                     .map_err(imap_error)?;
+                self.observe_mailbox(folder, &state);
                 check_validity(a, state.uid_validity)?;
                 if name == "get_email_status" {
                     return email_status(s, uid, state.uid_validity).await;
@@ -2021,7 +2026,8 @@ mod tests {
     {
         let mailbox = folder(args, InputLimits::Read)?;
         let wire_mailbox = mailbox_name(mailbox, InputLimits::Read)?;
-        let state = listing::select_list_mailbox(session, &wire_mailbox, args).await?;
+        let state = listing::select_list_mailbox(session, &wire_mailbox).await?;
+        check_validity(args, state.uid_validity)?;
         let Some(scan) = listing::scan_list(session, args, search, &state).await? else {
             return Ok(
                 json!({"emails":[],"next_before_uid":null,"uid_validity":state.uid_validity}),

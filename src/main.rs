@@ -27,14 +27,32 @@ async fn main() -> anyhow::Result<()> {
             message = "Task panicked; inspect operation state"
         )
     }));
-    let catalog = accounts::open_catalog(config::load_runtime()?)?;
+    let settings = config::load_runtime()?;
+    let cache_settings = config::load_cache_configuration(&settings)?;
+    let mut args = std::env::args_os().skip(1);
+    let restore = match (args.next(), args.next()) {
+        (None, None) => false,
+        (Some(flag), None) if flag == "--cache-restored" => true,
+        _ => anyhow::bail!("Usage: rust-email-mcp [--cache-restored]"),
+    };
+    anyhow::ensure!(
+        !restore || cache_settings.is_some(),
+        "CACHE_CONFIG_PATH is required to mark a restored cache"
+    );
+    let catalog = accounts::open_catalog(settings)?;
+    let cache = MailRuntime::prepare_cache(&catalog, cache_settings)?;
+    if restore {
+        cache.mark_restored()?;
+        tracing::info!(event = "cache_restore_marked");
+        return Ok(());
+    }
     let config = catalog.config().clone();
     let path = Path::new(&config.database);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let journal = Arc::new(Journal::open(path)?);
-    let mail = Arc::new(MailRuntime::new(catalog, journal)?);
+    let mail = Arc::new(MailRuntime::with_cache(catalog, journal, cache.clone())?);
     let auth = Auth::new(config.clone()).await?;
     let ct = tokio_util::sync::CancellationToken::new();
     let host = reqwest::Url::parse(&config.resource)?
@@ -96,5 +114,6 @@ async fn main() -> anyhow::Result<()> {
             tokio::time::sleep(std::time::Duration::from_secs(35)).await;
         })
         .await?;
+    cache.finish().await;
     Ok(())
 }

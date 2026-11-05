@@ -155,6 +155,7 @@ impl<'a> BodyReadSession<'a> {
                     reusable,
                 }
             })?;
+        self.service.observe_mailbox(mailbox, &state);
         state
             .uid_validity
             .filter(|value| *value > 0)
@@ -212,6 +213,22 @@ impl<'a> BodyReadSession<'a> {
             }
             Err(error) => return Err(ReadFault::command(error.mail())),
         };
+        if self.service.persists(&self.mailbox) {
+            self.service
+                .persist_manifest(&self.mailbox, self.state.uid_validity, uid, &manifest);
+            if let Ok(headers) = mime::headers(&manifest.body.root_headers) {
+                self.service.persist_headers(
+                    &self.mailbox,
+                    self.state.uid_validity,
+                    vec![persistence::HeaderObservation::new(
+                        uid,
+                        &manifest.body.root_headers,
+                        true,
+                        &headers,
+                    )],
+                );
+            }
+        }
         let selected = loop {
             // A probe can interrupt an alternative after collecting fragments.
             // Every retry starts at the root with a fresh transaction.
@@ -383,6 +400,7 @@ impl<'a> BodyReadSession<'a> {
             .examine(mailbox_name(&self.mailbox, InputLimits::Read).map_err(ReadFault::stop)?)
             .await
             .map_err(|e| ReadFault::stop(map_read_imap_error(e)))?;
+        self.service.observe_mailbox(&self.mailbox, &state);
         check_validity(
             &json!({"uid_validity":self.state.uid_validity}),
             state.uid_validity,
@@ -398,9 +416,15 @@ impl<'a> BodyReadSession<'a> {
             .await
             .map_err(ReadFault::command)?;
         self.session = Some(fresh);
-        let mut value =
+        let mut value = if self.service.persists(&self.mailbox) {
+            let part = mime::parse(&raw).map_err(ReadFault::local)?;
+            self.service
+                .persist_raw(&self.mailbox, self.state.uid_validity, uid, &raw, &part);
+            insights::parsed_with_part(&part, uid, self.state.uid_validity, hard_limit, args)
+        } else {
             insights::parsed_with_options(&raw, uid, self.state.uid_validity, hard_limit, args)
-                .map_err(ReadFault::local)?;
+        }
+        .map_err(ReadFault::local)?;
         value["read_diagnostics"] = serde_json::to_value(reason.diagnostics())
             .map_err(|_| ReadFault::local(MailError::backend()))?;
         Ok(value)

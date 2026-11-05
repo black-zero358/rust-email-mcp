@@ -24,6 +24,7 @@ MCP 客户端 ── HTTPS ── Nginx ── Rust Email MCP ── IMAP / SMTP
 | 附件 | `list_attachments`、`download_attachment`、`prepare_attachment_download` |
 | 会话与定位 | `read_conversation`、`locate_message` |
 | 诊断与统计 | `diagnose_connectivity`、`get_mailbox_statistics` |
+| 缓存状态 | `get_cache_status` |
 | 草稿与发送 | `save_draft`、`send_draft`、`send_email`、`reply_email`、`forward_email` |
 | 发送状态 | `get_operation` |
 | 邮件整理 | `mark_email`、`move_email`、`delete_email`、`mark_emails`、`move_emails`、`delete_emails` |
@@ -49,6 +50,8 @@ MIME 在构建结构时限制为 1024 个节点、32 层嵌套，头部每段最
 正文支持完整或去引用模式、长度设置及省略提示。单封、批量和会话读取先核对邮件结构及 MIME 头，再按 64 KiB 分块读取所选正文；大附件邮件中的小正文可独立读取。`get_email` 在正文长度上限内，按完整 JSON-RPC 响应预算返回可容纳的最长 UTF-8 正文前缀；额外截断设置 `body_truncated=true`。`body_byte_limit` 表示正文配置上限，实际正文可能因 JSON 转义、元数据和调用 id 而更短；元数据本身超限仍返回 `LIMIT_EXCEEDED`。所有显示长度选项均在完整正文校验后应用。整封 MIME 读取上限 32 MiB，单次工具输出上限 2 MiB。附件发现和下载准备优先读取邮件结构及必要 MIME 头，并核对原有附件索引；正文或附件需要整体解析时，在大小上限内回退一次整封读取。认证 HTTP 下载按 64 KiB 分块读取所选附件，完整解码并校验后提供文件；解码附件上限 32 MiB，连接累计读取上限 128 MiB，因此可下载超过整封上限的邮件中的小附件。内联 Base64 及需要整体解析的回退仍受整封 32 MiB 限制。新邮件支持文本；现有草稿发送保留原 MIME 附件。转发工具发送原邮件的纯文本内容。
 
 `download_attachment` 保留原有内联 Base64 返回格式及输出预算。附件支持稳定 `attachment_id` 或原有 `attachment_index` 选择；`list_attachments` 返回安全文件名、大小精度、可下载状态及交付方式，`prepare_attachment_download` 返回同主体 Bearer 认证的短期 URL。下载响应提供 SHA-256，客户端可核对文件完整性。仓库提供[标准客户端适配器](scripts/attachment-client-adapter/README.md)，用于认证下载、校验及本地落盘。当前仅用模拟邮箱和合成文件离线测试下载及内容读取，ChatGPT 实际连接测试放到后续阶段。参数与范围限制见 [邮件能力扩展](docs/capabilities.md)。
+
+可选持久缓存通过 `CACHE_CONFIG_PATH` 为指定账户和文件夹启用 `metadata` 模式，保存已完成在线读取的邮件头、部件证据和中文索引。`get_cache_status` 查看账户的实际覆盖、目录世代、磁盘额度及可用状态。查询范围全部纳入缓存时，跨文件夹会话游标可在原有效期内跨重启续查；`cursor_storage` 标明 `memory` 或 `persistent`。配置样例、备份恢复和阶段范围见[缓存设计](docs/cache-design.md)。
 
 ## 发送行为
 
@@ -117,6 +120,7 @@ JWKS 暂不可用时认证返回 HTTP 503 和 `Retry-After: 10`，客户端可�
 | `SMTP_STARTTLS` | `false` 使用隐式 TLS；`true` 使用必须成功的 STARTTLS |
 | `DRAFTS_MAILBOX`、`TRASH_MAILBOX` | 邮箱服务商的草稿和废纸篓名称 |
 | `ARCHIVE_MAILBOX` | 可选 Unicode 归档目录，用于 standard 会话范围；多账户 JSON 使用 `folders.archive` |
+| `CACHE_CONFIG_PATH` | 可选持久缓存配置 JSON 路径；省略或显式 off 时关闭，配置见[缓存设计](docs/cache-design.md#配置示例) |
 | `MAIL_MODE` | `read`、`draft`、`send`、`full`，默认 `read` |
 | `MCP_RESOURCE` | 公网 MCP 完整 HTTPS 地址 |
 | `OIDC_ISSUER` | 身份服务发现文档中的精确 issuer，包含其尾部斜线 |
@@ -215,6 +219,6 @@ async-imap 0.12.0 的流式命令终结状态补丁位于 vendor/async-imap，�
 
 旧单文件夹会话扫描在完整FETCH后跳过超大或解析失败的候选，通过 `skipped_candidates` 返回UID及脱敏错误；已关联邮件的本地内容错误放入 `message_errors`，同时保留已读取邮件与 `omitted_uids`。种子头或传输/协议错误明确失败。`get_emails` 和旧会话正文按完整JSON-RPC预算截断UTF-8前缀，保留元数据和逐项结果；元数据本身超限仍返回有界错误。
 
-跨文件夹会话每页共享 200 个候选头、20 个结果位置、256 KiB 展示正文和最多 60 秒期限；每条搜索只扫描至多 200 个 UID 的数值区间。首次固定目录及 UID 水位，后续用 `cursor` 续查，非默认账户同时传入原 `account_id`。返回 `folders`、`coverage`、逐项错误和 `omitted_refs`，供客户端核对扫描、关联与正文覆盖。游标全实例共用 64 项/8 MiB，空闲 10 分钟或服务重启后重新查询。调用样例与去重规则见[跨文件夹会话](docs/capabilities.md#跨文件夹会话)。
+跨文件夹会话每页共享 200 个候选头、20 个结果位置、256 KiB 展示正文和最多 60 秒期限；每条搜索只扫描至多 200 个 UID 的数值区间。首次固定目录及 UID 水位，后续用 `cursor` 续查，非默认账户同时传入原 `account_id`。返回 `folders`、`coverage`、逐项错误和 `omitted_refs`，供客户端核对扫描、关联与正文覆盖。游标全实例共用 64 项/8 MiB，空闲 10 分钟到期；memory 游标在重启后重新查询，persistent 游标保留原期限并在线复核目录后续查。调用样例与去重规则见[跨文件夹会话](docs/capabilities.md#跨文件夹会话)。
 
 默认完整头上限扩大后，18 KiB级长邮件头可直接读取。配置无需迁移，SQLite结构与操作键不变。部署模板的mail内存额度提高为1 GiB。SMTP行格式、未知发送去重、UIDVALIDITY、JWT与TLS校验保持原规则。

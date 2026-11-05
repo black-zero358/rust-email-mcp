@@ -2,6 +2,26 @@
 
 本文件保存带版本与环境边界的证据。每次新增记录注明提交/tag、日期与时区、环境、命令、结果、CI 链接及未覆盖项；保留历史结果，不把其测试数量或部署状态当作当前版本的证明。验证要求见 [贡献指南](../CONTRIBUTING.md#验证与完成标准)。
 
+## 2026-11-05 R10 持久元数据与会话游标
+
+源码 `4516c1adb4f8d93fc610fefefba77fc442643f05`；环境为 WSL Ubuntu、固定 Rust 1.99.1、Node 24.15.0 和 Docker Desktop。缓存、邮箱、身份和附件验证均使用隔离目录及合成数据。
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo +1.99.1 fmt --check` | 通过 |
+| `cargo +1.99.1 test --locked --quiet` | 420 单元、44 集成通过；2 项显式测试默认忽略 |
+| `cargo +1.99.1 clippy --locked --all-targets -- -D warnings` | 通过 |
+| `cargo +1.99.1 build --locked --release` | 通过 |
+| 显式 Rust→Node 附件客户端测试 | 8 文件下载、摘要与内容读取通过 |
+| 专用依赖审计及 Docker context 检查 | 1409 条公告、340 个依赖审计通过；上下文白名单通过 |
+| 发布二进制缓存恢复烟测 | 无网络命名空间中连续两次恢复成功；epoch、权限及操作库隔离检查通过 |
+
+存储 16 项回归覆盖账户/目录世代、迟到的旧 UIDVALIDITY、tombstone、中文 trigram 与短词有界扫描、退休分区磁盘记账、事务配额、根目录所有权、未知 schema、恢复标记，以及提交前取消和提交后诊断故障。会话核心共 35 项回归，包含持久编解码、近 8 MiB 状态恢复、全局槽位、租约、取消、原期限和重放。5 组新缓存 HTTP 场景覆盖默认关闭、完整证据索引、当前 ACL、世代、运行时重启、恢复、存储故障和额度耗尽；既有跨目录 HTTP 及完整 wire 预算测试一并通过。
+
+恢复烟测使用仓库 `deploy/cache.json.example`、合成身份和独立临时目录，在 `unshare --user --map-root-user --net` 内以 `env -i` 运行 release 程序的 `--cache-restored`。两次仅输出固定事件 `cache_restore_marked`，manifest 与 SQLite owner epoch 依次为 1、2，clean=false。缓存目录权限 0700，manifest、数据库、锁和注册库文件 0600。无效 SQLite 操作库哨兵的 SHA-256 两次保持一致，未生成操作库 sidecar 或附件暂存目录。二进制 SHA-256 为 `bb941cd942c440a3fc697a48af89a1ff5fab15fa0734b2f69e3cd6efdc5795d8`。
+
+独立交叉审阅已修复提交后诊断覆盖已知结果、首次并发观察世代倒退、FTS 候选扫描界限、持久解码临时空间计量和额度失败状态可见性。R10 新增的 rusqlite `blob` feature 使用现有锁定版本，Cargo.lock 保持原值。实际镜像、最终 PR head 的 CI 和合并结果随后登记。
+
 ## 2026-11-05 R09 跨文件夹会话
 
 源码提交 `4e499e4ccbaf4278630c609ec4d09b4553f8718a`，基于搜索基础合并 `2a07f31360ceffdc4929fc5b765813ceefadcea7`。环境为 WSL Ubuntu、Rust 1.99.1、Node 24.15.0 和 Docker Desktop；邮件、账户、JWT 与 TLS IMAP 后端均使用合成数据。
@@ -24,7 +44,7 @@
 
 集成中修复了大型 async 状态导致默认测试线程栈溢出的问题，使用 Box 固定关键异步边界；最终全量测试采用默认线程栈。独立审阅修复了 raw 指纹读取上限、同页同引用重复失败读取、完成页重放目录复核、健康副本代表、响应裁减标记与无进展页重放，并复核最终源码与文档。新增 Tokio `test-util` 仅用于开发测试，Cargo.lock 和生产依赖版本保持原值。账户注册库、发送操作库和旧单目录调用沿用原格式；跨目录游标当前为有界内存状态。
 
-最终源码已通过交叉独立审阅。PR 最终 head 的 check/audit/container 与合并结果随后登记。
+最终源码及 docs-only head 已通过交叉独立审阅。最终 head `21cc6611296852e9f6f269b7a7fefc3ac311872b` 的 [CI 42001971225](https://github.com/black-zero358/rust-email-mcp/actions/runs/42001971225) 中 check/audit/container 全部通过。[PR #74](https://github.com/black-zero358/rust-email-mcp/pull/74) 合并为 `3aeb3e23337ce1f14bd0a6818387c1c8a4590610`，本地 main、开发分支及对应远端已同步，R10 改动保留在开发工作区。GitHub 自动 Codex review 遇到账户额度限制；合并前 reviews/review threads 均为空。
 
 ## 2026-11-05 R09 有界搜索基础
 

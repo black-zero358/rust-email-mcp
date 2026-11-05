@@ -451,6 +451,7 @@ impl MailService {
             .examine(mailbox_name(mailbox, InputLimits::Read)?)
             .await
             .map_err(map_read_imap_error)?;
+        self.observe_mailbox(mailbox, &state);
         check_validity(args, state.uid_validity)?;
         let validity = state
             .uid_validity
@@ -463,16 +464,19 @@ impl MailService {
             .max_message
             .min(crate::config::DEFAULT_MAX_MESSAGE);
         match manifest(&mut session, uid).await {
-            Ok(manifest) => Ok(LoadedManifest {
-                source: ManifestSource::Structured(manifest),
-                validity,
-                whole_size: known_size,
-                diagnostics: ManifestDiagnostics {
-                    source: "bodystructure",
-                    fallback_reason: None,
-                    limit_kind: None,
-                },
-            }),
+            Ok(manifest) => {
+                self.persist_manifest(mailbox, Some(validity), uid, &manifest);
+                Ok(LoadedManifest {
+                    source: ManifestSource::Structured(manifest),
+                    validity,
+                    whole_size: known_size,
+                    diagnostics: ManifestDiagnostics {
+                        source: "bodystructure",
+                        fallback_reason: None,
+                        limit_kind: None,
+                    },
+                })
+            }
             Err(FetchFailure::Fallback { reason, .. }) => {
                 if known_size > max {
                     return Err(raw_limit(InputLimits::Read, max, known_size));
@@ -489,6 +493,7 @@ impl MailService {
                     .examine(mailbox_name(mailbox, InputLimits::Read)?)
                     .await
                     .map_err(map_read_imap_error)?;
+                self.observe_mailbox(mailbox, &state);
                 check_validity(&json!({"uid_validity":validity}), state.uid_validity)?;
                 let raw = self.raw_attachment(&mut fresh, uid).await?;
                 if raw.len() != known_size {

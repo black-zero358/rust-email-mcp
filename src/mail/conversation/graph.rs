@@ -55,7 +55,7 @@ impl SearchField {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) struct RefKey {
     pub folder: u8,
     pub uid: u32,
@@ -416,3 +416,6 @@ pub(super) fn reserve<T>(values: &mut Vec<T>, count: usize) -> Result<(), StateE
         .try_reserve_exact(count)
         .map_err(|_| StateError::Capacity)
 }
+
+#[path = "persist/graph.rs"]
+mod persist;

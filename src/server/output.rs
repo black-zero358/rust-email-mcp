@@ -79,6 +79,7 @@ fn cross_conversation() -> Value {
             "mode":{"const":"cross_mailbox"},"account_id":account_id(),"seed":message_ref,
             "folders":{"type":"array","minItems":1,"maxItems":20,"items":folder},
             "messages":{"type":"array","maxItems":20,"items":entity},"cursor":nullable(json!({"type":"string","format":"uuid"})),
+            "cursor_storage":enumeration(&["memory","persistent"]),
             "coverage":coverage,"errors":{"type":"array","maxItems":20,"items":errors},"errors_omitted":count(),"omitted_refs":array(message_ref),
             "complete":boolean(),"response_budget_omitted":boolean(),"content_trust":{"const":"untrusted"},
             "cursor_action":enumeration(&["resume_or_restart_with_narrower_scope","restart_later_or_with_narrower_scope"]),
@@ -90,6 +91,7 @@ fn cross_conversation() -> Value {
             "folders",
             "messages",
             "cursor",
+            "cursor_storage",
             "coverage",
             "errors",
             "errors_omitted",
@@ -309,7 +311,7 @@ fn read_diagnostics() -> Value {
 fn accounts() -> Value {
     let capabilities = all_required(json!({
         "attachment_delivery_modes":{"const":["inline_base64","authenticated_http"]},"part_fetch":{"const":true},
-        "cross_mailbox_conversation":{"const":true},"cache_modes":{"const":["off"]}
+        "cross_mailbox_conversation":{"const":true},"cache_modes":{"enum":[["off"],["off","metadata"]]}
     }));
     let mut limits = json!({});
     for name in [
@@ -360,6 +362,27 @@ fn data(name: &str) -> Value {
     };
     let schema = match name {
         "list_accounts" => accounts(),
+        "get_cache_status" => {
+            let folders = all_required(json!({
+                "mailbox":string(),"uid_validity":nullable(uid()),"high_uid":nullable(count()),
+                "checked_at_ms":nullable(count()),"dirty":boolean(),"messages":count(),
+                "complete_headers":count(),"indexed_headers":count(),"verified_parts":count()
+            }));
+            let storage = all_required(json!({
+                "max_bytes":count(),"used_bytes":count(),"global_max_bytes":count(),
+                "startup_unclean":boolean(),"folders":{"type":"array","maxItems":64,"items":folders}
+            }));
+            all_required(json!({
+                "mode":enumeration(&["off","metadata"]),
+                "status":enumeration(&["off","ready","unavailable"]),
+                "storage":nullable(storage),
+                "write_health":all_required(json!({
+                    "failed_writes":count(),
+                    "last_error":nullable(enumeration(&["quota","queue_full","storage"])),
+                    "quota_blocked":boolean()
+                }))
+            }))
+        }
         "list_mailboxes" => all_required(
             json!({"mailboxes":{"type":"array","maxItems":200,"items":all_required(json!({
                 "name":string(),"attributes":string(),"attribute_flags":array(string()),"delimiter":nullable(string()),
@@ -462,7 +485,7 @@ fn data(name: &str) -> Value {
             schema,
             !matches!(
                 name,
-                "list_mailboxes" | "locate_message" | "diagnose_connectivity"
+                "list_mailboxes" | "locate_message" | "diagnose_connectivity" | "get_cache_status"
             ),
         )
     } else {

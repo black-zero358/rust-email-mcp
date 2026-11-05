@@ -16,23 +16,40 @@ pub struct MailRuntime {
 
 impl MailRuntime {
     pub fn new(catalog: Arc<AccountCatalog>, journal: Arc<Journal>) -> anyhow::Result<Self> {
+        Self::with_cache(catalog, journal, PreparedCache::default())
+    }
+
+    pub fn prepare_cache(
+        catalog: &AccountCatalog,
+        settings: Option<crate::config::CacheSettings>,
+    ) -> anyhow::Result<PreparedCache> {
+        match settings {
+            Some(settings) => PreparedCache::open(catalog, settings),
+            None => Ok(PreparedCache::default()),
+        }
+    }
+
+    pub fn with_cache(
+        catalog: Arc<AccountCatalog>,
+        journal: Arc<Journal>,
+        cache: PreparedCache,
+    ) -> anyhow::Result<Self> {
         let config = catalog.config().clone();
         let attachments = Arc::new(attachments::AttachmentStore::new(config.clone()));
         let metadata_cache = Arc::new(std::sync::Mutex::new(insights::MetadataCache::default()));
         let mut services = HashMap::new();
         for lease in catalog.registered_accounts() {
-            services.insert(
+            let mut service = MailService::for_account(
+                lease.config,
+                journal.clone(),
                 lease.key.clone(),
-                MailService::for_account(
-                    lease.config,
-                    journal.clone(),
-                    lease.key,
-                    lease.alias,
-                    lease.is_legacy,
-                    attachments.clone(),
-                    metadata_cache.clone(),
-                )?,
-            );
+                lease.alias,
+                lease.is_legacy,
+                attachments.clone(),
+                metadata_cache.clone(),
+            )?;
+            service.persistent = cache.clone();
+            services.insert(lease.key, service);
         }
         Ok(Self {
             config,
@@ -41,7 +58,7 @@ impl MailRuntime {
             scheduler: Scheduler::new(),
             services,
             attachments,
-            conversations: Default::default(),
+            conversations: cache.cursor_store(),
         })
     }
 
@@ -81,6 +98,9 @@ impl MailRuntime {
                 } else {
                     "read"
                 });
+                if service.persistent.configured(&lease.key) {
+                    value["capabilities"]["cache_modes"] = json!(["off", "metadata"]);
+                }
                 Some(value)
             })
             .collect::<Vec<_>>();
@@ -115,6 +135,13 @@ impl MailRuntime {
                 .transpose()?;
             let lease = self.catalog.read_account(principal, requested)?;
             let service = self.service_for(&lease.key)?;
+            if name == "get_cache_status" {
+                return tokio::select! {
+                    biased;
+                    _ = lease.cancellation.cancelled() => Err(MailError::account_unavailable()),
+                    status = service.persistent.status(&lease.key, &lease.alias) => Ok(status),
+                };
+            }
             let mut selected = args.clone();
             selected
                 .as_object_mut()
@@ -240,6 +267,7 @@ pub(super) fn account_read(name: &str) -> bool {
             | "read_conversation"
             | "locate_message"
             | "get_mailbox_statistics"
+            | "get_cache_status"
             | "diagnose_connectivity"
     )
 }
