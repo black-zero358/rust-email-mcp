@@ -108,43 +108,45 @@ impl MailService {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
     {
+        self.cached_headers_checked(s, mailbox, validity, uid)
+            .await
+            .map_err(|fault| fault.error)
+    }
+
+    pub(super) async fn cached_headers_checked<S>(
+        &self,
+        s: &mut async_imap::Session<S>,
+        mailbox: &str,
+        validity: Option<u32>,
+        uid: u32,
+    ) -> std::result::Result<Vec<u8>, parts::body::ReadFault>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
+    {
         if let Some(headers) = self
             .metadata_cache
             .lock()
-            .map_err(|_| MailError::backend())?
+            .map_err(|_| parts::body::ReadFault::local(MailError::backend()))?
             .get(&self.account, mailbox, validity, uid, Instant::now())
         {
             return Ok(headers);
         }
-        let items = s
-            .uid_fetch(
-                uid.to_string(),
-                format!("(UID BODY.PEEK[HEADER]<0.{}>)", HEADER_LIMIT + 1),
-            )
+        let headers = parts::fetch::message_header(s, uid, HEADER_LIMIT + 1)
             .await
-            .map_err(map_read_imap_error)?
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(map_read_imap_error)?;
-        let bytes = items
-            .iter()
-            .filter(|f| f.uid == Some(uid))
-            .find_map(|f| f.header())
-            .ok_or_else(MailError::backend)?;
-        if bytes.len() > HEADER_LIMIT {
-            return Err(MailError::limit_with(
+            .map_err(parts::body::ReadFault::command)?;
+        if headers.len() > HEADER_LIMIT {
+            return Err(parts::body::ReadFault::local(MailError::limit_with(
                 LimitKind::HeaderBytes,
                 HEADER_LIMIT,
-                bytes.len(),
-            ));
+                headers.len(),
+            )));
         }
-        if !(bytes.ends_with(b"\r\n\r\n") || bytes.ends_with(b"\n\n")) {
-            return Err(MailError::limit());
+        if !(headers.ends_with(b"\r\n\r\n") || headers.ends_with(b"\n\n")) {
+            return Err(parts::body::ReadFault::local(MailError::limit()));
         }
-        let headers = bytes.to_vec();
         self.metadata_cache
             .lock()
-            .map_err(|_| MailError::backend())?
+            .map_err(|_| parts::body::ReadFault::local(MailError::backend()))?
             .insert(&self.account, mailbox, validity, uid, headers.clone());
         Ok(headers)
     }
@@ -160,7 +162,6 @@ impl MailService {
     {
         match name {
             "locate_message" => self.locate(s, a).await,
-            "read_conversation" => self.conversation(s, a).await,
             "get_mailbox_statistics" => self.statistics(s, a).await,
             _ => Err(MailError::input()),
         }
@@ -223,29 +224,28 @@ impl MailService {
         )
     }
 
-    async fn conversation<S>(&self, s: &mut async_imap::Session<S>, a: &Value) -> Result<Value>
-    where
-        S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
-    {
+    pub(super) async fn conversation_parts(
+        &self,
+        reader: &mut parts::body::BodyReadSession<'_>,
+        a: &Value,
+    ) -> Result<Value> {
         let mailbox = folder(a, InputLimits::Read)?;
         let seed = uid(a)?;
-        let state = s
-            .examine(mailbox_name(mailbox, InputLimits::Read)?)
-            .await
-            .map_err(map_read_imap_error)?;
+        let state = reader.state.clone();
         require_reference(&state)?;
-        check_validity(a, state.uid_validity)?;
         let candidate_limit = number(a, "candidate_limit", 100, 1, 200)? as usize;
         let limit = number(a, "limit", 10, 1, 20)? as usize;
         let seed_headers = self
-            .cached_headers(s, mailbox, state.uid_validity, seed)
+            .cached_headers(reader.session()?, mailbox, state.uid_validity, seed)
             .await?;
         let seed_links = thread_headers(&seed_headers)?;
         let (start, end) = window(a, state.uid_next)?;
         let mut ids = if state.exists == 0 || end == 0 {
             Vec::new()
         } else {
-            s.uid_search(format!("UID {start}:{end}"))
+            reader
+                .session()?
+                .uid_search(format!("UID {start}:{end}"))
                 .await
                 .map_err(map_read_imap_error)?
                 .into_iter()
@@ -265,18 +265,17 @@ impl MailService {
         let mut headers = Vec::new();
         let mut skipped_candidates = Vec::new();
         for id in ids {
-            // cached_headers only emits LIMIT_EXCEEDED after FETCH completed.
-            // Transport/protocol failures still stop the connection.
+            // Only local validation after a completed FETCH can skip a candidate.
             let raw = match self
-                .cached_headers(s, mailbox, state.uid_validity, id)
+                .cached_headers_checked(reader.session()?, mailbox, state.uid_validity, id)
                 .await
             {
                 Ok(raw) => raw,
-                Err(error) if error.code == "LIMIT_EXCEEDED" => {
-                    skipped_candidates.push(json!({"uid":id,"error":error}));
+                Err(fault) if fault.reusable => {
+                    skipped_candidates.push(json!({"uid":id,"error":fault.error}));
                     continue;
                 }
-                Err(error) => return Err(error),
+                Err(fault) => return Err(fault.error),
             };
             match thread_headers(&raw) {
                 Ok(value) => headers.push((id, value)),
@@ -292,25 +291,14 @@ impl MailService {
         let mut response_budget_omitted = false;
         let mut message_errors = Vec::new();
         for id in selected {
-            let raw = match self.raw(s, id).await {
-                Ok(raw) => raw,
-                Err(error) if error.code == "LIMIT_EXCEEDED" => {
-                    message_errors.push(json!({"uid":id,"error":error}));
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            let mut value = match parsed_with_options(
-                &raw,
-                id,
-                state.uid_validity,
-                remaining.min(64 * 1024),
-                a,
-            ) {
+            let mut value = match reader.read_item(id, remaining.min(64 * 1024), a).await {
                 Ok(value) => value,
-                Err(error) => {
-                    message_errors.push(json!({"uid":id,"error":error}));
-                    continue;
+                Err(fault) => {
+                    message_errors.push(json!({"uid":id,"error":fault.error}));
+                    if fault.reusable {
+                        continue;
+                    }
+                    break;
                 }
             };
             bound_conversation_metadata(&mut value);
@@ -622,6 +610,62 @@ pub(super) fn parsed_with_options(
     hard_limit: usize,
     a: &Value,
 ) -> Result<Value> {
+    let p = mime::parse(raw)?;
+    let displayed = p.display_body(display_format(a)?)?;
+    with_displayed(
+        parsed_metadata(&p, uid, validity)?,
+        &p.headers,
+        displayed,
+        hard_limit,
+        a,
+    )
+}
+
+pub(super) fn display_format(a: &Value) -> Result<crate::html::HtmlDisplay> {
+    Ok(match a.get("html_display") {
+        None => crate::html::HtmlDisplay::Legacy,
+        Some(Value::String(value)) if value == "legacy" => crate::html::HtmlDisplay::Legacy,
+        Some(Value::String(value)) if value == "readable" => crate::html::HtmlDisplay::Readable,
+        _ => return Err(MailError::input()),
+    })
+}
+
+pub(super) fn manifest_metadata(
+    headers: &[mailparse::MailHeader<'_>],
+    manifest: &parts::PartManifest,
+    uid: u32,
+    validity: Option<u32>,
+) -> Value {
+    let attachments = manifest
+        .parts
+        .iter()
+        .filter(|part| part.is_attachment)
+        .map(|part| {
+            json!({
+                "attachment_index": part.attachment_index,
+                "content_type": part.content_type,
+                "filename": part.filename,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "uid": uid,
+        "uid_validity": validity,
+        "subject": headers.get_first_value("Subject"),
+        "from": headers.get_first_value("From"),
+        "to": headers.get_first_value("To"),
+        "attachments": attachments,
+        "content_trust": "untrusted",
+    })
+}
+
+pub(super) fn with_displayed(
+    mut value: Value,
+    headers: &[mailparse::MailHeader<'_>],
+    displayed: crate::html::DisplayBody,
+    hard_limit: usize,
+    a: &Value,
+) -> Result<Value> {
     let mode = a.get("body_mode").and_then(Value::as_str).unwrap_or("full");
     if !["full", "trimmed"].contains(&mode) || a.get("body_mode").is_some_and(|v| !v.is_string()) {
         return Err(MailError::input());
@@ -637,15 +681,6 @@ pub(super) fn parsed_with_options(
     } else {
         hard_limit
     };
-    let p = mime::parse(raw)?;
-    let format = match a.get("html_display") {
-        None => crate::html::HtmlDisplay::Legacy,
-        Some(Value::String(value)) if value == "legacy" => crate::html::HtmlDisplay::Legacy,
-        Some(Value::String(value)) if value == "readable" => crate::html::HtmlDisplay::Readable,
-        _ => return Err(MailError::input()),
-    };
-    let displayed = p.display_body(format)?;
-    let mut value = parsed_metadata(&p, uid, validity)?;
     value["html_display_metadata"] =
         serde_json::to_value(displayed.metadata).map_err(|_| MailError::backend())?;
     let full = displayed.text;
@@ -664,9 +699,9 @@ pub(super) fn parsed_with_options(
     value["signature_omitted"] = json!(signature_omitted);
     value["body_original_bytes"] = json!(full.len());
     value["body_byte_limit"] = json!(limit);
-    value["message_id"] = json!(p.headers.get_first_value("Message-ID"));
-    value["references"] = json!(p.headers.get_first_value("References"));
-    value["in_reply_to"] = json!(p.headers.get_first_value("In-Reply-To"));
+    value["message_id"] = json!(headers.get_first_value("Message-ID"));
+    value["references"] = json!(headers.get_first_value("References"));
+    value["in_reply_to"] = json!(headers.get_first_value("In-Reply-To"));
     Ok(value)
 }
 fn utf8_prefix(s: &str, max: usize) -> &str {
@@ -839,136 +874,6 @@ pub(crate) fn tool_specs() -> Vec<(&'static str, &'static str, Value, Vec<&'stat
 
 #[cfg(test)]
 mod tests {
-    #[tokio::test]
-    async fn conversation_large_headers_skip_local_failures_but_stop_protocol_errors() {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        for (refused, bad_body) in [(false, false), (false, true), (true, false)] {
-            let seed_header = format!(
-                "Message-ID: <seed@example.test>\r\nX-Trace: {}\r\n\r\n",
-                "x".repeat(18000)
-            );
-            let linked_header =
-                "Message-ID: <linked@example.test>\r\nReferences: <seed@example.test>\r\n\r\n";
-            let too_large = format!("X-Trace: {}\r\n\r\n", "x".repeat(HEADER_LIMIT));
-            let raw_seed = format!("{seed_header}seed body");
-            let raw_linked = if bad_body {
-                "Content-Type: text/plain\r\nContent-Transfer-Encoding: unsupported\r\n\r\nopaque"
-                    .to_owned()
-            } else {
-                format!("{linked_header}linked body")
-            };
-            let literal = |uid, section: &str, raw: &str| {
-                format!(
-                    "* 1 FETCH (UID {uid} FLAGS ())\r\n* 1 FETCH (UID {uid} {section} {{{}}}\r\n{raw})\r\n",
-                    raw.len()
-                )
-            };
-            let mut script = vec![
-                (
-                    "LOGIN \"synthetic\" \"test\"".to_owned(),
-                    String::new(),
-                    "OK",
-                ),
-                (
-                    "EXAMINE \"INBOX\"".to_owned(),
-                    "* 3 EXISTS\r\n* OK [UIDVALIDITY 9] valid\r\n* OK [UIDNEXT 4] next\r\n"
-                        .to_owned(),
-                    "OK",
-                ),
-                (
-                    format!(
-                        "UID FETCH 1 (UID BODY.PEEK[HEADER]<0.{}>)",
-                        HEADER_LIMIT + 1
-                    ),
-                    literal(1, "BODY[HEADER]", &seed_header),
-                    "OK",
-                ),
-                (
-                    "UID SEARCH UID 1:3".to_owned(),
-                    "* SEARCH 1 2 3\r\n".to_owned(),
-                    "OK",
-                ),
-                (
-                    format!(
-                        "UID FETCH 3 (UID BODY.PEEK[HEADER]<0.{}>)",
-                        HEADER_LIMIT + 1
-                    ),
-                    literal(3, "BODY[HEADER]", linked_header),
-                    "OK",
-                ),
-                (
-                    format!(
-                        "UID FETCH 2 (UID BODY.PEEK[HEADER]<0.{}>)",
-                        HEADER_LIMIT + 1
-                    ),
-                    literal(2, "BODY[HEADER]", &too_large),
-                    if refused { "NO" } else { "OK" },
-                ),
-            ];
-            if !refused {
-                for (uid, raw) in [(1, raw_seed), (3, raw_linked)] {
-                    script.push((
-                        format!("UID FETCH {uid} (UID RFC822.SIZE)"),
-                        format!("* 1 FETCH (UID {uid} RFC822.SIZE {})\r\n", raw.len()),
-                        "OK",
-                    ));
-                    script.push((
-                        format!("UID FETCH {uid} (UID BODY.PEEK[]<0.8388609>)"),
-                        literal(uid, "BODY[]", &raw),
-                        "OK",
-                    ));
-                }
-            }
-            let (client, server) = tokio::io::duplex(262144);
-            let backend = tokio::spawn(async move {
-                let mut server = BufReader::new(server);
-                server.get_mut().write_all(b"* OK test\r\n").await.unwrap();
-                for (expected, data, status) in script {
-                    let mut line = String::new();
-                    server.read_line(&mut line).await.unwrap();
-                    let (tag, cmd) = line.trim_end().split_once(' ').unwrap();
-                    assert_eq!(cmd, expected);
-                    server
-                        .get_mut()
-                        .write_all(format!("{data}{tag} {status} completed\r\n").as_bytes())
-                        .await
-                        .unwrap();
-                }
-            });
-            let mut client = async_imap::Client::new(client);
-            client.read_response().await.unwrap();
-            let mut session = client.login("synthetic", "test").await.unwrap();
-            let service = MailService::new(
-                crate::config::fixture(),
-                Arc::new(Journal::open(std::path::Path::new(":memory:")).unwrap()),
-            )
-            .unwrap();
-            let result = service
-                .insight_operation(
-                    &mut session,
-                    "read_conversation",
-                    &json!({"uid":1,"uid_validity":9}),
-                )
-                .await;
-            if refused {
-                assert_eq!(result.unwrap_err().code, "MAIL_BACKEND");
-            } else {
-                let result = result.unwrap();
-                assert_eq!(result["skipped_candidates"][0]["uid"], 2);
-                assert_eq!(result["complete"], false);
-                assert_eq!(
-                    result["messages"].as_array().unwrap().len(),
-                    if bad_body { 1 } else { 2 }
-                );
-                assert_eq!(
-                    result["message_errors"].as_array().unwrap().len(),
-                    usize::from(bad_body)
-                );
-            }
-            drop(session);
-            backend.await.unwrap();
-        }
-    }
     #[test]
     fn new_reads_require_nonzero_reference_metadata() {
         let mut state = async_imap::types::Mailbox::default();

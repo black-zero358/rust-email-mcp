@@ -161,6 +161,7 @@ fn message(conversation: bool) -> Value {
             json!("metadata_fields_omitted"),
         ]);
     }
+    schema["properties"]["read_diagnostics"] = read_diagnostics();
     schema
 }
 
@@ -200,14 +201,14 @@ fn attachment_descriptor() -> Value {
 fn read_diagnostics() -> Value {
     all_required(json!({
         "source":enumeration(&["bodystructure","raw"]),
-        "fallback_reason":nullable(enumeration(&["structure_limit","structure_rejected","mapping_unverified","metadata_conflict","whole_multipart_attachment","header_budget"])),
+        "fallback_reason":nullable(enumeration(&["structure_limit","structure_rejected","mapping_unverified","metadata_conflict","whole_multipart_attachment","header_budget","charset_utf7"])),
         "limit_kind":nullable(enumeration(&["mime_structure"]))
     }))
 }
 
 fn accounts() -> Value {
     let capabilities = all_required(json!({
-        "attachment_delivery_modes":{"const":["inline_base64","authenticated_http"]},"part_fetch":{"const":false},
+        "attachment_delivery_modes":{"const":["inline_base64","authenticated_http"]},"part_fetch":{"const":true},
         "cross_mailbox_conversation":{"const":false},"cache_modes":{"const":["off"]}
     }));
     let mut limits = json!({});

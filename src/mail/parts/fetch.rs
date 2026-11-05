@@ -110,11 +110,86 @@ async fn chunk<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
 {
-    let selector = part.section.body_selector();
-    if selector.is_empty() {
-        return Err(MailError::backend());
-    }
-    let path = SectionPath::Part(part.section.numbers().to_vec(), None);
+    section_chunk(session, uid, &part.section, offset, request, Some(expected)).await
+}
+
+pub(super) async fn section_chunk<S>(
+    session: &mut async_imap::Session<S>,
+    uid: u32,
+    section: &super::mapping::Section,
+    offset: usize,
+    request: usize,
+    expected: Option<usize>,
+) -> Result<Vec<u8>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
+{
+    let selector = if section.numbers().is_empty() {
+        "TEXT".into()
+    } else {
+        section.body_selector()
+    };
+    let path = if section.numbers().is_empty() {
+        SectionPath::Full(imap_proto::MessageSection::Text)
+    } else {
+        SectionPath::Part(section.numbers().to_vec(), None)
+    };
+    body_slice(
+        session,
+        uid,
+        &selector,
+        Some(path),
+        offset,
+        request,
+        expected,
+    )
+    .await
+}
+
+pub(in crate::mail) async fn message_header<S>(
+    session: &mut async_imap::Session<S>,
+    uid: u32,
+    request: usize,
+) -> Result<Vec<u8>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
+{
+    body_slice(
+        session,
+        uid,
+        "HEADER",
+        Some(SectionPath::Full(imap_proto::MessageSection::Header)),
+        0,
+        request,
+        None,
+    )
+    .await
+}
+
+pub(super) async fn whole_message<S>(
+    session: &mut async_imap::Session<S>,
+    uid: u32,
+    request: usize,
+    expected: usize,
+) -> Result<Vec<u8>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
+{
+    body_slice(session, uid, "", None, 0, request, Some(expected)).await
+}
+
+async fn body_slice<S>(
+    session: &mut async_imap::Session<S>,
+    uid: u32,
+    selector: &str,
+    path: Option<SectionPath>,
+    offset: usize,
+    request: usize,
+    expected: Option<usize>,
+) -> Result<Vec<u8>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
+{
     let tag = session
         .run_command_with_limits(
             format!("UID FETCH {uid} (UID BODY.PEEK[{selector}]<{offset}.{request}>)"),
@@ -167,14 +242,16 @@ where
                     } = attr
                     {
                         // A body for this target must be the exact requested slice.
-                        if section.as_ref() != Some(&path) {
+                        if section != &path {
                             continue;
                         }
                         if *index != u32::try_from(offset).ok() || found.is_some() {
                             return Err(MailError::backend());
                         }
                         let data = data.as_deref().ok_or_else(MailError::backend)?;
-                        if data.len() != expected {
+                        if data.len() > request
+                            || expected.is_some_and(|expected| data.len() != expected)
+                        {
                             return Err(MailError::backend());
                         }
                         found = Some(data.to_vec());
@@ -253,7 +330,7 @@ pub(in crate::mail) async fn download(
         .await
     {
         Ok(manifest) => manifest,
-        Err(reader::FetchFailure::Fallback(reason)) => {
+        Err(reader::FetchFailure::Fallback { reason, .. }) => {
             let diagnostics = reason.diagnostics();
             tracing::info!(event="attachment_raw_fallback", diagnostics=?serde_json::to_value(diagnostics).ok());
             let max = service

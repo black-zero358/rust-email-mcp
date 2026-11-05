@@ -240,6 +240,12 @@ BODYSTRUCTURE 预算必须进入协议解析阶段，限制深度、节点、字
 
 服务器拒绝结构、可靠映射失败或特殊结构需要整体解析时，在整封预算内回退旧 reader；超限给出具体原因。协议失败后先关闭原连接，不能复用未完成命令的连接回退。
 
+R07 局部正文子包让 `get_email`、`get_emails` 和 `read_conversation` 共用正文读取编排。整个工具调用持有连接和一个固定期限；批量及会话中的最终读取目标每 UID 最多进行一次明确的 raw 策略回退。新连接重新 EXAMINE 并核对原 UIDVALIDITY，成功完成 raw 命令后继续服务后续 UID。候选头扫描不因本策略重连，传输或部件命令失败也不自动重试。
+
+正文候选规则与原 MIME 读取共享：alternative 优先完整纯文本候选，失败候选整体回滚；related 仅在没有 start 时取首子，存在 start 时精确匹配 Content-ID；附件子树保持剪枝。所有选中正文共用编码长度乘四的解码预留，字符集状态跨块保留，UTF-7 走有界 raw 回退。选中正文的字符集或解码失败按该正文返回错误，展示截断和 `max_body_length:0` 仍在完整正文验证后执行。
+
+继续批量读取依赖明确的命令完成状态：当前命令匹配 tagged OK 后发生的本地 MIME、字符集或展示错误可以记录为逐项错误；目标数据缺失、部件不匹配、协议或连接预算错误停止后续读取。批量返回 unprocessed，任何会话部分结果继续列出错误和遗漏。错误码与连接是否可继续使用分别记录。
+
 验收要求常见叶子附件只取得结构、必要 MIME 头和目标部件。覆盖单部件、alternative、related、mixed、multipart 整体附件、message/rfc822、RFC2231 名称、空附件、坏编码、断流、异步 FLAGS、世代变化。
 
 ## R08 预览与邮件头分类
@@ -389,7 +395,8 @@ UIDVALIDITY 改变立即停用旧世代数据、句柄和游标，后台清理�
 | R05 | 已完成，源码 `ffd1bda`；200 单元 + 2 集成、fmt/clippy/release、8 文件客户端联调通过 | [PR #67](https://github.com/black-zero358/rust-email-mcp/pull/67) 最终 head `9019ef7` 全部 CI 通过，已合并为 `501e539`；[设计与配置](multi-account-design.md)、[离线验证](validation.md#2026-11-02-r05-多账户离线验证) |
 | R06 | 已完成，源码 `885a1ce`；234 单元 + 29 集成、fmt/clippy/release、8 文件联调、审计及实际镜像通过 | parser 基础 [PR #68](https://github.com/black-zero358/rust-email-mcp/pull/68) 已合并；清单与回退 [PR #69](https://github.com/black-zero358/rust-email-mcp/pull/69) 最终 head `351353b` 全部 CI 通过，已合并为 `41fb821`；[离线验证](validation.md#2026-11-03-r06-附件清单与受控回退) |
 | R07 | 实施中；附件部件下载源码 `d0a1e62`，277 单元 + 34 集成、fmt/clippy/release、8 文件联调、审计及镜像通过 | [PR #70](https://github.com/black-zero358/rust-email-mcp/pull/70) 最终 head `bcb2b45` 全部 CI 通过，已合并为 `7837396`；[离线验证](validation.md#2026-11-03-r07-附件部件下载)；下一批接入局部正文，两批完成后关闭 R07 |
-| R08–R09 | 待实施 | 预览分类、跨目录会话 |
+| R08 | 待实施；分类规则已完成独立合成原型 | 预览分类；列表/搜索的 `has_attachment` 筛选改用已验证清单，保持扫描游标和附件判定语义 |
+| R09 | 待实施 | 跨目录会话 |
 | R10–R13 | 待实施 | 持久化、完整回填、离线及发布验收 |
 
 ## 对照实现

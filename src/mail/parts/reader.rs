@@ -3,7 +3,10 @@ use super::{
     mapping::{self, HeaderEvidence, HeaderRequest, ManifestOutcome},
     *,
 };
-use async_imap::{error::Error as ImapError, types::ResponseData};
+use async_imap::{
+    error::Error as ImapError,
+    types::{CommandReadLimits, ResponseData},
+};
 use imap_proto::{AttributeValue, MessageSection, Response, SectionPath, Status};
 use serde::Serialize;
 
@@ -18,6 +21,15 @@ pub(in crate::mail) struct ManifestDiagnostics {
     fallback_reason: Option<&'static str>,
     limit_kind: Option<&'static str>,
 }
+impl ManifestDiagnostics {
+    pub(super) fn structured() -> Self {
+        Self {
+            source: "bodystructure",
+            fallback_reason: None,
+            limit_kind: None,
+        }
+    }
+}
 #[derive(Clone, Copy)]
 pub(super) enum Fallback {
     StructureLimit,
@@ -26,6 +38,7 @@ pub(super) enum Fallback {
     MetadataConflict,
     WholeMultipart,
     HeaderBudget,
+    CharsetUtf7,
 }
 impl Fallback {
     pub(super) fn diagnostics(self) -> ManifestDiagnostics {
@@ -38,6 +51,7 @@ impl Fallback {
                 Self::MetadataConflict => "metadata_conflict",
                 Self::WholeMultipart => "whole_multipart_attachment",
                 Self::HeaderBudget => "header_budget",
+                Self::CharsetUtf7 => "charset_utf7",
             }),
             limit_kind: matches!(self, Self::StructureLimit).then_some("mime_structure"),
         }
@@ -71,28 +85,40 @@ pub(super) enum FetchFailure {
     Imap(ImapError),
     Backend,
     Missing,
-    Fallback(Fallback),
+    Fallback {
+        reason: Fallback,
+        /// Every metadata command completed with matching OK; local errors may retain it.
+        synchronized: bool,
+    },
 }
 impl FetchFailure {
     pub(super) fn mail(self) -> MailError {
         match self {
             Self::Imap(error) => map_read_imap_error(error),
             Self::Missing => not_found(),
-            Self::Fallback(Fallback::StructureLimit) => {
-                MailError::limit_kind(LimitKind::MimeStructure)
-            }
-            Self::Fallback(Fallback::HeaderBudget) => MailError::limit_kind(LimitKind::HeaderBytes),
+            Self::Fallback {
+                reason: Fallback::StructureLimit,
+                ..
+            } => MailError::limit_kind(LimitKind::MimeStructure),
+            Self::Fallback {
+                reason: Fallback::HeaderBudget,
+                ..
+            } => MailError::limit_kind(LimitKind::HeaderBytes),
             _ => MailError::backend(),
         }
     }
-    fn recoverable(self, structure_command: bool) -> Self {
+    fn structure_failure(self) -> Self {
         match self {
             Self::Imap(error) if async_imap::error::body_structure_limit(&error).is_some() => {
-                Self::Fallback(Fallback::StructureLimit)
+                Self::Fallback {
+                    reason: Fallback::StructureLimit,
+                    synchronized: false,
+                }
             }
-            Self::Imap(ImapError::No(_) | ImapError::Bad(_)) if structure_command => {
-                Self::Fallback(Fallback::StructureRejected)
-            }
+            Self::Imap(ImapError::No(_) | ImapError::Bad(_)) => Self::Fallback {
+                reason: Fallback::StructureRejected,
+                synchronized: false,
+            },
             other => other,
         }
     }
@@ -110,15 +136,17 @@ fn not_found() -> MailError {
 async fn command<S>(
     session: &mut async_imap::Session<S>,
     query: String,
+    limits: Option<CommandReadLimits>,
     mut consume: impl FnMut(ResponseData) -> std::result::Result<(), FetchFailure>,
 ) -> std::result::Result<(), FetchFailure>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
 {
-    let tag = session
-        .run_command(query)
-        .await
-        .map_err(FetchFailure::Imap)?;
+    let tag = match limits {
+        Some(limits) => session.run_command_with_limits(query, limits).await,
+        None => session.run_command(query).await,
+    }
+    .map_err(FetchFailure::Imap)?;
     loop {
         let response = session
             .read_response()
@@ -181,6 +209,7 @@ where
     command(
         session,
         format!("UID FETCH {uid} (UID RFC822.SIZE)"),
+        None,
         |response| {
             if let Response::Fetch(_, attrs) = response.parsed()
                 && matches_uid(attrs, uid)?
@@ -217,6 +246,7 @@ where
     command(
         session,
         format!("UID FETCH {uid} (UID BODYSTRUCTURE)"),
+        None,
         |response| {
             if let Response::Fetch(_, attrs) = response.parsed()
                 && matches_uid(attrs, uid)?
@@ -237,7 +267,7 @@ where
         },
     )
     .await
-    .map_err(|error| error.recoverable(true))?;
+    .map_err(FetchFailure::structure_failure)?;
     found.ok_or(if target {
         FetchFailure::Backend
     } else {
@@ -278,10 +308,14 @@ where
         .collect::<Vec<_>>()
         .join(" ");
     let mut received: Vec<Option<Vec<u8>>> = vec![None; requests.len()];
+    let mut over_budget = false;
     let mut target = false;
     command(
         session,
         format!("UID FETCH {uid} (UID {selectors})"),
+        Some(CommandReadLimits::body_section_literal_bytes(
+            HEADER_BYTES + 1,
+        )),
         |response| {
             if let Response::Fetch(_, attrs) = response.parsed()
                 && matches_uid(attrs, uid)?
@@ -299,14 +333,16 @@ where
                             return Err(FetchFailure::Backend);
                         }
                         let data = data.as_deref().ok_or(FetchFailure::Backend)?;
-                        let next = used
-                            .checked_add(data.len())
-                            .filter(|n| *n <= TOTAL_HEADER_BYTES)
-                            .ok_or(FetchFailure::Fallback(Fallback::HeaderBudget))?;
-                        if data.len() > HEADER_BYTES {
-                            return Err(FetchFailure::Fallback(Fallback::HeaderBudget));
+                        if over_budget
+                            || data.len() > HEADER_BYTES
+                            || *used + data.len() > TOTAL_HEADER_BYTES
+                        {
+                            over_budget = true;
+                            // Mark the required attribute without retaining its bytes.
+                            received[position] = Some(Vec::new());
+                            continue;
                         }
-                        *used = next;
+                        *used += data.len();
                         received[position] = Some(data.to_vec());
                     }
                 }
@@ -314,19 +350,29 @@ where
             Ok(())
         },
     )
-    .await
-    .map_err(|error| error.recoverable(false))?;
+    .await?;
+    if received.iter().any(Option::is_none) {
+        return Err(if target {
+            FetchFailure::Backend
+        } else {
+            FetchFailure::Missing
+        });
+    }
+    // Drain through matching OK before classifying a header budget failure as
+    // local. A rejected command or a missing attribute stays terminal.
+    if over_budget {
+        return Err(FetchFailure::Fallback {
+            reason: Fallback::HeaderBudget,
+            synchronized: true,
+        });
+    }
     requests
         .iter()
         .zip(received)
         .map(|(request, bytes)| {
             Ok(HeaderEvidence {
                 section: request.section.clone(),
-                bytes: bytes.ok_or(if target {
-                    FetchFailure::Backend
-                } else {
-                    FetchFailure::Missing
-                })?,
+                bytes: bytes.ok_or(FetchFailure::Backend)?,
             })
         })
         .collect()
@@ -357,26 +403,33 @@ where
     let mut used = 0;
     let mut commands = 0;
     loop {
-        match mapping::map(root, &evidence).map_err(|error| {
-            FetchFailure::Fallback(match error {
+        match mapping::map(root, &evidence).map_err(|error| FetchFailure::Fallback {
+            reason: match error {
                 mapping::MapError::StructureLimit => Fallback::StructureLimit,
                 mapping::MapError::HeaderLimit => Fallback::HeaderBudget,
-            })
+            },
+            synchronized: true,
         })? {
             ManifestOutcome::Ready(manifest) => return Ok(manifest),
             ManifestOutcome::RawFallback { reason } => {
-                return Err(FetchFailure::Fallback(match reason {
-                    "bodystructure_header_conflict" | "duplicate_mime_metadata" => {
-                        Fallback::MetadataConflict
-                    }
-                    "whole_multipart_attachment" => Fallback::WholeMultipart,
-                    _ => Fallback::MappingUnverified,
-                }));
+                return Err(FetchFailure::Fallback {
+                    reason: match reason {
+                        "bodystructure_header_conflict" | "duplicate_mime_metadata" => {
+                            Fallback::MetadataConflict
+                        }
+                        "whole_multipart_attachment" => Fallback::WholeMultipart,
+                        _ => Fallback::MappingUnverified,
+                    },
+                    synchronized: true,
+                });
             }
             ManifestOutcome::NeedsHeaders(requests) => {
                 for batch in requests.chunks(SECTIONS_PER_COMMAND) {
                     if commands >= HEADER_COMMANDS {
-                        return Err(FetchFailure::Fallback(Fallback::HeaderBudget));
+                        return Err(FetchFailure::Fallback {
+                            reason: Fallback::HeaderBudget,
+                            synchronized: true,
+                        });
                     }
                     commands += 1;
                     evidence.extend(headers(session, uid, batch, &mut used).await?);
@@ -420,7 +473,7 @@ impl MailService {
                     limit_kind: None,
                 },
             }),
-            Err(FetchFailure::Fallback(reason)) => {
+            Err(FetchFailure::Fallback { reason, .. }) => {
                 if known_size > max {
                     return Err(raw_limit(InputLimits::Read, max, known_size));
                 }

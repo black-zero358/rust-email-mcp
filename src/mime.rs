@@ -1,6 +1,8 @@
 //! Resource accounting before MIME object creation and transfer/charset decoding.
 //! mailparse's tree entry point cannot enforce a global part/header budget. Keep
 //! structure parsing here, and use its header and leaf codecs only on bounded input.
+pub(crate) mod selection;
+
 use crate::error::{LimitKind, MailError, Result};
 use mailparse::{MailHeader, MailHeaderMap, ParsedContentType, body::Body};
 
@@ -8,7 +10,7 @@ pub(crate) const MAX_PARTS: usize = 1024;
 pub(crate) const MAX_DEPTH: usize = 32;
 const MAX_HEADER_BLOCK: usize = 128 * 1024;
 const MAX_HEADER_BYTES: usize = 1024 * 1024;
-const MAX_HEADER_LINES: usize = 8192;
+pub(crate) const MAX_HEADER_LINES: usize = 8192;
 const MAX_DECODE_BYTES: usize = 32 * 1024 * 1024;
 
 pub(crate) fn attachment_input_limit(decoded_limit: usize) -> usize {
@@ -350,87 +352,9 @@ impl Part<'_> {
         Ok(())
     }
 
-    // The bool reports non-empty inline content unsupported in this mode,
-    // including HTML during a plain-only probe. Probes do not decode; one
-    // shared budget still covers all selected leaf codecs.
     fn select_text<'a>(&'a self, out: &mut Vec<&'a Self>, html: bool) -> bool {
-        if self.is_attachment() {
-            return false;
-        }
-        if self.transfer_encoding().is_err() {
-            return !self.body.is_empty();
-        }
-        if self.subparts.is_empty() {
-            match self.ctype.mimetype.as_str() {
-                "text/plain" => out.push(self),
-                "text/html" if html => out.push(self),
-                _ => return !self.body.is_empty(),
-            }
-            return false;
-        }
-        match self.ctype.mimetype.as_str() {
-            "multipart/alternative" => {
-                // Representations are alternatives, not consecutive body text.
-                // Prefer a complete plain representation, including a genuinely
-                // empty plain body. A mixed candidate containing HTML is not
-                // plain just because it also has a plain signature. Roll back
-                // all fragments of incomplete probes before trying another.
-                let mut unsupported = false;
-                for child in self.subparts.iter().rev() {
-                    let before = out.len();
-                    let failed = child.select_text(out, false);
-                    if failed {
-                        out.truncate(before);
-                        unsupported = true;
-                        continue;
-                    }
-                    if out.len() != before {
-                        return failed;
-                    }
-                    unsupported |= failed;
-                }
-                if html {
-                    for child in self.subparts.iter().rev() {
-                        let before = out.len();
-                        let failed = child.select_text(out, true);
-                        if failed {
-                            out.truncate(before);
-                            unsupported = true;
-                            continue;
-                        }
-                        if out.len() != before {
-                            return failed;
-                        }
-                        unsupported |= failed;
-                    }
-                }
-                unsupported
-            }
-            "multipart/related" => {
-                let root = match self.ctype.params.get("start") {
-                    Some(start) => self.subparts.iter().find(|p| {
-                        p.headers
-                            .get_first_value("Content-ID")
-                            .is_some_and(|id| id.trim() == start.trim())
-                    }),
-                    None => self.subparts.first(),
-                };
-                if let Some(root) = root {
-                    root.select_text(out, html)
-                } else {
-                    !self.body.is_empty()
-                }
-            }
-            _ => {
-                // Mixed inline parts remain consecutive body content. An
-                // attachment at any level prunes its entire subtree above.
-                let mut unsupported = false;
-                for child in &self.subparts {
-                    unsupported |= child.select_text(out, html);
-                }
-                unsupported
-            }
-        }
+        // Raw entities always have known encoded emptiness.
+        selection::select(self, out, html).unwrap_or(true)
     }
 
     fn append_plain_leaf(
