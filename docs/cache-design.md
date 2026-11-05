@@ -50,7 +50,7 @@ full 可增加 `sync` 以启用管理员选定范围的后台回填与周期核�
 
 省略 `sync` 保持后台暂停，显式提供时必须设置布尔 `enabled`。两个间隔默认分别为 60 和 900 秒，允许 1 至 86400 秒；metadata/off 不接受该配置。启停和间隔修改通过重启生效；暂停保留已保存内容、检查点及缺口，已有显式离线读取继续按授权与 dirty 状态处理。模型通过 `get_cache_status` 查询进度，管理配置由管理员维护。同步设计与验收范围见[全量回填与增量同步](cache-sync-design.md)。
 
-`sync.protocol` 接受 `rev1` 或 `auto`，省略时为 `rev1`。`auto` 在后台认证连接上探测能力并使用只读 `EXAMINE (CONDSTORE)`，按已知 UID 页获取 FLAGS 变化；能力缺失或扩展失败时回到 rev1。所有模式继续进行周期存在性核对。切换协议通过正常重启生效，前台读取工具保持原调用方式。
+`sync.protocol` 接受 `rev1` 或 `auto`，省略时为 `rev1`。`auto` 在后台认证连接上探测能力，优先协商 QRESYNC 同步 FLAGS 和删除，其次使用只读 `EXAMINE (CONDSTORE)` 获取 FLAGS 变化；基础 rev1 核对负责回退。每个步骤最多使用两条实际连接，共享原期限与累计传输预算。所有模式继续进行周期存在性核对。切换协议通过正常重启生效，前台读取工具保持原调用方式。
 
 ## 查询状态
 
@@ -62,7 +62,7 @@ full 的 `sync` 返回启用策略、两个间隔和所选目录的同步状态�
 
 目录 `runtime.last_error` 记录后台最近失败类别 network、protocol、storage、quota 或 null，`runtime.quota_paused` 显示当前进程的配额暂停。它们与当前状态查询的目录 error、前台缓存证据队列的 write_health 分别报告。
 
-`sync.protocol` 返回配置策略，目录 `runtime.protocol` 返回当前使用的 `rev1` 或 `condstore`。`runtime.protocol_fallback` 为 null，或固定类别 `capability_unavailable`、`extension_failed`、`nomodseq`、`modseq_rollback`。目录 `condstore` 为 null 或已持久化的 FLAGS 水位：`uid_validity`、覆盖 `high_uid`、`committed_modseq`、当前轮次的 `target_modseq`/`known_after` 和 `checked_at_ms`。两项 MODSEQ 使用十进制字符串，客户端按整数文本处理；每页保存位置，只有全部页面完成才推进 committed。NOMODSEQ、失效世代或待持久化的撤销会隐藏旧水位；该状态与完整内容覆盖分别展示。
+`sync.protocol` 返回配置策略，目录 `runtime.protocol` 返回当前使用的 `rev1`、`condstore` 或 `qresync`。`runtime.protocol_fallback` 为 null，或固定类别 `capability_unavailable`、`extension_failed`、`nomodseq`、`modseq_rollback`、`qresync_enable_failed`、`qresync_failed`、`qresync_reconciliation_required`。目录 `condstore` 和 `qresync` 各自为 null 或持久化水位，分别覆盖 FLAGS、FLAGS 与删除：`uid_validity`、覆盖 `high_uid`、`committed_modseq`、当前轮次的 `target_modseq`/`known_after` 和 `checked_at_ms`。两项 MODSEQ 使用十进制字符串，客户端按整数文本处理；每页保存位置，只有全部页面完成才推进 committed。NOMODSEQ、失效世代或待持久化的撤销会隐藏旧水位；该状态与完整内容覆盖分别展示。超出有界提交额度的已确认删除使该范围进入完整核对，核对期间离线读取返回 `CACHE_NEEDS_VERIFICATION`。
 
 完成判定按具体数据层读取：`listing_facts_complete` 要求 FLAGS、INTERNALDATE 和 SIZE 齐备；头部完整性、精确 Message-ID 索引、清单和正文索引各有独立计数与完成字段。raw/full_body/attachments 的 `available_complete` 允许已确认可从原件派生的内容，`materialization_complete` 还要求实际文件齐备。两者都受完整发现与存在性核对约束，保留 missing、omitted 和 unsupported 缺口。`flags_checked_at_ms` 是范围内最近一次单封标记观察，完整范围核对时间取 `reconciliation.completed_at_ms`。后台暂停时继续显示已提交进度。
 

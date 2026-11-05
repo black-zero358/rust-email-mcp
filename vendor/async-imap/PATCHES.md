@@ -224,3 +224,15 @@ errors. Consumers call `Session::abort_bounded_command` when the completed
 exchange fails their evidence checks. Existing command APIs retain their
 original grammar. Run `cargo test --locked --test sync_delta_budget` for
 fragmentation, cumulative budgets and terminal failure checks.
+
+### Opt-in QRESYNC commands
+
+`CommandReadLimits::qresync()` retains the 128 KiB cumulative command wire
+budget, adding distinct ENABLED and compressed VANISHED responses. An
+ENABLED or VANISHED response already buffered before the command cannot
+satisfy new evidence. Matching tags, terminal failure and post-completion
+buffering use the same machinery as other bounded commands. Consumers bind
+ENABLE and subsequent commands to one connection. The application limits
+generated extension command lines to 8192 bytes including framing, retaining
+the exact UID set or taking its bounded fallback. Run
+`cargo test --locked --test sync_qresync_budget`.

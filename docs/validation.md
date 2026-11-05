@@ -2,7 +2,39 @@
 
 本文件保存带版本与环境边界的证据。每次新增记录注明提交/tag、日期与时区、环境、命令、结果、CI 链接及未覆盖项；保留历史结果，不把其测试数量或部署状态当作当前版本的证明。验证要求见 [贡献指南](../CONTRIBUTING.md#验证与完成标准)。
 
+## 2026-11-05 R12 QRESYNC 标记与删除同步
+
+源码 `4963b8b6f24fcc7678516f3e8579be1938d1b111`，父提交为 CONDSTORE 合并 `62f353bdc297836aae72b27cd46f44a4cb9c44d9`。独立验证树为 `e658583e89a49d15c90ca287005db7daf9060c5c`；最终提交的全部 QRESYNC 生产、协议、存储和测试与该树一致，另继承 PR #80 已验证的缓存就绪测试修复及两份文档。环境为 WSL Ubuntu、Rust 1.99.1、Node 24.15.0；使用本地模拟服务、签名 HTTP 客户端和合成邮件。
+
+### 实现与审阅
+
+- auto 优先 QRESYNC，要求同一认证连接上的 CAPABILITY、ENABLE、明确 ENABLED QRESYNC 和匹配 tagged OK。完整非空已知集合至多 200 UID 时使用只读 EXAMINE QRESYNC；较大集合使用 EXAMINE CONDSTORE 和精确 UID 页 CHANGEDSINCE VANISHED；空集合跳过 FETCH。
+- 生成命令连同 tag 和 CRLF 最多 8192 字节；每条命令完整回复最多 128 KiB。VANISHED 保持压缩区间，解析前约束端点和范围数。EARLIER 属于精确请求集合且先于 FETCH；实时删除按 UIDNEXT、世代和事件顺序核对，FLAGS 后删除以删除为最终事实。协议回退共用最多两条实际连接、原期限和传输预算。
+- FLAGS 与 FLAGS/删除沿用 V6 的独立水位，预览/开始/分页/提交核对范围修订及 UID 序列。每页事实和位置原子提交，末页才推进冻结目标。最低显式水位、最终值和 NOMODSEQ 分别保留，两条已提交水位与候选共同参与回退判断。
+- 大范围已确认删除先暂停该范围离线交付和 clean receipt，持久化新 dirty 修订后开始新的完整 rev1 核对。前台读写在网络前捕获证据修订，正向写回在入队和执行时核验，恢复完成后仍拒绝旧请求的迟到写回；已经执行的 FIFO 写入通过屏障结清，再冻结新的核对范围。
+- 独立审阅发现并修复了“先前未缓存 UID 的旧网络结果在完整核对后返回”及“旧 FIFO 写已开始执行”两类竞态，均由真实签名请求与可控同步点回归。V1–V6 schema、Cargo 版本/锁文件与父提交一致；公开状态新增独立 qresync 水位和固定回退类别。
+
+### 验证结果
+
+| 检查 | 结果 |
+| --- | --- |
+| fmt、默认完整测试 | 560 单元、57 集成通过，2 项默认忽略；单元 41.74 秒 |
+| all-target Clippy `-D warnings` | 通过，15.32 秒 |
+| release 构建 | 通过，46.87 秒；SHA-256 `ad912db99390b717a7aadfa58f453ec049c61f05f523dbf4268450b4f7a0fa22` |
+| Rust→Node 附件客户端 | 八文件下载、SHA-256 与内容读取通过，4.78 秒 |
+| 实际 release V6 恢复 | 代次 1/2/3、off 失败启动见证轮换、损坏见证先于 Journal 拒绝、操作库哨兵和 0700/0600 通过 |
+| 专用审计与上下文 | 20 项适配回归、340 依赖/1409 公告检查和 Docker allowlist 通过；沿用已有维护告警策略 |
+| 精确源码独立复核 | QRESYNC 源码与验证树逐文件一致，继承的 C 测试补丁单独复核通过 |
+
+签名 QRESYNC 10 项、CONDSTORE 9 项、差分存储 25 项、同步协议/辅助层 27 项及根 QRESYNC 预算 4 项专项通过并纳入完整测试。覆盖分页重启、撤权、能力/ENABLE 失败、双失败实际两连接、低水位与 NOMODSEQ、压缩删除范围、128 KiB 完整命令预算及两种迟到写回竞态。
+
+本地实际 Docker 构建覆盖 QRESYNC 实现树 `e04e3b5a94cfa0c48e5727ddd7c3e5a62694df64`，镜像 `rust-email-mcp:r12-qresync-local` 的 manifest list 为 `sha256:f5f2355e3820abad0acd445540015381bf1d8418924609ce352d4decaa5a1085`；同一次构建完成，release 步骤 18 分 59 秒，主要时间用于索引和依赖下载。随后集成 TCP_NODELAY 的最终验证树为上述 `e658583`，最终提交的镜像由 PR CI 构建核对。
+
+跨归档复用 Cargo target 时，分别清理本包与两个 vendored path 包的 dev 和 release 产物后重新验证；记录中的最终 release 摘要已核对并另存归档。R13 的大规模持续负载使用独立候选继续执行。
+
 ## 2026-11-05 R12 CONDSTORE 标记同步
+
+[PR #80](https://github.com/black-zero358/rust-email-mcp/pull/80) 最终 head `4d65fec6aa8bc72e9f59ceb75175dc9f9615c93a` 的 [CI 42045282182](https://github.com/black-zero358/rust-email-mcp/actions/runs/42045282182) 中 check、audit、container 全部通过。精确源码、追加修复及最终文档的独立审阅完成；GitHub 自动审阅遇到账户限流，评论与空 review threads 已核对。合并提交为 `62f353bdc297836aae72b27cd46f44a4cb9c44d9`，本地 main、开发分支及对应远端引用已同步，后续批次工作区保留。
 
 源码 `b5366fd6f66fb2f182d5c656a60f6866b67c5910`，父提交为 R12B 合并 `68b32353c2214b238c6f4ed33768316254d1275e`。环境为 WSL Ubuntu、固定 Rust 1.99.1、Node 24.15.0；所有邮箱、身份、文件和失败场景使用合成数据、本地模拟 TLS IMAP/HTTP 服务及隔离目录。
 
@@ -40,7 +72,7 @@
 
 ### 缓存就绪与软期限回归
 
-head `e26184bb800f2875aa43157373d1176945de0c11` 的 [CI 42043024618](https://github.com/black-zero358/rust-email-mcp/actions/runs/42043024618) 已通过原三项失败用例；一项旧缓存测试在合法的 100 ms 软缓存探测回退时过早要求命中缓存。测试修复 `e77e9880403efb1d0ccc52e212aac160ed712574` 先等待指定 UID 和正文真正可离线读取，再在原 2 秒观察窗口内验证实际缓存命中；只有正文完全相同的 bodystructure 回退允许重试，其他错误立即失败。最终命中请求必须恰好新建一条连接并发送 EXAMINE 与目标 UID 的 SIZE，两者之后没有正文 FETCH。相邻三封预热逐封等待可读，避免超过最佳努力写回的两个 payload 许可；删除、tombstone、零网络及局部错误断言继续保留。
+head `e26184bb800f2875aa43157373d1176945de0c11` 的 [CI 42043024618](https://github.com/black-zero358/rust-email-mcp/actions/runs/42043024618) 已通过原三项失败用例；一项旧缓存测试遇到合法的 bodystructure 回退，却直接要求命中缓存；生产缓存探测仍保留 100 ms 软期限。测试修复 `e77e9880403efb1d0ccc52e212aac160ed712574` 先等待指定 UID 和正文真正可离线读取，再在 2 秒的测试观察窗口内验证实际缓存命中；只有正文完全相同的 bodystructure 回退允许重试，其他错误立即失败。最终命中请求必须恰好新建一条连接并发送 EXAMINE 与目标 UID 的 SIZE，两者之后没有正文 FETCH。相邻三封预热逐封等待可读，避免超过最佳努力写回的两个 payload 许可；删除、tombstone、零网络及局部错误断言继续保留。
 
 该提交仅修改测试文件。独立审阅通过；四 CPU、八测试线程的缓存组 13 项通过，精确快照 fmt、540 单元 + 53 集成（2 项默认忽略）、all-target Clippy 通过，单元 27.13 秒、Clippy 13.90 秒。生产源码与 `c8daed4` 相同，沿用其 release、八文件与 V6 恢复证据，最终提交重新执行三项 CI。
 

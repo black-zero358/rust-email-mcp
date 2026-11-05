@@ -18,6 +18,7 @@ pub use content::{
 };
 pub use delta::{
     DeltaFlags, DeltaLane, DeltaObservation, DeltaPage, DeltaRound, DeltaStart, DeltaStatus,
+    QresyncChanges, QresyncPreview,
 };
 pub use gc::{SyncReclaimCandidate, SyncReclaimPage, SyncReclaimPosition};
 pub use status::{SyncCoverage, SyncGapCount, SyncLayerStatus, SyncScanStatus, SyncScopeStatus};
@@ -123,6 +124,8 @@ pub enum SyncError {
     NotReady,
     #[error("Synchronization was cancelled.")]
     Cancelled,
+    #[error("A complete mailbox reconciliation is required.")]
+    ReconcileRequired,
 }
 
 impl From<rusqlite::Error> for SyncError {

@@ -15,7 +15,7 @@ use async_imap::{
     },
     types::{CommandReadLimits, Flag, Mailbox},
 };
-use std::{fmt::Debug, fmt::Write};
+use std::{borrow::Cow, fmt::Debug, fmt::Write};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 #[cfg(test)]
@@ -65,25 +65,41 @@ pub(super) async fn supports_condstore<S>(session: &mut Session<S>) -> Result<bo
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + Debug,
 {
+    Ok(capabilities(session).await?.condstore)
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct Capabilities {
+    pub(super) condstore: bool,
+    pub(super) qresync: bool,
+    pub(super) enable: bool,
+}
+
+pub(super) async fn capabilities<S>(session: &mut Session<S>) -> Result<Capabilities>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + Debug,
+{
     let mut supported = None;
     read_evidence(session, "CAPABILITY", |response| {
         let Response::Capabilities(capabilities) = response else {
             return Ok(());
         };
         let mut imap = false;
-        let mut condstore = false;
+        let mut supported_extensions = Capabilities::default();
         for capability in capabilities {
             match capability {
                 Capability::Imap4rev1 => imap = true,
                 Capability::Atom(atom) => {
                     imap |= atom.eq_ignore_ascii_case("IMAP4rev2");
-                    condstore |= atom.eq_ignore_ascii_case("CONDSTORE")
-                        || atom.eq_ignore_ascii_case("QRESYNC");
+                    supported_extensions.condstore |= atom.eq_ignore_ascii_case("CONDSTORE");
+                    supported_extensions.qresync |= atom.eq_ignore_ascii_case("QRESYNC");
+                    supported_extensions.enable |= atom.eq_ignore_ascii_case("ENABLE");
                 }
                 _ => {}
             }
         }
-        if !imap || supported.replace(condstore).is_some() {
+        supported_extensions.condstore |= supported_extensions.qresync;
+        if !imap || supported.replace(supported_extensions).is_some() {
             return Err(MailError::backend());
         }
         Ok(())
@@ -193,64 +209,12 @@ where
                     _ => {}
                 },
                 Response::Fetch(sequence, attributes) => {
-                    if *sequence == 0 {
-                        return Err(MailError::backend());
-                    }
-                    let mut uid = None;
-                    let mut modseq = None;
-                    let mut flags = None;
-                    for attribute in attributes {
-                        match attribute {
-                            AttributeValue::Uid(value)
-                                if *value != 0 && uid.replace(*value).is_none() => {}
-                            AttributeValue::ModSeq(value) if modseq.replace(*value).is_none() => {}
-                            AttributeValue::Flags(value) if flags.replace(value).is_none() => {}
-                            _ => return Err(MailError::backend()),
-                        }
-                    }
-                    let (Some(modseq), Some(flags)) = (modseq, flags) else {
-                        return Err(MailError::backend());
-                    };
+                    let change = FetchFlags::read(*sequence, attributes)?;
                     // Untagged updates outside the requested UID set carry no evidence for it.
-                    let Some(uid) = uid else {
-                        return Err(MailError::backend());
-                    };
-                    let Ok(index) = expected.binary_search(&uid) else {
+                    let Ok(index) = expected.binary_search(&change.uid) else {
                         return Ok(());
                     };
-                    if modseq <= base || modseq > MAX_MODSEQ {
-                        return Err(MailError::backend());
-                    }
-                    flag_atoms += flags.len();
-                    if flag_atoms > FLAG_ATOMS_PER_COMMAND {
-                        return Err(MailError::backend());
-                    }
-                    let mut bytes = 0;
-                    let mut values = Vec::with_capacity(flags.len());
-                    for flag in flags {
-                        let value = format!("{:?}", Flag::from(flag.as_ref()));
-                        bytes += value.len();
-                        if value.len() > 256 || bytes > FLAG_BYTES_PER_UID {
-                            return Err(MailError::backend());
-                        }
-                        values.push(value);
-                    }
-                    values.sort_unstable();
-                    values.dedup();
-                    let item = &mut items[index];
-                    if let Some(previous) = item {
-                        if previous.modseq == modseq && previous.flags != values {
-                            return Err(MailError::backend());
-                        }
-                        if previous.modseq >= modseq {
-                            return Ok(());
-                        }
-                    }
-                    *item = Some(ChangedFlags {
-                        uid,
-                        modseq,
-                        flags: values,
-                    });
+                    change.merge(&mut items[index], base, &mut flag_atoms)?;
                 }
                 _ => {}
             }
@@ -266,9 +230,105 @@ where
     })
 }
 
+pub(super) struct FetchFlags<'a, 'wire> {
+    pub(super) uid: u32,
+    modseq: u64,
+    flags: Option<&'a [Cow<'wire, str>]>,
+}
+
+impl<'a, 'wire> FetchFlags<'a, 'wire> {
+    pub(super) fn read(sequence: u32, attributes: &'a [AttributeValue<'wire>]) -> Result<Self> {
+        let change = Self::read_optional(sequence, attributes)?;
+        if change.flags.is_none() {
+            return Err(MailError::backend());
+        }
+        Ok(change)
+    }
+
+    pub(super) fn read_optional(
+        sequence: u32,
+        attributes: &'a [AttributeValue<'wire>],
+    ) -> Result<Self> {
+        if sequence == 0 {
+            return Err(MailError::backend());
+        }
+        let mut uid = None;
+        let mut modseq = None;
+        let mut flags = None;
+        for attribute in attributes {
+            match attribute {
+                AttributeValue::Uid(value) if *value != 0 && uid.replace(*value).is_none() => {}
+                AttributeValue::ModSeq(value) if modseq.replace(*value).is_none() => {}
+                AttributeValue::Flags(value) if flags.replace(value).is_none() => {}
+                _ => return Err(MailError::backend()),
+            }
+        }
+        Ok(Self {
+            uid: uid.ok_or_else(MailError::backend)?,
+            modseq: modseq.ok_or_else(MailError::backend)?,
+            flags: flags.map(Vec::as_slice),
+        })
+    }
+
+    pub(super) fn merge(
+        self,
+        item: &mut Option<ChangedFlags>,
+        base: u64,
+        atoms: &mut usize,
+    ) -> Result<()> {
+        let Self { uid, modseq, flags } = self;
+        let flags = flags.ok_or_else(MailError::backend)?;
+        if modseq <= base || modseq > MAX_MODSEQ {
+            return Err(MailError::backend());
+        }
+        *atoms += flags.len();
+        if *atoms > FLAG_ATOMS_PER_COMMAND {
+            return Err(MailError::backend());
+        }
+        let mut bytes = 0;
+        let mut values = Vec::with_capacity(flags.len());
+        for flag in flags {
+            let value = format!("{:?}", Flag::from(flag.as_ref()));
+            bytes += value.len();
+            if value.len() > 256 || bytes > FLAG_BYTES_PER_UID {
+                return Err(MailError::backend());
+            }
+            values.push(value);
+        }
+        values.sort_unstable();
+        values.dedup();
+        if let Some(previous) = item {
+            if previous.modseq == modseq && previous.flags != values {
+                return Err(MailError::backend());
+            }
+            if previous.modseq >= modseq {
+                return Ok(());
+            }
+        }
+        *item = Some(ChangedFlags {
+            uid,
+            modseq,
+            flags: values,
+        });
+        Ok(())
+    }
+}
+
 async fn read_evidence<S>(
     session: &mut Session<S>,
     command: &str,
+    visit: impl FnMut(&Response<'_>) -> Result<()>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + Debug,
+{
+    read_evidence_with_limits(session, command, CommandReadLimits::condstore(), visit).await
+}
+
+pub(super) async fn read_evidence_with_limits<S>(
+    session: &mut Session<S>,
+    command: &str,
+    limits: CommandReadLimits,
     mut visit: impl FnMut(&Response<'_>) -> Result<()>,
 ) -> Result<()>
 where
@@ -276,7 +336,7 @@ where
 {
     let result = async {
         let tag = session
-            .run_command_with_limits(command, CommandReadLimits::condstore())
+            .run_command_with_limits(command, limits)
             .await
             .map_err(map_read_imap_error)?;
         loop {
@@ -308,7 +368,7 @@ where
     validated(session, result)
 }
 
-fn validated<S, T>(session: &mut Session<S>, result: Result<T>) -> Result<T>
+pub(super) fn validated<S, T>(session: &mut Session<S>, result: Result<T>) -> Result<T>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + Debug,
 {

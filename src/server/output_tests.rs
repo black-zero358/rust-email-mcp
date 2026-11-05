@@ -32,6 +32,7 @@ mod condstore_acceptance;
 mod conversation;
 mod listing;
 mod parts;
+mod qresync_acceptance;
 mod structure;
 mod sync_acceptance;
 

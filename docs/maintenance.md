@@ -65,7 +65,7 @@ R09 搜索基础继续使用现有两份 vendored 版本、许可证及校验和
 
 R12A 延续相同上游身份，新增 opt-in metadata FETCH 的完整命令和 header literal 双预算，保留普通 FETCH/SEARCH 入口。同步只能对合法单条 SEARCH 的 UID 数量溢出缩窗；重复结果或 UID 提前归为协议错误。升级须同时运行同步、既有正文与根协议回归，核对严格 INTERNALDATE、空 FLAGS、header 原点与分配前限额；V4 检查点和持久收据还需迁移/取消/恢复验证。源码 API 与取代条件继续由两库 PATCHES.md 管理。
 
-R12C 在相同 vendored 上游身份上增加 opt-in CONDSTORE 命令 grammar 与终止接口，包版本、许可证及锁文件保持。升级须运行 `tests/sync_delta_budget.rs`、命令辅助层、V6 存储和签名 HTTP 同步回归，覆盖分片、命令预算、正 63 位水位、只读 EXAMINE、分页/重启/撤权和失败回退；并重跑普通 FETCH/SEARCH/APPEND 的完成状态与原 BODYSTRUCTURE 预算回归。V1–V5 迁移保持不可变，V6 升级失败保留原版本，QRESYNC 接线按后续工作包独立验收。
+R12C 在相同 vendored 上游身份上增加 opt-in CONDSTORE 命令 grammar 与终止接口，R12D 扩展独立 QRESYNC grammar；包版本、许可证及锁文件保持。升级须运行 `tests/sync_delta_budget.rs`、`tests/sync_qresync_budget.rs`、命令辅助层、V6 存储和签名 HTTP 同步回归，覆盖分片、完整命令预算、正 63 位水位、只读 EXAMINE、同连接 ENABLE、压缩 VANISHED 范围与顺序、分页/重启/撤权和两连接回退；并重跑普通 FETCH/SEARCH/APPEND 的完成状态与原 BODYSTRUCTURE 预算回归。R12D 沿用 V6，V1–V6 迁移保持不可变；升级失败保留原版本。完整核对还须覆盖已开始 FIFO 写入及核对结束后才返回的旧网络证据，防止已删除 UID 被重新缓存。
 
 R09 签名 HTTP 回归在 dev-dependencies 中为锁定的 Tokio 版本启用 `test-util`，使用虚拟时钟核对 60 秒请求期限与 10 分钟游标有效期。生产构建沿用原有 Tokio 功能集。
 

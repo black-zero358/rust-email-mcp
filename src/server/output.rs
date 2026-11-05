@@ -84,18 +84,19 @@ fn sync_status() -> Value {
         "tail":nullable(scan.clone()),"reconciliation":nullable(scan),
         "history_coverage":nullable(coverage.clone()),"current_coverage":nullable(coverage)
     }));
+    let lane = nullable(all_required(json!({
+        "uid_validity":uid(),"high_uid":count(),"committed_modseq":string(),
+        "target_modseq":nullable(string()),"known_after":nullable(count()),"checked_at_ms":count()
+    })));
     let folder = all_required(json!({
         "mailbox":string(),"progress":nullable(scope),
         "error":nullable(enumeration(&["quota","storage","verification_pending"])),
-        "condstore":nullable(all_required(json!({
-            "uid_validity":uid(),"high_uid":count(),"committed_modseq":string(),
-            "target_modseq":nullable(string()),"known_after":nullable(count()),"checked_at_ms":count()
-        }))),
+        "condstore":lane.clone(),"qresync":lane,
         "runtime":all_required(json!({
             "last_error":nullable(enumeration(&["network","protocol","storage","quota"])),
             "quota_paused":boolean(),
-            "protocol":enumeration(&["rev1","condstore"]),
-            "protocol_fallback":nullable(enumeration(&["capability_unavailable","extension_failed","nomodseq","modseq_rollback"]))
+            "protocol":enumeration(&["rev1","condstore","qresync"]),
+            "protocol_fallback":nullable(enumeration(&["capability_unavailable","extension_failed","nomodseq","modseq_rollback","qresync_enable_failed","qresync_failed","qresync_reconciliation_required"]))
         }))
     }));
     all_required(json!({

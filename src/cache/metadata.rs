@@ -195,7 +195,12 @@ impl Cache {
             self.write(namespace, database, |tx| {
                 // The selected session can be ahead of the stored watermark.
                 // Keep the deletion fence without rewriting folder observations.
-                let id = ensure_message_row(tx, reference)?;
+                let id = ensure_message_row(
+                    tx,
+                    reference.mailbox,
+                    reference.uid_validity,
+                    reference.uid,
+                )?;
                 mark_tombstone(tx, id, full_schema)
             })?;
         }
@@ -501,18 +506,23 @@ pub(super) fn message_id(tx: &Transaction<'_>, reference: Ref<'_>) -> Result<i64
     if !exists || reference.uid == 0 {
         return Err(CacheError::OutOfScope);
     }
-    ensure_message_row(tx, reference)
+    ensure_message_row(tx, reference.mailbox, reference.uid_validity, reference.uid)
 }
 
-fn ensure_message_row(tx: &Transaction<'_>, reference: Ref<'_>) -> Result<i64, CacheError> {
+pub(super) fn ensure_message_row(
+    tx: &Transaction<'_>,
+    mailbox: &str,
+    uid_validity: u32,
+    uid: u32,
+) -> Result<i64, CacheError> {
     tx.execute(
         "INSERT INTO messages(mailbox,uid_validity,uid) VALUES(?1,?2,?3)
          ON CONFLICT(mailbox,uid_validity,uid) DO NOTHING",
-        params![reference.mailbox, reference.uid_validity, reference.uid],
+        params![mailbox, uid_validity, uid],
     )?;
     Ok(tx.query_row(
         "SELECT id FROM messages WHERE mailbox=?1 AND uid_validity=?2 AND uid=?3",
-        params![reference.mailbox, reference.uid_validity, reference.uid],
+        params![mailbox, uid_validity, uid],
         |row| row.get(0),
     )?)
 }
