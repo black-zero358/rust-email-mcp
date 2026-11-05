@@ -148,6 +148,12 @@ impl Scheduler {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    #[cfg(test)]
+    pub(super) fn admission_counts_for_test(&self) -> (usize, usize) {
+        let state = self.state();
+        (state.admitted, state.running)
+    }
+
     /// Stops new work. A clean shutdown can only be published if no queued
     /// ticket or permit remains, including detached blocking work.
     pub(super) fn stop_admission(&self) -> bool {
