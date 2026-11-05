@@ -396,7 +396,7 @@ UIDVALIDITY 改变立即停用旧世代数据、句柄和游标，后台清理�
 | R06 | 已完成，源码 `885a1ce`；234 单元 + 29 集成、fmt/clippy/release、8 文件联调、审计及实际镜像通过 | parser 基础 [PR #68](https://github.com/black-zero358/rust-email-mcp/pull/68) 已合并；清单与回退 [PR #69](https://github.com/black-zero358/rust-email-mcp/pull/69) 最终 head `351353b` 全部 CI 通过，已合并为 `41fb821`；[离线验证](validation.md#2026-11-03-r06-附件清单与受控回退) |
 | R07 | 已完成；附件部件下载与局部正文均已合并；正文源码 `b4b21da` 的 312 单元 + 34 集成、14 组正文 HTTP、fmt/clippy/release、8 文件联调及审计通过，独立审阅闭环 | 附件 [PR #70](https://github.com/black-zero358/rust-email-mcp/pull/70) 合并为 `7837396`；正文 [PR #71](https://github.com/black-zero358/rust-email-mcp/pull/71) 最终 head `0c07455` 的 check/audit/container 全通过，合并为 `f5e7877`，见[正文离线验证](validation.md#2026-11-05-r07-局部正文读取) |
 | R08 | 已完成；源码 `cc55dca` 的 339 单元 + 34 集成、13 项列表专项、fmt/clippy/release、8 文件联调通过；最终源码独立审阅闭环 | [PR #72](https://github.com/black-zero358/rust-email-mcp/pull/72) 最终 head `93ec230` 的 check/audit/container 全通过，合并为 `d853737`；见[离线验证](validation.md#2026-11-05-r08-正文预览与邮件头分类) |
-| R09 | 实施中；搜索基础源码 `f6b7c4c` 的 339 单元 + 44 集成、fmt/clippy/release、附件离线联调、审计及实际镜像通过，独立审阅闭环，待基础 PR 最终 CI/合并 | 异步通知分配预算已修复；跨目录编排、纯状态/身份/游标和认证 HTTP 验收并行实施，见[基础验证](validation.md#2026-11-05-r09-有界搜索基础) |
+| R09 | 应用层源码 `4e499e4` 已通过 385 单元 + 44 集成、20 组会话 HTTP、fmt/clippy/release、8 文件离线联调、审计、实际生产镜像及独立审阅；等待应用层 PR 最终 CI/合并 | 搜索基础 [PR #73](https://github.com/black-zero358/rust-email-mcp/pull/73) 已合并为 `2a07f31`；见[会话验证](validation.md#2026-11-05-r09-跨文件夹会话)和[基础验证](validation.md#2026-11-05-r09-有界搜索基础) |
 | R10–R13 | 待实施 | 持久化、完整回填、离线及发布验收 |
 
 ## 对照实现
