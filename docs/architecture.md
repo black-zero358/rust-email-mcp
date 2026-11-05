@@ -17,6 +17,7 @@
 | `mail` | IMAP 会话、邮件操作编排、发送意图与结果记录 | 调用 `imap_text`、`mime`、`smtp`、`journal`，持有执行槽位 |
 | `mail/runtime`、`mail/scheduler` | 按主体和账户路由、全局准入及公平调度 | 授权先于队列、缓存和连接；固定原写账户，保持发送生命周期 |
 | `mail/attachments`、`mail/insights` | 附件交付及有界读取扩展 | 由 `mail` 编排，共用 MIME、协议、槽位与预算 |
+| `mail/listing`、`mail/classification` | 摘要分页、附件筛选、可选预览及固定邮件头分类 | 保留最后已检查 UID 游标；分类只使用完整观察到的头字段，预览失败保留摘要 |
 | `mail/parts` | BODYSTRUCTURE、必要 MIME 头、统一部件清单及正文分块读取 | 核对原 DFS 索引后发布引用；正文与 raw MIME 共用候选规则，读回退有独立大小证据、次数及总期限边界 |
 | `imap_text` | rev1 邮箱名、非 ASCII 搜索与严格统计 STATUS | 处理编码、literal 和命令终结；不承担 MCP 授权 |
 | `mime`、`html` | 有界 MIME 解析、正文选择、附件分类、HTML 文本提取 | `mime` 调用 `html`；不执行网络请求、不发送邮件 |
@@ -96,6 +97,14 @@ HTTP 内容固定为 octet-stream，带 no-store/nosniff、`X-Content-SHA256` �
 `mail/insights.rs` 提供有界标识符图会话、精确 Message-ID 定位、严格 STATUS 统计、脱敏诊断与正文展示。头部缓存最多 256 项/16 MiB、60 秒，只保存不可变头部并以新 UIDVALIDITY 失效；正文共用 `mime`/`html` 选择器。统计用 `imap_text::status_counts` 验证完整字段和命令完成。批量修改使用明确 UID、总体期限和逐项结果，失败项保守为 unknown、后续 unprocessed；没有持久化修改日志，重试前必须检查邮箱。范围与限制见 [能力说明](capabilities.md)。
 
 ## MIME and HTML
+
+`mail/listing` 在一个绝对期限内完成列表或搜索。附件筛选使用 PartManifest，必须取得目标 SIZE 和验证的 MIME 头；显式策略回退每页最多一次，关闭旧连接、复查 UIDVALIDITY 与大小，再严格读取 raw。回退后以最后已检查 UID 形成短页，剩余候选由原游标继续。两条串行连接共享同一 `BudgetStream` 剩余额度，新连接的 parser allocation limit 采用该剩余值，保持每页原有传输上限。
+
+摘要先完整消费匹配 tagged OK，再解析或缓存。单个 HEADER literal 最多 8192 字节，严格核对目标 UID、HEADER section、origin 0 和唯一头数据；FLAGS-only 不构造空摘要，实际 FLAGS（含空值）按到达顺序更新。短于取样上限的头可以是无正文、无终止空行的完整头；达到上限且没有结束标记时，分类仅使用已完整观察到的逻辑字段，标记 partial。头部缓存仍遵守其原完整性检查。
+
+`mail/parts/preview` 共用完整正文的候选选择、transfer/charset 解码与 HTML 安全策略。每封 8 KiB、整页 128 KiB 编码申请额度包含非空和 EOF 探针，失败命令不退还；取样最多输出 200 Unicode 码点并跨叶折叠空白。只有完整取得所选叶且验证结束时才 flush transfer/charset 或 HTML EOF。部分 HTML 只处理已完成 token，保留原复杂度与 foreign-content 拒绝。预览期限设为 5 秒与总期限剩余一半中的较小值；网络等待按期限取消，同步 MIME 解析受字节/结构界限约束，取样完成后再核对期限。本地错误可继续、协议错误或超时停止后续预览，已经取得的摘要与游标始终保留。筛选已读回的单个 raw 只为匹配 UID 保留至该项本地取样结束，最多 32 MiB，并共用页预览额度。
+
+列表分类采用固定 `headers-v1`：信号只包含允许字段名和类别。退订 URI 的语法、2048 字节及协议检查均在本地完成，不访问外部地址。完整响应预算通过 `bounded_listing_result` 计入真实 JSON-RPC id、request_id 及转义副本；必要时从尾部撤掉预览并标记 wire_budget_skipped。状态字段仍超限时，整页省略全部可选预览字段，保留摘要、分类及分页信息；仅基础元数据超限返回 LIMIT_EXCEEDED。
 
 `get_email`、`get_emails` 和 `read_conversation` 共用 `mail/parts/body` 的正文读取会话。先完成独立 SIZE、BODYSTRUCTURE 和必要 MIME 头核对，再由 `mime/selection` 在 raw 树与已核对部件树上使用同一候选规则。所有选中叶按原 DFS 顺序共享编码长度四倍的 32 MiB 解码预留和 HTML 预算；transfer 与 charset 状态跨 64 KiB 块保留。完整正文验证后应用显示截断，包括 `max_body_length:0`。成功输出增加有界 `read_diagnostics`，UTF-7 的固定 raw 回退原因为 `charset_utf7`。
 
@@ -190,6 +199,8 @@ R04 的 D1/D2/D3/D5 回归入口为 `opaque_ids_bind_every_reference_dimension_a
 R02/R03 的新增验证入口：`accounts/tests.rs` 覆盖 D1/D4 的身份绑定、并发初始化、损坏与恢复；`every_read_output_schema_validates_real_handler_success_and_empty_results` 和其余 `server/output_tests` 覆盖 D3/D5 的正常、局部失败、诊断超时和完整 wire 压缩结果；`readable_reads_use_one_display_policy_while_forward_keeps_legacy_body`、`readable_html_expansion_uses_display_budget_after_bounded_charset_decode` 及 `html/readable` 回归覆盖 MIME 候选、旧转发、显示膨胀与跨部件预算。
 
 R07 正文的 D2/D3/D5 验证入口为 `server::output_tests::body_parts`：14 组认证 HTTP 场景对照 raw 与 parts 的三种正文工具，覆盖 40 MiB 邮件的小正文、隐式 charset、alternative/related、拆块字符、HTML 共享预算、完整 wire 前缀、重复 UID、UTF-7 和 UIDVALIDITY、局部错误继续，以及 raw/HEADER/部件协议失败停止。`mail::parts::charset_decode` 覆盖编码/BOM/输出边界，`mail::parts::body` 对照传输与字符解码，`mail::parts::mapping::body_selection_tests` 核对完整候选、默认字符集和全树头部预算，`mail::parts::reader::tests` 核对 tagged completion 与预算失败阶段。
+
+R08 的 D2/D3/D5 验证入口为 `server::output_tests::listing`，覆盖默认关闭的预览、完整/部分头分类、严格摘要协议、非首正文部件、FLAGS 更新、HTML 与字符截断、页取样额度、逐项错误和摘要保留、完整 wire 预算及附件筛选游标。`preview_reuses_the_single_validated_attachment_filter_fallback` 核对筛选回退与预览组合只读一次；`replacement_stream_spends_only_the_page_budget_left_by_the_first` 核对替换连接共用传输余额。`mail::classification` 与 `mail::parts::preview` 的合成回归分别覆盖固定头规则、URI 与字段截断，以及网络/本地 raw 共用的前缀解码和字符数限制。
 
 以下为当前选择的简短追溯记录，状态均为“采用”。新决策记录背景、决定、代价及重审条件；被替代的决策保留并指向后继记录，不以部署状态覆盖设计历史。
 

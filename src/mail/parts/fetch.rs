@@ -166,7 +166,7 @@ where
     .await
 }
 
-pub(super) async fn whole_message<S>(
+pub(in crate::mail) async fn whole_message<S>(
     session: &mut async_imap::Session<S>,
     uid: u32,
     request: usize,

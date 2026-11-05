@@ -355,7 +355,7 @@ fn transfer_error(error: transfer_decode::DecodeError) -> MailError {
         _ => MailError::backend(),
     }
 }
-fn decode_charset(
+pub(super) fn decode_charset(
     decoder: &mut charset_decode::CharsetDecoder,
     input: &[u8],
     eof: bool,
@@ -384,7 +384,7 @@ fn decode_charset(
         }
     }
 }
-fn decode_transfer(
+pub(super) fn decode_transfer(
     decoder: &mut transfer_decode::Decoder,
     charset: &mut charset_decode::CharsetDecoder,
     input: &[u8],

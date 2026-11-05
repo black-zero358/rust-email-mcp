@@ -44,6 +44,8 @@ MIME 在构建结构时限制为 1024 个节点、32 层嵌套，头部每段最
 文件夹名称在工具参数、LIST 返回值和 DRAFTS_MAILBOX/TRASH_MAILBOX 配置中使用 Unicode；返回的 name 可直接传给读取、移动或重命名工具。连接采用 IMAP4rev1，线路上的名称使用 modified UTF-7，包含 & 的名称也会正确转换。非规范或无法安全往返的服务端名称返回 MAIL_BACKEND，避免误引用其他文件夹。ASCII 搜索继续使用 US-ASCII；中文等非 ASCII 查询使用 CHARSET UTF-8 和同步 literal。服务器返回 BADCHARSET 时报告 UNSUPPORTED_CHARSET，不降级为含义不同的查询；未协商 UTF8=ACCEPT 或 IMAP4rev2。
 搜索支持日期、发件人、收件人、主题、已读、星标、已回复、附件和大小组合。会话根据关联头组织；跨文件夹定位使用精确 Message-ID。批量整理最多 50 个明确 UID，保留逐项结果，批量删除必须确认。
 
+列表和搜索可用 `preview:true` 附带最多 200 个 Unicode 码点的正文预览，每封编码取样最多 8 KiB、每页共用 128 KiB。预览失败或达到额度时保留摘要及分页游标，逐项状态说明原因。摘要同时按邮件头给出 newsletter、automated 或 unclassified 分类与固定规则信号；退订字段只提示是否有可用地址。附件筛选优先核对 MIME 结构与头部，必要时每页最多一次有界整封回退。详细状态与限制见[能力说明](docs/capabilities.md#筛选与分页)。
+
 正文支持完整或去引用模式、长度设置及省略提示。单封、批量和会话读取先核对邮件结构及 MIME 头，再按 64 KiB 分块读取所选正文；大附件邮件中的小正文可独立读取。`get_email` 在正文长度上限内，按完整 JSON-RPC 响应预算返回可容纳的最长 UTF-8 正文前缀；额外截断设置 `body_truncated=true`。`body_byte_limit` 表示正文配置上限，实际正文可能因 JSON 转义、元数据和调用 id 而更短；元数据本身超限仍返回 `LIMIT_EXCEEDED`。所有显示长度选项均在完整正文校验后应用。整封 MIME 读取上限 32 MiB，单次工具输出上限 2 MiB。附件发现和下载准备优先读取邮件结构及必要 MIME 头，并核对原有附件索引；正文或附件需要整体解析时，在大小上限内回退一次整封读取。认证 HTTP 下载按 64 KiB 分块读取所选附件，完整解码并校验后提供文件；解码附件上限 32 MiB，连接累计读取上限 128 MiB，因此可下载超过整封上限的邮件中的小附件。内联 Base64 及需要整体解析的回退仍受整封 32 MiB 限制。新邮件支持文本；现有草稿发送保留原 MIME 附件。转发工具发送原邮件的纯文本内容。
 
 `download_attachment` 保留原有内联 Base64 返回格式及输出预算。附件支持稳定 `attachment_id` 或原有 `attachment_index` 选择；`list_attachments` 返回安全文件名、大小精度、可下载状态及交付方式，`prepare_attachment_download` 返回同主体 Bearer 认证的短期 URL。下载响应提供 SHA-256，客户端可核对文件完整性。仓库提供[标准客户端适配器](scripts/attachment-client-adapter/README.md)，用于认证下载、校验及本地落盘。当前仅用模拟邮箱和合成文件离线测试下载及内容读取，ChatGPT 实际连接测试放到后续阶段。参数与范围限制见 [邮件能力扩展](docs/capabilities.md)。

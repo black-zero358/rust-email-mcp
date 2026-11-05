@@ -31,7 +31,7 @@ impl ManifestDiagnostics {
     }
 }
 #[derive(Clone, Copy)]
-pub(super) enum Fallback {
+pub(in crate::mail) enum Fallback {
     StructureLimit,
     StructureRejected,
     MappingUnverified,
@@ -81,7 +81,7 @@ pub(in crate::mail) fn map_read_imap_error(error: ImapError) -> MailError {
     }
 }
 
-pub(super) enum FetchFailure {
+pub(in crate::mail) enum FetchFailure {
     Imap(ImapError),
     Backend,
     Missing,
@@ -92,7 +92,7 @@ pub(super) enum FetchFailure {
     },
 }
 impl FetchFailure {
-    pub(super) fn mail(self) -> MailError {
+    pub(in crate::mail) fn mail(self) -> MailError {
         match self {
             Self::Imap(error) => map_read_imap_error(error),
             Self::Missing => not_found(),
@@ -133,7 +133,7 @@ fn not_found() -> MailError {
 }
 
 /// Consume through the matching OK. ResponseData owners are retained only when needed.
-async fn command<S>(
+pub(in crate::mail) async fn command<S>(
     session: &mut async_imap::Session<S>,
     query: String,
     limits: Option<CommandReadLimits>,
@@ -197,7 +197,7 @@ fn matches_uid(attrs: &[AttributeValue<'_>], uid: u32) -> std::result::Result<bo
     Ok(first == Some(uid))
 }
 
-pub(super) async fn size<S>(
+pub(in crate::mail) async fn size<S>(
     session: &mut async_imap::Session<S>,
     uid: u32,
 ) -> std::result::Result<usize, FetchFailure>
@@ -378,7 +378,7 @@ where
         .collect()
 }
 
-pub(super) async fn manifest<S>(
+pub(in crate::mail) async fn manifest<S>(
     session: &mut async_imap::Session<S>,
     uid: u32,
 ) -> std::result::Result<PartManifest, FetchFailure>

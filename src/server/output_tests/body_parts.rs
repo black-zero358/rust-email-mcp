@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 
 const CHUNK: usize = 64 * 1024;
 
-struct Entity {
+pub(super) struct Entity {
     headers: Vec<u8>,
     encoded: Vec<u8>,
     structure: String,
@@ -28,7 +28,7 @@ fn parameters(values: &BTreeMap<String, String>) -> String {
     )
 }
 impl Entity {
-    fn leaf(headers: &str, bytes: impl Into<Vec<u8>>) -> Self {
+    pub(super) fn leaf(headers: &str, bytes: impl Into<Vec<u8>>) -> Self {
         let headers = format!("{headers}\r\n\r\n").into_bytes();
         let parsed = crate::mime::parse(&headers).unwrap();
         let (kind, subtype) = parsed.ctype.mimetype.split_once('/').unwrap();
@@ -71,13 +71,18 @@ impl Entity {
             children: Vec::new(),
         }
     }
-    fn text(body: &str) -> Self {
+    pub(super) fn text(body: &str) -> Self {
         Self::leaf(
             "Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit",
             body.as_bytes().to_vec(),
         )
     }
-    fn multipart(subtype: &str, boundary: &str, extra: &str, children: Vec<Self>) -> Self {
+    pub(super) fn multipart(
+        subtype: &str,
+        boundary: &str,
+        extra: &str,
+        children: Vec<Self>,
+    ) -> Self {
         let headers =
             format!("Content-Type: multipart/{subtype}; boundary={boundary}{extra}\r\n\r\n")
                 .into_bytes();
@@ -106,13 +111,13 @@ impl Entity {
             children,
         }
     }
-    fn raw(&self, uid: u32) -> Vec<u8> {
+    pub(super) fn raw(&self, uid: u32) -> Vec<u8> {
         let mut raw = format!("Message-ID: <id{uid}@example.test>\r\nReferences: <id7@example.test>\r\nSubject: 合成正文 \\\"\r\nFrom: sender@example.test\r\nTo: owner@example.test\r\n").into_bytes();
         raw.extend_from_slice(&self.headers);
         raw.extend_from_slice(&self.encoded);
         raw
     }
-    fn install(&self, h: &Harness, uid: u32) {
+    pub(super) fn install(&self, h: &Harness, uid: u32) {
         h.structure.structures.lock().unwrap().insert(
             uid,
             structure::Reply::Data(
@@ -141,14 +146,20 @@ impl Entity {
         }
     }
 }
-fn signed(h: &Harness) -> (Router, String) {
+pub(super) fn signed(h: &Harness) -> (Router, String) {
     let credentials = attachments::Credentials::new(h.service.config().clone());
     (
         attachments::router(h.service.clone(), credentials.auth.clone()),
         credentials.token(),
     )
 }
-async fn call(h: &Harness, app: &Router, token: &str, name: &str, mut args: Value) -> Value {
+pub(super) async fn call(
+    h: &Harness,
+    app: &Router,
+    token: &str,
+    name: &str,
+    mut args: Value,
+) -> Value {
     args.as_object_mut()
         .unwrap()
         .entry("uid_validity")
@@ -183,10 +194,10 @@ async fn call(h: &Harness, app: &Router, token: &str, name: &str, mut args: Valu
     assert_eq!(copy, content);
     content
 }
-fn commands(h: &Harness) -> Vec<(usize, String)> {
+pub(super) fn commands(h: &Harness) -> Vec<(usize, String)> {
     h.structure.commands.lock().unwrap().clone()
 }
-fn raw_fetches(h: &Harness) -> Vec<(usize, String)> {
+pub(super) fn raw_fetches(h: &Harness) -> Vec<(usize, String)> {
     commands(h)
         .into_iter()
         .filter(|(_, command)| command.contains("BODY.PEEK[]"))

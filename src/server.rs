@@ -226,6 +226,81 @@ fn bounded_collection_result(
     });
     bounded_tool_result(result, request_id, id, limit)
 }
+
+/// Keep every summary and the continuation cursor when optional previews overflow the wire budget.
+fn bounded_listing_result(
+    result: crate::error::Result<Value>,
+    request_id: &str,
+    id: &RequestId,
+    limit: usize,
+) -> std::result::Result<CallToolResult, ErrorData> {
+    let result = result.map(|mut value| {
+        let fits = |value: &Value| {
+            response_fits(
+                &CallToolResult::structured(json!({"data":value,"request_id":request_id})),
+                id,
+                limit,
+            )
+        };
+        if fits(&value) {
+            return value;
+        }
+        let Some(emails) = value.get("emails").and_then(Value::as_array) else {
+            return value;
+        };
+        let previews = emails
+            .iter()
+            .enumerate()
+            .filter_map(|(index, email)| {
+                (email.get("preview").is_some() || email.get("preview_error").is_some())
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if !previews.is_empty() {
+            let render = |keep: usize, value: &mut Value| {
+                for &index in &previews[keep..] {
+                    let email = value["emails"][index]
+                        .as_object_mut()
+                        .expect("listing summary is an object");
+                    email.remove("preview");
+                    email.remove("preview_truncated");
+                    email.remove("preview_error");
+                    email.insert("preview_status".into(), json!("wire_budget_skipped"));
+                }
+            };
+            let (mut low, mut high) = (0, previews.len() - 1);
+            while low < high {
+                let mid = low + (high - low).div_ceil(2);
+                let mut candidate = value.clone();
+                render(mid, &mut candidate);
+                if fits(&candidate) {
+                    low = mid;
+                } else {
+                    high = mid - 1;
+                }
+            }
+            render(low, &mut value);
+            if fits(&value) {
+                return value;
+            }
+        }
+        // A tight response budget may accommodate the summaries alone.
+        if let Some(emails) = value["emails"].as_array_mut() {
+            for email in emails.iter_mut().filter_map(Value::as_object_mut) {
+                for field in [
+                    "preview",
+                    "preview_truncated",
+                    "preview_error",
+                    "preview_status",
+                ] {
+                    email.remove(field);
+                }
+            }
+        }
+        value
+    });
+    bounded_tool_result(result, request_id, id, limit)
+}
 pub fn is_send(name: &str) -> bool {
     ["send_email", "send_draft", "reply_email", "forward_email"].contains(&name)
 }
@@ -292,14 +367,14 @@ pub fn tools(mode: &str) -> Vec<Tool> {
         ),
         (
             "list_emails",
-            "List newest metadata in a bounded UID window. Follow next_before_uid even if a page is empty.",
-            json!({"mailbox":mailbox,"limit":{"type":"integer","minimum":1,"maximum":50,"default":20},"before_uid":uid,"uid_validity":uid}),
+            "List newest metadata and header classifications in a bounded UID window. Set preview to true to request bounded body previews and inspect each preview_status. Follow next_before_uid even if a page is empty.",
+            json!({"mailbox":mailbox,"limit":{"type":"integer","minimum":1,"maximum":50,"default":20},"before_uid":uid,"uid_validity":uid,"preview":{"type":"boolean","default":false}}),
             vec![],
         ),
         (
             "search_emails",
-            "Search using server filters, then bounded whole-message attachment filtering. Dates are YYYY-MM-DD (since inclusive, before exclusive); sizes inclusive bytes. Follow next_before_uid even on empty pages.",
-            json!({"mailbox":mailbox,"query":{"type":"string","maxLength":512},"from":{"type":"string","maxLength":512},"to":{"type":"string","maxLength":512},"subject":{"type":"string","maxLength":512},"since":{"type":"string","minLength":10,"maxLength":10},"before":{"type":"string","minLength":10,"maxLength":10},"seen":{"type":"boolean"},"flagged":{"type":"boolean"},"answered":{"type":"boolean"},"has_attachment":{"type":"boolean"},"min_size":{"type":"integer","minimum":0,"maximum":4294967295_u64},"max_size":{"type":"integer","minimum":0,"maximum":4294967295_u64},"limit":{"type":"integer","minimum":1,"maximum":50},"before_uid":uid,"uid_validity":uid}),
+            "Search using server filters and verified MIME metadata for has_attachment. Dates are YYYY-MM-DD with an inclusive since and exclusive before. Sizes use inclusive byte bounds. Set preview to true for bounded body previews. Follow next_before_uid even on empty pages.",
+            json!({"mailbox":mailbox,"query":{"type":"string","maxLength":512},"from":{"type":"string","maxLength":512},"to":{"type":"string","maxLength":512},"subject":{"type":"string","maxLength":512},"since":{"type":"string","minLength":10,"maxLength":10},"before":{"type":"string","minLength":10,"maxLength":10},"seen":{"type":"boolean"},"flagged":{"type":"boolean"},"answered":{"type":"boolean"},"has_attachment":{"type":"boolean"},"min_size":{"type":"integer","minimum":0,"maximum":4294967295_u64},"max_size":{"type":"integer","minimum":0,"maximum":4294967295_u64},"limit":{"type":"integer","minimum":1,"maximum":50},"before_uid":uid,"uid_validity":uid,"preview":{"type":"boolean","default":false}}),
             vec![],
         ),
         (
@@ -606,6 +681,8 @@ impl ServerHandler for EmailServer {
         let service = self.0.clone();
         let truncate_email = name == "get_email";
         let truncate_collection = matches!(name.as_str(), "get_emails" | "read_conversation");
+        let fit_previews =
+            matches!(name.as_str(), "list_emails" | "search_emails") && args["preview"] == true;
         let started = Instant::now();
         let log_name = name.clone();
         let log_id = request_id.clone();
@@ -657,6 +734,8 @@ impl ServerHandler for EmailServer {
             bounded_email_result
         } else if truncate_collection {
             bounded_collection_result
+        } else if fit_previews {
+            bounded_listing_result
         } else {
             bounded_tool_result
         };

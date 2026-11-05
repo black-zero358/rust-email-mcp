@@ -4,8 +4,9 @@ mod body_tree;
 pub(super) mod charset_decode;
 pub(in crate::mail) mod fetch;
 mod mapping;
+pub(in crate::mail) mod preview;
 mod raw;
-mod reader;
+pub(in crate::mail) mod reader;
 pub(super) mod transfer_decode;
 
 pub(super) use mapping::{ManifestPart, PartManifest};

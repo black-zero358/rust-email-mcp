@@ -262,6 +262,10 @@ impl Part<'_> {
         self.body.len()
     }
 
+    pub(crate) fn encoded_body(&self) -> &[u8] {
+        self.body
+    }
+
     pub(crate) fn attachment_encoding_supported(&self) -> bool {
         self.transfer_encoding().is_ok()
     }

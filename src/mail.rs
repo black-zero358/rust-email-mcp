@@ -9,7 +9,9 @@ use crate::{
     smtp::SmtpSender,
 };
 pub mod attachments;
+mod classification;
 pub mod insights;
+mod listing;
 mod parts;
 mod runtime;
 pub(crate) mod scheduler;
@@ -49,13 +51,11 @@ pub struct BudgetStream<T> {
 impl<T> BudgetStream<T> {
     pub fn new(inner: T, budget: usize) -> (Self, Arc<AtomicUsize>) {
         let remaining = Arc::new(AtomicUsize::new(budget));
-        (
-            Self {
-                inner,
-                remaining: remaining.clone(),
-            },
-            remaining,
-        )
+        (Self::with_remaining(inner, remaining.clone()), remaining)
+    }
+
+    fn with_remaining(inner: T, remaining: Arc<AtomicUsize>) -> Self {
+        Self { inner, remaining }
     }
 }
 impl<T: AsyncRead + Unpin> AsyncRead for BudgetStream<T> {
@@ -201,13 +201,17 @@ impl MailService {
     }
 
     async fn connect(&self) -> Result<Session> {
-        self.connect_for(false).await
+        self.connect_for(false, None).await
     }
     async fn connect_read(&self) -> Result<Session> {
-        self.connect_for(true).await
+        self.connect_for(true, None).await
     }
-    async fn connect_for(&self, read: bool) -> Result<Session> {
-        let result = self.connect_inner(read).await;
+    async fn connect_for(
+        &self,
+        read: bool,
+        remaining: Option<Arc<AtomicUsize>>,
+    ) -> Result<Session> {
+        let result = self.connect_inner(read, remaining).await;
         if result
             .as_ref()
             .is_err_and(|error| error.code == "MAIL_BACKEND")
@@ -217,7 +221,17 @@ impl MailService {
         result
     }
 
-    async fn connect_inner(&self, read: bool) -> Result<Session> {
+    async fn connect_inner(
+        &self,
+        read: bool,
+        remaining: Option<Arc<AtomicUsize>>,
+    ) -> Result<Session> {
+        let remaining =
+            remaining.unwrap_or_else(|| Arc::new(AtomicUsize::new(self.config.max_message * 4)));
+        let budget = remaining.load(Ordering::Relaxed);
+        if budget == 0 {
+            return Err(MailError::limit_kind(LimitKind::ConnectionBytes));
+        }
         let tls = ClientConfig::builder()
             .with_root_certificates(self.imap_roots())
             .with_no_client_auth();
@@ -230,8 +244,7 @@ impl MailService {
             .connect(name, tcp)
             .await
             .map_err(|_| MailError::backend())?;
-        let budget = self.config.max_message * 4;
-        let (stream, _) = BudgetStream::new(stream, budget);
+        let stream = BudgetStream::with_remaining(stream, remaining);
         let mut client = async_imap::Client::with_buffer_limit(stream, budget);
         client.read_response().await.map_err(|error| {
             if read {
@@ -334,6 +347,12 @@ impl MailService {
                 _ => Ok(batch_unprocessed(&ids)),
             };
         }
+        if matches!(name, "list_emails" | "search_emails") {
+            let deadline = tokio::time::Instant::now() + self.config.timeout;
+            return tokio::time::timeout_at(deadline, self.list_operation(name, args, deadline))
+                .await
+                .map_err(|_| self.backend_timeout())?;
+        }
         tokio::time::timeout(self.config.timeout, self.imap_operation(name, args))
             .await
             .map_err(|_| self.backend_timeout())?
@@ -387,7 +406,6 @@ impl MailService {
                     .collect::<Result<Vec<_>>>()?;
                 Ok(json!({"mailboxes":mailboxes}))
             }
-            "list_emails" | "search_emails" => self.list(s, a, name == "search_emails").await,
             "get_email_status" | "download_attachment" => {
                 let folder = folder(a, InputLimits::Read)?;
                 let uid = uid(a)?;
@@ -539,13 +557,6 @@ impl MailService {
         Ok(run_batch(&mut executor, &ids, deadline).await)
     }
 
-    async fn raw<S>(&self, s: &mut async_imap::Session<S>, uid: u32) -> Result<Vec<u8>>
-    where
-        S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
-    {
-        self.raw_with_limits(s, uid, InputLimits::Read).await
-    }
-
     async fn raw_with_limits<S>(
         &self,
         s: &mut async_imap::Session<S>,
@@ -622,154 +633,6 @@ impl MailService {
             return Err(MailError::backend());
         }
         Ok(body.to_vec())
-    }
-    async fn list<S>(
-        &self,
-        s: &mut async_imap::Session<S>,
-        a: &Value,
-        search: bool,
-    ) -> Result<Value>
-    where
-        S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
-    {
-        let m = s
-            .examine(mailbox_name(
-                folder(a, InputLimits::Read)?,
-                InputLimits::Read,
-            )?)
-            .await
-            .map_err(map_read_imap_error)?;
-        check_validity(a, m.uid_validity)?;
-        let limit = number(a, "limit", 20, 1, LIST_PAGE_ITEMS as u64)? as usize;
-        let before = number(
-            a,
-            "before_uid",
-            m.uid_next.unwrap_or(u32::MAX) as u64,
-            1,
-            u32::MAX as u64,
-        )? as u32;
-        if m.exists == 0 || before <= 1 {
-            return Ok(json!({"emails":[],"next_before_uid":null,"uid_validity":m.uid_validity}));
-        }
-        // Scan a finite UID window; callers explicitly advance the cursor even for sparse results.
-        let end = before - 1;
-        let start = end.saturating_sub(SCAN_UID_WINDOW - 1).max(1);
-        let mut filters = a.clone();
-        for field in ["query", "from", "to", "subject"] {
-            filters
-                .as_object_mut()
-                .ok_or_else(MailError::input)?
-                .remove(field);
-        }
-        let query = search_query(&filters, start, end, search)?;
-        let has_text = search
-            && ["query", "from", "to", "subject"]
-                .iter()
-                .any(|key| a.get(key).is_some());
-        let mut found = if has_text && query == format!("UID {start}:{end}") {
-            None
-        } else {
-            Some(s.uid_search(query).await.map_err(map_read_imap_error)?)
-        };
-        if search {
-            for (field, key) in [
-                ("query", "TEXT"),
-                ("from", "FROM"),
-                ("to", "TO"),
-                ("subject", "SUBJECT"),
-            ] {
-                if a.get(field).is_some() {
-                    let matching = uid_field_search(s, start, end, key, text(a, field)?).await?;
-                    if let Some(ids) = &mut found {
-                        ids.retain(|uid| matching.contains(uid));
-                    } else {
-                        found = Some(matching);
-                    }
-                }
-            }
-        }
-        let found = found.unwrap_or_default();
-        let mut ids = found
-            .into_iter()
-            .filter(|u| *u >= start && *u <= end)
-            .collect::<Vec<_>>();
-        ids.sort_unstable_by(|a, b| b.cmp(a));
-        let mut last_examined = None;
-        if let Some(wanted) = a.get("has_attachment") {
-            let wanted = wanted.as_bool().ok_or_else(MailError::input)?;
-            let mut matches = Vec::new();
-            for id in &ids {
-                last_examined = Some(*id);
-                let raw = self.raw(s, *id).await?;
-                if attachments::has_attachment(&raw)? == wanted {
-                    matches.push(*id);
-                }
-                if matches.len() == limit {
-                    break;
-                }
-            }
-            // Retain the last examined UID, not the last server match: rejected
-            // BODYSTRUCTURE candidates must not be revisited or skipped incorrectly.
-            ids = matches;
-        }
-        let more = ids.len() > limit;
-        ids.truncate(limit);
-        let next = page_cursor(
-            start,
-            &ids,
-            limit,
-            more,
-            a.get("has_attachment").is_some(),
-            last_examined,
-        );
-        if ids.is_empty() {
-            return Ok(json!({"emails":[],"next_before_uid":next,"uid_validity":m.uid_validity}));
-        }
-        let set = ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
-        let fetched = s
-            .uid_fetch(set, "(UID FLAGS RFC822.SIZE BODY.PEEK[HEADER]<0.8192>)")
-            .await
-            .map_err(map_read_imap_error)?
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(map_read_imap_error)?;
-        #[derive(Default)]
-        struct Summary<'a> {
-            header: Option<&'a [u8]>,
-            size: Option<u32>,
-            flags: Vec<String>,
-        }
-        let mut summaries = std::collections::BTreeMap::<u32, Summary<'_>>::new();
-        for f in &fetched {
-            let Some(id) = f.uid.filter(|id| ids.contains(id)) else {
-                continue;
-            };
-            let summary = summaries.entry(id).or_default();
-            if let Some(header) = f.header() {
-                summary.header = Some(header);
-            }
-            if let Some(size) = f.size {
-                summary.size = Some(size);
-            }
-            if f.has_flags() {
-                summary.flags = f.flags().map(|flag| format!("{flag:?}")).collect();
-            }
-        }
-        let mut out = Vec::new();
-        for (id, summary) in summaries.into_iter().rev() {
-            // A FLAGS-only update is not evidence of an empty message header.
-            let Some(header) = summary.header else {
-                continue;
-            };
-            if header.len() < 8192 {
-                self.remember_headers(folder(a, InputLimits::Read)?, m.uid_validity, id, header);
-            }
-            let headers = mime::headers(header)?;
-            out.push(json!({"uid":id,"subject":headers.get_first_value("Subject"),"from":headers.get_first_value("From"),"date":headers.get_first_value("Date"),"size":summary.size,"flags":summary.flags}));
-        }
-        Ok(
-            json!({"emails":out,"uid_validity":m.uid_validity,"next_before_uid":next,"scanned_uid_range":[start,end]}),
-        )
     }
     async fn send(&self, name: &str, a: &Value, principal: &str) -> Result<Value> {
         let key = text(a, "operation_key")?;
@@ -1935,7 +1798,13 @@ mod tests {
                     (size_command.clone(), format!("{unrelated}{size_rows}"), "OK"),
                     (body_command.clone(), format!("* 2 FETCH (UID 99 BODY[] {{5}}\r\nother)\r\n* 3 FETCH (BODY[] {{5}}\r\nother)\r\n{body_rows}"), "OK"),
                 ]).await;
-                assert_eq!(service.raw(&mut session, 7).await.unwrap(), raw.as_bytes());
+                assert_eq!(
+                    service
+                        .raw_with_limits(&mut session, 7, InputLimits::Read)
+                        .await
+                        .unwrap(),
+                    raw.as_bytes()
+                );
                 backend.await.unwrap();
             }
         }
@@ -1954,7 +1823,11 @@ mod tests {
             }
             let (mut session, backend) = fetch_script(script).await;
             assert_eq!(
-                service.raw(&mut session, 7).await.unwrap_err().code,
+                service
+                    .raw_with_limits(&mut session, 7, InputLimits::Read)
+                    .await
+                    .unwrap_err()
+                    .code,
                 "MAIL_BACKEND"
             );
             backend.await.unwrap();
@@ -1971,7 +1844,11 @@ mod tests {
                 }
                 let (mut session, backend) = fetch_script(script).await;
                 assert_eq!(
-                    service.raw(&mut session, 7).await.unwrap_err().code,
+                    service
+                        .raw_with_limits(&mut session, 7, InputLimits::Read)
+                        .await
+                        .unwrap_err()
+                        .code,
                     "MAIL_BACKEND"
                 );
                 backend.await.unwrap();
@@ -1986,7 +1863,7 @@ mod tests {
             for header in [None, Some("")] {
                 let rows = match header {
                     Some(header) => format!(
-                        "* 1 FETCH (UID 7 FLAGS () BODY[HEADER] {{{}}}\r\n{header})\r\n",
+                        "* 1 FETCH (UID 7 FLAGS () BODY[HEADER]<0> {{{}}}\r\n{header})\r\n",
                         header.len()
                     ),
                     None => "* 1 FETCH (UID 7 FLAGS (\\Seen))\r\n".into(),
@@ -2006,13 +1883,10 @@ mod tests {
                     ),
                 ])
                 .await;
-                let result = service.list(&mut session, &json!({"limit":1}), false).await;
+                let result = list_summaries(&service, &mut session, 1, false).await;
                 backend.await.unwrap();
                 if status == "OK" {
-                    assert_eq!(
-                        result.unwrap()["emails"].as_array().unwrap().len(),
-                        usize::from(header.is_some())
-                    );
+                    assert_eq!(result.unwrap().len(), usize::from(header.is_some()));
                 } else {
                     assert_eq!(result.unwrap_err().code, "MAIL_BACKEND");
                 }
@@ -2026,10 +1900,10 @@ mod tests {
         let header = "Subject: split\r\n\r\n";
         let mut rows = String::new();
         for uid in [5, 6, 7] {
-            rows.push_str(&format!("* 1 FETCH (UID {uid} FLAGS (\\Flagged))\r\n* 1 FETCH (UID {uid} BODY[HEADER] {{{}}}\r\n{header})\r\n* 1 FETCH (UID {uid} RFC822.SIZE 100)\r\n", header.len()));
+            rows.push_str(&format!("* 1 FETCH (UID {uid} FLAGS (\\Flagged))\r\n* 1 FETCH (UID {uid} BODY[HEADER]<0> {{{}}}\r\n{header})\r\n* 1 FETCH (UID {uid} RFC822.SIZE 100)\r\n", header.len()));
         }
         rows.push_str(&format!(
-            "* 1 FETCH (BODY[HEADER] {{{}}}\r\n{header})\r\n",
+            "* 1 FETCH (BODY[HEADER]<0> {{{}}}\r\n{header})\r\n",
             header.len()
         ));
         let (mut session, backend) = fetch_script(vec![
@@ -2050,15 +1924,14 @@ mod tests {
             ),
         ])
         .await;
-        let result = service
-            .list(&mut session, &json!({"limit":2}), false)
+        let result = list_summaries(&service, &mut session, 2, false)
             .await
             .unwrap();
         backend.await.unwrap();
-        assert_eq!(result["emails"].as_array().unwrap().len(), 2);
-        assert_eq!(result["emails"][0]["uid"], 7);
-        assert_eq!(result["emails"][1]["uid"], 6);
-        for email in result["emails"].as_array().unwrap() {
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0]["uid"], 7);
+        assert_eq!(result[1]["uid"], 6);
+        for email in result {
             assert_eq!(email["subject"], "split");
             assert_eq!(email["flags"], json!(["Flagged"]));
             assert_eq!(email["size"], 100);
@@ -2070,7 +1943,7 @@ mod tests {
         let (_dir, service) = fetch_fixture();
         let header = "Subject: synthetic\r\nFrom: sender@example.invalid\r\n\r\n";
         let full = format!(
-            "* 1 FETCH (UID 7 FLAGS (\\Seen) RFC822.SIZE 100 BODY[HEADER] {{{}}}\r\n{header})\r\n",
+            "* 1 FETCH (UID 7 FLAGS (\\Seen) RFC822.SIZE 100 BODY[HEADER]<0> {{{}}}\r\n{header})\r\n",
             header.len()
         );
         for tool in ["list_emails", "search_emails"] {
@@ -2093,12 +1966,10 @@ mod tests {
                     ),
                 ])
                 .await;
-                let result = service
-                    .with_session(&mut session, tool, &json!({"limit":1}))
+                let emails = list_summaries(&service, &mut session, 1, tool == "search_emails")
                     .await
                     .unwrap();
                 backend.await.unwrap();
-                let emails = result["emails"].as_array().unwrap();
                 assert_eq!(emails.len(), 1);
                 assert_eq!(emails[0]["uid"], 7);
                 assert_eq!(emails[0]["subject"], "synthetic");
@@ -2113,6 +1984,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    async fn list_summaries<S>(
+        service: &MailService,
+        session: &mut async_imap::Session<S>,
+        limit: usize,
+        search: bool,
+    ) -> Result<Vec<Value>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
+    {
+        let page = list_test_page(service, session, &json!({"limit":limit}), search).await?;
+        Ok(page["emails"]
+            .as_array()
+            .expect("fixture summaries")
+            .clone())
+    }
+
+    async fn list_test_page<S>(
+        service: &MailService,
+        session: &mut async_imap::Session<S>,
+        args: &Value,
+        search: bool,
+    ) -> Result<Value>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
+    {
+        let mailbox = folder(args, InputLimits::Read)?;
+        let wire_mailbox = mailbox_name(mailbox, InputLimits::Read)?;
+        let state = listing::select_list_mailbox(session, &wire_mailbox, args).await?;
+        let Some(scan) = listing::scan_list(session, args, search, &state).await? else {
+            return Ok(
+                json!({"emails":[],"next_before_uid":null,"uid_validity":state.uid_validity}),
+            );
+        };
+        let (ids, next) = scan.unfiltered();
+        let emails = service
+            .fetch_summaries(session, mailbox, state.uid_validity, &ids)
+            .await?;
+        Ok(json!({"emails":emails,"next_before_uid":next,"uid_validity":state.uid_validity}))
     }
 
     #[test]
@@ -2251,7 +2162,7 @@ mod tests {
                             assert_eq!(server.read_line(&mut line).await.unwrap(), 0);
                         });
                         let mut session = async_imap::Client::new(client).login("synthetic", "test-only").await.unwrap();
-                        let result = service.with_session(&mut session, tool, &json!({})).await;
+                        let result = list_test_page(&service, &mut session, &json!({}), tool == "search_emails").await;
                         drop(session);
                         backend.await.unwrap();
                         if completion == "OK" {
@@ -2299,7 +2210,7 @@ mod tests {
             });
             let service = MailService::new(crate::config::fixture(), Arc::new(Journal::open(std::path::Path::new(":memory:")).unwrap())).unwrap();
             let mut session = async_imap::Client::new(client).login("synthetic", "test-only").await.unwrap();
-            let found = service.with_session(&mut session, "search_emails", &json!({"mailbox":"项目&","uid_validity":9,"since":"2024-02-29","seen":false,"from":"sender@example.test","subject":"发票"})).await.unwrap();
+            let found = list_test_page(&service, &mut session, &json!({"mailbox":"项目&","uid_validity":9,"since":"2024-02-29","seen":false,"from":"sender@example.test","subject":"发票"}), true).await.unwrap();
             assert_eq!(found["emails"], json!([]));
             backend.await.unwrap();
         }).await.unwrap();
@@ -2372,7 +2283,7 @@ mod tests {
             service.with_session(&mut session, "delete_mailbox", &json!({"name":name,"confirm":true})).await.unwrap();
             service.with_session(&mut session, "move_email", &json!({"mailbox":name,"uid":7,"destination":"日本語"})).await.unwrap();
             service.with_session(&mut session, "delete_email", &json!({"mailbox":name,"uid":7})).await.unwrap();
-            let found = service.with_session(&mut session, "search_emails", &json!({"mailbox":name,"query":"发票"})).await.unwrap();
+            let found = list_test_page(&service, &mut session, &json!({"mailbox":name,"query":"发票"}), true).await.unwrap();
             assert_eq!(found["emails"], json!([]));
             service.with_session(&mut session, "save_draft", &json!({"to":["recipient@example.com"],"subject":"synthetic","body":"synthetic"})).await.unwrap();
             backend.await.unwrap();
@@ -2506,7 +2417,11 @@ mod tests {
                             }
                         });
                         let mut session = async_imap::Client::new(client).login("synthetic", "test-only").await.unwrap();
-                        let result = service.with_session(&mut session, tool, &json!({"folder":"INBOX","uid":7,"uid_validity":9,"flag":"seen","value":true,"permanent":true,"confirm":true,"query":"synthetic"})).await;
+                        let result = if tool == "search_emails" {
+                            list_test_page(&service, &mut session, &json!({"query":"synthetic","uid_validity":9}), true).await
+                        } else {
+                            service.with_session(&mut session, tool, &json!({"folder":"INBOX","uid":7,"uid_validity":9,"flag":"seen","value":true,"permanent":true,"confirm":true})).await
+                        };
                         assert_eq!(result.unwrap_err().code, "MAIL_BACKEND", "{tool}/{target}/{status}/{partial}");
                         drop(session);
                         backend.await.unwrap();
@@ -3382,5 +3297,27 @@ mod tests {
         let mut bytes = Vec::new();
         assert!(stream.read_to_end(&mut bytes).await.is_err());
         assert_eq!(bytes, b"1234");
+    }
+
+    #[tokio::test]
+    async fn replacement_stream_spends_only_the_page_budget_left_by_the_first() {
+        use tokio::io::AsyncReadExt;
+        let (mut first, remaining) = BudgetStream::new(&b"12"[..], 4);
+        let mut prefix = [0; 2];
+        first.read_exact(&mut prefix).await.unwrap();
+        assert_eq!(&prefix, b"12");
+        assert_eq!(remaining.load(Ordering::Relaxed), 2);
+        drop(first);
+
+        let mut replacement = BudgetStream::with_remaining(&b"3456"[..], remaining.clone());
+        let mut suffix = Vec::new();
+        let error = replacement.read_to_end(&mut suffix).await.unwrap_err();
+        assert_eq!(&suffix, b"34");
+        assert_eq!(remaining.load(Ordering::Relaxed), 0);
+        assert!(
+            error
+                .get_ref()
+                .is_some_and(|cause| cause.is::<ConnectionBudgetExceeded>())
+        );
     }
 }

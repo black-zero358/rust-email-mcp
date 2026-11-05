@@ -165,6 +165,49 @@ fn message(conversation: bool) -> Value {
     schema
 }
 
+fn listing_summary() -> Value {
+    let mut schema = all_required(json!({
+        "account_id":account_id(),"mailbox":string(),"uid_validity":nullable(uid()),"uid":uid(),
+        "subject":nullable(string()),"from":nullable(string()),"date":nullable(string()),"size":nullable(count()),"flags":array(string()),
+        "classification":{"type":"array","items":enumeration(&["newsletter","automated","unclassified"]),"minItems":1,"maxItems":2,"uniqueItems":true},
+        "classification_signals":{"type":"array","items":all_required(json!({
+            "field":enumeration(&["list-id","list-unsubscribe","list-unsubscribe-post","auto-submitted","precedence"]),
+            "category":enumeration(&["newsletter","automated"])
+        })),"maxItems":6,"uniqueItems":true},
+        "classification_rule_version":{"const":"headers-v1"},
+        "classification_status":enumeration(&["complete","partial"]),"unsubscribe_available":boolean()
+    }));
+    let properties = schema["properties"]
+        .as_object_mut()
+        .expect("summary properties");
+    properties.insert("preview".into(), json!({"type":"string","maxLength":200}));
+    properties.insert("preview_truncated".into(), boolean());
+    properties.insert("preview_error".into(), reference("error"));
+    properties.insert(
+        "preview_status".into(),
+        enumeration(&[
+            "ok",
+            "empty",
+            "error",
+            "unprocessed",
+            "budget_skipped",
+            "wire_budget_skipped",
+        ]),
+    );
+    schema["dependentRequired"] = json!({
+        "preview":["preview_status","preview_truncated"],
+        "preview_truncated":["preview_status","preview"],
+        "preview_error":["preview_status"]
+    });
+    schema["dependentSchemas"] = json!({"preview_status":{"oneOf":[
+        {"properties":{"preview_status":{"const":"ok"}},"required":["preview","preview_truncated"],"not":{"required":["preview_error"]}},
+        {"properties":{"preview_status":{"const":"empty"},"preview":{"const":""},"preview_truncated":{"const":false}},"required":["preview","preview_truncated"],"not":{"required":["preview_error"]}},
+        {"properties":{"preview_status":{"const":"error"}},"required":["preview_error"],"not":{"required":["preview"]}},
+        {"properties":{"preview_status":enumeration(&["unprocessed","budget_skipped","wire_budget_skipped"])},"not":{"anyOf":[{"required":["preview"]},{"required":["preview_error"]}]}}
+    ]}});
+    schema
+}
+
 fn operation() -> Value {
     all_required(
         json!({"status":enumeration(&["sending","accepted","rejected","unknown"]),"message_id":string(),"warnings":array(string())}),
@@ -258,7 +301,7 @@ fn data(name: &str) -> Value {
         ),
         "list_emails" | "search_emails" => object(
             json!({
-                "emails":{"type":"array","maxItems":50,"items":all_required(json!({"account_id":account_id(),"mailbox":string(),"uid_validity":nullable(uid()),"uid":uid(),"subject":nullable(string()),"from":nullable(string()),"date":nullable(string()),"size":nullable(count()),"flags":array(string())}))},
+                "emails":{"type":"array","maxItems":50,"items":listing_summary()},
                 "next_before_uid":nullable(uid()),"uid_validity":nullable(uid()),
                 "scanned_uid_range":{"type":"array","prefixItems":[uid(),uid()],"minItems":2,"maxItems":2}
             }),
