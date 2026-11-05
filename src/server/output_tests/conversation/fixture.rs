@@ -686,6 +686,7 @@ async fn serve(
         .write_all(b"* OK isolated conversation fixture\r\n")
         .await
         .is_err()
+        || stream.flush().await.is_err()
     {
         return;
     }
@@ -702,6 +703,7 @@ async fn serve(
                 .write_all(format!("{tag} OK login\r\n").as_bytes())
                 .await
                 .is_err()
+                || stream.flush().await.is_err()
             {
                 return;
             }
@@ -778,7 +780,8 @@ async fn serve(
             }
         };
         reply.extend_from_slice(format!("{tag} {status} synthetic\r\n").as_bytes());
-        if stream.write_all(&reply).await.is_err() {
+        // TLS can accept plaintext while encrypted bytes are still buffered.
+        if stream.write_all(&reply).await.is_err() || stream.flush().await.is_err() {
             return;
         }
         protocol.completions.fetch_add(1, Ordering::Relaxed);

@@ -473,14 +473,24 @@ async fn reject_pending_seed(failure: SeedFailure, reason: &str) {
             .iter()
             .all(|command| !command.text.contains(&stale_search))
     );
-    let listing = h
-        .call_tool(
-            Some(&app),
-            "alice",
-            "list_emails",
-            json!({"read_source":"cache","uid_validity":9,"before_uid":2}),
-        )
-        .await;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let listing = loop {
+        let listing = h
+            .call_tool(
+                Some(&app),
+                "alice",
+                "list_emails",
+                json!({"read_source":"cache","uid_validity":9,"before_uid":2}),
+            )
+            .await;
+        // Background content work can change the cached scope revision
+        // between the list snapshot and its final verification.
+        if listing["error"]["code"] != "CACHE_NEEDS_VERIFICATION" {
+            break listing;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{listing}");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    };
     assert_eq!(
         listing["data"]["emails"][0]["flags"],
         json!(["Flagged"]),
