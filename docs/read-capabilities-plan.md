@@ -394,7 +394,7 @@ UIDVALIDITY 改变立即停用旧世代数据、句柄和游标，后台清理�
 | R04 | 本阶段已完成，提交 `60b8cca`；164 单元 + 2 集成、fmt/clippy/release、7 组客户端测试及 8 文件联调通过 | [PR #65](https://github.com/black-zero358/rust-email-mcp/pull/65) 已合并；最终 head `99aa4e4` 增补 URI 回归并通过全部 CI；[离线验证记录](validation.md#2026-11-02-r04-附件离线下载与内容读取)；真实 ChatGPT 测试后移 |
 | R05 | 已完成，源码 `ffd1bda`；200 单元 + 2 集成、fmt/clippy/release、8 文件客户端联调通过 | [PR #67](https://github.com/black-zero358/rust-email-mcp/pull/67) 最终 head `9019ef7` 全部 CI 通过，已合并为 `501e539`；[设计与配置](multi-account-design.md)、[离线验证](validation.md#2026-11-02-r05-多账户离线验证) |
 | R06 | 已完成，源码 `885a1ce`；234 单元 + 29 集成、fmt/clippy/release、8 文件联调、审计及实际镜像通过 | parser 基础 [PR #68](https://github.com/black-zero358/rust-email-mcp/pull/68) 已合并；清单与回退 [PR #69](https://github.com/black-zero358/rust-email-mcp/pull/69) 最终 head `351353b` 全部 CI 通过，已合并为 `41fb821`；[离线验证](validation.md#2026-11-03-r06-附件清单与受控回退) |
-| R07 | 实施中；附件部件下载源码 `d0a1e62`，277 单元 + 34 集成、fmt/clippy/release、8 文件联调、审计及镜像通过 | [PR #70](https://github.com/black-zero358/rust-email-mcp/pull/70) 最终 head `bcb2b45` 全部 CI 通过，已合并为 `7837396`；[离线验证](validation.md#2026-11-03-r07-附件部件下载)；下一批接入局部正文，两批完成后关闭 R07 |
+| R07 | 附件部件下载已合并；局部正文源码 `b4b21da` 已实现，312 单元 + 34 集成、14 组正文 HTTP、fmt/clippy/release、8 文件联调及审计通过，独立审阅闭环 | 附件 [PR #70](https://github.com/black-zero358/rust-email-mcp/pull/70) 合并为 `7837396`；正文正在完成镜像与 PR/最终 CI 交付，见[正文离线验证](validation.md#2026-11-05-r07-局部正文读取) |
 | R08 | 待实施；分类规则已完成独立合成原型 | 预览分类；列表/搜索的 `has_attachment` 筛选改用已验证清单，保持扫描游标和附件判定语义 |
 | R09 | 待实施 | 跨目录会话 |
 | R10–R13 | 待实施 | 持久化、完整回填、离线及发布验收 |
