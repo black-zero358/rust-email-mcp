@@ -21,7 +21,7 @@ full 工具矩阵覆盖本地列表、单封/批量正文、附件清单/内联/
 
 V3 是独立于已发布 V2 的新事务迁移，完整正文文本与有界叶元数据分别保存。正文可见性和筛选证据改变时更新搜索修订；重复相同证据保持修订。会话 source 绑定格式与线上 v1 分离，454 字节旧 codec fixture 验证原字段及容量记账；最终 SQLite CAS 还核对未落盘的删除观察，拒绝提交时保留原 token/replay。
 
-真实生产调用入口连接本地 TLS IMAP/SMTP，验证 MOVE、软删除、APPEND、目录操作和发送在首个实际副作用前登记 dirty；APPEND 拒绝不发送 literal。SMTP 先持久 claim，再登记缓存范围，再连接；accepted/unknown、已接受后 Journal 更新失败及操作键重放均保留原结果。批量写前 FLAGS 查询按原会话 UIDNEXT 处理缺失，保留 unknown/unprocessed。Sent 角色阻塞查询与取消清理持有共享许可至实际结束。
+真实生产调用入口连接本地 TLS IMAP/SMTP，验证 MOVE、软删除、APPEND、目录操作和发送在首个实际副作用前登记 dirty；APPEND 拒绝不发送 literal。SMTP 先持久 claim，再登记缓存范围，再连接；accepted/unknown、已接受后 Journal 更新失败及操作键重放均保留原结果。批量写前 UID 存在性查询按原会话 UIDNEXT 处理缺失，保留 unknown/unprocessed。Sent 角色阻塞查询与取消清理持有共享许可至实际结束。
 
 已完成的严格 FETCH 缺失观察覆盖列表筛选、预览、正文、附件、头部、指纹及批量写前检查。未来 UID、缺少原会话 UIDNEXT、UID 仍存在但缺必要属性和 tagged NO 保持各自语义；水位以内尚未落库的 UID 留下持久墓碑，阻止迟到旧证据。回归模拟未来 UID 先获得新内容，再处理早先空结果的时序，确认新内容继续可读。旧 UIDVALIDITY 的队列失败仅清除原引用的 pending 标记。
 
