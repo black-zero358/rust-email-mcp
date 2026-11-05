@@ -174,7 +174,7 @@ JWKS 的硬缓存期限为 300 秒，不因刷新失败延长。刷新 I/O 使�
 
 ## Persistent metadata cache
 
-`CACHE_CONFIG_PATH` 在 Journal 恢复前解析严格版本化配置，省略或显式 off 不打开缓存。metadata 只接受已登记账户的明确文件夹列表，使用内部 AccountKey 命名空间分库。每账户 `cache.sqlite` 保持 application_id、schema v1、namespace 和恢复世代，元数据键包含 mailbox/UIDVALIDITY/UID。目录权限、根清单、符号链接、硬链接与保留路径冲突先核对，未知非空目录不接管；根锁在所有连接关闭后释放。
+`CACHE_CONFIG_PATH` 在 Journal 恢复前解析严格版本化配置，省略或显式 off 不打开缓存。metadata 只接受已登记账户的明确文件夹列表，使用内部 AccountKey 命名空间分库。每账户 `cache.sqlite` 保持 application_id、schema 版本、namespace 和恢复世代，元数据键包含 mailbox/UIDVALIDITY/UID。metadata 默认新建 v1；内部 full 存储入口将 v1 原子升级为 v2，当前 metadata 入口也可打开已升级的 v2。目录权限、根清单、符号链接、硬链接与保留路径冲突先核对，未知非空目录不接管；根锁在所有连接关闭后释放。
 
 全局与每账户额度按物理文件占用计算，包含主库、DELETE 回滚日志、清单、暂存及旧分区。事务前预留日志与主库增长，限制 SQLite page_count，避免用逻辑行长度代替磁盘用量。短事务内更新元数据、部件证据和索引。提交成功后保留返回值及 revision，后置磁盘诊断失败只阻止后续写入并报告故障。原操作库与账户注册库保持独立。
 
@@ -185,6 +185,18 @@ JWKS 的硬缓存期限为 300 秒，不因刷新失败延长。刷新 I/O 使�
 `cursor_storage` 反映实际 memory/persistent 模式。仅整个冻结范围都被管理员配置选中时使用持久模式；选中但不可用的范围明确失败，已存在持久 token 不转入内存。`get_cache_status` 先授权，只返回当前账户的配置、覆盖、配额及故障；本地读屏障最多等待 2 秒，不连接邮箱。备份恢复命令 `--cache-restored` 在 Journal 前执行，原子提升根恢复世代、清除游标、标记 dirty，未启用分区以后打开时也应用该世代。单次 EXAMINE 更新目录世代，完整存在性核对负责清除 dirty。
 
 当前公共能力为持久元数据、部件证据、索引基础和在线会话续查。R11 接入原始邮件/派生内容、显式离线读取及写操作 dirty 范围通知，R12 接入全量扫描和受影响范围的只读收敛。D1/D2/D3/D5 验证位置为 `src/cache/tests.rs`、`src/config/cache_config.rs`、`src/mail/conversation/tests/durable.rs` / `persist.rs` 和 `src/server/output_tests/cache.rs`；配置/运维入口见[缓存设计](cache-design.md)。
+
+### Full-cache storage foundation
+
+内部 `Cache::open_full` 提供 R11 文件存储基础；用户 full 配置与离线工具随后接线。`cache/blob` 保存完整 raw、带解析版本的完整正文和按原 MIME index 定位的附件。状态区分 materialized、derivable_from_raw、missing、omitted 与 unsupported，层覆盖仅统计本地已观察数据。完整历史范围的完成标记由 R12 扫描检查点决定。
+
+文件使用私有随机名称和 64 KiB I/O 块，单个暂存最多 32 MiB。暂存预留、数据库及回滚日志预留共用全局/账户物理预算，旧世代和待清理文件继续计费。完整文件同步并无覆盖发布后才用短事务登记；失败或取消保留资源所有权直到清理完成。原始内容身份与派生引用保持一致，文件丢失、损坏或回收也必须保留这一约束。
+
+文件引用查找、打开与 pin 在同一临界区完成，同一描述符完成长度及摘要校验后才可交付。离线 lease 绑定目录修订号和恢复世代，dirty 后旧离线 lease 保持失效，读取按块复核。LiveVerified lease 由调用方先在线核对，保持完整邮件引用、文件与恢复世代绑定。回收等待 pin 归零，关闭描述符后释放 pin，物理删除完成后释放磁盘额度。
+
+`cache/dirty` 在同账户事务中登记多个源/目标 scope，包括尚未 EXAMINE 的配置目录。dirty ticket 绑定当前 Cache 实例、恢复世代及 claim ID，关联受影响 scopes；核对 stamp 另绑定 UIDVALIDITY 和 scope 修订；存在活跃 claim 时拒绝取得核对 stamp，清除时再用 UIDVALIDITY/修订/无活跃 claim 条件 CAS。结束 claim 保留 dirty，异常退出和备份恢复要求核对。`mail/cache_write_guard` 当前只在测试构建中注册，验证期限、许可与阻塞清理所有权；生产写路径的接线和独立运行见证由 R11 后续批次完成，见[实施设计](cache-content-design.md)。
+
+D2/D3/D4/D5 验证入口为 `src/cache/full_tests.rs`、`src/mail/cache_write_guard/tests.rs`；metadata 和持久游标继续运行 R10 回归。
 
 ## Local operation store
 
