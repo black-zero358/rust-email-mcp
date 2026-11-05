@@ -2,6 +2,30 @@
 
 本文件保存带版本与环境边界的证据。每次新增记录注明提交/tag、日期与时区、环境、命令、结果、CI 链接及未覆盖项；保留历史结果，不把其测试数量或部署状态当作当前版本的证明。验证要求见 [贡献指南](../CONTRIBUTING.md#验证与完成标准)。
 
+## 2026-11-05 R12 CONDSTORE 标记同步
+
+源码 `b5366fd6f66fb2f182d5c656a60f6866b67c5910`，父提交为 R12B 合并 `68b32353c2214b238c6f4ed33768316254d1275e`。环境为 WSL Ubuntu、固定 Rust 1.99.1、Node 24.15.0；所有邮箱、身份、文件和失败场景使用合成数据、本地模拟 TLS IMAP/HTTP 服务及隔离目录。
+
+### 行为与修复
+
+- full 管理配置新增 `sync.protocol:rev1|auto`，默认 rev1。auto 在后台认证连接上探测并使用只读 EXAMINE/CONDSTORE，周期 rev1 核对继续处理存在性和 dirty。状态分别公开配置策略、实际协议、固定回退类别和十进制字符串 MODSEQ。
+- 独立 V6 保存基线及 FLAGS/删除两条水位，C 批只接入 FLAGS 加速。V1–V5 的 SQL 与父提交逐常量字节核对一致；迁移失败保留 V5、已有头部及元数据，重试升级成功。管理员缩小目录范围并重启后，旧扫描与差分页凭据受到当前范围校验。
+- 最多 200 个已知 UID 一页，遗漏的 CHANGEDSINCE UID 保留存在性，显式空 FLAGS 正确更新。同 UID 选择最高 MODSEQ；同序冲突拒收。事实与页位置短事务提交，最后页才推进冻结 target；范围内成员/FLAGS 修订、恢复、dirty、活跃 claim 和撤权均参与 CAS。
+- 首次基线必须在同一完整 rev1 核对首个页面前取得。跨页或命令内的最低水位与最后值分别保留；只低于候选时撤销候选，低于已提交值或 NOMODSEQ 时撤销扩展水位。临时退回普通协议时保留已提交值并撤销未完成候选。撤销先登记进程内标记再写 SQLite，失败保留标记并阻止 clean；同一轮后续更高水位也无法重新建立已撤候选。
+- CONDSTORE 命令使用独立 grammar、完整 128 KiB 线路预算及分配前容器预算。未终止的长 FLAGS/CAPABILITY/status token 和空白在第一个越界字节拒绝，合法分片保持 Incomplete。匹配 tagged OK、明确 READ-ONLY、正 63 位 MODSEQ 和完整选择证据共同约束收据。
+
+### 验证结果
+
+最终整仓命令链全部通过：fmt；**539 单元测试与 53 集成测试**（另 2 项默认忽略）；all-target Clippy `-D warnings`；release 构建；显式 Rust→Node 八文件附件下载、SHA-256 与内容读取；V6 release 恢复烟测；依赖审计与 Docker 上下文检查。
+
+签名 CONDSTORE 9 项、同步存储 21 项、同步协议/辅助层 21 项和根协议预算 6 项专项通过，已包含于整仓测试。新增签名场景覆盖 201 UID 跨页重启、撤权取消、能力缺失/撤回/拒绝、NOMODSEQ、跨页候选回退、最后基线页中的较低水位，以及活跃差分先返回低值或 NOMODSEQ 再返回较高值。原后台同步、缓存读取与配置回归继续通过。
+
+最终单元测试耗时 49.56 秒，release 构建 34.24 秒，显式八文件客户端联调 14.13 秒。release 二进制 SHA-256 为 `cb37cda1a6d04408218cee72efd163f47eb97db4931c6d55a36225ad132ebaed`。恢复烟测在独立网络命名空间验证 schema 6、恢复代次 1/2/3、off 失败启动时运行见证更新、损坏见证在 Journal 前拒绝、操作库哨兵原字节及目录/文件 0700/0600。
+
+专用审计核对 340 个依赖与 1409 条公告，20 项审计适配回归通过；保留已有 pin-utils 未维护告警允许项 RUSTSEC-2026-0441。Cargo.toml、Cargo.lock 和上游包身份保持。148 个本地文档链接及锚点检查通过。独立审阅发现的长 token 扫描、范围缩小、候选回退及命令内最低水位问题均已修复并回归，最终精确源码复核完成。
+
+实际镜像从 `git archive b5366fd6f66fb2f182d5c656a60f6866b67c5910` 的独立目录构建通过，标签 `rust-email-mcp:r12-condstore-local`，manifest list digest 为 `sha256:7666fde3a0df79a7cec106317ab55079c9afc05de171178a1538ad901554da6b`。Docker release 步骤共 16 分 24 秒，其中索引和依赖下载约 15 分钟；同一次构建持续完成。QRESYNC 与 R13 持续负载由后续批次验收；真实 ChatGPT 接入与生产部署按各自流程安排。
+
 ## 2026-11-05 R12 后台同步与有界回收
 
 [PR #79](https://github.com/black-zero358/rust-email-mcp/pull/79) 最终 head `80fd706f7852982dcc99f010eabe94d81213b7c7` 的 [CI 42030094273](https://github.com/black-zero358/rust-email-mcp/actions/runs/42030094273) 中 check、audit、container 全部通过。精确源码及最终文档 head 的独立交叉审阅完成；GitHub 自动审阅遇到账户限流，已核对评论和空 review threads。合并提交为 `68b32353c2214b238c6f4ed33768316254d1275e`，本地 main、开发分支及对应远端引用已同步；R12C 工作区改动保留。
