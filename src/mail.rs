@@ -249,6 +249,9 @@ impl MailService {
         let tcp = TcpStream::connect((&*self.config.imap_host, self.config.imap_port))
             .await
             .map_err(|_| MailError::backend())?;
+        // IMAP commands are sent as several small writes before waiting for
+        // the tagged reply. Avoid a Nagle delay on each sequential command.
+        tcp.set_nodelay(true).map_err(|_| MailError::backend())?;
         let name =
             ServerName::try_from(self.config.imap_host.clone()).map_err(|_| MailError::input())?;
         let stream = TlsConnector::from(Arc::new(tls))
@@ -1482,6 +1485,74 @@ fn attachment(raw: &[u8], index: usize, max: usize) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn production_imap_login_enables_tcp_nodelay() {
+        use tokio::{
+            io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+            net::TcpListener,
+        };
+        use tokio_rustls::{
+            TlsAcceptor,
+            rustls::{
+                ServerConfig,
+                pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer},
+            },
+        };
+
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert = certified.cert.der().clone();
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            certified.signing_key.serialize_der(),
+        ));
+        let tls = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key)
+            .unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(cert).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = (*crate::config::fixture()).clone();
+        config.imap_host = "localhost".into();
+        config.imap_port = listener.local_addr().unwrap().port();
+        let journal = Arc::new(Journal::open(std::path::Path::new(":memory:")).unwrap());
+        let mut service = MailService::new(Arc::new(config), journal).unwrap();
+        service.test_imap_roots = Some(roots);
+        let backend = async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let stream = TlsAcceptor::from(Arc::new(tls))
+                .accept(socket)
+                .await
+                .unwrap();
+            let mut stream = BufReader::new(stream);
+            stream.write_all(b"* OK synthetic IMAP\r\n").await.unwrap();
+            stream.flush().await.unwrap();
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            let (tag, command) = line.split_once(' ').unwrap();
+            assert!(command.starts_with("LOGIN "));
+            stream
+                .write_all(format!("{tag} OK authenticated\r\n").as_bytes())
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+        };
+        let (session, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(service.connect_inner(true, None), backend)
+        })
+        .await
+        .unwrap();
+        assert!(
+            session
+                .unwrap()
+                .get_ref()
+                .inner
+                .get_ref()
+                .0
+                .nodelay()
+                .unwrap()
+        );
+    }
     #[test]
     fn readable_reads_use_one_display_policy_while_forward_keeps_legacy_body() {
         let raw = b"Subject: synthetic\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p><a href='https://example.test/'>Meeting</a></p><ul><li>Agenda</li></ul>";

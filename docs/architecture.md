@@ -85,6 +85,8 @@ IMAP 文本模式固定为 rev1：所有邮箱参数编码为 modified UTF-7，L
 
 async-imap 0.12 的 APPEND flags 原样序列化，必须传入 `(\Draft)` 这样的带括号列表。合成 duplex 回归覆盖 literal continuation 及 OK/NO/BAD。vendored completion-status 补丁只允许匹配 tag 的 OK 成功；NO/BAD、缺失终结响应和错误 tag 均失败。SELECT/EXAMINE（含 CONDSTORE）和 STATUS 共用这一完成边界；无响应或只有 `0 EXISTS`/部分元数据的断连不能解释成成功空邮箱，列表/搜索不得在未完成 EXAMINE 时返回空页。来源、退出条件与审计方式见 [PATCHES.md](../vendor/async-imap/PATCHES.md)。
 
+IMAP TCP 连接在 TLS 握手前启用 `TCP_NODELAY`。命令编码器按 tag、空格、命令和 CRLF 分次写入，小包应及时发出，避免 Nagle 与对端延迟 ACK 在连续分块读取中累积等待；连接期限、传输预算和 tagged completion 规则保持一致。设置失败沿用固定 Backend 错误。真实 TLS 登录后的客户端 socket 选项由 `mail::tests::production_imap_login_enables_tcp_nodelay` 验证，依据 [RFC 9293 §3.7.4](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.7.4)。
+
 APPEND 等待同步 literal continuation 时，先将合法 untagged 通知交给现有有界 unsolicited 队列，再继续读取；只有 `Continue` 才发送正文。continuation 前任何 tagged 结果（包括提前 OK 和错误 tag）、BYE、EOF 或读取错误均失败且不发送 literal，拒绝后排队的 continuation 不能恢复命令。完整 literal 后仍等待匹配 tag 的 OK。`save_draft_waits_for_continuation_after_notifications` 和 `save_draft_append_protocol` 覆盖这一 D2 协议边界；不改变草稿 flags/MIME 或发送策略。
 
 `mail/parts` 负责有界 BODYSTRUCTURE/必要 MIME 头与原 raw MIME 的统一 PartManifest；`mail/attachments.rs` 编排附件清单、准备和下载生命周期，`mail/attachments/metadata.rs` 负责稳定引用、索引选择及描述。`get_email`、列表、内联 Base64 和二进制下载共用原 MIME 遍历索引（0–1023）与附件子树边界。`att_v1_` 引用用带域分离的 SHA-256 绑定 AccountKey 命名空间、文件夹、UIDVALIDITY、UID、索引和 MIME 引用版本；同时传入 id/index 时核对一致性。描述中的原文件名保留展示用途，安全文件名另行约束路径字符、控制字符、长度及保留设备名。
@@ -213,6 +215,10 @@ R12A 的 `cache/sync_state` 使用 V4 保存独立历史、新 UID 与存在性/
 R12B 的 `mail/sync/worker` 接入 full 配置的可选后台循环，省略 sync 保持暂停。每步重新核对当前账户、有效读取授权与管理员范围；历史、tail、FLAGS/存在性、内容和清理交错执行，任务提交使用真实收据。关闭先取消并等待后台实际工作，阻塞 SQLite/文件操作及暂存清理继续持有共享许可；未完成清理或尚未持久化的世代/删除观察保留未清洁状态。
 
 V5 独立保存派生文件的访问顺序，前台成功读取更新顺序，后台验证保持原值；压力回收复核同版本原件、产物和访问序号，保留租约。GC 按有界候选 keyset 推进，过滤后空批仍保留继续位置。范围发现与存在性核对分别报告，数据层完成还核对对应内容及索引证据。D1/D2/D3/D5 对应 `src/cache/sync_state/tests.rs`、`src/mail/sync/tests.rs`、`src/mail/sync/content/tests.rs`、`src/server/output_tests/sync_acceptance.rs` 与 `tests/thread_search_budget.rs`。完整分期、恢复及验收条件见[同步设计](cache-sync-design.md)。
+
+R12C 通过可选 `sync.protocol:"auto"` 接入 CONDSTORE，默认 rev1。`mail/sync/delta` 在认证连接上执行有界 CAPABILITY、只读 EXAMINE 和 CHANGEDSINCE，每命令共用 128 KiB 线路预算，parser 独立约束 token、节点和 owned allocation；只接纳正 63 位 MODSEQ、完整选中证据与匹配 tagged OK，EXAMINE 必须确认 READ-ONLY。语义或解析失败关闭当前命令流，回退最多使用一个新连接并保留原期限及累计字节预算。普通前台协议接口保持原有语法。
+
+V6 独立持久化扩展水位与修订。基线只能来自同一完整 rev1 核对首个页面之前的 EXAMINE；FLAGS 与未来的删除加速分别使用独立水位。每轮冻结 base、target、UID 上界及恢复/dirty/事实修订，每页至多 200 个已知 UID，事实与下一位置原子提交，末页才将 committed 提升至 target。并发范围内成员或 FLAGS 变化使旧页失效；范围外新增 UID 留给后续覆盖。遗漏的 CHANGEDSINCE UID 保留原存在性，周期 rev1 核对负责删除和 dirty 收敛。明确 NOMODSEQ 或 committed 回退先撤销进程内水位可见性，再持久化；存储失败保留撤销标记并阻止 clean receipt。D1/D2/D3 对应 `src/cache/sync_state/delta/tests.rs`、`src/mail/sync/delta/tests.rs`、`src/server/output_tests/condstore_acceptance.rs` 和 `tests/sync_delta_budget.rs`。
 
 ## Local operation store
 

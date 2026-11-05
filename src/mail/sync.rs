@@ -1,5 +1,6 @@
 //! Read-only protocol building blocks for persisted mailbox synchronization.
 mod content;
+mod delta;
 mod reconcile;
 mod scan;
 pub(super) mod worker;

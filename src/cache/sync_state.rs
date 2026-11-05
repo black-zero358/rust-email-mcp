@@ -9,11 +9,15 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use uuid::Uuid;
 
 mod content;
+mod delta;
 mod gc;
 mod status;
 mod sweep;
 pub use content::{
     ContentLayer, ContentOutcome, ContentWork, FailureReason, SyncFacts, SyncProgress,
+};
+pub use delta::{
+    DeltaFlags, DeltaLane, DeltaObservation, DeltaPage, DeltaRound, DeltaStart, DeltaStatus,
 };
 pub use gc::{SyncReclaimCandidate, SyncReclaimPage, SyncReclaimPosition};
 pub use status::{SyncCoverage, SyncGapCount, SyncLayerStatus, SyncScanStatus, SyncScopeStatus};
@@ -483,6 +487,7 @@ impl Cache {
             if page.complete {
                 tx.execute("UPDATE scope_fences SET dirty=0 WHERE mailbox=?1", [&stamp.mailbox])?;
                 tx.execute("UPDATE mailboxes SET dirty=0 WHERE mailbox=?1 AND uid_validity=?2", params![stamp.mailbox, stamp.uid_validity])?;
+                delta::finish_seed(tx, stamp, checked_at_ms)?;
             }
             tx.execute("UPDATE sync_checkpoints SET known_after=?2,completed_at_ms=?3,revision=revision+1,
                         proof_presence_revision=presence_revision WHERE mailbox=?1 AND kind=2",
@@ -544,6 +549,9 @@ fn scope_fence(
 }
 
 fn checked_scan(cache: &Cache, db: &Connection, stamp: &ScanStamp) -> Result<ScanState, SyncError> {
+    if !cache.namespace_has_folder(&stamp.namespace, &stamp.mailbox) {
+        return Err(CacheError::OutOfScope.into());
+    }
     if !cache.full
         || cache.disk.restore_epoch() != stamp.restore_epoch
         || scope_fence(db, &stamp.mailbox, stamp.uid_validity, stamp.kind)? != stamp.dirty_revision

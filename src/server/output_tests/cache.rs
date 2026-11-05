@@ -50,6 +50,54 @@ fn full_configuration(root: &Path, accounts: &[(&str, &[&str])]) -> PathBuf {
     path
 }
 
+const CACHE_OBSERVATION_WAIT: Duration = Duration::from_secs(2);
+
+async fn wait_cached_body(h: &CacheHarness, app: &axum::Router, uid: u32, expected: &str) {
+    let mut last = Value::Null;
+    tokio::time::timeout(CACHE_OBSERVATION_WAIT, async {
+        loop {
+            last = h
+                .call_tool(
+                    Some(app),
+                    "alice",
+                    "get_email",
+                    json!({"uid":uid,"uid_validity":9,"read_source":"cache"}),
+                )
+                .await;
+            if !matches!(
+                last["error"]["code"].as_str(),
+                Some("CACHE_MISS" | "CACHE_NEEDS_VERIFICATION")
+            ) {
+                assert_eq!(last["data"]["read_source"], "cache", "{last}");
+                assert_eq!(last["data"]["uid"], uid, "{last}");
+                assert_eq!(last["data"]["body"], expected, "{last}");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("UID {uid} did not become readable from cache: {last}"));
+}
+
+async fn wait_cache_barrier(h: &CacheHarness, app: &axum::Router) {
+    let mut last = Value::Null;
+    tokio::time::timeout(CACHE_OBSERVATION_WAIT, async {
+        loop {
+            last = h
+                .call_tool(Some(app), "alice", "get_cache_status", json!({}))
+                .await;
+            match last["data"]["status"].as_str() {
+                Some("ready") => break,
+                Some("unavailable") => tokio::time::sleep(Duration::from_millis(10)).await,
+                _ => panic!("unexpected cache status: {last}"),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("cache queue did not confirm readiness: {last}"));
+}
+
 #[tokio::test]
 async fn live_missing_future_uid_does_not_disable_cache_or_tombstone_later_arrival() {
     let root = tempfile::tempdir().unwrap();
@@ -125,8 +173,10 @@ async fn live_listing_and_preview_tombstone_only_confirmed_missing_uids() {
             call("get_email", json!({"uid":uid,"uid_validity":9})).await["data"]["body"],
             "synthetic content"
         );
+        // One in-flight capture at a time here. The shared write-through
+        // payload pool is best-effort, so a third rapid capture can be skipped.
+        wait_cached_body(&h, &app, uid, "synthetic content").await;
     }
-    let _ = call("get_cache_status", json!({})).await;
     let summary = "UID FETCH 9 (UID FLAGS RFC822.SIZE INTERNALDATE BODY.PEEK[HEADER]<0.8192>)";
     h.fault("INBOX", summary, Fault::OnlyUid(9));
     let flags_only = call("list_emails", json!({"limit":1})).await;
@@ -156,7 +206,7 @@ async fn live_listing_and_preview_tombstone_only_confirmed_missing_uids() {
     assert_eq!(item["uid"], 7);
     assert_eq!(item["preview_status"], "error");
     assert_eq!(item["preview_error"]["code"], "MAIL_BACKEND");
-    let _ = call("get_cache_status", json!({})).await;
+    wait_cache_barrier(&h, &app).await;
     let before = h.connections();
     for uid in 7..=9 {
         assert_eq!(local(uid).await["error"]["code"], "CACHE_MISS");
@@ -290,13 +340,37 @@ async fn default_live_checks_exact_uid_before_using_cached_body_and_tombstones_d
         read("get_email", args.clone()).await["data"]["body"],
         "synthetic content"
     );
-    let _ = read("get_cache_status", json!({})).await;
-    let old_connections = h.connections();
-    assert_eq!(
-        read("get_email", args.clone()).await["data"]["read_diagnostics"]["source"],
-        "cache"
-    );
-    assert!(h.connections() > old_connections);
+    wait_cached_body(&h, &app, 7, "synthetic content").await;
+    let mut last = Value::Null;
+    tokio::time::timeout(CACHE_OBSERVATION_WAIT, async {
+        loop {
+            let old_connections = h.connections();
+            let first_command = h.commands().len();
+            last = read("get_email", args.clone()).await;
+            assert_eq!(last["data"]["body"], "synthetic content", "{last}");
+            match last["data"]["read_diagnostics"]["source"].as_str() {
+                Some("cache") => {
+                    assert_eq!(h.connections(), old_connections + 1);
+                    let trace = h.commands();
+                    let commands: Vec<_> = trace[first_command..]
+                        .iter()
+                        .map(|command| command.text.as_str())
+                        .collect();
+                    assert_eq!(
+                        commands,
+                        ["EXAMINE \"INBOX\"", "UID FETCH 7 (UID RFC822.SIZE)"]
+                    );
+                    break;
+                }
+                // Even a materialized body may miss the optional 100 ms
+                // cache probe under load and take the valid live parts path.
+                Some("bodystructure") => tokio::time::sleep(Duration::from_millis(10)).await,
+                _ => panic!("unexpected live body source: {last}"),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("live exact UID check did not reuse the ready cached body: {last}"));
     h.update("INBOX", |folder| {
         folder.next = Some(8);
         folder.messages.clear();
@@ -314,7 +388,7 @@ async fn default_live_checks_exact_uid_before_using_cached_body_and_tombstones_d
         ),
         "{missing}"
     );
-    let _ = read("get_cache_status", json!({})).await;
+    wait_cache_barrier(&h, &app).await;
     assert_eq!(
         read("get_email", offline).await["error"]["code"],
         "CACHE_MISS"
@@ -331,7 +405,7 @@ async fn default_live_checks_exact_uid_before_using_cached_body_and_tombstones_d
     );
     let oversized = read("get_email", json!({"uid":8,"uid_validity":9})).await;
     assert_eq!(oversized["error"]["code"], "LIMIT_EXCEEDED", "{oversized}");
-    let _ = read("get_cache_status", json!({})).await;
+    wait_cache_barrier(&h, &app).await;
     let local = read("list_emails", json!({"read_source":"cache"})).await;
     assert_eq!(local["data"]["emails"], json!([]), "{local}");
     assert_eq!(

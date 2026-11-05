@@ -766,7 +766,10 @@ fn v4_migration_rolls_back_independently_and_metadata_reopens_it() {
         let databases = cache.lock().unwrap();
         let db = &databases[&namespace].connection;
         db.execute_batch(
-            "DROP TRIGGER recency_artifact_insert; DROP TRIGGER recency_artifact_update;
+            "DROP TRIGGER delta_epoch_change; DROP TRIGGER delta_member_insert;
+            DROP TRIGGER delta_member_update; DROP TRIGGER delta_flags_insert; DROP TRIGGER delta_flags_update;
+            DROP TABLE sync_delta_seed; DROP TABLE sync_delta;
+            DROP TRIGGER recency_artifact_insert; DROP TRIGGER recency_artifact_update;
             DROP TRIGGER recency_artifact_delete; DROP TABLE blob_recency;
             DROP TRIGGER sync_presence_insert; DROP TRIGGER sync_presence_update;
             DROP TRIGGER sync_tombstone_work; DROP TRIGGER sync_artifact_lost; DROP TABLE sync_checkpoints; DROP TABLE sync_work;
@@ -802,7 +805,7 @@ fn v4_migration_rolls_back_independently_and_metadata_reopens_it() {
             .connection
             .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
             .unwrap(),
-        5
+        6
     );
 }
 
@@ -835,7 +838,10 @@ fn v5_recency_migration_is_atomic_and_foreground_touch_survives_reopen() {
         databases[&namespace]
             .connection
             .execute_batch(
-                "DROP TRIGGER recency_artifact_insert; DROP TRIGGER recency_artifact_update;
+                "DROP TRIGGER delta_epoch_change; DROP TRIGGER delta_member_insert;
+             DROP TRIGGER delta_member_update; DROP TRIGGER delta_flags_insert; DROP TRIGGER delta_flags_update;
+             DROP TABLE sync_delta_seed; DROP TABLE sync_delta;
+             DROP TRIGGER recency_artifact_insert; DROP TRIGGER recency_artifact_update;
              DROP TRIGGER recency_artifact_delete; DROP TABLE blob_recency;
              PRAGMA user_version=4; CREATE INDEX blob_recency_scope ON messages(uid);",
             )

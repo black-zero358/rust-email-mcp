@@ -123,6 +123,14 @@ impl<'a> Response<'a> {
         bounded::parse_mailbox_metadata(msg, limits, max_header_bytes)
     }
 
+    /// Parse responses to a bounded CONDSTORE capability, selection or flag query.
+    pub fn parse_bounded_condstore(
+        msg: &'a [u8],
+        limits: &bounded::BodyStructureLimits,
+    ) -> bounded::ParseResult<'a> {
+        bounded::parse_condstore(msg, limits)
+    }
+
     pub fn into_owned(self) -> Response<'static> {
         match self {
             Response::Capabilities(capabilities) => Response::Capabilities(

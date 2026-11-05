@@ -212,3 +212,15 @@ parser failures stop later reads and command writes.
 Run `cargo test --locked --test thread_search_budget` for the public parser and
 isolated async session checks. Upstream versions, checksums, licenses and
 dependency resolution remain unchanged.
+
+### Opt-in CONDSTORE commands
+
+`CommandReadLimits::condstore()` reuses the 128 KiB cumulative command wire
+budget and adds a separate grammar for CAPABILITY, EXAMINE (CONDSTORE) and
+UID FETCH (CHANGEDSINCE). Pre-command capability, selection and FETCH data
+cannot satisfy the command. The transport rejects unexpected tags, BYE and
+continuations, preserves bytes after matching completion, and closes on parser
+errors. Consumers call `Session::abort_bounded_command` when the completed
+exchange fails their evidence checks. Existing command APIs retain their
+original grammar. Run `cargo test --locked --test sync_delta_budget` for
+fragmentation, cumulative budgets and terminal failure checks.

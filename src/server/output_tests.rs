@@ -28,6 +28,7 @@ mod accounts;
 mod attachments;
 mod body_parts;
 mod cache;
+mod condstore_acceptance;
 mod conversation;
 mod listing;
 mod parts;

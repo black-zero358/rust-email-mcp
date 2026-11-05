@@ -258,14 +258,16 @@ impl Cache {
     }
 
     pub fn enabled_for_folder(&self, account: &AccountKey, mailbox: &str) -> bool {
-        self.scopes
-            .get(&account.reference_namespace())
-            .is_some_and(|scope| {
-                scope
-                    .mailboxes
-                    .binary_search_by(|name| name.as_str().cmp(mailbox))
-                    .is_ok()
-            })
+        self.namespace_has_folder(&account.reference_namespace(), mailbox)
+    }
+
+    fn namespace_has_folder(&self, namespace: &Namespace, mailbox: &str) -> bool {
+        self.scopes.get(namespace).is_some_and(|scope| {
+            scope
+                .mailboxes
+                .binary_search_by(|name| name.as_str().cmp(mailbox))
+                .is_ok()
+        })
     }
 
     pub fn cursor_backend(self: &Arc<Self>) -> cursor::CursorBackend {

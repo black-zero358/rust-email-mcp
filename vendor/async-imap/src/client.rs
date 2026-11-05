@@ -1485,6 +1485,12 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
         Ok(id)
     }
 
+    /// Prevent further reads and writes after the consumer rejects bounded
+    /// command evidence. Drop the session before opening a replacement.
+    pub fn abort_bounded_command(&mut self) {
+        self.conn.stream.close();
+    }
+
     /// Runs an arbitrary command, without adding a tag to it.
     pub async fn run_command_untagged<S: AsRef<str>>(&mut self, command: S) -> Result<()> {
         self.conn.run_command_untagged(command.as_ref()).await?;

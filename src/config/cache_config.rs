@@ -62,6 +62,16 @@ pub(crate) struct SyncPolicy {
     pub(crate) interval_seconds: u64,
     #[serde(default = "reconcile_interval")]
     pub(crate) reconcile_interval_seconds: u64,
+    #[serde(default)]
+    pub(crate) protocol: SyncProtocol,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, serde::Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SyncProtocol {
+    #[default]
+    Rev1,
+    Auto,
 }
 
 impl Default for SyncPolicy {
@@ -70,6 +80,7 @@ impl Default for SyncPolicy {
             enabled: false,
             interval_seconds: sync_interval(),
             reconcile_interval_seconds: reconcile_interval(),
+            protocol: SyncProtocol::Rev1,
         }
     }
 }
@@ -407,6 +418,7 @@ mod tests {
         write(&path, &full);
         let policy = read().unwrap().unwrap().sync;
         assert!(policy.enabled);
+        assert_eq!(policy.protocol, SyncProtocol::Rev1);
         assert_eq!(
             (policy.interval_seconds, policy.reconcile_interval_seconds),
             (60, 900)
@@ -420,12 +432,17 @@ mod tests {
             (policy.interval_seconds, policy.reconcile_interval_seconds),
             (1, 86_400)
         );
+        full["sync"]["protocol"] = json!("auto");
+        write(&path, &full);
+        assert_eq!(read().unwrap().unwrap().sync.protocol, SyncProtocol::Auto);
         for sync in [
             json!(null),
             json!({}),
             json!({"enabled":true,"interval_seconds":0}),
             json!({"enabled":true,"reconcile_interval_seconds":86_401}),
             json!({"enabled":true,"unknown":1}),
+            json!({"enabled":true,"protocol":"qresync"}),
+            json!({"enabled":true,"protocol":null}),
         ] {
             full["sync"] = sync;
             write(&path, &full);

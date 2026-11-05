@@ -87,13 +87,20 @@ fn sync_status() -> Value {
     let folder = all_required(json!({
         "mailbox":string(),"progress":nullable(scope),
         "error":nullable(enumeration(&["quota","storage","verification_pending"])),
+        "condstore":nullable(all_required(json!({
+            "uid_validity":uid(),"high_uid":count(),"committed_modseq":string(),
+            "target_modseq":nullable(string()),"known_after":nullable(count()),"checked_at_ms":count()
+        }))),
         "runtime":all_required(json!({
             "last_error":nullable(enumeration(&["network","protocol","storage","quota"])),
-            "quota_paused":boolean()
+            "quota_paused":boolean(),
+            "protocol":enumeration(&["rev1","condstore"]),
+            "protocol_fallback":nullable(enumeration(&["capability_unavailable","extension_failed","nomodseq","modseq_rollback"]))
         }))
     }));
     all_required(json!({
         "enabled":boolean(),"interval_seconds":count(),"reconcile_interval_seconds":count(),
+        "protocol":enumeration(&["rev1","auto"]),
         "running":boolean(),"folders":nullable(json!({"type":"array","maxItems":64,"items":folder}))
     }))
 }
