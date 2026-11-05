@@ -2,6 +2,28 @@
 
 本文件保存带版本与环境边界的证据。每次新增记录注明提交/tag、日期与时区、环境、命令、结果、CI 链接及未覆盖项；保留历史结果，不把其测试数量或部署状态当作当前版本的证明。验证要求见 [贡献指南](../CONTRIBUTING.md#验证与完成标准)。
 
+## 2026-11-05 R09 有界搜索基础
+
+源码提交 `f6b7c4c8d22e367d07f292268bc5bc420098df1d`。环境为 WSL Ubuntu、Rust 1.99.1、Docker Desktop 和 Node 24.15.0；仅使用合成协议输入及本地模拟 IMAP/MCP 客户端。
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo fmt --check`、`git diff --check` | 通过 |
+| `cargo test --locked --quiet` | 339 单元 + 44 集成通过；单元 26.37 秒，新增搜索 10 项 0.73 秒 |
+| `cargo clippy --locked --all-targets -- -D warnings` | 通过；vendored async-imap 保留上游 4 条 deprecated 宏提示 |
+| `cargo build --locked --release` | 通过，25.79 秒 |
+| 显式 `standalone_node_adapter_consumes_real_rust_mcp_and_authorized_get -- --ignored` | 8 文件下载、摘要及内容读取通过，9.63 秒 |
+| `scripts/test-audit-dependencies.sh` | 20 项离线审计适配回归通过 |
+| `scripts/audit-dependencies.sh` | 1403 条公告、340 个依赖，退出 0 |
+| `scripts/test-docker-context.sh` | 上下文白名单通过 |
+| `docker build --tag rust-email-mcp:r09-search-local <源码快照>` | 使用 `git archive f6b7c4c` 导出的独立目录，通过；依赖索引遇到一次 TLS 网络重试，发布构建共 11 分 50 秒，最终镜像导出成功 |
+
+新增 10 项根集成回归覆盖解析器和实际 async client：199/200/201 个 UID、合法输入的每个分片前缀、显式空结果、重复/缺失 SEARCH、重复 UID、NO/BAD/BYE/EOF、错 tag、意外 continuation、128 KiB 精确命令阈值及少一字节、超长 literal 声明提前失败、错误后读写闭锁、命令前 SEARCH 隔离和完成后缓冲尾恢复。普通 SEARCH 超过 200 个结果仍按原入口工作。
+
+独立审阅实测 20,027 字节的 FETCH/FLAGS 输入原可创建 393,216 字节的 flags 向量。本批为有界 SEARCH 引入专用通知解析，FLAGS/FETCH 嵌套容器分配前共用 128 KiB 记账；状态文本、响应码和尾空白仅扫描，其他扩展响应拒绝。高层 collector 只转交标量邮箱通知，120 条合法 FLAGS 回归核对原始响应不积留在通知队列。typed 错误只携带类别和数字，既有 BODYSTRUCTURE、部件 FETCH、完成状态回归全部通过。
+
+最终源码与契约文档已通过独立复核。两份 vendored 上游版本、校验和及 Cargo.lock 保持原值，PATCHES.md 同步接口与替换验证要求。本子包交付搜索解析与传输基础；跨文件夹会话、状态存储及客户端契约随后接线。
+
 ## 2026-11-05 R08 正文预览与邮件头分类
 
 源码提交 `cc55dca9c4acffa7e74c9b7c2d797ae290f5cdbc`。环境为 WSL Ubuntu、Rust 1.99.1、Node 24.15.0；测试使用合成邮件、本地 TLS IMAP 与签名 JWT/MCP/HTTP。
@@ -20,6 +42,8 @@
 分类专项覆盖固定信号顺序、重复头、CFWS/参数、完整逻辑头边界，以及 RFC 6068 的编码本地部分、UTF-8/IDNA 域名、查询字段名和地址分隔符。无效百分号域名、坏 UTF-8、裸保留字符和非法查询字段均有负例。预览共用有界 MIME 选择、编码和 HTML 策略；截断样本不执行完整 EOF 收束，UTF-7 给逐项错误，已取得 raw 的本地取样完成后复核期限。
 
 独立审阅在最终源码提交上完成，修复了退订地址误判，以及预览状态字段占满输出时整页丢失的问题。最终降级依次移除预览内容和全部可选预览字段，保留可容纳的摘要、分类与游标；基础摘要本身超限返回 `LIMIT_EXCEEDED`。配置、依赖锁定及持久化格式沿用现有值。附件继续离线验收；真实 ChatGPT 连接测试留在后续阶段。PR 最终提交的 check/audit/container 作为合并门禁。
+
+最终 PR head `93ec2301ff3bf30f818825d102129ef17047b0b0` 相对源码只追加验证记录与实施状态。[CI 41993366234](https://github.com/black-zero358/rust-email-mcp/actions/runs/41993366234) 的 check/audit/container 全部通过。GitHub 自动 Codex review 因账户额度限制未执行，最终源码及文档由独立 agent 复核通过；合并前 reviews/review threads 为空。[PR #72](https://github.com/black-zero358/rust-email-mcp/pull/72) 合并为 `d8537374f4b2a0ff16997c194f9a0d0d48a4654c`，本地 main、开发分支及对应远端均已同步，R09 的开发改动保留在工作区。
 
 ## 2026-11-05 R07 局部正文读取
 

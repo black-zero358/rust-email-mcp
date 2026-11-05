@@ -33,6 +33,17 @@ pub fn body_section_literal_limit(
     }
 }
 
+/// Recover the numeric UID count or response byte limit of a bounded SEARCH.
+pub fn search_limit(error: &Error) -> Option<imap_proto::bounded::SearchLimitError> {
+    match error {
+        Error::Io(error) => error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<imap_proto::bounded::SearchLimitError>())
+            .copied(),
+        _ => None,
+    }
+}
+
 /// A set of errors that can occur in the IMAP client
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]

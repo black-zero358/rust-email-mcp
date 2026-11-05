@@ -212,6 +212,7 @@ pub(crate) use self::id_generator::IdGenerator;
 mod response_data;
 pub use self::response_data::ResponseData;
 mod command_limits;
+pub(crate) use self::command_limits::CommandLimit;
 pub use self::command_limits::CommandReadLimits;
 
 mod request;
