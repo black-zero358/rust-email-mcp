@@ -85,6 +85,8 @@ IMAP 文本模式固定为 rev1：所有邮箱参数编码为 modified UTF-7，L
 
 async-imap 0.12 的 APPEND flags 原样序列化，必须传入 `(\Draft)` 这样的带括号列表。合成 duplex 回归覆盖 literal continuation 及 OK/NO/BAD。vendored completion-status 补丁只允许匹配 tag 的 OK 成功；NO/BAD、缺失终结响应和错误 tag 均失败。SELECT/EXAMINE（含 CONDSTORE）和 STATUS 共用这一完成边界；无响应或只有 `0 EXISTS`/部分元数据的断连不能解释成成功空邮箱，列表/搜索不得在未完成 EXAMINE 时返回空页。来源、退出条件与审计方式见 [PATCHES.md](../vendor/async-imap/PATCHES.md)。
 
+IMAP TCP 连接在 TLS 握手前启用 `TCP_NODELAY`。命令编码器按 tag、空格、命令和 CRLF 分次写入，小包应及时发出，避免 Nagle 与对端延迟 ACK 在连续分块读取中累积等待；连接期限、传输预算和 tagged completion 规则保持一致。设置失败沿用固定 Backend 错误。真实 TLS 登录后的客户端 socket 选项由 `mail::tests::production_imap_login_enables_tcp_nodelay` 验证，依据 [RFC 9293 §3.7.4](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.7.4)。
+
 APPEND 等待同步 literal continuation 时，先将合法 untagged 通知交给现有有界 unsolicited 队列，再继续读取；只有 `Continue` 才发送正文。continuation 前任何 tagged 结果（包括提前 OK 和错误 tag）、BYE、EOF 或读取错误均失败且不发送 literal，拒绝后排队的 continuation 不能恢复命令。完整 literal 后仍等待匹配 tag 的 OK。`save_draft_waits_for_continuation_after_notifications` 和 `save_draft_append_protocol` 覆盖这一 D2 协议边界；不改变草稿 flags/MIME 或发送策略。
 
 `mail/parts` 负责有界 BODYSTRUCTURE/必要 MIME 头与原 raw MIME 的统一 PartManifest；`mail/attachments.rs` 编排附件清单、准备和下载生命周期，`mail/attachments/metadata.rs` 负责稳定引用、索引选择及描述。`get_email`、列表、内联 Base64 和二进制下载共用原 MIME 遍历索引（0–1023）与附件子树边界。`att_v1_` 引用用带域分离的 SHA-256 绑定 AccountKey 命名空间、文件夹、UIDVALIDITY、UID、索引和 MIME 引用版本；同时传入 id/index 时核对一致性。描述中的原文件名保留展示用途，安全文件名另行约束路径字符、控制字符、长度及保留设备名。

@@ -32,6 +32,12 @@
 
 隔离诊断在 4 MiB 邮件最后一块 `BODY.PEEK[]<4194304.184>` 的底层密文写入处注入一次 Pending：无 flush 时 28.33 秒失败并复现相同 network 缺口；增加 flush 后 10.36 秒通过。相同补丁的精确快照在默认并发下通过 fmt、539 单元与 53 集成（2 项默认忽略）、all-target Clippy 和 release；单元 52.09 秒、Clippy 12.02 秒、release 32.34 秒。额外单 CPU 并发诊断中配额恢复通过，两项原先通过的后台测试达到各自 25 秒等待上限；本次保留其等待期限。独立补丁审阅完成，后续合并以新 head 的三项 CI 为准。
 
+### 连续命令延迟修复
+
+文档 head `47b79a4c71bef80dfc6f037d88dbfa31f852c1e7` 的 [CI 42040350521](https://github.com/black-zero358/rust-email-mcp/actions/runs/42040350521) 中两项 CONDSTORE 用例通过，配额恢复仍触及网络期限。逐块诊断观察到 IMAP 编码器的四次小 TLS 写入与延迟 ACK 累积等待。源码 `c8daed44c045fa3710f6882dcd6b187c1feed80b` 在 TCP 连接成功后、TLS 握手前启用 TCP_NODELAY，并增加真实 TLS 登录后读取客户端 socket 选项的确定性回归；继续使用原 4 MiB 邮件、64 KiB 分块、请求期限和错误映射。
+
+同一 ACK 控制条件下，分块命令间隔中位数由 68 ms 降至 1 ms，读至 EOF 由 5.062 秒降至 0.414 秒。四 CPU 加每块 55 ms 人工延迟的额外压力实验中，两种配置均触及原期限，NODELAY 多完成 6–9 块；该实验用于定位等待来源。精确源码快照使用独立 target 通过 fmt、**540 单元 + 53 集成**（2 项默认忽略）、all-target Clippy、release、显式 Node 八文件下载与内容读取以及 V6 隔离恢复；单元 26.72 秒、Clippy 12.55 秒、release 94 秒、八文件 4.07 秒。新 release SHA-256 为 `a3571a23c2fbbd60a84d79d524a2c74d9c4fcc8c7956cea0bfbf40a64f97972c`。恢复验证覆盖代次 1/2/3、运行见证、损坏见证先于 Journal 拒绝、操作库哨兵和 0700/0600。独立补丁审阅通过，最终 CI 随新 head 重新执行。
+
 ## 2026-11-05 R12 后台同步与有界回收
 
 [PR #79](https://github.com/black-zero358/rust-email-mcp/pull/79) 最终 head `80fd706f7852982dcc99f010eabe94d81213b7c7` 的 [CI 42030094273](https://github.com/black-zero358/rust-email-mcp/actions/runs/42030094273) 中 check、audit、container 全部通过。精确源码及最终文档 head 的独立交叉审阅完成；GitHub 自动审阅遇到账户限流，已核对评论和空 review threads。合并提交为 `68b32353c2214b238c6f4ed33768316254d1275e`，本地 main、开发分支及对应远端引用已同步；R12C 工作区改动保留。
