@@ -2,6 +2,25 @@
 
 本文件保存带版本与环境边界的证据。每次新增记录注明提交/tag、日期与时区、环境、命令、结果、CI 链接及未覆盖项；保留历史结果，不把其测试数量或部署状态当作当前版本的证明。验证要求见 [贡献指南](../CONTRIBUTING.md#验证与完成标准)。
 
+## 2026-11-05 R08 正文预览与邮件头分类
+
+源码提交 `cc55dca9c4acffa7e74c9b7c2d797ae290f5cdbc`。环境为 WSL Ubuntu、Rust 1.99.1、Node 24.15.0；测试使用合成邮件、本地 TLS IMAP 与签名 JWT/MCP/HTTP。
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo fmt --check`、`git diff --check` | 通过；相关文档的相对文件链接通过 |
+| `cargo test --locked --quiet` | 339 单元 + 34 集成通过；单元 26.14 秒；2 项默认忽略为另行执行的 Node 联调及父测试调用的跨进程锁探针 |
+| `cargo clippy --locked --all-targets -- -D warnings` | 通过；vendored async-imap 保留上游 4 条 deprecated 宏提示 |
+| `cargo build --locked --release` | 通过，22.53 秒 |
+| 显式 `standalone_node_adapter_consumes_real_rust_mcp_and_authorized_get -- --ignored` | 8 文件下载、摘要及内容读取通过，9.37 秒 |
+| `pnpm --dir scripts/attachment-client-adapter test` | 7 项通过 |
+
+列表专项共 13 项：12 组认证 HTTP 场景覆盖默认关闭预览、非首正文部件、跨叶空白、HTML 与字符截断、取样和页预算、完整/截断邮件头分类、FLAGS 合并、严格头部 FETCH、逐项错误和超时、附件筛选游标，以及筛选 raw 回退与预览组合只读取一次。另一个完整响应预算测试覆盖状态字段单独超限、成功/错误混合预览、992 字节转义 ID、结构化与文本副本、Schema、精确预算阈值及少一字节。
+
+分类专项覆盖固定信号顺序、重复头、CFWS/参数、完整逻辑头边界，以及 RFC 6068 的编码本地部分、UTF-8/IDNA 域名、查询字段名和地址分隔符。无效百分号域名、坏 UTF-8、裸保留字符和非法查询字段均有负例。预览共用有界 MIME 选择、编码和 HTML 策略；截断样本不执行完整 EOF 收束，UTF-7 给逐项错误，已取得 raw 的本地取样完成后复核期限。
+
+独立审阅在最终源码提交上完成，修复了退订地址误判，以及预览状态字段占满输出时整页丢失的问题。最终降级依次移除预览内容和全部可选预览字段，保留可容纳的摘要、分类与游标；基础摘要本身超限返回 `LIMIT_EXCEEDED`。配置、依赖锁定及持久化格式沿用现有值。附件继续离线验收；真实 ChatGPT 连接测试留在后续阶段。PR 最终提交的 check/audit/container 作为合并门禁。
+
 ## 2026-11-05 R07 局部正文读取
 
 源码提交 `b4b21dab3a787ebb4ccfe070e717e56890b01b46`。环境为 WSL Ubuntu、Rust 1.99.1、Docker Desktop、Node 24.15.0；使用本地 TLS IMAP、签名 JWT/MCP/HTTP 和合成邮件。
@@ -16,13 +35,15 @@
 | `pnpm --dir scripts/attachment-client-adapter test` | 7 项通过 |
 | `scripts/audit-dependencies.sh` | 1403 条公告、340 个依赖，退出 0 |
 | `scripts/test-audit-dependencies.sh`、`scripts/test-docker-context.sh` | 20 项离线审计回归与上下文白名单通过 |
-| `docker build --tag rust-email-mcp:r07-body-local .` | 运行中 |
+| `docker build --tag rust-email-mcp:r07-body-local .` | 通过；首次下载依赖遇到网络重试，builder 完成耗时 19 分 19 秒，最终镜像导出成功 |
 
 14 组正文认证 HTTP 场景覆盖单封、批量、会话与旧 raw 结果的逐字段对照；模拟服务声明 40 MiB 邮件，在正文省略 charset、BODYSTRUCTURE 补 US-ASCII 的情况下只读取第二个小正文部件。另覆盖完整 alternative 回滚、related 精确 CID、HTML 跨叶预算、跨 64 KiB 字符集、UTF-7 一次回退、新连接 UIDVALIDITY、重复 UID、完整 JSON-RPC 转义预算及 `max_body_length:0` 完整验证。原客户端的 8 个合成 CSV/XLSX/PDF 等文件继续校验字节、摘要和解析内容。
 
 协议故障矩阵覆盖部件第二块、raw 回退和候选 HEADER 的错 origin/section、重复、短读、多读、NO/BAD、错 tag、BYE/EOF；逐项核对批量及会话停止后续正文读取。局部 charset/内容错误只在命令已完成时继续，结构映射预算与未完成命令失败分别处理。底层映射新增全树 8192 行预算、默认 charset 与 MIME 候选差分；编码器覆盖 BOM、坏字节、跨块状态、输出边界和原字符解码结果。
 
 独立审阅修复了 raw/候选头匹配、重复 UID 回退、全树头部行预算、逐叶错误顺序、非结构命令意外 BODYSTRUCTURE 预算错误，以及默认字符集映射。正文缺目标数据保持原 `MAIL_BACKEND`；输出增加可选 `read_diagnostics`，`part_fetch` 更新为 true。`encoding_rs 0.8.42` 从既有传递依赖显式声明为直接依赖，锁定包版本保持一致；配置和持久化格式沿用原值。附件与正文均采用离线验收，真实 ChatGPT 连接测试保留到后续阶段。
+
+最终 PR head `0c07455c5973440047c6964fdae6bdfc7c6c09b5` 相对源码仅更新验证记录与实施状态。[CI 41989646668](https://github.com/black-zero358/rust-email-mcp/actions/runs/41989646668) 的 check/audit/container 全部通过，包含实际生产 Dockerfile 构建；GitHub 自动审阅遇到 Codex 额度限制，独立 agent 的最终源码审阅已完成并记录在 [PR #71](https://github.com/black-zero358/rust-email-mcp/pull/71)。合并前复查 reviews/review threads 均为空，合并提交为 `f5e7877a0f46ca6c7d6055341b0303ffcafc83cb`。本地 main、开发分支及对应远端同步到该提交，R08 的进行中改动继续保留在开发工作区。
 
 ## 2026-11-03 R07 附件部件下载
 
