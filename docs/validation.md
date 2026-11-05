@@ -29,7 +29,13 @@ V3 是独立于已发布 V2 的新事务迁移，完整正文文本与有界叶�
 
 恢复烟测以 `uv run --no-project python` 启动隔离脚本，在 `unshare --user --map-root-user --net` 与 `env -i` 环境运行实际 release 程序。三次 `--cache-restored` 依次得到 epoch 1、2、3；off 模式遇到合成无效 Journal 时仍推进见证，缓存 epoch 保持；损坏见证在 Journal 前拒绝。操作库哨兵字节保持，无 sidecar 和附件暂存目录；缓存目录 0700、文件 0600。二进制 SHA-256 为 `d97f73452647f66a18c400441518036f1f6c2e5bbf021d23e2a3beded389bcfa`。
 
-全历史回填、周期增量/删除核对和运行期自动回收继续由 R12 交付；R13 执行至少 10,000 封合成邮件与 30 分钟负载。附件验收继续采用离线客户端，真实 ChatGPT 接入及生产操作按单独流程安排。此批依赖、Cargo.lock 与 Docker 构建配置保持原值；最终 PR CI 与合并证据在完成后追加。
+[PR #77](https://github.com/black-zero358/rust-email-mcp/pull/77) 首次最终 head `ec2ed442441d668f8f86d92431880a812a81bfe9` 的 [CI 42019754751](https://github.com/black-zero358/rust-email-mcp/actions/runs/42019754751) 中 audit/container 通过，check 的取消请求测试在旧 2 秒连接就绪窗口失败（active=0、accepted=0）；其余 481 项单元通过。原用例只等待四条连接，随后即假设全部二十条请求已准入。
+
+测试修复 `6a5c2c45600d257f918a33e763a409606a9d06d5` 使用只在测试构建存在的调度快照，分别等待 `(admitted,running)=(4,4)` 和 `(20,4)`，JoinSet 立即报告提前返回的 HTTP 请求，再检查 overflow BUSY。排队就绪与 overflow 共用 8 秒截止点，短于真实 10 秒队列上限；取消和资源归零也共用独立截止点。只为该用例延长刻意阻塞的模拟 greeting 期限，生产调度及请求限额保持原值。
+
+修复从 `git archive ec2ed44` 的隔离源码仅覆盖三份测试相关文件验证：默认线程栈、单 CPU、12 个测试线程的账户组连续两轮各 9 项通过（8.48/8.28 秒）；普通并发全量 482 单元、44 集成通过（38.67 秒）。最后共用截止点微调后，最终三文件快照的 fmt、all-target Clippy 及单 CPU/12 线程账户组 9 项通过（9.47 秒）。独立差异审阅通过；新的最终 PR CI 与合并结果在完成后追加。
+
+全历史回填、周期增量/删除核对和运行期自动回收继续由 R12 交付；R13 执行至少 10,000 封合成邮件与 30 分钟负载。附件验收继续采用离线客户端，真实 ChatGPT 接入及生产操作按单独流程安排。此批依赖、Cargo.lock 与 Docker 构建配置保持原值。
 
 ## 2026-11-05 R11 文件缓存与失效基础
 
