@@ -16,6 +16,27 @@ pub(crate) const BACKGROUND_SLOTS: usize = 1;
 pub(crate) const QUEUE_WAIT: Duration = Duration::from_secs(10);
 type Account = [u8; 32];
 
+#[cfg(all(test, target_os = "linux"))]
+const QUEUE_US_BOUNDS: [u64; 17] = [
+    10,
+    50,
+    100,
+    500,
+    1_000,
+    5_000,
+    10_000,
+    25_000,
+    50_000,
+    100_000,
+    250_000,
+    500_000,
+    1_000_000,
+    2_000_000,
+    5_000_000,
+    10_000_000,
+    u64::MAX,
+];
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WorkClass {
     Foreground,
@@ -35,6 +56,8 @@ struct Waiter {
     class: WorkClass,
     granted: bool,
     wake: Option<oneshot::Sender<()>>,
+    #[cfg(all(test, target_os = "linux"))]
+    queued_at: std::time::Instant,
 }
 
 #[derive(Default)]
@@ -46,6 +69,8 @@ struct State {
     accounts: HashMap<Account, usize>,
     next_id: u64,
     queue: VecDeque<Waiter>,
+    #[cfg(all(test, target_os = "linux"))]
+    queue_wait_counts: [[u64; QUEUE_US_BOUNDS.len()]; 2],
 }
 
 impl State {
@@ -106,7 +131,16 @@ impl State {
             if class == WorkClass::Background {
                 self.background += 1;
             }
-            if wake.is_none_or(|wake| wake.send(()).is_err()) {
+            let delivered = wake.is_some_and(|wake| wake.send(()).is_ok());
+            #[cfg(all(test, target_os = "linux"))]
+            if delivered {
+                let elapsed = waiter.queued_at.elapsed().as_micros();
+                let bucket = QUEUE_US_BOUNDS.partition_point(|bound| u128::from(*bound) < elapsed);
+                let counts =
+                    &mut self.queue_wait_counts[usize::from(class == WorkClass::Background)];
+                counts[bucket.min(counts.len() - 1)] += 1;
+            }
+            if !delivered {
                 // A dropped receiving future cannot reserve a slot. Its RAII
                 // ticket may still be unwinding; removing by id is idempotent.
                 self.queue.remove(index);
@@ -142,6 +176,21 @@ impl Scheduler {
         (state.admitted, state.running)
     }
 
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) fn sample_for_test(&self) -> serde_json::Value {
+        let state = self.state();
+        serde_json::json!({
+            "admitted": state.admitted,
+            "running": state.running,
+            "background": state.background,
+            "queue_wait_us": {
+                "bounds": QUEUE_US_BOUNDS,
+                "foreground_counts": state.queue_wait_counts[0],
+                "background_counts": state.queue_wait_counts[1],
+            },
+        })
+    }
+
     /// Stops new work. A clean shutdown can only be published if no queued
     /// ticket or permit remains, including detached blocking work.
     pub(super) fn stop_admission(&self) -> bool {
@@ -175,6 +224,8 @@ impl Scheduler {
                 class,
                 granted: false,
                 wake: Some(wake),
+                #[cfg(all(test, target_os = "linux"))]
+                queued_at: std::time::Instant::now(),
             });
             id
         };

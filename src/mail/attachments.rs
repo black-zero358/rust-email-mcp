@@ -83,6 +83,11 @@ impl AttachmentStore {
         self.transfers.close();
         self.transfers.available_permits() == MAX_TRANSFERS
     }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn transfers_for_test(&self) -> usize {
+        MAX_TRANSFERS - self.transfers.available_permits()
+    }
     async fn insert(&self, transfer: Transfer) -> Result<String> {
         let mut handles = self.handles.lock().await;
         handles.retain(|_, t| t.expires > Instant::now());

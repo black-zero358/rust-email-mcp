@@ -240,6 +240,10 @@ JSON 日志使用固定事件名和受控字段，记录服务端生成的 reque
 
 ## Invariants and verification
 
+R13 的 Linux release 验收由 `server::output_tests::r13_acceptance` 与 `scripts/run-r13-acceptance.py` 驱动。服务进程和 `main` 共用 `server::http_router`，保持相同的认证、Host/Origin、请求体和 JSON-RPC id 限制；测试根证书注入与资源观测接口仅在 Linux 测试构建中启用。模拟 IMAP/OIDC、服务和负载驱动分进程运行，独立网络命名空间仅开放 loopback；CPU/RSS 采样绑定服务 PID，磁盘统计覆盖缓存数据库、日志、blob、暂存及打开后已删除的文件。
+
+该验收对应 D1/D2/D3/D5：至少 10,000 封双账户合成邮件，持续至少 30 分钟，并在验收窗口内重新观察初始范围的原件、正文、完整索引和附件均已物化。分别验证四路 IMAP 读取占满后端，以及四路 HTTP 慢消费持有文件/传输许可但释放后端的场景；检查第五路拒绝、前台排队结果、两账户增量进度与取消清理。真实 HTTPS 发现/JWKS 刷新、冷/热请求、中文检索、跨目录副本及边界附件由同一运行记录。恢复与迁移继续由专用存储回归及 `scripts/check-cache-recovery.py` 验证；运行方法见[维护规程](maintenance.md#离线持续验收)。
+
 下表把总纲原则映射到当前实现和已有验证入口。它不宣称每条约束都有自动化覆盖；涉及真实部署的检查需按变更范围补充验收记录，测试名称变化时同步更新映射。
 
 | 原则 | 实现入口 | 现有验证与审阅入口 |

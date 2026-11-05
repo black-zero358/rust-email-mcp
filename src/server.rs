@@ -19,6 +19,65 @@ mod output_tests;
 
 pub const MAX_RPC_ID_BYTES: usize = 1024;
 
+pub fn http_router(
+    config: &crate::config::Config,
+    mail: Arc<MailRuntime>,
+    auth: Arc<crate::auth::Auth>,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> anyhow::Result<axum::Router> {
+    use axum::{Json, Router, middleware, routing::get};
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    };
+
+    let host = reqwest::Url::parse(&config.resource)?
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing resource hostname"))?
+        .to_owned();
+    let transport = StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(false)
+        .with_json_response(true)
+        .with_max_request_body_bytes(256 * 1024)
+        .with_allowed_hosts([host, "127.0.0.1".into(), "localhost".into()])
+        .with_allowed_origins(["https://chatgpt.com:443".to_string()])
+        .with_cancellation_token(shutdown.child_token());
+    let download_mail = mail.clone();
+    let service = StreamableHttpService::new(
+        move || Ok(EmailServer(mail.clone())),
+        Arc::new(LocalSessionManager::default()),
+        transport,
+    );
+    let metadata = json!({
+        "resource":config.resource,"authorization_servers":[config.issuer],
+        "scopes_supported":[config.scope],"bearer_methods_supported":["header"]
+    });
+    Ok(Router::new()
+        .route(
+            "/mcp/attachments/{token}",
+            get(crate::mail::attachments::download),
+        )
+        .with_state(download_mail)
+        .nest_service("/mcp", service)
+        .layer(middleware::from_fn(limit_rpc_id))
+        .layer(middleware::from_fn_with_state(
+            auth,
+            crate::auth::require_auth,
+        ))
+        .layer(tower_http::catch_panic::CatchPanicLayer::new())
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(256 * 1024))
+        .route(
+            "/healthz",
+            get(|| async { Json(json!({"status":"ok","checks":["process","configuration"]})) }),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(move || {
+                let metadata = metadata.clone();
+                async move { Json(metadata) }
+            }),
+        ))
+}
+
 /// Enforce the id bound before rmcp can execute a write or echo an oversized id.
 pub async fn limit_rpc_id(
     req: axum::extract::Request,
