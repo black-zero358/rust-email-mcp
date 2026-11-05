@@ -1,12 +1,12 @@
 # 持久化缓存设计
 
-本文记录 R10 持久元数据与游标的配置、存储和恢复契约。实施顺序及验收条件以[读取能力方案](read-capabilities-plan.md#r10-至-r12-完整本地缓存)为准，带源码提交的验证结果进入 validation。
+本文记录持久元数据、完整内容与游标的配置、存储和恢复契约。实施顺序及验收条件以[读取能力方案](read-capabilities-plan.md#r10-至-r12-完整本地缓存)为准，带源码提交的验证结果进入 validation。
 
 ## 分阶段交付
 
 R10 提供持久元数据、部件索引、中文检索基础及可跨进程重启的会话游标。R11 先交付内部文件存储与 dirty 基础，再接入原始邮件和派生内容、显式离线读取与写操作失效，分批契约见[正文与附件缓存设计](cache-content-design.md)。R12 接入完整历史回填、增量同步、删除核对和管理进度。R13 执行双账户、多客户端、故障恢复及持续负载验收。
 
-默认关闭持久化。R10 的 metadata 模式只缓存管理员明确选择的账户和文件夹；full 模式在 R11 完成对应数据层后启用。默认在线调用仍检查当前权限、文件夹世代和命令终结，缓存故障保留在线读取的实际结果。
+默认关闭持久化。metadata 和 full 都只缓存管理员明确选择的账户和文件夹。full 保存已观察的完整内容，开放显式本地读取；默认在线调用仍检查当前权限、文件夹世代、目标存在性和命令终结，运行期缓存写入失败保留在线读取的实际结果。
 
 ## 配置示例
 
@@ -26,13 +26,15 @@ R10 提供持久元数据、部件索引、中文检索基础及可跨进程重�
 
 `directory` 相对配置 JSON 所在目录解析；例如 `/data/cache.json` 中的 `cache` 对应 `/data/cache`。全局和每账户额度均为实际磁盘字节，每账户不超过全局，每项至少 1 MiB。每账户最多 64 个目录；INBOX 大小写规范为 INBOX，其余名称精确匹配，重复项、未知账户及未知 JSON 字段在启动前拒绝。配置文件最多 256 KiB。
 
-省略 `CACHE_CONFIG_PATH`，或使用 `{"version":1,"mode":"off"}` 关闭持久缓存。off 只接受 version 和 mode，不创建缓存文件。当前 metadata 模式积累在线读取的证据；full 在后续工作包完成后开放，当前配置 full 返回明确的模式错误。账户、目录或额度配置修改通过重启生效。
+省略 `CACHE_CONFIG_PATH`，或使用 `{"version":1,"mode":"off"}` 关闭持久缓存。off 只接受 version 和 mode，不创建内容缓存。将样例的 mode 改为 full 即启用完整内容保存和显式离线读取；其余配置字段保持一致。账户、目录或额度配置修改通过重启生效。所有模式启动时均在账户注册库旁更新运行见证，相关目录需可写；full 初始化失败会结束启动，管理员修复后重试。
 
 ## 查询状态
 
-`get_cache_status` 接受可选 `account_id`，省略时选择默认读取账户，先检查当前主体权限并仅查询本地状态。`mode` 为 off 或 metadata，`status` 为 off、ready 或 unavailable。账户未纳入配置时也返回 off；off 或 unavailable 时 storage 为 null。ready 时 `storage` 给出本账户 `max_bytes` / `used_bytes`、全局上限 `global_max_bytes`、启动未清洁标记 `startup_unclean`，以及各目录的 UIDVALIDITY、水位、最近检查时间、dirty、messages、complete_headers、indexed_headers 和 verified_parts。
+`get_cache_status` 接受可选 `account_id`，省略时选择默认读取账户，先检查当前主体权限并仅查询本地状态。`mode` 为 off、metadata 或 full，`status` 为 off、ready 或 unavailable。账户未纳入配置时也返回 off；off 或 unavailable 时 storage 为 null。ready 时 `storage` 给出本账户 `max_bytes` / `used_bytes`、全局上限 `global_max_bytes`、启动未清洁标记 `startup_unclean`，以及各目录的 UIDVALIDITY、水位、最近检查时间、dirty、messages、complete_headers、indexed_headers 和 verified_parts。
 
-这些计数描述已经观察并写入的当前目录世代。完整扫描和全历史覆盖由 R12 同步任务补齐；正文、附件及显式离线交付由 R11 接入。部分头保留其完整性标记，只有完整头进入相应索引。状态读取先等待已排队写入的本地屏障，最多 2 秒；缓存不可用时返回 unavailable，管理员检查目录、额度和恢复状态。
+这些计数描述已经观察并写入的当前目录世代。full 的 `content_pending` 显示正在排队或执行的内容保存，目录 `layers` 分别统计 raw、full_body 和 attachments 的 materialized、materialized_bytes、derivable_from_raw、missing、omitted 和 unsupported。完整扫描和全历史覆盖由 R12 同步任务补齐。部分头保留完整性标记，只有完整头和完整正文进入对应索引。状态读取先等待元数据本地屏障，最多 2 秒；内容保存进度另由 content_pending 和各层物化状态反映。缓存不可用时返回 unavailable，管理员检查目录、额度和恢复状态。
+
+full 的显式工具矩阵及字节限制见[内容缓存设计](cache-content-design.md#显式离线契约)。离线结果包含 `read_source:"cache"` 或 `search_source:"cache"`，以及 `cache.stale:true`、`remote_generation_unverified:true`、各范围最后观察时间和 coverage。FLAGS、INTERNALDATE、SIZE 保留独立观察时间，缺失字段以未知状态报告。`get_email_status`、`get_mailbox_statistics` 和 `diagnose_connectivity` 保持在线；`get_cache_status` 查询本地状态。中文全文搜索可返回 `next_cache_cursor`，下一页使用相同查询和筛选条件；数据修订变化时重新开始搜索。
 
 `write_health` 始终返回 `failed_writes`、`last_error` 和 `quota_blocked`。失败计数以当前进程中归类为 quota、queue_full 或 storage 的失败证据任务为单位，一批记录计一次；固定最后错误类别为 quota、queue_full、storage 或 null。quota_blocked 在当前进程内保留，重启后重新评估。普通额度不足时仍展示已有 storage 和覆盖计数，管理员可据此增加额度或调整范围；后续成功状态读取或小额写入保留历史失败记录。
 
@@ -60,7 +62,7 @@ R10 提供持久元数据、部件索引、中文检索基础及可跨进程重�
 
 完整 JSON-RPC 响应和实际 next token 通过预算后，以一个短 SQLite CAS 事务原子替换检查点、active 和最近 replay。事务成功后才确认交付。崩溃发生在提交与回包之间时，原输入 token 可重放已提交页；取消或写入失败保留未交付数据。执行中的阻塞文件工作继续拥有租约和额度，结束前不允许另一请求接管。
 
-有效期记录为绝对到期时间，重启不延长原 600 秒窗口。无进展成功页轮换 token 并保留重放，但不刷新到期时间；未来或异常倒拨时间按失效处理。恢复的会话继续在线复核全部冻结目录，任一 UIDVALIDITY 改变使其失效。
+有效期记录为绝对到期时间，重启不延长原 600 秒窗口。无进展成功页轮换 token 并保留重放，但不刷新到期时间；未来或异常倒拨时间按失效处理。恢复的 live 会话在线复核全部冻结目录，任一 UIDVALIDITY 改变使其失效；cache 会话复核本地冻结范围、索引修订、dirty 修订和恢复世代。游标来源保持绑定。
 
 跨目录结果的 `cursor_storage` 显示实际模式。整个冻结范围均在管理员缓存配置中时使用 persistent；关闭缓存或范围包含未选目录时使用 memory。已配置的持久范围发生存储故障时返回固定游标错误，已提交记录供故障恢复后重试；已确认的目录世代变化使旧 token 失效。持久提交仍使用本页总期限，并为提交预留至多 1 秒。响应预算检查计入 cursor_storage 及下一 token。
 
@@ -68,7 +70,7 @@ R10 提供持久元数据、部件索引、中文检索基础及可跨进程重�
 
 正常重启和异常退出保留可在线复核的会话检查点。管理员执行备份恢复时，通过 `rust-email-mcp --cache-restored` 清除旧游标并将缓存范围标为待核对，操作步骤见[部署规程](deployment.md#持久缓存备份与恢复)；恢复操作库遵循原发送记录规程。数据库损坏、未知 schema 或迁移失败提供可重建的缓存故障状态，避免更改发送操作结果。
 
-R11 开放离线内容前，必须接入未清洁运行标记和所有既有写路径的 dirty scope 登记。在线核验清除 dirty，已知 tombstone、失效世代及撤权立即阻止交付。完整 raw、正文、附件、索引和物化层分别报告 present/missing/omitted/complete；R12 全量扫描与失败队列收敛后才更新对应范围的完成标志。
+R11 的离线内容通过独立运行见证、未清洁运行标记和所有既有写路径的 dirty scope 登记保护。完整只读核验以修订 CAS 清除 dirty，已知 tombstone、失效世代及撤权立即阻止交付。完整 raw、正文与附件分别报告 materialized、derivable_from_raw、missing、omitted 或 unsupported，索引报告已完整保存的覆盖；R12 全量扫描与失败队列收敛后更新对应历史范围的完成标志。
 
 ## 验证入口
 

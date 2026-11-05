@@ -1,7 +1,7 @@
 //! Principal-aware account routing over one journal and one backend scheduler.
 use super::*;
 use crate::accounts::{AccountCatalog, AccountLease};
-use scheduler::{AdmissionError, Scheduler, WorkClass};
+use scheduler::{AdmissionError, BackendPermit, Scheduler, WorkClass};
 use std::{collections::HashMap, future::Future};
 
 pub struct MailRuntime {
@@ -9,9 +9,18 @@ pub struct MailRuntime {
     journal: Arc<Journal>,
     pub(super) catalog: Arc<AccountCatalog>,
     pub(super) scheduler: Arc<Scheduler>,
+    write_guards: Arc<cache_write_guard::WriteGuardPool>,
     services: HashMap<AccountKey, MailService>,
     pub attachments: Arc<attachments::AttachmentStore>,
     conversations: conversation::CursorStore,
+}
+
+tokio::task_local! {
+    static READ_ADMISSION: Arc<BackendPermit>;
+}
+
+pub(super) fn read_admission() -> Option<Arc<BackendPermit>> {
+    READ_ADMISSION.try_with(Arc::clone).ok()
 }
 
 impl MailRuntime {
@@ -19,12 +28,21 @@ impl MailRuntime {
         Self::with_cache(catalog, journal, PreparedCache::default())
     }
 
+    #[cfg(test)]
     pub fn prepare_cache(
         catalog: &AccountCatalog,
         settings: Option<crate::config::CacheSettings>,
     ) -> anyhow::Result<PreparedCache> {
+        Self::prepare_cache_for_run(catalog, settings, None)
+    }
+
+    pub fn prepare_cache_for_run(
+        catalog: &AccountCatalog,
+        settings: Option<crate::config::CacheSettings>,
+        run: Option<crate::accounts::CacheRunIdentity>,
+    ) -> anyhow::Result<PreparedCache> {
         match settings {
-            Some(settings) => PreparedCache::open(catalog, settings),
+            Some(settings) => PreparedCache::open(catalog, settings, run),
             None => Ok(PreparedCache::default()),
         }
     }
@@ -37,6 +55,7 @@ impl MailRuntime {
         let config = catalog.config().clone();
         let attachments = Arc::new(attachments::AttachmentStore::new(config.clone()));
         let metadata_cache = Arc::new(std::sync::Mutex::new(insights::MetadataCache::default()));
+        let write_guards = Arc::new(cache_write_guard::WriteGuardPool::default());
         let mut services = HashMap::new();
         for lease in catalog.registered_accounts() {
             let mut service = MailService::for_account(
@@ -49,6 +68,7 @@ impl MailRuntime {
                 metadata_cache.clone(),
             )?;
             service.persistent = cache.clone();
+            service.write_guards = write_guards.clone();
             services.insert(lease.key, service);
         }
         Ok(Self {
@@ -56,6 +76,7 @@ impl MailRuntime {
             journal,
             catalog,
             scheduler: Scheduler::new(),
+            write_guards,
             services,
             attachments,
             conversations: cache.cursor_store(),
@@ -64,6 +85,18 @@ impl MailRuntime {
 
     pub fn config(&self) -> &Arc<Config> {
         &self.config
+    }
+
+    pub async fn finish_cache(&self, cache: PreparedCache) {
+        let writes_finished = self
+            .write_guards
+            .seal_and_drain(std::time::Duration::from_secs(10))
+            .await;
+        let reads_finished = self.scheduler.stop_admission();
+        let transfers_finished = self.attachments.stop_transfers();
+        if writes_finished && reads_finished && transfers_finished {
+            cache.finish().await;
+        }
     }
 
     pub fn has_read_access(&self, principal: &str) -> bool {
@@ -98,7 +131,9 @@ impl MailRuntime {
                 } else {
                     "read"
                 });
-                if service.persistent.configured(&lease.key) {
+                if service.persistent.full_storage(&lease.key).is_some() {
+                    value["capabilities"]["cache_modes"] = json!(["off", "metadata", "full"]);
+                } else if service.persistent.configured(&lease.key) {
                     value["capabilities"]["cache_modes"] = json!(["off", "metadata"]);
                 }
                 Some(value)
@@ -136,20 +171,49 @@ impl MailRuntime {
             let lease = self.catalog.read_account(principal, requested)?;
             let service = self.service_for(&lease.key)?;
             if name == "get_cache_status" {
-                return tokio::select! {
-                    biased;
-                    _ = lease.cancellation.cancelled() => Err(MailError::account_unavailable()),
-                    status = service.persistent.status(&lease.key, &lease.alias) => Ok(status),
-                };
+                return self
+                    .scheduler
+                    .run(
+                        lease.key.reference_namespace(),
+                        WorkClass::Foreground,
+                        &lease.cancellation,
+                        || service.persistent.status(&lease.key, &lease.alias),
+                    )
+                    .await
+                    .map_err(admission_error);
             }
             let mut selected = args.clone();
             selected
                 .as_object_mut()
                 .ok_or_else(MailError::input)?
                 .insert("account_id".into(), json!(lease.alias));
-            let result = self
-                .run_read(&lease, service.execute(name, &selected, principal))
-                .await?;
+            let offline = if name == "read_conversation" {
+                conversation::cached_request(&selected)?
+            } else {
+                read_source::Source::parse(name, &selected)? == read_source::Source::Cache
+            };
+            let result = if offline {
+                self.run_cached(
+                    &lease,
+                    Box::pin(async {
+                        if name == "read_conversation" {
+                            Box::pin(
+                                service.cached_legacy_conversation(&selected, &lease.cancellation),
+                            )
+                            .await
+                        } else {
+                            Box::pin(service.cached_operation(name, &selected, principal)).await
+                        }
+                    }),
+                )
+                .await?
+            } else {
+                self.run_read(
+                    &lease,
+                    Box::pin(service.execute(name, &selected, principal)),
+                )
+                .await?
+            };
             Ok(account_context(name, result, &selected, &lease.alias))
         } else {
             let lease = self.catalog.write_account(principal)?;
@@ -157,18 +221,12 @@ impl MailRuntime {
                 return Err(MailError::account_unavailable());
             }
             let service = self.service_for(&lease.key)?;
-            let _permit = self
-                .scheduler
-                .acquire(
-                    lease.key.reference_namespace(),
-                    WorkClass::Foreground,
-                    &lease.cancellation,
-                )
+            let _write = self
+                .write_guards
+                .admit()
+                .ok_or_else(|| admission_error(AdmissionError::Capacity))?;
+            self.run_write(&lease, Box::pin(service.execute(name, args, principal)))
                 .await
-                .map_err(admission_error)?;
-            // Preserve SMTP's journal-before-send and known/unknown outcome
-            // handling: an already started write is never cancelled by ACL.
-            service.execute(name, args, principal).await
         }
     }
 
@@ -176,6 +234,25 @@ impl MailRuntime {
         self.services
             .get(key)
             .ok_or_else(MailError::account_unavailable)
+    }
+
+    pub(super) async fn run_write<T>(
+        &self,
+        lease: &AccountLease,
+        operation: impl Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let permit = self
+            .scheduler
+            .acquire(
+                lease.key.reference_namespace(),
+                WorkClass::Foreground,
+                &lease.cancellation,
+            )
+            .await
+            .map_err(admission_error)?;
+        // Admission can be shared with blocking preflight work. After the
+        // write starts, ACL cancellation never cuts its outcome handling.
+        READ_ADMISSION.scope(Arc::new(permit), operation).await
     }
 
     pub(crate) async fn cross_conversation(
@@ -191,17 +268,18 @@ impl MailRuntime {
             .transpose()?;
         let lease = self.catalog.read_account(principal, requested)?;
         let service = self.service_for(&lease.key)?;
-        self.run_read(
-            &lease,
-            Box::pin(service.cross_conversation(
-                &self.conversations,
-                args,
-                principal,
-                &lease.cancellation,
-                fits,
-            )),
-        )
-        .await
+        let operation = Box::pin(service.cross_conversation(
+            &self.conversations,
+            args,
+            principal,
+            &lease.cancellation,
+            fits,
+        ));
+        if conversation::cached_request(args)? {
+            self.run_cached(&lease, operation).await
+        } else {
+            self.run_read(&lease, operation).await
+        }
     }
 
     pub(super) async fn run_read<T>(
@@ -211,18 +289,36 @@ impl MailRuntime {
     ) -> Result<T> {
         let service = self.service_for(&lease.key)?;
         service.backend_ready()?;
-        self.scheduler
-            .run(
+        self.run_cached(lease, async {
+            service.backend_ready()?;
+            operation.await
+        })
+        .await
+    }
+
+    pub(super) async fn run_cached<T>(
+        &self,
+        lease: &AccountLease,
+        operation: impl Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let permit = self
+            .scheduler
+            .acquire(
                 lease.key.reference_namespace(),
                 WorkClass::Foreground,
                 &lease.cancellation,
-                || async {
-                    service.backend_ready()?;
-                    operation.await
-                },
             )
             .await
-            .map_err(admission_error)?
+            .map_err(admission_error)?;
+        READ_ADMISSION
+            .scope(Arc::new(permit), async {
+                tokio::select! {
+                    biased;
+                    _ = lease.cancellation.cancelled() => Err(MailError::account_unavailable()),
+                    result = operation => result,
+                }
+            })
+            .await
     }
 
     #[cfg(test)]

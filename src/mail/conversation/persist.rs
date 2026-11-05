@@ -2,7 +2,7 @@
 use super::{Cursor, Prepared, Replay};
 use crate::mail::conversation::{
     graph::{Failure, RefKey, SearchField},
-    state::State,
+    state::{CacheStamp, CacheStamps, State},
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -12,6 +12,7 @@ use std::{
 };
 
 pub(in crate::mail::conversation) const CODEC_VERSION: u16 = 1;
+pub(super) const CACHE_CODEC_VERSION: u16 = 2;
 const MAGIC: &[u8; 8] = b"REMCPCUR";
 const CHECKSUM_BYTES: usize = 32;
 const MAX_ENCODED: usize = 8 * 1024 * 1024;
@@ -292,9 +293,22 @@ pub(super) fn encode(
         buffered: 0,
     };
     encoder.bytes(MAGIC)?;
-    encoder.u16(CODEC_VERSION)?;
+    encoder.u16(codec_version(state))?;
     encoder.u16(state.version())?;
     state.encode(&mut encoder, &prepared.delivery)?;
+    if let Some(stamps) = state.cache_stamps() {
+        for stamp in stamps {
+            encoder.option(*stamp, |e, stamp| {
+                e.u64(stamp.checked_at_ms.try_into().map_err(|_| Invalid)?)?;
+                e.u64(stamp.index_revision)?;
+                e.u64(stamp.dirty_revision)?;
+                e.u64(stamp.restore_epoch)?;
+                e.u64(stamp.complete_headers)?;
+                e.u64(stamp.indexed_threads)?;
+                e.u64(stamp.known_messages)
+            })?;
+        }
+    }
     encoder.boolean(record_replay)?;
     if record_replay {
         encoder.bytes(prepared.input.0.as_bytes())?;
@@ -334,13 +348,34 @@ pub(super) fn decode(
         position: 0,
         buffered: 0,
     };
-    if &decoder.array::<8>()? != MAGIC
-        || decoder.u16()? != CODEC_VERSION
-        || decoder.u16()? != super::STATE_VERSION
-    {
+    if &decoder.array::<8>()? != MAGIC {
         return Err(Invalid);
     }
-    let state = State::decode(&mut decoder, namespace)?;
+    let version = decoder.u16()?;
+    if !supported(version) || decoder.u16()? != super::STATE_VERSION {
+        return Err(Invalid);
+    }
+    let mut state = State::decode(&mut decoder, namespace)?;
+    if version == CACHE_CODEC_VERSION {
+        let mut stamps = [None; super::MAX_FOLDERS];
+        for stamp in &mut stamps {
+            *stamp = decoder.option(|d| {
+                Ok(CacheStamp {
+                    checked_at_ms: d.u64()?.try_into().map_err(|_| Invalid)?,
+                    index_revision: d.u64()?,
+                    dirty_revision: d.u64()?,
+                    restore_epoch: d.u64()?,
+                    complete_headers: d.u64()?,
+                    indexed_threads: d.u64()?,
+                    known_messages: d.u64()?,
+                })
+            })?;
+        }
+        decoder.charge(size_of::<CacheStamps>())?;
+        state
+            .set_cache_stamps(stamps, owned_limit)
+            .map_err(|_| Invalid)?;
+    }
     if state.owned_bytes() > owned_limit {
         return Err(Invalid);
     }
@@ -361,6 +396,8 @@ pub(super) fn decode(
             || coverage != state.coverage()
             || next.is_none() != (coverage.graph_complete && !coverage.delivery_pending)
             || next == Some(input)
+            || input.cached() != state.cache_stamps().is_some()
+            || next.is_some_and(|next| next.cached() != input.cached())
         {
             return Err(Invalid);
         }
@@ -387,6 +424,18 @@ pub(super) fn decode(
         return Err(Invalid);
     }
     Ok((state, replay))
+}
+
+pub(super) fn codec_version(state: &State) -> u16 {
+    if state.cache_stamps().is_some() {
+        CACHE_CODEC_VERSION
+    } else {
+        CODEC_VERSION
+    }
+}
+
+pub(super) fn supported(version: u16) -> bool {
+    matches!(version, CODEC_VERSION | CACHE_CODEC_VERSION)
 }
 
 #[cfg(test)]

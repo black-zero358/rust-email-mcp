@@ -209,6 +209,33 @@ impl CursorBackend {
         write: CursorWrite<'_>,
         encode: impl FnOnce(&mut dyn Write) -> Result<(), CursorError>,
     ) -> Result<(), CursorError> {
+        self.save_inner(write, None, encode)
+    }
+
+    pub fn save_offline(
+        &self,
+        write: CursorWrite<'_>,
+        expected: &[super::ScopeSnapshot],
+        encode: impl FnOnce(&mut dyn Write) -> Result<(), CursorError>,
+    ) -> Result<(), CursorError> {
+        if expected.len() != write.frozen.len()
+            || !write.frozen.iter().all(|folder| {
+                expected.iter().any(|scope| {
+                    scope.mailbox == folder.mailbox && scope.uid_validity == folder.uid_validity
+                })
+            })
+        {
+            return Err(CursorError::Unavailable);
+        }
+        self.save_inner(write, Some(expected), encode)
+    }
+
+    fn save_inner(
+        &self,
+        write: CursorWrite<'_>,
+        offline: Option<&[super::ScopeSnapshot]>,
+        encode: impl FnOnce(&mut dyn Write) -> Result<(), CursorError>,
+    ) -> Result<(), CursorError> {
         let row = checked_write(&write)?;
         let namespace = write.binding.namespace;
         let mut databases = self.0.lock()?;
@@ -269,6 +296,15 @@ impl CursorBackend {
             .get_mut(&namespace)
             .ok_or(CursorError::Unavailable)?;
         self.0.write_checked(namespace, database, |tx| {
+            if let Some(expected) = offline {
+                let configured = self.0.scopes.get(&namespace).ok_or(CursorError::Unavailable)?;
+                for scope in expected {
+                    if !configured.mailboxes.contains(&scope.mailbox) {
+                        return Err(CursorError::Unavailable);
+                    }
+                    super::thread_index::verify_scope(&self.0, tx, namespace, scope)?;
+                }
+            }
             let mut frozen = write.frozen.to_vec();
             frozen.sort_unstable_by(|a, b| a.mailbox.cmp(b.mailbox));
             let mut hash = digest_prefix(write.binding, row);
@@ -324,6 +360,9 @@ impl CursorBackend {
             }
             Ok(())
         }, || {
+            if offline.is_some() {
+                self.0.require_offline_health()?;
+            }
             if (write.cancelled)() {
                 return Err(CursorError::Unavailable);
             }

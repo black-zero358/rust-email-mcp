@@ -15,6 +15,7 @@ fn transfer(service: &MailService) -> Transfer {
     Transfer {
         principal:"owner".into(),account:service.account.clone(),mailbox:"收件箱".into(),uid:7,validity:9,
         part: entries(b"Content-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=synthetic.bin\r\n\r\nx").unwrap().remove(0),
+        cache:None,
         expires:Instant::now()+HANDLE_TTL,
     }
 }

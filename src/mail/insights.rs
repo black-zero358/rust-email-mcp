@@ -102,13 +102,13 @@ impl MailService {
         &self,
         s: &mut async_imap::Session<S>,
         mailbox: &str,
-        validity: Option<u32>,
+        state: &async_imap::types::Mailbox,
         uid: u32,
     ) -> Result<Vec<u8>>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
     {
-        self.cached_headers_checked(s, mailbox, validity, uid)
+        self.cached_headers_checked(s, mailbox, state, uid)
             .await
             .map_err(|fault| fault.error)
     }
@@ -117,12 +117,13 @@ impl MailService {
         &self,
         s: &mut async_imap::Session<S>,
         mailbox: &str,
-        validity: Option<u32>,
+        state: &async_imap::types::Mailbox,
         uid: u32,
     ) -> std::result::Result<Vec<u8>, parts::body::ReadFault>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
     {
+        let validity = state.uid_validity;
         if let Some(headers) = self
             .metadata_cache
             .lock()
@@ -133,7 +134,15 @@ impl MailService {
         }
         let headers = parts::fetch::message_header(s, uid, HEADER_LIMIT + 1)
             .await
-            .map_err(parts::body::ReadFault::command)?;
+            .map_err(|error| {
+                parts::body::ReadFault::command(self.observe_fetch_error(
+                    mailbox,
+                    validity,
+                    state.uid_next,
+                    uid,
+                    error,
+                ))
+            })?;
         if headers.len() > HEADER_LIMIT {
             return Err(parts::body::ReadFault::local(MailError::limit_with(
                 LimitKind::HeaderBytes,
@@ -217,9 +226,7 @@ impl MailService {
                 if matches.len() >= limit {
                     break;
                 }
-                let headers = self
-                    .cached_headers(s, mailbox, state.uid_validity, id)
-                    .await?;
+                let headers = self.cached_headers(s, mailbox, &state, id).await?;
                 checked += 1;
                 let h = thread_headers(&headers)?;
                 // IMAP HEADER is substring matching; verify the entire parsed identifier.
@@ -248,7 +255,7 @@ impl MailService {
         let candidate_limit = number(a, "candidate_limit", 100, 1, 200)? as usize;
         let limit = number(a, "limit", 10, 1, 20)? as usize;
         let seed_headers = self
-            .cached_headers(reader.session()?, mailbox, state.uid_validity, seed)
+            .cached_headers(reader.session()?, mailbox, &state, seed)
             .await?;
         let seed_links = thread_headers(&seed_headers)?;
         let (start, end) = window(a, state.uid_next)?;
@@ -279,7 +286,7 @@ impl MailService {
         for id in ids {
             // Only local validation after a completed FETCH can skip a candidate.
             let raw = match self
-                .cached_headers_checked(reader.session()?, mailbox, state.uid_validity, id)
+                .cached_headers_checked(reader.session()?, mailbox, &state, id)
                 .await
             {
                 Ok(raw) => raw,

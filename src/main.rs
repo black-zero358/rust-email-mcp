@@ -40,7 +40,8 @@ async fn main() -> anyhow::Result<()> {
         "CACHE_CONFIG_PATH is required to mark a restored cache"
     );
     let catalog = accounts::open_catalog(settings)?;
-    let cache = MailRuntime::prepare_cache(&catalog, cache_settings)?;
+    let run = accounts::CacheRun::begin(catalog.config())?;
+    let cache = MailRuntime::prepare_cache_for_run(&catalog, cache_settings, Some(run.identity()))?;
     if restore {
         cache.mark_restored()?;
         tracing::info!(event = "cache_restore_marked");
@@ -67,6 +68,7 @@ async fn main() -> anyhow::Result<()> {
         .with_allowed_origins(["https://chatgpt.com:443".to_string()])
         .with_cancellation_token(ct.child_token());
     let download_mail = mail.clone();
+    let shutdown_mail = mail.clone();
     let service = StreamableHttpService::new(
         move || Ok(EmailServer(mail.clone())),
         Arc::new(LocalSessionManager::default()),
@@ -114,6 +116,7 @@ async fn main() -> anyhow::Result<()> {
             tokio::time::sleep(std::time::Duration::from_secs(35)).await;
         })
         .await?;
-    cache.finish().await;
+    shutdown_mail.finish_cache(cache).await;
+    drop(run);
     Ok(())
 }

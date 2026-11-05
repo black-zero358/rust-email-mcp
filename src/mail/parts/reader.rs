@@ -458,14 +458,18 @@ impl MailService {
             .filter(|v| *v > 0)
             .ok_or_else(MailError::backend)?;
         // A separately completed size command survives a later parser failure.
-        let known_size = size(&mut session, uid).await.map_err(FetchFailure::mail)?;
+        let observe =
+            |error| self.observe_fetch_error(mailbox, Some(validity), state.uid_next, uid, error);
+        let known_size = size(&mut session, uid)
+            .await
+            .map_err(|error| observe(error.mail()))?;
         let max = self
             .config
             .max_message
             .min(crate::config::DEFAULT_MAX_MESSAGE);
         match manifest(&mut session, uid).await {
             Ok(manifest) => {
-                self.persist_manifest(mailbox, Some(validity), uid, &manifest);
+                self.persist_structured_manifest(mailbox, Some(validity), uid, &manifest);
                 Ok(LoadedManifest {
                     source: ManifestSource::Structured(manifest),
                     validity,
@@ -495,7 +499,18 @@ impl MailService {
                     .map_err(map_read_imap_error)?;
                 self.observe_mailbox(mailbox, &state);
                 check_validity(&json!({"uid_validity":validity}), state.uid_validity)?;
-                let raw = self.raw_attachment(&mut fresh, uid).await?;
+                let raw = self
+                    .raw_attachment(&mut fresh, uid)
+                    .await
+                    .map_err(|error| {
+                        self.observe_fetch_error(
+                            mailbox,
+                            Some(validity),
+                            state.uid_next,
+                            uid,
+                            error,
+                        )
+                    })?;
                 if raw.len() != known_size {
                     return Err(MailError::backend());
                 }
@@ -506,7 +521,7 @@ impl MailService {
                     diagnostics,
                 })
             }
-            Err(error) => Err(error.mail()),
+            Err(error) => Err(observe(error.mail())),
         }
     }
 }

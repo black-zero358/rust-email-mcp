@@ -1,5 +1,6 @@
 mod graph;
 mod identity;
+mod offline;
 mod state;
 mod store;
 
@@ -39,6 +40,57 @@ pub(crate) fn cross_requested(args: &Value) -> bool {
         .any(|key| args.get(key).is_some())
 }
 
+pub(crate) fn cached_request(args: &Value) -> Result<bool> {
+    use super::read_source::Source;
+    let requested = Source::parse("read_conversation", args)? == Source::Cache;
+    let Some(cursor) = args["cursor"].as_str() else {
+        return Ok(requested);
+    };
+    let cached = cursor.parse::<Cursor>().map_err(store_error)?.cached();
+    if args.get("read_source").is_some() && requested != cached {
+        return Err(MailError::input_field(crate::error::InputViolation::new(
+            "/read_source",
+            "conflicting_field",
+            "remove_conflicting_field",
+        )));
+    }
+    Ok(cached)
+}
+
+pub(super) const THREAD_INDEX_VERSION: u16 = 1;
+
+pub(super) fn normalized_message_id(input: &str) -> Result<String> {
+    identity::MessageId::parse(input.as_bytes())
+        .map_err(|_| MailError::input())?
+        .map(|id| id.into_boxed_str().into_string())
+        .ok_or_else(MailError::input)
+}
+
+pub(super) fn thread_index_ids(
+    headers: &[mailparse::MailHeader<'_>],
+) -> Result<Vec<(crate::cache::ThreadRole, Box<str>)>> {
+    use crate::cache::ThreadRole;
+    let facts =
+        ThreadFacts::parse(headers).map_err(|_| MailError::limit_kind(LimitKind::HeaderBytes))?;
+    Ok(facts
+        .id
+        .into_iter()
+        .map(|id| (ThreadRole::MessageId, id.into_boxed_str()))
+        .chain(
+            facts
+                .references
+                .into_iter()
+                .map(|id| (ThreadRole::References, id.into_boxed_str())),
+        )
+        .chain(
+            facts
+                .in_reply_to
+                .into_iter()
+                .map(|id| (ThreadRole::InReplyTo, id.into_boxed_str())),
+        )
+        .collect())
+}
+
 impl MailService {
     pub(super) async fn cross_conversation(
         &self,
@@ -48,12 +100,13 @@ impl MailService {
         cancellation: &CancellationToken,
         fits: impl Fn(&Value) -> bool,
     ) -> Result<Value> {
+        let cached = cached_request(args)?;
         let budget = self
             .config
             .timeout
             .min(Duration::from_secs(MAX_PAGE_SECONDS));
         let deadline = Deadline::now() + budget;
-        let durable = self.persistent.durable_account(&self.account);
+        let durable = cached || self.persistent.durable_account(&self.account);
         // Leave time for the durable commit after assembling the exact page.
         let network_deadline = if durable {
             deadline - (budget / 8).min(Duration::from_secs(1))
@@ -62,7 +115,14 @@ impl MailService {
         };
         let namespace = self.account.reference_namespace();
         let binding = Binding::new(namespace, principal);
-        let mut backend = Backend::new(self, network_deadline);
+        let mut backend = if cached {
+            PageBackend::Cache(Box::new(offline::CachedBackend::new(
+                self,
+                network_deadline,
+            )?))
+        } else {
+            PageBackend::Live(Box::new(Backend::new(self, network_deadline)))
+        };
         let (mut lease, replay) = if let Some(cursor) = args["cursor"].as_str() {
             match timed(
                 deadline,
@@ -80,20 +140,30 @@ impl MailService {
             }
         } else {
             let options = options(args)?;
-            let (folders, seed, facts) = backend.freeze(args).await?;
+            let (folders, seed, facts, stamps) = Box::pin(backend.freeze(args)).await?;
             let durable_scope = store.durable_scope(&namespace, &folders);
             if !durable_scope
-                && folders.iter().all(|folder| {
-                    self.persistent
-                        .configured_folder(&self.account, &folder.name)
-                })
+                && (cached
+                    || folders.iter().all(|folder| {
+                        self.persistent
+                            .configured_folder(&self.account, &folder.name)
+                    }))
             {
                 return Err(MailError::cursor_unavailable());
             }
-            let capacity =
+            let mut capacity =
                 unavailable_start(&self.alias, &folders, seed, cursor_storage(durable_scope))?;
+            if let Some(stamps) = &stamps {
+                offline::annotate(&mut capacity, &folders, stamps);
+            } else {
+                capacity["read_source"] = json!("live");
+            }
             let lease = match store.open_lease(binding, Deadline::now().into_std(), |limit| {
-                State::new(namespace, folders, seed, options, facts, limit)
+                let mut state = State::new(namespace, folders, seed, options, facts, limit)?;
+                if let Some(stamps) = stamps {
+                    state.set_cache_stamps(stamps, limit)?;
+                }
+                Ok(state)
             }) {
                 Ok(lease) => lease,
                 Err(StoreError::Capacity) if fits(&capacity) => return Ok(capacity),
@@ -102,6 +172,9 @@ impl MailService {
             };
             (lease, false)
         };
+        if lease.state().cache_stamps().is_some() != cached {
+            return Err(MailError::cursor_unavailable());
+        }
 
         if args.get("cursor").is_some() {
             if !replay {
@@ -132,7 +205,7 @@ impl MailService {
                 }
                 probe_order.sort_by_key(|index| !required[*index]);
             }
-            let per_folder = backend.deadline.saturating_duration_since(Deadline::now())
+            let per_folder = network_deadline.saturating_duration_since(Deadline::now())
                 / (2 * folder_count as u32);
             let mut replay_failure = None;
             for index in probe_order {
@@ -140,15 +213,20 @@ impl MailService {
                 let Boundary::Frozen { uid_validity, .. } = folder.boundary else {
                     continue;
                 };
-                let checked = backend
-                    .probe(index as u8, &folder.name, Some(uid_validity), per_folder)
-                    .await;
-                if checked
-                    .as_ref()
-                    .is_err_and(|error| error.code == "STALE_UID")
+                let checked = Box::pin(backend.probe(
+                    lease.state(),
+                    index as u8,
+                    &folder.name,
+                    uid_validity,
+                    per_folder,
+                ))
+                .await;
+                if let Err(error) = &checked
+                    && invalidates_source(error, cached)
                 {
+                    let error = error.clone();
                     let _ = timeout_at(deadline, lease.invalidate_async()).await;
-                    return Err(stale_uid());
+                    return Err(error);
                 }
                 if replay {
                     if let Err(error) = checked {
@@ -177,10 +255,10 @@ impl MailService {
         let capacity_reached = if replay {
             false
         } else {
-            match backend.scan(&mut lease).await {
+            match Box::pin(backend.scan(&mut lease)).await {
                 Ok(capacity) => capacity,
                 Err(error) => {
-                    if error.code == "STALE_UID" {
+                    if invalidates_source(&error, cached) {
                         let _ = timeout_at(deadline, lease.invalidate_async()).await;
                     }
                     return Err(error);
@@ -198,13 +276,13 @@ impl MailService {
             }
             view.delivery.clone()
         } else {
-            lease.state().plan_delta_for_folders(backend.verified)
+            lease.state().plan_delta_for_folders(backend.verified())
         };
         let original_wire_omitted = lease.replay().is_some_and(|view| view.wire_omitted);
         let bodies = if original_wire_omitted {
             Vec::new()
         } else {
-            match backend.bodies(lease.state(), &delivery).await {
+            match Box::pin(backend.bodies(lease.state(), &delivery)).await {
                 Ok(bodies) => bodies,
                 Err(error) => {
                     let _ = timeout_at(deadline, lease.invalidate_async()).await;
@@ -220,42 +298,56 @@ impl MailService {
             if !lease.persistence_available() {
                 return Err(MailError::cursor_unavailable());
             }
-            let snapshot = Snapshot {
-                next: view.next,
-                coverage: view.coverage,
-                folder: &|index| view.folder_coverage(index),
-                errors: view.errors,
-                capacity_reached: view.capacity_reached,
-                wire_omitted: view.wire_omitted,
-                cursor_storage: storage,
+            let value = {
+                let snapshot = Snapshot {
+                    next: view.next,
+                    coverage: view.coverage,
+                    folder: &|index| view.folder_coverage(index),
+                    errors: view.errors,
+                    capacity_reached: view.capacity_reached,
+                    wire_omitted: view.wire_omitted,
+                    cursor_storage: storage,
+                };
+                let full = render(
+                    &self.alias,
+                    lease.state(),
+                    &delivery,
+                    &snapshot,
+                    &bodies,
+                    original_wire_omitted,
+                )?;
+                if fits(&full) {
+                    full
+                } else {
+                    if original_wire_omitted || bodies.is_empty() {
+                        return Err(wire_limit());
+                    }
+                    let lean = render(
+                        &self.alias,
+                        lease.state(),
+                        &delivery,
+                        &snapshot,
+                        &bodies,
+                        true,
+                    )?;
+                    if !fits(&lean) {
+                        return Err(wire_limit());
+                    }
+                    lean
+                }
             };
-            let full = render(
-                &self.alias,
-                lease.state(),
-                &delivery,
-                &snapshot,
-                &bodies,
-                original_wire_omitted,
-            )?;
-            if fits(&full) {
-                return Ok(full);
+            if let PageBackend::Cache(backend) = &backend
+                && let Err(error) = backend.verify_page(lease.state()).await
+            {
+                if invalidates_source(&error, true) {
+                    let _ = timeout_at(deadline, lease.invalidate_async()).await;
+                }
+                return Err(error);
             }
-            if original_wire_omitted || bodies.is_empty() {
-                return Err(wire_limit());
+            if cancellation.is_cancelled() {
+                return Err(MailError::account_unavailable());
             }
-            let lean = render(
-                &self.alias,
-                lease.state(),
-                &delivery,
-                &snapshot,
-                &bodies,
-                true,
-            )?;
-            return if fits(&lean) {
-                Ok(lean)
-            } else {
-                Err(wire_limit())
-            };
+            return Ok(value);
         }
 
         let mut delivery = delivery;
@@ -284,16 +376,27 @@ impl MailService {
                 )?
             };
             if fits(&value) {
+                if let PageBackend::Cache(backend) = &backend
+                    && let Err(error) = backend.verify_page(lease.state()).await
+                {
+                    if invalidates_source(&error, true) {
+                        let _ = timeout_at(deadline, lease.invalidate_async()).await;
+                    }
+                    return Err(error);
+                }
                 if cancellation.is_cancelled() {
                     return Err(MailError::account_unavailable());
                 }
                 if !lease.persistence_available() {
                     return Err(MailError::cursor_unavailable());
                 }
+                let cache = self.persistent.clone();
+                let account = self.account.clone();
                 let commit = Box::pin(lease.commit_async(
                     prepared,
                     Deadline::now().into_std(),
                     cancellation.clone(),
+                    move |state| offline::scopes_current(&cache, &account, state),
                 ));
                 let committed = if durable {
                     timed(deadline, commit).await?
@@ -321,6 +424,82 @@ impl MailService {
             }
         }
     }
+}
+
+type FrozenPage = (Vec<Folder>, RefKey, ThreadFacts, Option<state::CacheStamps>);
+
+enum PageBackend<'a> {
+    Live(Box<Backend<'a>>),
+    Cache(Box<offline::CachedBackend<'a>>),
+}
+
+impl PageBackend<'_> {
+    async fn freeze(&mut self, args: &Value) -> Result<FrozenPage> {
+        match self {
+            Self::Live(backend) => {
+                let (folders, seed, facts) = Box::pin(backend.freeze(args)).await?;
+                Ok((folders, seed, facts, None))
+            }
+            Self::Cache(backend) => {
+                let (folders, seed, facts, stamps) = Box::pin(backend.freeze(args)).await?;
+                Ok((folders, seed, facts, Some(stamps)))
+            }
+        }
+    }
+
+    async fn probe(
+        &mut self,
+        state: &State,
+        index: u8,
+        mailbox: &str,
+        validity: u32,
+        budget: Duration,
+    ) -> Result<()> {
+        match self {
+            Self::Live(backend) => Box::pin(backend.probe(index, mailbox, Some(validity), budget))
+                .await
+                .map(|_| ()),
+            Self::Cache(backend) => Box::pin(backend.probe(state, index)).await,
+        }
+    }
+
+    async fn scan(&mut self, lease: &mut Lease) -> Result<bool> {
+        match self {
+            Self::Live(backend) => Box::pin(backend.scan(lease)).await,
+            Self::Cache(backend) => Box::pin(backend.scan(lease)).await,
+        }
+    }
+
+    async fn bodies(&mut self, state: &State, delivery: &Delivery) -> Result<Vec<Body>> {
+        match self {
+            Self::Live(backend) => Box::pin(backend.bodies(state, delivery)).await,
+            Self::Cache(backend) => Box::pin(backend.bodies(state, delivery)).await,
+        }
+    }
+
+    fn verified(&self) -> [bool; MAX_FOLDERS] {
+        match self {
+            Self::Live(backend) => backend.verified,
+            Self::Cache(backend) => backend.verified,
+        }
+    }
+
+    fn verified_event(&self, state: &State, item: EmitKey) -> bool {
+        let verified = self.verified();
+        state.event(item).is_some_and(|event| {
+            verified[event.location.folder as usize]
+                && verified[event.representative.folder as usize]
+        })
+    }
+}
+
+fn invalidates_source(error: &MailError, cached: bool) -> bool {
+    error.code == "STALE_UID"
+        || (cached
+            && matches!(
+                error.code,
+                "CURSOR_UNAVAILABLE" | "CACHE_NEEDS_VERIFICATION" | "CACHE_UNAVAILABLE"
+            ))
 }
 
 fn options(args: &Value) -> Result<Options> {
@@ -449,13 +628,6 @@ impl<'a> Backend<'a> {
         result
     }
 
-    fn verified_event(&self, state: &State, item: EmitKey) -> bool {
-        state.event(item).is_some_and(|event| {
-            self.verified[event.location.folder as usize]
-                && self.verified[event.representative.folder as usize]
-        })
-    }
-
     async fn freeze(&mut self, args: &Value) -> Result<(Vec<Folder>, RefKey, ThreadFacts)> {
         let seed_mailbox = canonical_inbox(folder(args, InputLimits::Read)?);
         let seed_uid = uid(args)?;
@@ -487,7 +659,9 @@ impl<'a> Backend<'a> {
             .facts(seed_mailbox, uid_validity, seed_uid)
             .await
             .map_err(|fault| fault.error)?;
-        let facts = self.fingerprint(seed_uid, facts).await?;
+        let facts = self
+            .fingerprint(seed_mailbox, uid_validity, seed_uid, facts)
+            .await?;
         let mut folders = Vec::with_capacity(names.len());
         let per_folder =
             self.deadline.saturating_duration_since(Deadline::now()) / (2 * names.len() as u32);
@@ -584,18 +758,21 @@ impl<'a> Backend<'a> {
         uid: u32,
     ) -> std::result::Result<ThreadFacts, parts::body::ReadFault> {
         use parts::body::ReadFault;
-        let session = self
+        let reader = self
             .reader
             .as_mut()
-            .ok_or_else(|| ReadFault::stop(MailError::backend()))?
-            .session()
-            .map_err(ReadFault::stop)?;
+            .ok_or_else(|| ReadFault::stop(MailError::backend()))?;
+        let uid_next = reader.state.uid_next;
+        let session = reader.session().map_err(ReadFault::stop)?;
         let result = timed(
             self.deadline,
             fetch::message_header(session, uid, insights::HEADER_LIMIT + 1),
         )
         .await;
         let raw = result.map_err(ReadFault::stop)?.map_err(|error| {
+            let error =
+                self.service
+                    .observe_fetch_error(mailbox, Some(validity), uid_next, uid, error);
             if error.code == "NOT_FOUND" {
                 ReadFault::local(error)
             } else {
@@ -624,7 +801,13 @@ impl<'a> Backend<'a> {
         Ok(facts)
     }
 
-    async fn fingerprint(&mut self, uid: u32, mut facts: ThreadFacts) -> Result<ThreadFacts> {
+    async fn fingerprint(
+        &mut self,
+        mailbox: &str,
+        validity: u32,
+        uid: u32,
+        mut facts: ThreadFacts,
+    ) -> Result<ThreadFacts> {
         if facts.id.is_none() || self.fingerprint_remaining == 0 || Deadline::now() >= self.deadline
         {
             return Ok(facts);
@@ -634,18 +817,27 @@ impl<'a> Backend<'a> {
             + (self.deadline - now)
                 .div_f64(4.0)
                 .min(Duration::from_secs(2));
-        let session = self
-            .reader
-            .as_mut()
-            .ok_or_else(MailError::backend)?
-            .session()?;
+        let reader = self.reader.as_mut().ok_or_else(MailError::backend)?;
+        let uid_next = reader.state.uid_next;
+        let session = reader.session()?;
         let max = self
             .fingerprint_remaining
             .min(self.service.config.max_message);
         let size = match timed(evidence_deadline, reader::size(session, uid)).await {
             Ok(Ok(size)) if size > 0 && size <= max => size,
             Ok(Ok(_)) => return Ok(facts),
-            _ => {
+            Ok(Err(error)) => {
+                self.service.observe_fetch_error(
+                    mailbox,
+                    Some(validity),
+                    uid_next,
+                    uid,
+                    error.mail(),
+                );
+                self.disconnect();
+                return Ok(facts);
+            }
+            Err(_) => {
                 self.disconnect();
                 return Ok(facts);
             }
@@ -658,7 +850,13 @@ impl<'a> Backend<'a> {
         .await;
         let raw = match result {
             Ok(Ok(raw)) => raw,
-            _ => {
+            Ok(Err(error)) => {
+                self.service
+                    .observe_fetch_error(mailbox, Some(validity), uid_next, uid, error);
+                self.disconnect();
+                return Ok(facts);
+            }
+            Err(_) => {
                 self.disconnect();
                 return Ok(facts);
             }
@@ -769,7 +967,7 @@ impl<'a> Backend<'a> {
                                 SearchField::InReplyTo => facts.in_reply_to.contains(target),
                             };
                             if exact {
-                                self.fingerprint(uid, facts).await
+                                self.fingerprint(&mailbox, uid_validity, uid, facts).await
                             } else {
                                 Ok(facts)
                             }
@@ -993,6 +1191,11 @@ fn render(
         "complete":coverage.graph_complete && !coverage.delivery_pending,
         "response_budget_omitted":snapshot.wire_omitted,"content_trust":"untrusted",
     });
+    if let Some(stamps) = state.cache_stamps() {
+        offline::annotate(&mut value, state.folders(), stamps);
+    } else {
+        value["read_source"] = json!("live");
+    }
     if snapshot.capacity_reached {
         value["cursor_action"] = json!("resume_or_restart_with_narrower_scope");
     } else if coverage.remaining_windows == 0
@@ -1147,7 +1350,7 @@ fn failure(error: &MailError, protocol: bool) -> Failure {
     match error.code {
         "TIMEOUT" => Failure::Timeout,
         "LIMIT_EXCEEDED" => Failure::Limit,
-        "NOT_FOUND" => Failure::Missing,
+        "NOT_FOUND" | "CACHE_MISS" => Failure::Missing,
         _ if protocol => Failure::Protocol,
         _ => Failure::Backend,
     }

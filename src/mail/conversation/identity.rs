@@ -29,6 +29,10 @@ impl MessageId {
         &self.0
     }
 
+    pub(super) fn into_boxed_str(self) -> Box<str> {
+        self.0
+    }
+
     /// An ASCII domain atom occurs in both modern and obsolete forms. If no
     /// such anchor exists, an empty HEADER search covers the entire field.
     pub(super) fn search_anchor(&self) -> &str {

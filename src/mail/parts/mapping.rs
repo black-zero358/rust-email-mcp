@@ -59,6 +59,12 @@ pub struct PartManifest {
     #[cfg(test)]
     pub(super) accounted_bytes: usize,
 }
+
+impl PartManifest {
+    pub(in crate::mail) fn root_headers(&self) -> &[u8] {
+        &self.body.root_headers
+    }
+}
 #[derive(Debug, Eq, PartialEq)]
 pub struct ManifestPart {
     pub section: Section,

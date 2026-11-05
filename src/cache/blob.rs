@@ -14,11 +14,18 @@ use std::{
 use uuid::Uuid;
 
 const MAX_TEMP_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_BODY_METADATA_BYTES: usize = 16 * 1024;
 const MAX_GC_ROWS: u32 = 200;
 const IO_BLOCK: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct BlobId(Uuid);
+
+impl BlobId {
+    pub(super) fn bytes(self) -> [u8; 16] {
+        *self.0.as_bytes()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BlobInfo {
@@ -41,7 +48,7 @@ pub enum ArtifactKey {
 }
 
 impl ArtifactKey {
-    fn sql(self) -> Result<(u8, u32, u16, u16), CacheError> {
+    pub(super) fn sql(self) -> Result<(u8, u32, u16, u16), CacheError> {
         match self {
             Self::Raw => Ok((0, 0, 0, 0)),
             Self::FullBody {
@@ -175,6 +182,7 @@ pub struct BlobLease {
     reference: MessageRef,
     kind: ArtifactKey,
     info: BlobInfo,
+    body_metadata: Option<Vec<u8>>,
     offline_stamp: Option<DirtyStamp>,
     restore_epoch: u64,
     file: Option<File>,
@@ -273,6 +281,24 @@ impl Cache {
             if expected_blob.is_some_and(|id| info.id != id) {
                 return Err(CacheError::OutOfScope);
             }
+            let body_metadata = if matches!(kind, ArtifactKey::FullBody { .. }) {
+                let record: Option<(Vec<u8>, [u8; 32])> = database.connection.query_row(
+                    "SELECT payload,digest FROM body_leaf_metadata WHERE blob_id=?1 AND length(payload)<=16384",
+                    [info.id.0.as_bytes()], |row| Ok((row.get(0)?, row.get(1)?)),
+                ).optional()?;
+                match record {
+                    Some((payload, digest)) if body_metadata_digest(info, &payload) == digest => {
+                        Some(payload)
+                    }
+                    Some(_) => {
+                        self.quarantine_blob(namespace, database, info.id)?;
+                        return Err(CacheError::Corrupt);
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
             let path = self.disk.blob_path(&database.name, info.id.0, false)?;
             let file = match self.disk.open_blob_file(&path) {
                 Err(CacheError::Corrupt) => {
@@ -289,6 +315,7 @@ impl Cache {
                 reference: reference.into(),
                 kind,
                 info,
+                body_metadata,
                 offline_stamp,
                 restore_epoch: self.disk.restore_epoch(),
                 file: Some(file),
@@ -330,44 +357,46 @@ impl Cache {
         kind: ArtifactKey,
         state: ArtifactState,
     ) -> Result<(), CacheError> {
-        let namespace = self.scope(reference.account, reference.mailbox)?;
-        if !self.full {
+        self.record_artifact_states(reference, &[(kind, state)])
+    }
+
+    pub fn record_artifact_states(
+        &self,
+        reference: Ref<'_>,
+        states: &[(ArtifactKey, ArtifactState)],
+    ) -> Result<(), CacheError> {
+        if !self.full || states.len() > 1025 {
             return Err(CacheError::OutOfScope);
         }
-        let (kind, part, mime, html) = kind.sql()?;
-        let (state, raw_id, reason) = match state {
-            ArtifactState::Missing => (0, None, None),
-            ArtifactState::Derivable { raw } if kind != 0 => (2, Some(*raw.0.as_bytes()), None),
-            ArtifactState::Omitted(
-                reason @ (Omission::RawLimit | Omission::DecodedLimit | Omission::Quota),
-            ) => (3, None, Some(reason as u8)),
-            ArtifactState::Unsupported(
-                reason @ (Omission::UnsupportedEncoding | Omission::UnsupportedContent),
-            ) => (4, None, Some(reason as u8)),
-            _ => return Err(CacheError::OutOfScope),
-        };
-        let mut databases = self.lock()?;
-        let database = databases
-            .get_mut(&namespace)
-            .ok_or(CacheError::OutOfScope)?;
-        self.write(namespace, database, |tx| {
-            let message = present_message(tx, reference)?;
-            if let Some(id) = raw_id {
-                let known: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM artifacts WHERE message_id=?1 AND kind=0 AND blob_id=?2)",
-                    params![message, id], |row| row.get(0),
-                )?;
-                if !known {
-                    return Err(CacheError::OutOfScope);
-                }
-            }
+        if states.is_empty() {
+            return Ok(());
+        }
+        self.update_message(reference, |tx, message| {
+            apply_artifact_states(tx, message, states)
+        })
+    }
+
+    pub fn remember_full_manifest(
+        &self,
+        reference: Ref<'_>,
+        parts: &[u8],
+        expected: &[(ArtifactKey, ArtifactState)],
+    ) -> Result<(), CacheError> {
+        if !self.full
+            || parts.is_empty()
+            || parts.len() > 256 * 1024
+            || expected.len() > 1024
+            || expected
+                .iter()
+                .any(|(kind, _)| !matches!(kind, ArtifactKey::Attachment { .. }))
+        {
+            return Err(CacheError::OutOfScope);
+        }
+        self.update_message(reference, |tx, message| {
+            apply_artifact_states(tx, message, expected)?;
             tx.execute(
-                "INSERT INTO artifacts VALUES(?1,?2,?3,?4,?5,?6,NULL,?7,?8)
-                 ON CONFLICT(message_id,kind,part,mime_version,html_version)
-                 DO UPDATE SET state=excluded.state,raw_id=excluded.raw_id,reason=excluded.reason
-                 WHERE excluded.state<>0 AND artifacts.state<>1
-                   AND (artifacts.state NOT IN (2,4) OR excluded.state=2)",
-                params![message, kind, part, mime, html, state, raw_id, reason],
+                "UPDATE messages SET parts=?2 WHERE id=?1",
+                params![message, parts],
             )?;
             Ok(())
         })
@@ -586,6 +615,29 @@ impl Cache {
                  )",
                 [MAX_GC_ROWS],
             )?;
+            tx.execute(
+                "DELETE FROM body_segments WHERE id IN (
+                    SELECT s.id FROM body_segments s JOIN body_indexes b ON b.id=s.index_id
+                    WHERE NOT EXISTS(
+                        SELECT 1 FROM artifacts a WHERE a.message_id=b.message_id AND a.kind=1
+                          AND a.mime_version=b.mime_version AND a.html_version=b.html_version
+                          AND a.state=1 AND a.blob_id=b.blob_id)
+                    LIMIT 16
+                 )",
+                [],
+            )?;
+            tx.execute(
+                "DELETE FROM body_indexes WHERE id IN (
+                    SELECT b.id FROM body_indexes b
+                    WHERE NOT EXISTS(SELECT 1 FROM body_segments s WHERE s.index_id=b.id)
+                    AND NOT EXISTS(
+                        SELECT 1 FROM artifacts a WHERE a.message_id=b.message_id AND a.kind=1
+                          AND a.mime_version=b.mime_version AND a.html_version=b.html_version
+                          AND a.state=1 AND a.blob_id=b.blob_id)
+                    LIMIT ?1
+                 )",
+                [MAX_GC_ROWS],
+            )?;
             Ok::<_, CacheError>(())
         })?;
         let candidates = {
@@ -623,9 +675,77 @@ impl Cache {
     }
 }
 
+fn apply_artifact_states(
+    tx: &rusqlite::Transaction<'_>,
+    message: i64,
+    states: &[(ArtifactKey, ArtifactState)],
+) -> Result<(), CacheError> {
+    let raw: Option<[u8; 16]> = tx
+        .query_row(
+            "SELECT blob_id FROM artifacts WHERE message_id=?1 AND kind=0 AND state=1",
+            [message],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let mut keys = std::collections::BTreeSet::new();
+    let mut insert = tx.prepare_cached(
+        "INSERT INTO artifacts VALUES(?1,?2,?3,?4,?5,?6,NULL,?7,?8)
+         ON CONFLICT(message_id,kind,part,mime_version,html_version)
+         DO UPDATE SET state=excluded.state,raw_id=excluded.raw_id,reason=excluded.reason
+         WHERE excluded.state<>0 AND artifacts.state<>1
+           AND (artifacts.state NOT IN (2,4) OR excluded.state=2)",
+    )?;
+    for (kind, state) in states {
+        let key = kind.sql()?;
+        if !keys.insert(key) {
+            return Err(CacheError::OutOfScope);
+        }
+        let (kind, part, mime, html) = key;
+        let (state, raw_id, reason) = match *state {
+            ArtifactState::Missing => (0, None, None),
+            ArtifactState::Derivable { raw: id } if kind != 0 && Some(id.bytes()) == raw => {
+                (2, raw, None)
+            }
+            ArtifactState::Omitted(
+                reason @ (Omission::RawLimit | Omission::DecodedLimit | Omission::Quota),
+            ) => (3, None, Some(reason as u8)),
+            ArtifactState::Unsupported(
+                reason @ (Omission::UnsupportedEncoding | Omission::UnsupportedContent),
+            ) => (4, None, Some(reason as u8)),
+            _ => return Err(CacheError::OutOfScope),
+        };
+        insert.execute(params![
+            message, kind, part, mime, html, state, raw_id, reason
+        ])?;
+    }
+    Ok(())
+}
+
 impl BlobStage {
     /// Call only with verified, complete evidence after protocol completion.
-    pub fn publish(mut self, cancelled: &dyn Fn() -> bool) -> Result<BlobInfo, CacheError> {
+    pub fn publish(self, cancelled: &dyn Fn() -> bool) -> Result<BlobInfo, CacheError> {
+        self.publish_inner(None, cancelled)
+    }
+
+    pub fn publish_body(
+        self,
+        leaf_metadata: &[u8],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<BlobInfo, CacheError> {
+        if !matches!(self.kind, ArtifactKey::FullBody { .. })
+            || leaf_metadata.is_empty()
+            || leaf_metadata.len() > MAX_BODY_METADATA_BYTES
+        {
+            return Err(CacheError::OutOfScope);
+        }
+        self.publish_inner(Some(leaf_metadata), cancelled)
+    }
+
+    fn publish_inner(
+        mut self,
+        body_metadata: Option<&[u8]>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<BlobInfo, CacheError> {
         if self.failed || self.expected_len.is_some_and(|len| len != self.bytes) {
             return Err(CacheError::Corrupt);
         }
@@ -649,7 +769,8 @@ impl BlobStage {
         let reference = self.reference.as_ref();
         let namespace = reference.account.reference_namespace();
         let (kind, part, mime, html) = self.kind.sql()?;
-        for _ in 0..2 {
+        let mut replace_legacy = None;
+        for _ in 0..3 {
             let mut databases = self.cache.lock()?;
             if self.restore_epoch != self.cache.disk.restore_epoch() {
                 return Err(CacheError::NeedsVerification);
@@ -659,6 +780,7 @@ impl BlobStage {
                 .ok_or(CacheError::OutOfScope)?;
             if let ArtifactState::Materialized(existing) =
                 artifact(&database.connection, reference, self.kind)?
+                && replace_legacy != Some(existing.id)
             {
                 if existing.bytes != info.bytes || existing.sha256 != info.sha256 {
                     return Err(CacheError::Corrupt);
@@ -671,7 +793,16 @@ impl BlobStage {
                     Some(existing.id),
                 ) {
                     Ok(lease) if lease.restore_epoch == self.restore_epoch && !cancelled() => {
-                        return Ok(existing);
+                        match (body_metadata, lease.body_metadata()) {
+                            (Some(_), None) => {
+                                replace_legacy = Some(existing.id);
+                                continue;
+                            }
+                            (Some(next), Some(prior)) if next != prior => {
+                                return Err(CacheError::Corrupt);
+                            }
+                            _ => return Ok(existing),
+                        }
                     }
                     Ok(_) => return Err(CacheError::OutOfScope),
                     Err(CacheError::Corrupt | CacheError::OutOfScope) => continue,
@@ -710,6 +841,16 @@ impl BlobStage {
                         "INSERT INTO blobs VALUES(?1,?2,?3)",
                         params![info.id.0.as_bytes(), info.bytes as u32, info.sha256],
                     )?;
+                    if let Some(metadata) = body_metadata {
+                        tx.execute(
+                            "INSERT INTO body_leaf_metadata VALUES(?1,?2,?3)",
+                            params![
+                                info.id.0.as_bytes(),
+                                metadata,
+                                body_metadata_digest(info, metadata)
+                            ],
+                        )?;
+                    }
                     tx.execute(
                         "INSERT INTO artifacts VALUES(?1,?2,?3,?4,?5,1,?6,NULL,NULL)
                      ON CONFLICT(message_id,kind,part,mime_version,html_version) DO UPDATE
@@ -739,6 +880,15 @@ impl BlobStage {
         }
         Err(CacheError::Storage)
     }
+}
+
+fn body_metadata_digest(info: BlobInfo, metadata: &[u8]) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"email-mcp-body-leaf-metadata-v1\0");
+    hash.update(info.id.bytes());
+    hash.update(info.sha256);
+    hash.update(metadata);
+    hash.finalize().into()
 }
 
 impl Write for BlobStage {
@@ -796,6 +946,10 @@ impl Drop for BlobStage {
 impl BlobLease {
     pub fn info(&self) -> BlobInfo {
         self.info
+    }
+
+    pub fn body_metadata(&self) -> Option<&[u8]> {
+        self.body_metadata.as_deref()
     }
 
     /// A prepared offline handle must bind this stamp as well as the blob id.
@@ -912,7 +1066,10 @@ impl Drop for BlobLease {
     }
 }
 
-fn present_message(tx: &rusqlite::Transaction<'_>, reference: Ref<'_>) -> Result<i64, CacheError> {
+pub(super) fn present_message(
+    tx: &rusqlite::Transaction<'_>,
+    reference: Ref<'_>,
+) -> Result<i64, CacheError> {
     let id = message_id(tx, reference)?;
     let tombstone: bool =
         tx.query_row("SELECT tombstone FROM messages WHERE id=?1", [id], |row| {
@@ -924,7 +1081,7 @@ fn present_message(tx: &rusqlite::Transaction<'_>, reference: Ref<'_>) -> Result
     Ok(id)
 }
 
-fn artifact(
+pub(super) fn artifact(
     db: &Connection,
     reference: Ref<'_>,
     kind: ArtifactKey,

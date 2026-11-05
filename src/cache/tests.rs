@@ -125,6 +125,80 @@ fn metadata_and_parts_respect_account_generation_tombstones_and_clean_reopen() {
 }
 
 #[test]
+fn fetch_miss_tombstones_only_uids_below_the_observed_uidnext() {
+    let directory = tempfile::tempdir().unwrap();
+    let account = AccountKey::synthetic();
+    let cache = open(
+        &directory.path().join("cache"),
+        std::slice::from_ref(&account),
+    );
+    cache
+        .observe_folder(&account, MAILBOX, 9, Some(8), 100)
+        .unwrap();
+    let existing = message(&account, 9, 7);
+    cache
+        .remember_headers(existing, true, b"old", Some("old"))
+        .unwrap();
+    cache.remember_parts(existing, b"old manifest").unwrap();
+    cache.tombstone_observed(existing, 9).unwrap();
+    assert!(cache.header(existing).unwrap().is_none());
+    assert!(cache.parts(existing).unwrap().is_none());
+    assert!(matches!(
+        cache.remember_headers(existing, true, b"late", None),
+        Err(CacheError::OutOfScope)
+    ));
+
+    let assigned = message(&account, 9, 9);
+    let future = message(&account, 9, 10);
+    cache.tombstone_observed(assigned, 10).unwrap();
+    cache
+        .observe_folder(&account, MAILBOX, 9, Some(10), 120)
+        .unwrap();
+    assert!(matches!(
+        cache.remember_headers(assigned, true, b"late observation", None),
+        Err(CacheError::OutOfScope)
+    ));
+    cache
+        .remember_headers(future, true, b"new delivery", None)
+        .unwrap();
+    cache.tombstone_observed(future, 10).unwrap();
+    assert_eq!(
+        cache.header(future).unwrap().as_deref(),
+        Some(&b"new delivery"[..])
+    );
+
+    cache
+        .observe_folder(&account, MAILBOX, 10, Some(8), 130)
+        .unwrap();
+    let current = message(&account, 10, 7);
+    cache
+        .remember_headers(current, true, b"current", None)
+        .unwrap();
+    cache.tombstone_observed(existing, 9).unwrap();
+    assert_eq!(
+        cache.header(current).unwrap().as_deref(),
+        Some(&b"current"[..])
+    );
+
+    cache.tombstone_observed(current, 9).unwrap();
+    let still_present = message(&account, 10, 8);
+    cache
+        .remember_headers(still_present, true, b"present", None)
+        .unwrap();
+    cache.write_fault.store(2, Ordering::Relaxed);
+    cache.tombstone_observed(current, 9).unwrap();
+    cache.tombstone_observed(still_present, 8).unwrap();
+    assert!(matches!(
+        cache.tombstone_observed(still_present, 9),
+        Err(CacheError::Storage)
+    ));
+    assert_eq!(
+        cache.header(still_present).unwrap().as_deref(),
+        Some(&b"present"[..])
+    );
+}
+
+#[test]
 fn bundled_trigram_handles_chinese_and_short_scan_resumes_past_empty_page() {
     let directory = tempfile::tempdir().unwrap();
     let a = AccountKey::synthetic();

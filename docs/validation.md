@@ -22,7 +22,9 @@
 
 5 项 guard 回归使用真实 cache 和 SQLite，覆盖首个副作用前多目录保护、活跃 claim 阻止取得核对 stamp、过时 stamp 的 CAS 拒绝、容量/期限失败先关闭离线，以及真实 SQLite 写锁阻塞超时后许可由阻塞任务持有至清理完成。生产调用尚未接入。
 
-源码独立复核关闭了并发核对清 dirty、原文损坏后旧派生内容保留、同摘要幂等校验、已知 Missing 覆盖丢失、坏 raw 驱逐、实例/恢复世代绑定及租约释放顺序等问题。现有主库与 journal 联合 max_page_count 上界涵盖初始化的连续短事务。GC 每批最多处理 200 个候选，后续后台调度继续限制扫描工作量。依赖版本、Cargo.lock、生产配置和工具契约保持 R10 值。最终 PR head 的 CI 与合并结果随后登记。
+源码独立复核关闭了并发核对清 dirty、原文损坏后旧派生内容保留、同摘要幂等校验、已知 Missing 覆盖丢失、坏 raw 驱逐、实例/恢复世代绑定及租约释放顺序等问题。现有主库与 journal 联合 max_page_count 上界涵盖初始化的连续短事务。GC 每批最多处理 200 个候选，后续后台调度继续限制扫描工作量。依赖版本、Cargo.lock、生产配置和工具契约保持 R10 值。
+
+[PR #76](https://github.com/black-zero358/rust-email-mcp/pull/76) 最终 head `979a507eb8238c22c42a421095285f8be1e02da6` 只追加进度与验证记录，独立复核通过。[CI 42009840047](https://github.com/black-zero358/rust-email-mcp/actions/runs/42009840047) 的 check/audit/container 全部成功，包含实际生产 Dockerfile 构建。GitHub 自动代码及安全审阅遇到账户额度限制；合并前 reviews/review threads 均为空。合并提交为 `f4031879fdde1ae77164ef19f9fb44586fa94db9`，本地 main、开发分支和对应远端全部同步，R11 应用层改动保留在工作区。
 
 ## 2026-11-05 R10 持久元数据与会话游标
 

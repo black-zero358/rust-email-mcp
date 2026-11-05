@@ -22,6 +22,7 @@ const MAX_TRANSFERS: usize = 4;
 const MIME_REFERENCE_VERSION: u32 = 1;
 pub(crate) const MAX_ATTACHMENT_INDEX: usize = mime::MAX_PARTS - 1;
 
+mod cache;
 mod metadata;
 #[cfg(test)]
 mod regression;
@@ -62,6 +63,7 @@ struct Transfer {
     uid: u32,
     validity: u32,
     part: Part,
+    cache: Option<cache::Binding>,
     expires: Instant,
 }
 pub struct AttachmentStore {
@@ -76,6 +78,10 @@ impl AttachmentStore {
             handles: Mutex::new(HashMap::new()),
             transfers: Arc::new(Semaphore::new(MAX_TRANSFERS)),
         }
+    }
+    pub(super) fn stop_transfers(&self) -> bool {
+        self.transfers.close();
+        self.transfers.available_permits() == MAX_TRANSFERS
     }
     async fn insert(&self, transfer: Transfer) -> Result<String> {
         let mut handles = self.handles.lock().await;
@@ -171,7 +177,16 @@ impl MailService {
                     value
                 })
                 .collect(),
-            parts::ManifestSource::Raw(raw) => entries(&raw)?,
+            parts::ManifestSource::Raw(raw) => {
+                let entries = entries(&raw)?;
+                if let Ok(part) = mime::parse(&raw) {
+                    self.persist_raw(mailbox, Some(validity), uid, &raw, &part);
+                }
+                if let Some(permit) = self.content_capture(mailbox) {
+                    self.capture_raw(mailbox, Some(validity), uid, raw, permit);
+                }
+                entries
+            }
         };
         let reference = AttachmentReference {
             alias: &self.alias,
@@ -181,31 +196,10 @@ impl MailService {
             validity,
         };
         if name == "list_attachments" {
-            let offset =
-                number(a, "attachment_offset", 0, 0, MAX_ATTACHMENT_INDEX as u64)? as usize;
-            let mut metadata = Vec::new();
-            let mut used = 1024;
-            let mut next = None;
-            for (i, p) in entries
-                .iter()
-                .enumerate()
-                .skip(offset)
-                .filter(|(_, p)| p.attachment)
-            {
-                let item = descriptor(p, &reference, &self.config, None);
-                let size = serde_json::to_vec(&item)
-                    .map_err(|_| MailError::backend())?
-                    .len();
-                if used + size > self.config.max_output / 2 && !metadata.is_empty() {
-                    next = Some(i);
-                    break;
-                }
-                used += size;
-                metadata.push(item);
-            }
-            return Ok(
-                json!({"account_id":self.alias,"mailbox":mailbox,"uid":uid,"uid_validity":validity,"attachments":metadata,"next_attachment_offset":next,"read_diagnostics":diagnostics,"content_trust":"untrusted"}),
-            );
+            let mut value =
+                attachment_list(a, &entries, &reference, &self.config, |_, item| Ok(item))?;
+            value["read_diagnostics"] = json!(diagnostics);
+            return Ok(value);
         }
         let index = select_part(&entries, a, &reference)?;
         let part = entries[index].clone();
@@ -219,6 +213,27 @@ impl MailService {
         {
             return Err(MailError::limit_kind(LimitKind::DecodedAttachmentBytes));
         }
+        let mut value = self
+            .issue_attachment(principal, reference, part, None)
+            .await?;
+        value["read_diagnostics"] = json!(diagnostics);
+        Ok(value)
+    }
+
+    async fn issue_attachment(
+        &self,
+        principal: &str,
+        reference: AttachmentReference<'_>,
+        part: Part,
+        cache: Option<cache::Binding>,
+    ) -> Result<Value> {
+        let AttachmentReference {
+            mailbox,
+            uid,
+            validity,
+            ..
+        } = reference;
+        let index = part.index;
         let expires_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|_| MailError::backend())?
@@ -235,11 +250,12 @@ impl MailService {
                 uid,
                 validity,
                 part,
+                cache,
                 expires: Instant::now() + HANDLE_TTL,
             })
             .await?;
         Ok(
-            json!({"account_id":self.alias,"mailbox":mailbox,"uid":uid,"uid_validity":validity,"attachment_id":attachment_id,"attachment_index":index,"download_url":download_url(&self.config.resource,&token)?,"method":"GET","required_headers":{"Authorization":"Bearer <access_token>"},"expires_in_seconds":HANDLE_TTL.as_secs(),"delivery":metadata["delivery"],"metadata":metadata,"read_diagnostics":diagnostics,"content_trust":"untrusted"}),
+            json!({"account_id":self.alias,"mailbox":mailbox,"uid":uid,"uid_validity":validity,"attachment_id":attachment_id,"attachment_index":index,"download_url":download_url(&self.config.resource,&token)?,"method":"GET","required_headers":{"Authorization":"Bearer <access_token>"},"expires_in_seconds":HANDLE_TTL.as_secs(),"delivery":metadata["delivery"],"metadata":metadata,"content_trust":"untrusted"}),
         )
     }
     #[cfg(test)]
@@ -267,6 +283,40 @@ impl MailService {
             self.config.max_message,
         )
     }
+}
+
+fn attachment_list(
+    args: &Value,
+    entries: &[Part],
+    reference: &AttachmentReference<'_>,
+    config: &Config,
+    mut map: impl FnMut(&Part, Value) -> Result<Value>,
+) -> Result<Value> {
+    let offset = number(args, "attachment_offset", 0, 0, MAX_ATTACHMENT_INDEX as u64)? as usize;
+    let mut metadata = Vec::new();
+    let mut used = 1024;
+    let mut next = None;
+    for (index, part) in entries
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .filter(|(_, part)| part.attachment)
+    {
+        let item = map(part, descriptor(part, reference, config, None))?;
+        let size = serde_json::to_vec(&item)
+            .map_err(|_| MailError::backend())?
+            .len();
+        if used + size > config.max_output / 2 && !metadata.is_empty() {
+            next = Some(index);
+            break;
+        }
+        used += size;
+        metadata.push(item);
+    }
+    Ok(
+        json!({"account_id":reference.alias,"mailbox":reference.mailbox,"uid":reference.uid,"uid_validity":reference.validity,
+        "attachments":metadata,"next_attachment_offset":next,"content_trust":"untrusted"}),
+    )
 }
 
 pub(super) fn attachment_missing() -> MailError {
@@ -384,7 +434,23 @@ fn fetch_http_error(error: &MailError, request_id: &str, limit: usize) -> Respon
             "contact_operator",
             request_id,
         ),
-        "ACCOUNT_UNAVAILABLE" => handle_not_found(request_id),
+        "ACCOUNT_UNAVAILABLE" | "CACHE_UNAVAILABLE" | "CACHE_MISS" => handle_not_found(request_id),
+        "CACHE_NEEDS_VERIFICATION" => http_error(
+            StatusCode::CONFLICT,
+            "CACHE_NEEDS_VERIFICATION",
+            "The cached attachment needs live verification.",
+            "cache_reference",
+            "relist_attachments",
+            request_id,
+        ),
+        "STORAGE_UNAVAILABLE" => http_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "STORAGE_UNAVAILABLE",
+            "The cached attachment is unavailable.",
+            "cache_read",
+            "contact_operator",
+            request_id,
+        ),
         "BUSY" => {
             let mut response = http_error(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -519,9 +585,12 @@ pub async fn download(
     let Ok(lease) = runtime.catalog.read_key(&principal.0, &transfer.account) else {
         return handle_not_found(&request_id);
     };
+    if transfer.cache.is_some() {
+        return Box::pin(cache::download(&runtime, lease, transfer, request_id)).await;
+    }
     let config = lease.config.clone();
     let backend = runtime.clone();
-    download_staged_selected(
+    Box::pin(download_staged_selected(
         &runtime.attachments,
         &config,
         transfer,
@@ -531,8 +600,9 @@ pub async fn download(
             let activity = parts::fetch::FetchActivity::default();
             tokio::time::timeout_at(
                 deadline,
-                backend.run_read(&lease, async {
-                    parts::fetch::download(
+                backend.run_read(
+                    &lease,
+                    Box::pin(parts::fetch::download(
                         service,
                         parts::fetch::PartReference {
                             mailbox: &transfer.mailbox,
@@ -542,9 +612,8 @@ pub async fn download(
                         },
                         stage,
                         &activity,
-                    )
-                    .await
-                }),
+                    )),
+                ),
             )
             .await
             .map_err(|_| {
@@ -555,7 +624,7 @@ pub async fn download(
                 }
             })?
         },
-    )
+    ))
     .await
 }
 
@@ -630,7 +699,16 @@ where
             Some((Bytes::from(bytes), ready))
         })
     });
-    let mut response = Body::from_stream(stream).into_response();
+    attachment_response(Body::from_stream(stream), metadata, &filename, &request_id)
+}
+
+fn attachment_response(
+    body: Body,
+    metadata: staging::ReadyMetadata,
+    filename: &str,
+    request_id: &str,
+) -> Response {
+    let mut response = body.into_response();
     let headers = response.headers_mut();
     headers.insert(
         header::CONTENT_TYPE,
@@ -822,6 +900,7 @@ mod tests {
             uid: 1,
             validity: 1,
             expires,
+            cache: None,
             part: Part {
                 index: 1,
                 wire_size: 4,

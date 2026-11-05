@@ -34,7 +34,7 @@ impl MailService {
         };
         let remaining = Arc::new(AtomicUsize::new(self.config.max_message * 4));
         let mut session = self.connect_for(true, Some(remaining.clone())).await?;
-        let state = select_list_mailbox(&mut session, &wire_mailbox).await?;
+        let mut state = select_list_mailbox(&mut session, &wire_mailbox).await?;
         self.observe_mailbox(mailbox, &state);
         check_validity(args, state.uid_validity)?;
         let Some(scan) = scan_list(&mut session, args, name == "search_emails", &state).await?
@@ -51,9 +51,12 @@ impl MailService {
             let mut last_examined = None;
             let mut resume = None;
             for (index, &uid) in scan.ids.iter().enumerate() {
+                let (validity, uid_next) = (state.uid_validity, state.uid_next);
+                let observe =
+                    |error| self.observe_fetch_error(mailbox, validity, uid_next, uid, error);
                 let known_size = reader::size(&mut session, uid)
                     .await
-                    .map_err(reader::FetchFailure::mail)?;
+                    .map_err(|error| observe(error.mail()))?;
                 let (attached, used_fallback) = match reader::manifest(&mut session, uid).await {
                     Ok(manifest) => {
                         self.persist_manifest(mailbox, state.uid_validity, uid, &manifest);
@@ -79,22 +82,33 @@ impl MailService {
                             .map_err(map_read_imap_error)?;
                         self.observe_mailbox(mailbox, &fresh);
                         check_validity(&json!({"uid_validity":validity}), fresh.uid_validity)?;
+                        state = fresh;
+                        let observe_fresh = |error| {
+                            self.observe_fetch_error(
+                                mailbox,
+                                Some(validity),
+                                state.uid_next,
+                                uid,
+                                error,
+                            )
+                        };
                         let size = reader::size(&mut session, uid)
                             .await
-                            .map_err(reader::FetchFailure::mail)?;
+                            .map_err(|error| observe_fresh(error.mail()))?;
                         if size != known_size {
                             return Err(MailError::backend());
                         }
                         let raw =
                             fetch::whole_message(&mut session, uid, known_size + 1, known_size)
-                                .await?;
+                                .await
+                                .map_err(observe_fresh)?;
                         let attached = attachments::has_attachment(&raw)?;
                         if with_preview && attached == wanted {
                             raw_preview = Some((uid, raw));
                         }
                         (attached, true)
                     }
-                    Err(fault) => return Err(fault.mail()),
+                    Err(fault) => return Err(observe(fault.mail())),
                 };
                 last_examined = Some(uid);
                 if attached == wanted {
@@ -120,13 +134,34 @@ impl MailService {
             scan.unfiltered()
         };
         let mut emails = self
-            .fetch_summaries(&mut session, mailbox, state.uid_validity, &ids)
+            .fetch_summaries(
+                &mut session,
+                mailbox,
+                state.uid_validity,
+                state.uid_next,
+                &ids,
+            )
             .await?;
         if with_preview && !emails.is_empty() {
             let now = Instant::now();
             let preview_deadline =
                 now + PREVIEW_TIME.min(deadline.saturating_duration_since(now) / 2);
-            attach_previews(&mut session, &mut emails, preview_deadline, raw_preview).await;
+            attach_previews(
+                &mut session,
+                &mut emails,
+                preview_deadline,
+                raw_preview,
+                |uid, error| {
+                    self.observe_fetch_error(
+                        mailbox,
+                        state.uid_validity,
+                        state.uid_next,
+                        uid,
+                        error,
+                    )
+                },
+            )
+            .await;
         }
         let mut result =
             json!({"emails":emails,"next_before_uid":next,"uid_validity":state.uid_validity});
@@ -141,6 +176,7 @@ impl MailService {
         session: &mut async_imap::Session<S>,
         mailbox: &str,
         validity: Option<u32>,
+        uid_next: Option<u32>,
         ids: &[u32],
     ) -> Result<Vec<Value>>
     where
@@ -150,16 +186,22 @@ impl MailService {
             return Ok(Vec::new());
         }
         let set = ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+        let full = self
+            .persistent
+            .full_folder(&self.account, mailbox)
+            .is_some();
+        let internal_date = if full { " INTERNALDATE" } else { "" };
         #[derive(Default)]
         struct Summary {
             header: Option<Vec<u8>>,
             size: Option<u32>,
-            flags: Vec<String>,
+            flags: Option<Vec<String>>,
+            internal_date: Option<String>,
         }
         let mut summaries = std::collections::BTreeMap::<u32, Summary>::new();
         reader::command(
             session,
-            format!("UID FETCH {set} (UID FLAGS RFC822.SIZE BODY.PEEK[HEADER]<0.{SUMMARY_HEADER_BYTES}>)"),
+            format!("UID FETCH {set} (UID FLAGS RFC822.SIZE{internal_date} BODY.PEEK[HEADER]<0.{SUMMARY_HEADER_BYTES}>)"),
             Some(CommandReadLimits::body_section_literal_bytes(SUMMARY_HEADER_BYTES)),
             |response| {
                 use reader::FetchFailure::Backend;
@@ -199,8 +241,11 @@ impl MailService {
                             summary.header = Some(data.to_vec());
                         }
                         AttributeValue::Rfc822Size(size) => summary.size = Some(*size),
+                        AttributeValue::InternalDate(date) if full && date.len() <= 64 => {
+                            summary.internal_date = Some(date.to_string());
+                        }
                         AttributeValue::Flags(flags) => {
-                            summary.flags = flags.iter().map(|flag| format!("{:?}", Flag::from(flag.as_ref()))).collect();
+                            summary.flags = Some(flags.iter().map(|flag| format!("{:?}", Flag::from(flag.as_ref()))).collect());
                         }
                         _ => {}
                     }
@@ -208,8 +253,16 @@ impl MailService {
                 Ok(())
             },
         ).await.map_err(reader::FetchFailure::mail)?;
+        if full {
+            for &uid in ids {
+                if !summaries.contains_key(&uid) {
+                    self.cache_tombstone(mailbox, validity, uid_next, uid);
+                }
+            }
+        }
         let mut emails = Vec::new();
         let mut observations = Vec::new();
+        let mut listing = Vec::new();
         let persistent = self.persists(mailbox);
         for (id, summary) in summaries.into_iter().rev() {
             // FLAGS-only updates cannot create a summary with blank headers.
@@ -243,7 +296,15 @@ impl MailService {
             email["from"] = json!(headers.get_first_value("From"));
             email["date"] = json!(headers.get_first_value("Date"));
             email["size"] = json!(summary.size);
-            email["flags"] = json!(summary.flags);
+            email["flags"] = json!(summary.flags.as_deref().unwrap_or_default());
+            if full {
+                listing.push(persistence::ListingObservation {
+                    uid: id,
+                    flags: summary.flags,
+                    internal_date: summary.internal_date,
+                    size: summary.size,
+                });
+            }
             if persistent {
                 observations.push(persistence::HeaderObservation::new(
                     id, header, complete, &headers,
@@ -252,6 +313,7 @@ impl MailService {
             emails.push(email);
         }
         self.persist_headers(mailbox, validity, observations);
+        self.persist_listing(mailbox, validity, listing);
         Ok(emails)
     }
 }
@@ -359,6 +421,7 @@ async fn attach_previews<S>(
     emails: &mut [Value],
     deadline: Instant,
     mut raw_preview: Option<(u32, Vec<u8>)>,
+    observe: impl Fn(u32, MailError) -> MailError,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
 {
@@ -376,9 +439,12 @@ async fn attach_previews<S>(
                     let result = preview::from_raw(&raw, &mut remaining);
                     (Instant::now() < deadline).then_some(result)
                 } else {
-                    tokio::time::timeout_at(deadline, preview::read(session, uid, &mut remaining))
-                        .await
-                        .ok()
+                    tokio::time::timeout_at(
+                        deadline,
+                        preview::read(session, uid, &mut remaining, |error| observe(uid, error)),
+                    )
+                    .await
+                    .ok()
                 }
             } else {
                 None

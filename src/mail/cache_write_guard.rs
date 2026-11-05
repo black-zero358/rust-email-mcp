@@ -4,15 +4,45 @@ use crate::{
     cache::{Cache, DirtyTicket, MAX_FOLDERS_PER_ACCOUNT},
     input_limits::ReadInputLimits,
 };
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::{
     runtime::Handle,
-    sync::{OwnedSemaphorePermit, Semaphore},
+    sync::{Notify, OwnedSemaphorePermit, Semaphore},
+    time::Instant,
 };
 
 pub(super) struct WriteGuardPool {
     permits: Arc<Semaphore>,
     capacity: u32,
+    admission: Arc<WriteLifecycle>,
+}
+
+struct WriteLifecycle {
+    state: Mutex<WriteState>,
+    changed: Notify,
+}
+
+#[derive(Default)]
+struct WriteState {
+    sealed: bool,
+    active: usize,
+}
+
+#[must_use = "hold write admission until the authorized mutation lifecycle ends"]
+pub(super) struct WriteAdmission(Arc<WriteLifecycle>);
+
+impl Drop for WriteAdmission {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.0.state.lock() {
+            state.active -= 1;
+            if state.active == 0 {
+                self.0.changed.notify_one();
+            }
+        }
+    }
 }
 
 impl Default for WriteGuardPool {
@@ -26,7 +56,48 @@ impl WriteGuardPool {
         Self {
             permits: Arc::new(Semaphore::new(capacity as usize)),
             capacity,
+            admission: Arc::new(WriteLifecycle {
+                state: Mutex::default(),
+                changed: Notify::new(),
+            }),
         }
+    }
+
+    /// Call before an authorized write enters the execution queue, including
+    /// cache-off and degraded runs. Sealing does not revoke existing tickets.
+    pub(super) fn admit(&self) -> Option<WriteAdmission> {
+        let mut state = self.admission.state.lock().ok()?;
+        if state.sealed {
+            return None;
+        }
+        state.active = state.active.checked_add(1)?;
+        Some(WriteAdmission(self.admission.clone()))
+    }
+
+    /// Close admission permanently before publishing a clean receipt. The
+    /// same budget covers queued writes, active writes and detached SQLite
+    /// work; a timeout leaves the durable run unclean.
+    pub(super) async fn seal_and_drain(&self, wait: Duration) -> bool {
+        let deadline = Instant::now() + wait;
+        match self.admission.state.lock() {
+            Ok(mut state) => state.sealed = true,
+            Err(_) => return false,
+        }
+        loop {
+            match self.admission.state.lock() {
+                Ok(state) if state.active == 0 => break,
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+            if tokio::time::timeout_at(deadline, self.admission.changed.notified())
+                .await
+                .is_err()
+            {
+                return false;
+            }
+        }
+        self.drain(deadline.saturating_duration_since(Instant::now()))
+            .await
     }
 
     /// The caller has already stopped write admission. A timeout leaves the
@@ -130,3 +201,7 @@ impl Drop for DirtyWriteGuard {
 #[cfg(test)]
 #[path = "cache_write_guard/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "cache_write_guard/production_tests.rs"]
+mod production_tests;

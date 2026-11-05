@@ -193,14 +193,111 @@ impl<'a> BodyReadSession<'a> {
         hard_limit: usize,
         args: &Value,
     ) -> std::result::Result<Value, ReadFault> {
+        let result = Box::pin(self.read_item_inner(uid, hard_limit, args)).await;
+        if let Err(fault) = &result {
+            use crate::cache::{ArtifactState, Omission};
+            let evidence = match fault.error.code {
+                "UNSUPPORTED_BODY" | "UNSUPPORTED_CHARSET" => {
+                    Some(ArtifactState::Unsupported(Omission::UnsupportedContent))
+                }
+                "UNSUPPORTED_TRANSFER_ENCODING" => {
+                    Some(ArtifactState::Unsupported(Omission::UnsupportedEncoding))
+                }
+                "LIMIT_EXCEEDED"
+                    if matches!(
+                        fault
+                            .error
+                            .details
+                            .as_deref()
+                            .and_then(|details| details.limit_kind),
+                        Some(LimitKind::DecodedBodyBytes)
+                    ) =>
+                {
+                    Some(ArtifactState::Omitted(Omission::DecodedLimit))
+                }
+                _ => None,
+            };
+            if let Some(state) = evidence {
+                self.service.cache_artifact_state(
+                    &self.mailbox,
+                    self.state.uid_validity,
+                    uid,
+                    cached_body::KEY,
+                    state,
+                );
+            }
+        }
+        result
+    }
+
+    async fn read_item_inner(
+        &mut self,
+        uid: u32,
+        hard_limit: usize,
+        args: &Value,
+    ) -> std::result::Result<Value, ReadFault> {
         let format = insights::display_format(args).map_err(ReadFault::local)?;
+        let command_fault = |error| {
+            ReadFault::command(self.service.observe_fetch_error(
+                &self.mailbox,
+                self.state.uid_validity,
+                self.state.uid_next,
+                uid,
+                error,
+            ))
+        };
         let session = self
             .session
             .as_mut()
             .ok_or_else(|| ReadFault::stop(MailError::backend()))?;
         let size = reader::size(session, uid)
             .await
-            .map_err(|e| ReadFault::command(e.mail()))?;
+            .map_err(|error| command_fault(error.mail()))?;
+        if self
+            .service
+            .persistent
+            .full_folder(&self.service.account, &self.mailbox)
+            .is_some()
+        {
+            self.service.persist_listing(
+                &self.mailbox,
+                self.state.uid_validity,
+                vec![persistence::ListingObservation {
+                    uid,
+                    flags: None,
+                    internal_date: None,
+                    size: u32::try_from(size).ok(),
+                }],
+            );
+        }
+        if let Some(value) = self
+            .service
+            .cached_live_body(
+                &self.mailbox,
+                self.state.uid_validity,
+                uid,
+                hard_limit,
+                args,
+            )
+            .await
+        {
+            return Ok(value);
+        }
+        if size
+            > self
+                .service
+                .config
+                .max_message
+                .min(crate::config::DEFAULT_MAX_MESSAGE)
+        {
+            self.service.cache_artifact_state(
+                &self.mailbox,
+                self.state.uid_validity,
+                uid,
+                crate::cache::ArtifactKey::Raw,
+                crate::cache::ArtifactState::Omitted(crate::cache::Omission::RawLimit),
+            );
+        }
         let mut manifest = match reader::manifest(session, uid).await {
             Ok(manifest) => manifest,
             Err(reader::FetchFailure::Fallback {
@@ -211,24 +308,14 @@ impl<'a> BodyReadSession<'a> {
                     .raw_fallback(uid, size, hard_limit, args, reason, synchronized)
                     .await;
             }
-            Err(error) => return Err(ReadFault::command(error.mail())),
+            Err(error) => return Err(command_fault(error.mail())),
         };
-        if self.service.persists(&self.mailbox) {
-            self.service
-                .persist_manifest(&self.mailbox, self.state.uid_validity, uid, &manifest);
-            if let Ok(headers) = mime::headers(&manifest.body.root_headers) {
-                self.service.persist_headers(
-                    &self.mailbox,
-                    self.state.uid_validity,
-                    vec![persistence::HeaderObservation::new(
-                        uid,
-                        &manifest.body.root_headers,
-                        true,
-                        &headers,
-                    )],
-                );
-            }
-        }
+        self.service.persist_structured_manifest(
+            &self.mailbox,
+            self.state.uid_validity,
+            uid,
+            &manifest,
+        );
         let selected = loop {
             // A probe can interrupt an alternative after collecting fragments.
             // Every retry starts at the root with a fresh transaction.
@@ -256,7 +343,7 @@ impl<'a> BodyReadSession<'a> {
                     };
                     let bytes = fetch::section_chunk(session, uid, section, 0, 1, None)
                         .await
-                        .map_err(ReadFault::command)?;
+                        .map_err(command_fault)?;
                     let nonempty = Some(!bytes.is_empty());
                     manifest.body.nodes[index].nonempty = nonempty;
                 }
@@ -265,6 +352,8 @@ impl<'a> BodyReadSession<'a> {
         let mut remaining = 32usize * 1024 * 1024;
         let mut context = DisplayContext::new(format);
         let mut text = String::new();
+        let capture = self.service.content_capture(&self.mailbox);
+        let mut complete = cached_body::Record::default();
         // Match the raw reader's validation order across the chosen leaves.
         // A failure discards the result without changing the selection.
         for node in selected {
@@ -308,7 +397,11 @@ impl<'a> BodyReadSession<'a> {
                 _ => return Err(ReadFault::local(crate::html::unsupported())),
             };
             let mut transfer = transfer_decode::Decoder::new(encoding, reserve);
-            let mut leaf = String::new();
+            let mut leaf = if capture.is_some() {
+                String::with_capacity(reserve)
+            } else {
+                String::new()
+            };
             let mut offset = 0;
             while offset < encoded {
                 let expected = (encoded - offset).min(transfer_decode::OUTPUT_CHUNK);
@@ -321,28 +414,33 @@ impl<'a> BodyReadSession<'a> {
                     Some(expected),
                 )
                 .await
-                .map_err(ReadFault::command)?;
+                .map_err(command_fault)?;
                 decode_transfer(&mut transfer, &mut charset, &bytes, false, &mut leaf)
                     .map_err(ReadFault::local)?;
                 offset += expected;
             }
             fetch::section_chunk(session, uid, &part.section, encoded, 1, Some(0))
                 .await
-                .map_err(ReadFault::command)?;
+                .map_err(command_fault)?;
             decode_transfer(&mut transfer, &mut charset, &[], true, &mut leaf)
                 .map_err(ReadFault::local)?;
             decode_charset(&mut charset, &[], true, &mut leaf).map_err(ReadFault::local)?;
-            let leaf = if part.content_type == "text/html" {
-                crate::html::render_selected(&leaf, &mut context).map_err(ReadFault::local)?
+            let html = part.content_type == "text/html";
+            let displayed = if html {
+                std::borrow::Cow::Owned(
+                    crate::html::render_selected(&leaf, &mut context).map_err(ReadFault::local)?,
+                )
             } else {
-                leaf
+                std::borrow::Cow::Borrowed(leaf.as_str())
             };
-            if leaf.len() > reserve
-                && !(part.content_type == "text/html" && format == HtmlDisplay::Readable)
-            {
+            if displayed.len() > reserve && !(html && format == HtmlDisplay::Readable) {
                 return Err(ReadFault::local(body_limit()));
             }
-            text.push_str(&leaf);
+            text.push_str(&displayed);
+            drop(displayed);
+            if capture.is_some() {
+                complete.push(leaf, html, reserve);
+            }
         }
         let headers = mime::headers(&manifest.body.root_headers).map_err(ReadFault::local)?;
         let metadata =
@@ -360,6 +458,15 @@ impl<'a> BodyReadSession<'a> {
         .map_err(ReadFault::local)?;
         value["read_diagnostics"] = serde_json::to_value(reader::ManifestDiagnostics::structured())
             .map_err(|_| ReadFault::local(MailError::backend()))?;
+        if let Some(permit) = capture {
+            self.service.capture_body(
+                &self.mailbox,
+                self.state.uid_validity,
+                uid,
+                complete,
+                permit,
+            );
+        }
         Ok(value)
     }
     async fn raw_fallback(
@@ -406,25 +513,39 @@ impl<'a> BodyReadSession<'a> {
             state.uid_validity,
         )
         .map_err(ReadFault::stop)?;
+        let command_fault = |error| {
+            ReadFault::command(self.service.observe_fetch_error(
+                &self.mailbox,
+                self.state.uid_validity,
+                state.uid_next,
+                uid,
+                error,
+            ))
+        };
         let fresh_size = reader::size(&mut fresh, uid)
             .await
-            .map_err(|error| ReadFault::command(error.mail()))?;
+            .map_err(|error| command_fault(error.mail()))?;
         if fresh_size != size {
             return Err(ReadFault::stop(MailError::backend()));
         }
         let raw = fetch::whole_message(&mut fresh, uid, max + 1, size)
             .await
-            .map_err(ReadFault::command)?;
+            .map_err(command_fault)?;
         self.session = Some(fresh);
-        let mut value = if self.service.persists(&self.mailbox) {
-            let part = mime::parse(&raw).map_err(ReadFault::local)?;
-            self.service
-                .persist_raw(&self.mailbox, self.state.uid_validity, uid, &raw, &part);
-            insights::parsed_with_part(&part, uid, self.state.uid_validity, hard_limit, args)
+        let value = if self.service.persists(&self.mailbox) {
+            mime::parse(&raw).and_then(|part| {
+                self.service
+                    .persist_raw(&self.mailbox, self.state.uid_validity, uid, &raw, &part);
+                insights::parsed_with_part(&part, uid, self.state.uid_validity, hard_limit, args)
+            })
         } else {
             insights::parsed_with_options(&raw, uid, self.state.uid_validity, hard_limit, args)
+        };
+        if let Some(permit) = self.service.content_capture(&self.mailbox) {
+            self.service
+                .capture_raw(&self.mailbox, self.state.uid_validity, uid, raw, permit);
         }
-        .map_err(ReadFault::local)?;
+        let mut value = value.map_err(ReadFault::local)?;
         value["read_diagnostics"] = serde_json::to_value(reason.diagnostics())
             .map_err(|_| ReadFault::local(MailError::backend()))?;
         Ok(value)

@@ -296,6 +296,7 @@ impl StagingRoot {
             id: StageId(id),
             bytes: 0,
             hash: Sha256::new(),
+            capture: None,
         })
     }
 }
@@ -442,10 +443,27 @@ pub struct Stage {
     id: StageId,
     bytes: usize,
     hash: Sha256,
+    capture: Option<Capture>,
 }
+
+pub(in crate::mail) struct Capture {
+    pub bytes: Vec<u8>,
+    pub _permit: super::super::persistence::ContentAdmission,
+}
+
 impl Stage {
     pub fn id(&self) -> StageId {
         self.id
+    }
+    pub(in crate::mail) fn capture(
+        &mut self,
+        limit: usize,
+        permit: super::super::persistence::ContentAdmission,
+    ) {
+        self.capture = Some(Capture {
+            bytes: Vec::with_capacity(limit.min(MAX_FILE_BYTES)),
+            _permit: permit,
+        });
     }
     pub async fn write_chunk(mut self, chunk: Vec<u8>) -> Result<Self> {
         if chunk.len() > MAX_CHUNK_BYTES {
@@ -477,6 +495,13 @@ impl Stage {
         owned.file.as_mut().ok_or(Error::Closed)?.write_all(chunk)?;
         self.hash.update(chunk);
         self.bytes = next;
+        if let Some(capture) = &mut self.capture {
+            if next <= capture.bytes.capacity() {
+                capture.bytes.extend_from_slice(chunk);
+            } else {
+                self.capture = None;
+            }
+        }
         Ok(())
     }
     pub async fn finish(
@@ -534,6 +559,7 @@ impl Stage {
         file.seek(SeekFrom::Start(0))?;
         Ok(Ready {
             owned,
+            capture: self.capture.take(),
             metadata: ReadyMetadata {
                 decoded_size: self.bytes,
                 sha256: digest,
@@ -544,8 +570,12 @@ impl Stage {
 pub struct Ready {
     owned: OwnedFile,
     metadata: ReadyMetadata,
+    capture: Option<Capture>,
 }
 impl Ready {
+    pub(in crate::mail) fn take_capture(&mut self) -> Option<Capture> {
+        self.capture.take()
+    }
     pub fn metadata(&self) -> ReadyMetadata {
         self.metadata
     }

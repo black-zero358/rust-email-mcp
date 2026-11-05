@@ -1,4 +1,5 @@
 //! Signed MCP acceptance of the metadata cache in the real account router.
+use super::conversation::fixture::Fault;
 use super::{
     conversation::fixture::{Folder, Harness as CacheHarness, message},
     *,
@@ -35,6 +36,647 @@ fn synthetic(uid: u32, subject: &str) -> Vec<u8> {
         subject,
         "synthetic content",
     )
+}
+
+fn full_configuration(root: &Path, accounts: &[(&str, &[&str])]) -> PathBuf {
+    let path = configuration(root, accounts);
+    let mut settings: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    settings["mode"] = json!("full");
+    settings["max_bytes"] = json!(96 * 1024 * 1024);
+    for account in settings["accounts"].as_array_mut().unwrap() {
+        account["max_bytes"] = json!(40 * 1024 * 1024);
+    }
+    std::fs::write(&path, serde_json::to_vec(&settings).unwrap()).unwrap();
+    path
+}
+
+#[tokio::test]
+async fn live_missing_future_uid_does_not_disable_cache_or_tombstone_later_arrival() {
+    let root = tempfile::tempdir().unwrap();
+    let path = full_configuration(root.path(), &[("default", &["INBOX"])]);
+    let h = CacheHarness::new(
+        [(
+            "INBOX",
+            Folder::new("", 9, [(7, synthetic(7, "already assigned"))]),
+        )],
+        512 * 1024,
+    )
+    .await;
+    let (app, runtime, cache, witness, _) = h.full_cache_router(&path);
+    let call = |name, args| h.call_tool(Some(&app), "alice", name, args);
+    let local = |uid| {
+        call(
+            "get_email",
+            json!({"uid":uid,"uid_validity":9,"read_source":"cache"}),
+        )
+    };
+    let _ = call("get_email", json!({"uid":7,"uid_validity":9})).await;
+    let _ = call("get_cache_status", json!({})).await;
+    assert_eq!(local(7).await["data"]["subject"], "already assigned");
+    let future = call("get_email_status", json!({"uid":100,"uid_validity":9})).await;
+    assert_eq!(future["error"]["code"], "NOT_FOUND");
+    let next = call("get_email_status", json!({"uid":8,"uid_validity":9})).await;
+    assert_eq!(next["error"]["code"], "NOT_FOUND");
+    h.update("INBOX", |folder| folder.report_uid_next = false);
+    h.fault("INBOX", "UID FETCH 7 (UID FLAGS)", Fault::NoDataOk);
+    let unknown = call("get_email_status", json!({"uid":7,"uid_validity":9})).await;
+    assert_eq!(unknown["error"]["code"], "NOT_FOUND");
+    let _ = call("get_cache_status", json!({})).await;
+    assert_eq!(local(7).await["data"]["subject"], "already assigned");
+
+    h.update("INBOX", |folder| {
+        folder.report_uid_next = true;
+        folder.messages.insert(8, synthetic(8, "later arrival"));
+    });
+    assert_eq!(
+        call("get_email", json!({"uid":8,"uid_validity":9})).await["data"]["subject"],
+        "later arrival"
+    );
+    let _ = call("get_cache_status", json!({})).await;
+    let before = h.connections();
+    assert_eq!(local(7).await["data"]["subject"], "already assigned");
+    assert_eq!(local(8).await["data"]["subject"], "later arrival");
+    assert_eq!(h.connections(), before);
+    drop(app);
+    runtime.finish_cache(cache).await;
+    drop(runtime);
+    drop(witness);
+}
+
+#[tokio::test]
+async fn live_listing_and_preview_tombstone_only_confirmed_missing_uids() {
+    let root = tempfile::tempdir().unwrap();
+    let path = full_configuration(root.path(), &[("default", &["INBOX"])]);
+    let messages = std::array::from_fn::<_, 3, _>(|i| {
+        let uid = 7 + i as u32;
+        (uid, synthetic(uid, "cached listing"))
+    });
+    let h = CacheHarness::new([("INBOX", Folder::new("", 9, messages))], 512 * 1024).await;
+    let (app, runtime, cache, witness, _) = h.full_cache_router(&path);
+    let call = |name, args| h.call_tool(Some(&app), "alice", name, args);
+    let local = |uid| {
+        call(
+            "get_email",
+            json!({"uid":uid,"uid_validity":9,"read_source":"cache"}),
+        )
+    };
+    for uid in 7..=9 {
+        assert_eq!(
+            call("get_email", json!({"uid":uid,"uid_validity":9})).await["data"]["body"],
+            "synthetic content"
+        );
+    }
+    let _ = call("get_cache_status", json!({})).await;
+    let summary = "UID FETCH 9 (UID FLAGS RFC822.SIZE INTERNALDATE BODY.PEEK[HEADER]<0.8192>)";
+    h.fault("INBOX", summary, Fault::OnlyUid(9));
+    let flags_only = call("list_emails", json!({"limit":1})).await;
+    assert_eq!(flags_only["data"]["emails"], json!([]), "{flags_only}");
+    assert_eq!(local(9).await["data"]["body"], "synthetic content");
+    h.fault("INBOX", summary, Fault::NoDataOk);
+    assert_eq!(
+        call("list_emails", json!({"limit":1})).await["data"]["emails"],
+        json!([])
+    );
+
+    h.fault("INBOX", "UID FETCH 8 (UID RFC822.SIZE)", Fault::NoDataOk);
+    let filtered = call(
+        "search_emails",
+        json!({"before_uid":9,"has_attachment":false}),
+    )
+    .await;
+    assert_eq!(filtered["error"]["code"], "NOT_FOUND", "{filtered}");
+
+    h.fault(
+        "INBOX",
+        "UID FETCH 7 (UID BODY.PEEK[1]<0.17>)",
+        Fault::NoDataOk,
+    );
+    let preview = call("list_emails", json!({"before_uid":8,"preview":true})).await;
+    let item = &preview["data"]["emails"][0];
+    assert_eq!(item["uid"], 7);
+    assert_eq!(item["preview_status"], "error");
+    assert_eq!(item["preview_error"]["code"], "MAIL_BACKEND");
+    let _ = call("get_cache_status", json!({})).await;
+    let before = h.connections();
+    for uid in 7..=9 {
+        assert_eq!(local(uid).await["error"]["code"], "CACHE_MISS");
+    }
+    assert_eq!(h.connections(), before);
+    drop(app);
+    runtime.finish_cache(cache).await;
+    drop(runtime);
+    drop(witness);
+}
+
+#[tokio::test]
+async fn full_signed_body_listing_search_and_exact_locate_survive_clean_restart_without_imap() {
+    let root = tempfile::tempdir().unwrap();
+    let path = full_configuration(root.path(), &[("default", &["INBOX"])]);
+    let html = "<p>中文正文独有检索词</p><p>下一行 &amp; 引号</p>";
+    let raw = format!(
+        "Subject: 独立主题\r\nFrom: author@example.test\r\nTo: owner@example.test\r\nMessage-ID: <full@example.test>\r\nContent-Type: text/html; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n{html}"
+    );
+    let mut inbox = Folder::new("", 9, [(7, raw.into_bytes())]);
+    inbox.structures.insert(
+        7,
+        format!(
+            "(\"TEXT\" \"HTML\" (\"CHARSET\" \"utf-8\") NIL NIL \"8BIT\" {} 1 NIL NIL)",
+            html.len()
+        ),
+    );
+    let h = CacheHarness::new([("INBOX", inbox)], 512 * 1024).await;
+    let (app, runtime, cache, witness, _) = h.full_cache_router(&path);
+    let read = |name, args| h.call_tool(Some(&app), "alice", name, args);
+    let accounts = read("list_accounts", json!({})).await;
+    assert_eq!(
+        accounts["data"]["accounts"][0]["capabilities"]["cache_modes"],
+        json!(["off", "metadata", "full"])
+    );
+    assert_eq!(
+        read("list_mailboxes", json!({})).await["data"]["mailboxes"][0]["name"],
+        "INBOX"
+    );
+    assert_eq!(
+        read("list_emails", json!({})).await["data"]["emails"][0]["uid"],
+        7
+    );
+    let warm = read(
+        "get_email",
+        json!({"uid":7,"uid_validity":9,"html_display":"readable"}),
+    )
+    .await;
+    assert!(
+        warm["data"]["body"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("中文正文"),
+        "{warm}"
+    );
+    let status = read("get_cache_status", json!({})).await;
+    assert_eq!(status["data"]["content_pending"], 0, "{status}");
+    assert_eq!(
+        status["data"]["storage"]["folders"][0]["layers"]["full_body"]["materialized"], 1,
+        "{status}"
+    );
+    drop(app);
+    runtime.finish_cache(cache).await;
+    drop(runtime);
+    drop(witness);
+
+    let before = h.connections();
+    h.stop_imap();
+    let (app, runtime, cache, witness, _) = h.full_cache_router(&path);
+    let read = |name, args| h.call_tool(Some(&app), "alice", name, args);
+    let folders = read("list_mailboxes", json!({"read_source":"cache"})).await;
+    assert_eq!(folders["data"]["mailboxes"][0]["name"], "INBOX");
+    assert_eq!(
+        folders["data"]["cache"]["remote_generation_unverified"],
+        true
+    );
+    let list = read("list_emails", json!({"read_source":"cache","preview":true})).await;
+    assert_eq!(list["data"]["emails"][0]["flags"], json!(["Seen"]));
+    assert_eq!(list["data"]["emails"][0]["preview_status"], "ok");
+    let single = read(
+        "get_email",
+        json!({"uid":7,"uid_validity":9,"read_source":"cache","html_display":"readable"}),
+    )
+    .await;
+    assert_eq!(single["data"]["body"], warm["data"]["body"], "{single}");
+    assert_eq!(single["data"]["cache"]["scopes"][0]["uid_validity"], 9);
+    let batch = read(
+        "get_emails",
+        json!({"uids":[7,8,7],"uid_validity":9,"read_source":"cache","body_mode":"trimmed"}),
+    )
+    .await;
+    assert_eq!(
+        batch["data"]["items"][0]["email"],
+        batch["data"]["items"][2]["email"]
+    );
+    assert_eq!(batch["data"]["items"][1]["error"]["code"], "CACHE_MISS");
+    for query in ["中文正文", "检索"] {
+        let found = read("search_emails", json!({"query":query,"search_source":"cache","seen":true,"since":"2025-02-07","before":"2025-02-08"})).await;
+        assert_eq!(found["data"]["emails"][0]["uid"], 7, "{found}");
+        assert_eq!(found["data"]["emails"][0]["cache_match"]["body"], true);
+    }
+    let found = read(
+        "locate_message",
+        json!({"message_id":"<full@example.test>","mailboxes":["INBOX"],"search_source":"cache"}),
+    )
+    .await;
+    assert_eq!(found["data"]["matches"][0]["uid"], 7, "{found}");
+    assert_eq!(h.connections(), before);
+    drop(app);
+    runtime.finish_cache(cache).await;
+    drop(runtime);
+    drop(witness);
+}
+
+#[tokio::test]
+async fn default_live_checks_exact_uid_before_using_cached_body_and_tombstones_deletion() {
+    let root = tempfile::tempdir().unwrap();
+    let path = full_configuration(root.path(), &[("default", &["INBOX"])]);
+    let h = CacheHarness::new(
+        [(
+            "INBOX",
+            Folder::new("", 9, [(7, synthetic(7, "uid fence"))]),
+        )],
+        512 * 1024,
+    )
+    .await;
+    let (app, runtime, cache, witness, _) = h.full_cache_router(&path);
+    let read = |name, args| h.call_tool(Some(&app), "alice", name, args);
+    let args = json!({"uid":7,"uid_validity":9});
+    assert_eq!(
+        read("get_email", args.clone()).await["data"]["body"],
+        "synthetic content"
+    );
+    let _ = read("get_cache_status", json!({})).await;
+    let old_connections = h.connections();
+    assert_eq!(
+        read("get_email", args.clone()).await["data"]["read_diagnostics"]["source"],
+        "cache"
+    );
+    assert!(h.connections() > old_connections);
+    h.update("INBOX", |folder| {
+        folder.next = Some(8);
+        folder.messages.clear();
+    });
+    assert_eq!(
+        read("get_email", args).await["error"]["code"],
+        "MAIL_BACKEND"
+    );
+    let offline = json!({"uid":7,"uid_validity":9,"read_source":"cache"});
+    let missing = read("get_email", offline.clone()).await;
+    assert!(
+        matches!(
+            missing["error"]["code"].as_str(),
+            Some("CACHE_MISS" | "CACHE_NEEDS_VERIFICATION")
+        ),
+        "{missing}"
+    );
+    let _ = read("get_cache_status", json!({})).await;
+    assert_eq!(
+        read("get_email", offline).await["error"]["code"],
+        "CACHE_MISS"
+    );
+    h.update("INBOX", |folder| {
+        folder.next = Some(9);
+        folder.messages.insert(8, synthetic(8, "未观察头部"));
+        folder.sizes.insert(8, 33 * 1024 * 1024);
+    });
+    h.fault(
+        "INBOX",
+        "UID FETCH 8 (UID BODYSTRUCTURE)",
+        Fault::NoAfterData,
+    );
+    let oversized = read("get_email", json!({"uid":8,"uid_validity":9})).await;
+    assert_eq!(oversized["error"]["code"], "LIMIT_EXCEEDED", "{oversized}");
+    let _ = read("get_cache_status", json!({})).await;
+    let local = read("list_emails", json!({"read_source":"cache"})).await;
+    assert_eq!(local["data"]["emails"], json!([]), "{local}");
+    assert_eq!(
+        local["data"]["cache"]["scopes"][0]["coverage"]["headers_missing"],
+        1
+    );
+    drop(app);
+    runtime.finish_cache(cache).await;
+    drop(runtime);
+    drop(witness);
+}
+
+#[tokio::test]
+async fn raw_derived_attachment_keeps_binary_bytes_indices_and_acl_after_imap_stops() {
+    let root = tempfile::tempdir().unwrap();
+    let path = full_configuration(root.path(), &[("default", &["INBOX"])]);
+    let raw = b"Subject: Synthetic\r\nContent-Type: multipart/mixed; boundary=m\r\n\r\n--m\r\nContent-Type: text/plain\r\n\r\nbody\r\n--m\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=same.bin\r\nContent-Transfer-Encoding: base64\r\n\r\nAP9h\r\n--m\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=same.bin\r\nContent-Transfer-Encoding: base64\r\n\r\nAP5i\r\n--m--\r\n".to_vec();
+    let h = CacheHarness::new([("INBOX", Folder::new("", 9, [(7, raw)]))], 512 * 1024).await;
+    let (app, runtime, cache, witness, catalog) = h.full_cache_router(&path);
+    h.fault(
+        "INBOX",
+        "UID FETCH 7 (UID BODYSTRUCTURE)",
+        Fault::NoAfterData,
+    );
+    let read = |name, args| h.call_tool(Some(&app), "alice", name, args);
+    let live = read("list_attachments", json!({"uid":7,"uid_validity":9})).await;
+    assert_eq!(
+        live["data"]["attachments"].as_array().map(Vec::len),
+        Some(2),
+        "{live}"
+    );
+    let _ = read("get_cache_status", json!({})).await;
+    let before = h.connections();
+    h.stop_imap();
+    let items = read(
+        "list_attachments",
+        json!({"uid":7,"uid_validity":9,"read_source":"cache"}),
+    )
+    .await;
+    let items = items["data"]["attachments"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{items}"));
+    assert_eq!(items[0]["filename"], items[1]["filename"]);
+    assert_ne!(items[0]["attachment_index"], items[1]["attachment_index"]);
+    let args = json!({"uid":7,"uid_validity":9,"attachment_id":items[1]["attachment_id"],"read_source":"cache"});
+    let inline = read("download_attachment", args.clone()).await;
+    assert_eq!(inline["data"]["base64"], "AP5i");
+    let prepared = read("prepare_attachment_download", args).await;
+    let url = prepared["data"]["download_url"].as_str().unwrap();
+    assert_eq!(
+        h.attachment(&app, "bob", url).await.status(),
+        axum::http::StatusCode::NOT_FOUND
+    );
+    let response = h.attachment(&app, "alice", url).await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert_eq!(response.headers()["content-length"], "3");
+    assert_eq!(
+        response.headers()["x-content-sha256"],
+        inline["data"]["checksum"]["value"].as_str().unwrap()
+    );
+    assert_eq!(
+        &axum::body::to_bytes(response.into_body(), 3).await.unwrap()[..],
+        &[0, 254, b'b']
+    );
+    let unfinished = h.attachment(&app, "alice", url).await;
+    assert_eq!(unfinished.status(), axum::http::StatusCode::OK);
+    catalog.revoke_read_for_test("default", "alice").unwrap();
+    assert_eq!(
+        h.attachment(&app, "alice", url).await.status(),
+        axum::http::StatusCode::NOT_FOUND
+    );
+    assert_eq!(h.connections(), before);
+    drop(app);
+    runtime.finish_cache(cache).await;
+    drop(unfinished);
+    drop(runtime);
+    drop(witness);
+    let (app, runtime, cache, witness, _) = h.full_cache_router(&path);
+    let status = h
+        .call_tool(Some(&app), "alice", "get_cache_status", json!({}))
+        .await;
+    assert_eq!(
+        status["data"]["storage"]["startup_unclean"], true,
+        "{status}"
+    );
+    drop(app);
+    runtime.finish_cache(cache).await;
+    drop(runtime);
+    drop(witness);
+}
+
+#[tokio::test]
+async fn large_remote_raw_stays_omitted_while_small_attachment_is_materialized_and_dirty_gated() {
+    let root = tempfile::tempdir().unwrap();
+    let path = full_configuration(root.path(), &[("default", &["INBOX"])]);
+    let raw = b"Subject: bounded part\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=payload.bin\r\nContent-Transfer-Encoding: base64\r\n\r\nAAH+f/8=".to_vec();
+    let mut folder = Folder::new("", 9, [(7, raw)]);
+    folder.sizes.insert(7, 33 * 1024 * 1024);
+    folder.structures.insert(7, r#"("APPLICATION" "OCTET-STREAM" NIL NIL NIL "BASE64" 8 NIL ("ATTACHMENT" ("FILENAME" "payload.bin")))"#.into());
+    let h = CacheHarness::new([("INBOX", folder)], 512 * 1024).await;
+    let (app, runtime, cache, witness, _) = h.full_cache_router(&path);
+    let read = |name, args| h.call_tool(Some(&app), "alice", name, args);
+    let mut args = json!({"uid":7,"uid_validity":9,"attachment_index":0});
+    let prepared = read("prepare_attachment_download", args.clone()).await;
+    let url = prepared["data"]["download_url"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{prepared}"));
+    let _ = read("get_cache_status", json!({})).await;
+    let missing = read(
+        "list_attachments",
+        json!({"uid":7,"uid_validity":9,"read_source":"cache"}),
+    )
+    .await;
+    assert_eq!(
+        missing["data"]["attachments"][0]["cache_state"], "missing",
+        "{missing}"
+    );
+    assert_eq!(
+        missing["data"]["attachments"][0]["delivery"]["available_modes"],
+        json!([])
+    );
+    let response = h.attachment(&app, "alice", url).await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert_eq!(
+        &axum::body::to_bytes(response.into_body(), 5).await.unwrap()[..],
+        &[0, 1, 254, 127, 255]
+    );
+    let status = read("get_cache_status", json!({})).await;
+    let layers = &status["data"]["storage"]["folders"][0]["layers"];
+    assert_eq!(layers["raw"]["omitted"], 1, "{status}");
+    assert_eq!(layers["attachments"]["materialized"], 1, "{status}");
+    assert!(
+        !h.commands()
+            .iter()
+            .any(|command| command.text.contains("BODY.PEEK[]"))
+    );
+    let before = h.connections();
+    args["read_source"] = json!("cache");
+    let available = read(
+        "list_attachments",
+        json!({"uid":7,"uid_validity":9,"read_source":"cache"}),
+    )
+    .await;
+    assert_eq!(
+        available["data"]["attachments"][0]["cache_state"], "materialized",
+        "{available}"
+    );
+    assert_eq!(
+        available["data"]["attachments"][0]["delivery"]["available_modes"],
+        json!(["inline_base64", "authenticated_http"])
+    );
+    let prepared = read("prepare_attachment_download", args.clone()).await;
+    let url = prepared["data"]["download_url"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{prepared}"));
+    let response = h.attachment(&app, "alice", url).await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert_eq!(
+        &axum::body::to_bytes(response.into_body(), 5).await.unwrap()[..],
+        &[0, 1, 254, 127, 255]
+    );
+    assert_eq!(h.connections(), before);
+    let marked = read(
+        "mark_email",
+        json!({"uid":7,"uid_validity":9,"flag":"seen","value":false}),
+    )
+    .await;
+    assert_eq!(marked["data"]["status"], "updated", "{marked}");
+    let before = h.connections();
+    let denied = h.attachment(&app, "alice", url).await;
+    assert_eq!(denied.status(), axum::http::StatusCode::CONFLICT);
+    assert_eq!(
+        read("download_attachment", args).await["error"]["code"],
+        "CACHE_NEEDS_VERIFICATION"
+    );
+    assert_eq!(h.connections(), before);
+    drop(app);
+    runtime.finish_cache(cache).await;
+    drop(runtime);
+    drop(witness);
+}
+
+#[tokio::test]
+async fn tagged_attachment_fetch_absence_after_size_invalidates_cached_copy_and_handle() {
+    use axum::http::StatusCode;
+
+    let root = tempfile::tempdir().unwrap();
+    let path = full_configuration(root.path(), &[("default", &["INBOX"])]);
+    let raw = b"Subject: disappeared\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=payload.bin\r\nContent-Transfer-Encoding: base64\r\n\r\nAAH+f/8=".to_vec();
+    let mut inbox = Folder::new("", 9, [(7, raw.clone()), (8, raw.clone()), (9, raw)]);
+    inbox.structures.insert(7, r#"("APPLICATION" "OCTET-STREAM" NIL NIL NIL "BASE64" 8 NIL ("ATTACHMENT" ("FILENAME" "payload.bin")))"#.into());
+    let h = CacheHarness::new([("INBOX", inbox)], 512 * 1024).await;
+    let (app, runtime, cache, witness, _) = h.full_cache_router(&path);
+    let call = |name, args| h.call_tool(Some(&app), "alice", name, args);
+    assert_eq!(
+        call("list_emails", json!({})).await["data"]["emails"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    let live = call(
+        "prepare_attachment_download",
+        json!({"uid":7,"uid_validity":9,"attachment_index":0}),
+    )
+    .await;
+    let live_url = live["data"]["download_url"].as_str().unwrap();
+    let warm = h.attachment(&app, "alice", live_url).await;
+    assert_eq!(warm.status(), StatusCode::OK);
+    assert_eq!(
+        axum::body::to_bytes(warm.into_body(), 5)
+            .await
+            .unwrap()
+            .len(),
+        5
+    );
+    let _ = call("get_cache_status", json!({})).await;
+    let local = call(
+        "prepare_attachment_download",
+        json!({"uid":7,"uid_validity":9,"attachment_index":0,"read_source":"cache"}),
+    )
+    .await;
+    let local_url = local["data"]["download_url"].as_str().unwrap();
+    let command = "UID FETCH 7 (UID BODY.PEEK[1]<0.65536>)";
+
+    h.fault("INBOX", command, Fault::NoAfterData);
+    assert_eq!(
+        h.attachment(&app, "alice", live_url).await.status(),
+        StatusCode::BAD_GATEWAY
+    );
+    let still_local = h.attachment(&app, "alice", local_url).await;
+    assert_eq!(still_local.status(), StatusCode::OK);
+    drop(still_local);
+
+    h.fault("INBOX", command, Fault::NoDataOk);
+    assert_eq!(
+        h.attachment(&app, "alice", live_url).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    let denied = h.attachment(&app, "alice", local_url).await;
+    assert!(matches!(
+        denied.status(),
+        StatusCode::CONFLICT | StatusCode::NOT_FOUND
+    ));
+    let _ = call("get_cache_status", json!({})).await;
+    assert_eq!(
+        h.attachment(&app, "alice", local_url).await.status(),
+        StatusCode::NOT_FOUND
+    );
+
+    h.fault("INBOX", "UID FETCH 8 (UID BODYSTRUCTURE)", Fault::NoDataOk);
+    let body = call("get_email", json!({"uid":8,"uid_validity":9})).await;
+    assert_eq!(body["error"]["code"], "MAIL_BACKEND");
+    h.fault("INBOX", "UID FETCH 9 (UID BODYSTRUCTURE)", Fault::NoDataOk);
+    let parts = call("list_attachments", json!({"uid":9,"uid_validity":9})).await;
+    assert_eq!(parts["error"]["code"], "NOT_FOUND");
+    let _ = call("get_cache_status", json!({})).await;
+    assert_eq!(
+        call("list_emails", json!({"read_source":"cache"})).await["data"]["emails"],
+        json!([])
+    );
+    drop(app);
+    runtime.finish_cache(cache).await;
+    drop(runtime);
+    drop(witness);
+}
+
+#[tokio::test]
+async fn signed_cache_isolates_accounts_and_keeps_full_index_after_wire_truncation_and_backoff() {
+    let root = tempfile::tempdir().unwrap();
+    let path = full_configuration(
+        root.path(),
+        &[("default", &["INBOX"]), ("second", &["INBOX"])],
+    );
+    let second = CacheHarness::new(
+        [("INBOX", Folder::new("", 9, [(7, synthetic(7, "另一账户"))]))],
+        32 * 1024,
+    )
+    .await;
+    let long = format!("{}末尾独有检索", "引号\\\"".repeat(8000));
+    let raw = message(Some("large@example.test"), &[], None, "第一账户", &long);
+    let h = CacheHarness::with_second_account(
+        [("INBOX", Folder::new("", 9, [(7, raw)]))],
+        32 * 1024,
+        &second,
+    )
+    .await;
+    let (app, runtime, cache, witness, _) = h.full_cache_router(&path);
+    let read = |name, args| h.call_tool(Some(&app), "alice", name, args);
+    let first = read("get_email", json!({"uid":7,"uid_validity":9})).await;
+    assert_eq!(first["data"]["subject"], "第一账户", "{first}");
+    assert_eq!(first["data"]["body_truncated"], true);
+    let next = read(
+        "get_email",
+        json!({"uid":7,"uid_validity":9,"account_id":"second"}),
+    )
+    .await;
+    assert_eq!(next["data"]["subject"], "另一账户", "{next}");
+    let _ = read("get_cache_status", json!({})).await;
+    let _ = read("get_cache_status", json!({"account_id":"second"})).await;
+    h.stop_imap();
+    let _ = read("get_email_status", json!({"uid":7,"uid_validity":9})).await;
+    let live = read("get_email", json!({"uid":7,"uid_validity":9})).await;
+    assert_eq!(live["error"]["code"], "BUSY", "{live}");
+    second.stop_imap();
+    let old = (h.connections(), second.connections());
+    let (response, wire) = h
+        .call_named(
+            &app,
+            "alice",
+            "get_email",
+            json!({"uid":7,"uid_validity":9,"read_source":"cache"}),
+            json!("\\\"".repeat(250)),
+        )
+        .await;
+    assert!(wire <= 32 * 1024);
+    assert_eq!(response["data"]["subject"], "第一账户");
+    assert_eq!(response["data"]["body_truncated"], true);
+    assert_eq!(response["data"]["body_original_bytes"], long.len());
+    let indexed = read(
+        "search_emails",
+        json!({"search_source":"cache","query":"末尾独有检索"}),
+    )
+    .await;
+    assert_eq!(indexed["data"]["emails"][0]["uid"], 7, "{indexed}");
+    let next = read(
+        "get_email",
+        json!({"uid":7,"uid_validity":9,"account_id":"second","read_source":"cache"}),
+    )
+    .await;
+    assert_eq!(next["data"]["subject"], "另一账户");
+    let denied = h
+        .call_tool(
+            Some(&app),
+            "bob",
+            "get_email",
+            json!({"uid":7,"uid_validity":9,"account_id":"second","read_source":"cache"}),
+        )
+        .await;
+    assert_eq!(denied["error"]["code"], "ACCOUNT_UNAVAILABLE");
+    assert_eq!((h.connections(), second.connections()), old);
+    drop(app);
+    runtime.finish_cache(cache).await;
+    drop(runtime);
+    drop(witness);
 }
 
 #[tokio::test]

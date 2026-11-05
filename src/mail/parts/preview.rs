@@ -24,6 +24,15 @@ pub(in crate::mail) enum Preview {
     BudgetSkipped,
 }
 
+pub(in crate::mail) fn from_displayed(text: &str) -> Preview {
+    let mut preview = PreviewText::default();
+    let truncated = preview.append(text);
+    Preview::Text {
+        text: preview.text,
+        truncated,
+    }
+}
+
 struct SampleBudget<'a> {
     message: usize,
     page: &'a mut usize,
@@ -154,7 +163,10 @@ impl PreviewText {
     }
 }
 
-fn manifest_fault(fault: reader::FetchFailure) -> ReadFault {
+fn manifest_fault(
+    fault: reader::FetchFailure,
+    observe: impl FnOnce(MailError) -> MailError,
+) -> ReadFault {
     if matches!(
         fault,
         reader::FetchFailure::Fallback {
@@ -164,7 +176,7 @@ fn manifest_fault(fault: reader::FetchFailure) -> ReadFault {
     ) {
         ReadFault::local(fault.mail())
     } else {
-        ReadFault::command(fault.mail())
+        ReadFault::command(observe(fault.mail()))
     }
 }
 
@@ -183,6 +195,7 @@ pub(in crate::mail) async fn read<S>(
     session: &mut async_imap::Session<S>,
     uid: u32,
     page_remaining: &mut usize,
+    observe: impl Fn(MailError) -> MailError,
 ) -> Result<Preview, ReadFault>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
@@ -196,7 +209,8 @@ where
     };
     let mut manifest = reader::manifest(session, uid)
         .await
-        .map_err(manifest_fault)?;
+        .map_err(|fault| manifest_fault(fault, &observe))?;
+    let command_fault = |error| ReadFault::command(observe(error));
     let selected = loop {
         let mut selected = Vec::new();
         match selection::select(
@@ -225,7 +239,7 @@ where
                 };
                 let bytes = fetch::section_chunk(session, uid, section, 0, 1, None)
                     .await
-                    .map_err(ReadFault::command)?;
+                    .map_err(command_fault)?;
                 manifest.body.nodes[index].nonempty = Some(!bytes.is_empty());
             }
         }
@@ -250,20 +264,20 @@ where
             }
             fetch::section_chunk(session, uid, &part.section, 0, 1, Some(0))
                 .await
-                .map_err(ReadFault::command)?;
+                .map_err(command_fault)?;
             (String::new(), true)
         } else {
             let mut decoder = SampleDecoder::new(&part.charset, &part.transfer_encoding, sample)?;
             budget.claim(sample);
             let bytes = fetch::section_chunk(session, uid, &part.section, 0, sample, Some(sample))
                 .await
-                .map_err(ReadFault::command)?;
+                .map_err(command_fault)?;
             decoder.feed(&bytes)?;
             let complete = sample == encoded && budget.claim(1) != 0;
             if complete {
                 fetch::section_chunk(session, uid, &part.section, encoded, 1, Some(0))
                     .await
-                    .map_err(ReadFault::command)?;
+                    .map_err(command_fault)?;
             }
             (decoder.finish(complete)?, complete)
         };

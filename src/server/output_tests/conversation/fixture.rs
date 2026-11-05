@@ -11,7 +11,11 @@ pub(in crate::server::output_tests) struct Folder {
     pub flags: &'static str,
     pub validity: u32,
     pub next: Option<u32>,
+    pub report_uid_next: bool,
     pub messages: BTreeMap<u32, Vec<u8>>,
+    pub sizes: BTreeMap<u32, u32>,
+    pub structures: BTreeMap<u32, String>,
+    pub sections: BTreeMap<(u32, String), Vec<u8>>,
 }
 
 impl Folder {
@@ -24,7 +28,11 @@ impl Folder {
             flags,
             validity,
             next: None,
+            report_uid_next: true,
             messages: messages.into(),
+            sizes: BTreeMap::new(),
+            structures: BTreeMap::new(),
+            sections: BTreeMap::new(),
         }
     }
 
@@ -67,6 +75,8 @@ pub(in crate::server::output_tests) fn message(
 #[derive(Clone, Copy)]
 pub(in crate::server::output_tests) enum Fault {
     NoAfterData,
+    NoDataOk,
+    OnlyUid(u32),
     Hang,
 }
 
@@ -263,6 +273,10 @@ impl Harness {
         self.imap.connections.load(Ordering::SeqCst)
     }
 
+    pub fn stop_imap(&self) {
+        self.backend.abort();
+    }
+
     pub fn commands(&self) -> Vec<Command> {
         self.imap.commands.lock().unwrap().clone()
     }
@@ -333,6 +347,37 @@ impl Harness {
         (router(runtime, self.credentials.auth.clone()), cache)
     }
 
+    pub fn full_cache_router(
+        &self,
+        path: &std::path::Path,
+    ) -> (
+        Router,
+        Arc<MailRuntime>,
+        crate::mail::PreparedCache,
+        crate::accounts::CacheRun,
+        Arc<AccountCatalog>,
+    ) {
+        let mut accounts = self.settings.clone();
+        let mut service = (*accounts.service_config).clone();
+        service.account_registry = Some(path.with_file_name("accounts.sqlite"));
+        service.attachment_staging_dir = Some(path.with_file_name("full-downloads"));
+        accounts.service_config = Arc::new(service);
+        let settings = config::load_cache_file(path, &accounts).unwrap();
+        let catalog = crate::accounts::open_catalog(accounts).unwrap();
+        let witness = crate::accounts::CacheRun::begin(catalog.config()).unwrap();
+        let cache =
+            MailRuntime::prepare_cache_for_run(&catalog, settings, Some(witness.identity()))
+                .unwrap();
+        let journal = Arc::new(Journal::open(std::path::Path::new(":memory:")).unwrap());
+        let runtime = Arc::new(
+            MailRuntime::with_cache(catalog.clone(), journal, cache.clone())
+                .unwrap()
+                .with_test_imap_roots(self.roots.clone()),
+        );
+        let app = router(runtime.clone(), self.credentials.auth.clone());
+        (app, runtime, cache, witness, catalog)
+    }
+
     pub async fn call_tool(
         &self,
         app: Option<&Router>,
@@ -343,6 +388,16 @@ impl Harness {
         self.call_named(app.unwrap_or(&self.app), principal, name, args, json!(1))
             .await
             .0
+    }
+
+    pub async fn attachment(
+        &self,
+        app: &Router,
+        principal: &str,
+        url: &str,
+    ) -> axum::response::Response {
+        let token = self.credentials.changed("sub", json!(principal));
+        super::super::attachments::get_attachment(app, Some(&token), url).await
     }
 
     async fn call_on(
@@ -356,7 +411,7 @@ impl Harness {
             .await
     }
 
-    async fn call_named(
+    pub async fn call_named(
         &self,
         app: &Router,
         principal: &str,
@@ -402,7 +457,9 @@ impl Harness {
         let result = &wire["result"];
         let content = result["structuredContent"].clone();
         assert_eq!(content["request_id"], trace, "{wire}");
-        assert_contract(name, &content);
+        if is_read(name) {
+            assert_contract(name, &content);
+        }
         let copy: Value =
             serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(copy, content);
@@ -440,7 +497,10 @@ async fn serve(
             }
             continue;
         }
-        if let Some(mailbox) = command.strip_prefix("EXAMINE ") {
+        if let Some(mailbox) = command
+            .strip_prefix("EXAMINE ")
+            .or_else(|| command.strip_prefix("SELECT "))
+        {
             selected = unquote(mailbox).unwrap_or_else(|| mailbox.to_owned());
         }
         protocol.commands.lock().unwrap().push(Command {
@@ -463,6 +523,11 @@ async fn serve(
             respond(&folders, &selected, command)
         };
         let (mut reply, status) = match (reply, fault) {
+            (_, Some(Fault::NoDataOk)) => (Vec::new(), "OK"),
+            (_, Some(Fault::OnlyUid(uid))) => (
+                format!("* 1 FETCH (UID {uid} FLAGS ())\r\n").into_bytes(),
+                "OK",
+            ),
             (Some(reply), Some(Fault::NoAfterData)) => (reply, "NO"),
             (Some(reply), _) => (reply, "OK"),
             (None, _) => (Vec::new(), "NO"),
@@ -488,16 +553,23 @@ fn respond(folders: &BTreeMap<String, Folder>, selected: &str, command: &str) ->
         return Some(b"* CAPABILITY IMAP4rev1 UIDPLUS SPECIAL-USE\r\n".to_vec());
     }
     let folder = folders.get(selected)?;
-    if command.starts_with("EXAMINE ") {
+    if command.starts_with("EXAMINE ") || command.starts_with("SELECT ") {
+        let next = if folder.report_uid_next {
+            format!("* OK [UIDNEXT {}] next\r\n", folder.high_water())
+        } else {
+            String::new()
+        };
         return Some(
             format!(
-                "* {} EXISTS\r\n* OK [UIDVALIDITY {}] valid\r\n* OK [UIDNEXT {}] next\r\n",
+                "* {} EXISTS\r\n* OK [UIDVALIDITY {}] valid\r\n{next}",
                 folder.messages.len(),
-                folder.validity,
-                folder.high_water()
+                folder.validity
             )
             .into_bytes(),
         );
+    }
+    if command.starts_with("UID STORE ") {
+        return Some(Vec::new());
     }
     if let Some(search) = Search::parse(command) {
         let mut reply = "* SEARCH".to_owned();
@@ -520,19 +592,38 @@ fn respond(folders: &BTreeMap<String, Folder>, selected: &str, command: &str) ->
         };
         let headers = header(raw);
         let encoded = &raw[headers.len()..];
+        let size = folder
+            .sizes
+            .get(&uid)
+            .map_or(raw.len(), |size| *size as usize);
         if attrs.contains("BODYSTRUCTURE") {
-            reply.extend_from_slice(format!("* 1 FETCH (UID {uid} BODYSTRUCTURE (\"TEXT\" \"PLAIN\" (\"CHARSET\" \"utf-8\") NIL NIL \"8BIT\" {} 1 NIL NIL))\r\n", encoded.len()).as_bytes());
+            let default = || {
+                format!(
+                    "(\"TEXT\" \"PLAIN\" (\"CHARSET\" \"utf-8\") NIL NIL \"8BIT\" {} 1 NIL NIL)",
+                    encoded.len()
+                )
+            };
+            let structure = folder.structures.get(&uid).cloned().unwrap_or_else(default);
+            reply.extend_from_slice(
+                format!("* 1 FETCH (UID {uid} BODYSTRUCTURE {structure})\r\n").as_bytes(),
+            );
         } else if attrs == "(UID RFC822.SIZE)" {
             reply.extend_from_slice(
-                format!("* 1 FETCH (UID {uid} RFC822.SIZE {})\r\n", raw.len()).as_bytes(),
+                format!("* 1 FETCH (UID {uid} RFC822.SIZE {size})\r\n").as_bytes(),
             );
+        } else if attrs == "(UID FLAGS)" {
+            reply.extend_from_slice(format!("* 1 FETCH (UID {uid} FLAGS (\\Seen))\r\n").as_bytes());
         } else {
             let (selector, range) = attrs.split_once("BODY.PEEK[")?.1.split_once(']')?;
-            let bytes = match selector {
-                "HEADER" => headers,
-                "" => raw,
-                "1" | "TEXT" => encoded,
-                _ => panic!("unexpected FETCH selector: {attrs}"),
+            let bytes = if let Some(bytes) = folder.sections.get(&(uid, selector.into())) {
+                bytes
+            } else {
+                match selector {
+                    "HEADER" => headers,
+                    "" => raw,
+                    "1" | "TEXT" => encoded,
+                    _ => panic!("unexpected FETCH selector: {attrs}"),
+                }
             };
             let (origin, bytes) = if let Some((offset, count)) = range
                 .strip_prefix('<')
@@ -546,9 +637,19 @@ fn respond(folders: &BTreeMap<String, Folder>, selected: &str, command: &str) ->
             } else {
                 (String::new(), bytes)
             };
+            let mut evidence = String::new();
+            if attrs.contains("FLAGS") {
+                evidence.push_str(" FLAGS (\\Seen)");
+            }
+            if attrs.contains("RFC822.SIZE") {
+                evidence.push_str(&format!(" RFC822.SIZE {size}"));
+            }
+            if attrs.contains("INTERNALDATE") {
+                evidence.push_str(" INTERNALDATE \" 7-Feb-2025 09:00:00 +0000\"");
+            }
             reply.extend_from_slice(
                 format!(
-                    "* 1 FETCH (UID {uid} BODY[{selector}]{origin} {{{}}}\r\n",
+                    "* 1 FETCH (UID {uid}{evidence} BODY[{selector}]{origin} {{{}}}\r\n",
                     bytes.len()
                 )
                 .as_bytes(),
