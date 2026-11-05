@@ -1,13 +1,15 @@
 //! Explicit allocation budgets for BODYSTRUCTURE and nested ENVELOPE values.
 use crate::{
-    core,
-    rfc3501::{self, Envelope},
-    Address, AttributeValue, Response,
+    Address, AttributeValue, MailboxDatum, Response, core,
+    rfc3501::{self, Envelope, Outcome, RequestId, Status},
 };
 use nom::{
-    bytes::streaming::tag,
-    error::{Error, ErrorKind},
     IResult, Parser,
+    branch::alt,
+    bytes::streaming::{tag, tag_no_case, take_while, take_while_m_n},
+    combinator::map,
+    error::{Error, ErrorKind},
+    sequence::preceded,
 };
 use std::{borrow::Cow, cell::Cell, mem::size_of};
 
@@ -81,8 +83,38 @@ impl std::error::Error for LimitError {}
 pub enum ParseError<'a> {
     Limit(LimitError),
     FetchLiteralLimit(FetchLiteralLimitError),
+    SearchLimit(SearchLimitError),
     Syntax(nom::Err<Error<&'a [u8]>>),
 }
+
+/// Hard limit for the opt-in windowed SEARCH parser.
+pub const MAX_SEARCH_UIDS: usize = 200;
+pub const MAX_SEARCH_RESPONSE_BYTES: usize = 128 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchLimitKind {
+    UidCount,
+    ResponseBytes,
+    ParserBytes,
+}
+
+/// Numeric information only. Search response data is never retained here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchLimitError {
+    pub kind: SearchLimitKind,
+    pub limit: usize,
+    pub actual: usize,
+}
+impl std::fmt::Display for SearchLimitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "IMAP SEARCH {:?} limit exceeded (limit {}, observed {})",
+            self.kind, self.limit, self.actual,
+        )
+    }
+}
+impl std::error::Error for SearchLimitError {}
 
 /// A command-scoped BODY section literal exceeded the requested byte count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -660,6 +692,206 @@ fn prefix(i: &[u8]) -> IResult<&[u8], u32> {
 pub(crate) fn parse_response<'a>(i: &'a [u8], limits: &BodyStructureLimits) -> ParseResult<'a> {
     parse_response_with_usage(i, limits).0
 }
+
+pub(crate) fn parse_response_with_search_limit<'a>(
+    i: &'a [u8],
+    limits: &BodyStructureLimits,
+    max_uids: usize,
+) -> ParseResult<'a> {
+    let mut rest = match tag_no_case::<_, _, Error<&[u8]>>("* SEARCH")(i) {
+        Ok((rest, _)) => rest,
+        Err(error @ nom::Err::Incomplete(_)) => return Err(ParseError::Syntax(error)),
+        Err(_) => return parse_search_side_response(i, limits),
+    };
+    if rest
+        .first()
+        .is_some_and(|byte| !matches!(byte, b' ' | b'\r'))
+    {
+        return parse_search_side_response(i, limits);
+    }
+    let limit = max_uids.min(MAX_SEARCH_UIDS);
+    // Retry on fragmentation without allocating a result vector. Only a
+    // complete SEARCH line allocates its exact UID list.
+    let mut uids = [0; MAX_SEARCH_UIDS];
+    let mut count = 0;
+    while let Some(value) = rest.strip_prefix(b" ") {
+        if value
+            .first()
+            .is_some_and(|byte| matches!(byte, b' ' | b'\r'))
+        {
+            // The ordinary response parser permits trailing spaces. A number
+            // after multiple separators still fails at the CRLF check.
+            rest = &value[value.iter().take_while(|byte| **byte == b' ').count()..];
+            break;
+        }
+        if value.first() == Some(&b'0') {
+            return Err(ParseError::Syntax(nom::Err::Error(Error::new(
+                value,
+                ErrorKind::Verify,
+            ))));
+        }
+        let (remaining, uid) = search_u32(value).map_err(ParseError::Syntax)?;
+        if count == limit {
+            return Err(ParseError::SearchLimit(SearchLimitError {
+                kind: SearchLimitKind::UidCount,
+                limit,
+                actual: limit + 1,
+            }));
+        }
+        uids[count] = uid;
+        count += 1;
+        rest = remaining;
+    }
+    let (rest, _) = tag("\r\n")(rest).map_err(ParseError::Syntax)?;
+    Ok((
+        rest,
+        Response::MailboxData(MailboxDatum::Search(uids[..count].to_vec())),
+    ))
+}
+/// Parse mailbox updates without entering unrelated response grammars. Their
+/// nested lists share a bounded allocation ledger, including capacity.
+fn parse_search_side_response<'a>(i: &'a [u8], limits: &BodyStructureLimits) -> ParseResult<'a> {
+    let mut limits = *limits;
+    limits.aggregate_bytes = limits.aggregate_bytes.min(MAX_SEARCH_RESPONSE_BYTES);
+    let budget = Budget::new(&limits);
+    let response = (|| {
+        let (rest, response) = match i.first() {
+            Some(b'*') => {
+                let (rest, _) = tag("* ")(i)?;
+                alt((
+                    map(search_status, |status| Response::Data {
+                        status,
+                        outcome: Outcome::default(),
+                    }),
+                    map(
+                        preceded(tag_no_case("FLAGS "), |i| search_flags(i, &budget)),
+                        |flags| Response::MailboxData(MailboxDatum::Flags(flags)),
+                    ),
+                    |i| search_numeric_notification(i, &budget),
+                ))
+                .parse(rest)?
+            }
+            Some(b'+') => {
+                let (rest, _) = tag("+")(i)?;
+                let (rest, _) = take_while(core::is_text_char)(rest)?;
+                (rest, Response::Continue(Outcome::default()))
+            }
+            _ => {
+                // The client generates short tags. A peer-supplied tag must
+                // fit this bound before it becomes an owned string.
+                let (rest, name) = take_while_m_n(1, 32, rfc3501::is_tag_char)(i)?;
+                let (rest, _) = tag(" ")(rest)?;
+                let (rest, status) = search_status(rest)?;
+                let name = std::str::from_utf8(name)
+                    .map_err(|_| nom::Err::Error(Error::new(i, ErrorKind::MapRes)))?;
+                (
+                    rest,
+                    Response::Done {
+                        tag: RequestId(name.to_owned()),
+                        status,
+                        outcome: Outcome::default(),
+                    },
+                )
+            }
+        };
+        let (rest, _) = take_while(|byte| byte == b' ')(rest)?;
+        let (rest, _) = tag("\r\n")(rest)?;
+        Ok((rest, response))
+    })();
+    response.map_err(|error| {
+        if let Some(limit) = budget.fetch_failure.get() {
+            ParseError::SearchLimit(SearchLimitError {
+                kind: SearchLimitKind::ResponseBytes,
+                limit: limit.limit,
+                actual: limit.actual,
+            })
+        } else if budget.failure.get().is_some() {
+            ParseError::SearchLimit(SearchLimitError {
+                kind: SearchLimitKind::ParserBytes,
+                limit: limits.aggregate_bytes,
+                actual: limits.aggregate_bytes + 1,
+            })
+        } else {
+            ParseError::Syntax(error)
+        }
+    })
+}
+
+fn search_status(i: &[u8]) -> IResult<&[u8], Status> {
+    let (rest, status) = Status::parse(i)?;
+    // The collector uses the status and tag. Text and response codes can be
+    // consumed without allocating an Outcome or decoding server strings.
+    if let Some(text) = rest.strip_prefix(b" ") {
+        let (rest, _) = take_while(core::is_text_char)(text)?;
+        Ok((rest, status))
+    } else {
+        Ok((rest, status))
+    }
+}
+
+fn search_flags<'a>(i: &'a [u8], budget: &Budget<'_>) -> IResult<&'a [u8], Vec<Cow<'a, str>>> {
+    let (rest, _) = tag("(")(i)?;
+    let (after_space, _) = take_while(|byte| matches!(byte, b' ' | b'\t'))(rest)?;
+    if let Some(tail) = after_space.strip_prefix(b")") {
+        return Ok((tail, Vec::new()));
+    }
+    budget.list(i, map(rfc3501::flag_perm, Cow::Borrowed))
+}
+
+fn search_u32(i: &[u8]) -> IResult<&[u8], u32> {
+    // Avoid repeatedly scanning a fragmented number past its maximum width.
+    if i.get(..11)
+        .is_some_and(|prefix| prefix.iter().all(u8::is_ascii_digit))
+    {
+        return Err(nom::Err::Error(Error::new(i, ErrorKind::Verify)));
+    }
+    core::number(i)
+}
+
+fn search_numeric_notification<'a>(
+    i: &'a [u8],
+    budget: &Budget<'_>,
+) -> IResult<&'a [u8], Response<'a>> {
+    let (rest, sequence) = search_u32(i)?;
+    alt((
+        map(tag_no_case(" EXISTS"), move |_| {
+            Response::MailboxData(MailboxDatum::Exists(sequence))
+        }),
+        map(tag_no_case(" RECENT"), move |_| {
+            Response::MailboxData(MailboxDatum::Recent(sequence))
+        }),
+        map(tag_no_case(" EXPUNGE"), move |_| {
+            Response::Expunge(sequence)
+        }),
+        map(
+            preceded(tag_no_case(" FETCH "), |i| {
+                budget.list(i, |i| search_fetch_attribute(i, budget))
+            }),
+            move |attrs| Response::Fetch(sequence, attrs),
+        ),
+    ))
+    .parse(rest)
+}
+
+fn search_fetch_attribute<'a>(
+    i: &'a [u8],
+    budget: &Budget<'_>,
+) -> IResult<&'a [u8], AttributeValue<'a>> {
+    alt((
+        map(
+            preceded(tag_no_case("UID "), search_u32),
+            AttributeValue::Uid,
+        ),
+        map(
+            preceded(tag_no_case("FLAGS "), |i| search_flags(i, budget)),
+            AttributeValue::Flags,
+        ),
+        crate::rfc4551::msg_att_mod_seq,
+        |i| budget.fetch_body_section(i, MAX_SEARCH_RESPONSE_BYTES),
+    ))
+    .parse(i)
+}
+
 pub(crate) fn parse_response_with_usage<'a>(
     i: &'a [u8],
     limits: &BodyStructureLimits,

@@ -11,8 +11,42 @@ use nom::Needed;
 #[cfg(feature = "runtime-tokio")]
 use tokio::io::{AsyncRead as Read, AsyncWrite as Write, AsyncWriteExt};
 
-use crate::types::{CommandReadLimits, Request, ResponseData};
-use imap_proto::{RequestId, Response};
+use crate::types::{CommandLimit, CommandReadLimits, Request, ResponseData};
+use imap_proto::{
+    MailboxDatum, RequestId, Response, Status,
+    bounded::{SearchLimitError, SearchLimitKind},
+};
+
+#[derive(Debug)]
+struct ActiveCommand {
+    tag: RequestId,
+    fetch_literal_bytes: Option<usize>,
+    search: Option<SearchBudget>,
+}
+
+#[derive(Debug)]
+struct SearchBudget {
+    response_bytes: usize,
+    uids: usize,
+    bytes_used: usize,
+    uids_used: usize,
+    precommand_bytes: usize,
+    seen_search: bool,
+}
+
+impl SearchBudget {
+    fn ensure_bytes(&self, pending: usize) -> io::Result<()> {
+        let actual = self.bytes_used.saturating_add(pending);
+        if actual > self.response_bytes {
+            return Err(io::Error::other(SearchLimitError {
+                kind: SearchLimitKind::ResponseBytes,
+                limit: self.response_bytes,
+                actual,
+            }));
+        }
+        Ok(())
+    }
+}
 
 /// Wraps a stream, and parses incoming data as imap server messages. Writes outgoing data
 /// as imap client messages.
@@ -35,7 +69,7 @@ pub struct ImapStream<R: Read + Write> {
     /// and `poll_next()` does not read
     /// from the underlying stream.
     read_closed: bool,
-    command_limits: Option<(RequestId, CommandReadLimits)>,
+    command_limits: Option<ActiveCommand>,
 }
 
 impl<R: Read + Write + Unpin> ImapStream<R> {
@@ -63,16 +97,20 @@ impl<R: Read + Write + Unpin> ImapStream<R> {
                 "IMAP stream is closed",
             ));
         }
-        if let Some((tag, _)) = &self.command_limits {
-            if msg.0.as_ref() != Some(tag) {
+        if let Some(command) = &self.command_limits {
+            if msg.0.as_ref() != Some(&command.tag) {
                 return Err(io::Error::other("A limited command is still active"));
             }
         }
-        log::trace!(
-            "encode: input: {:?}, {:?}",
-            msg.0,
-            std::str::from_utf8(&msg.1)
-        );
+        if self.search_budget().is_some() {
+            log::trace!("encode: bounded UID SEARCH");
+        } else {
+            log::trace!(
+                "encode: input: {:?}, {:?}",
+                msg.0,
+                std::str::from_utf8(&msg.1)
+            );
+        }
 
         if let Some(tag) = msg.0 {
             self.inner.write_all(tag.as_bytes()).await?;
@@ -92,7 +130,33 @@ impl<R: Read + Write + Unpin> ImapStream<R> {
         if self.read_closed || self.command_limits.is_some() {
             return Err(io::Error::other("IMAP command is unavailable"));
         }
-        self.command_limits = Some((tag, limits));
+        let (fetch_literal_bytes, search) = match limits.0 {
+            CommandLimit::BodySectionLiteralBytes(bytes) => (Some(bytes), None),
+            CommandLimit::Search {
+                response_bytes,
+                uids,
+            } => {
+                let search = SearchBudget {
+                    response_bytes,
+                    uids,
+                    bytes_used: 0,
+                    uids_used: 0,
+                    precommand_bytes: self.buffer.used(),
+                    seen_search: false,
+                };
+                if let Err(error) = search.ensure_bytes(self.buffer.used()) {
+                    self.read_closed = true;
+                    return Err(error);
+                }
+                self.buffer.set_command_capacity(Some(response_bytes));
+                (None, Some(search))
+            }
+        };
+        self.command_limits = Some(ActiveCommand {
+            tag,
+            fetch_literal_bytes,
+            search,
+        });
         // Any incomplete literal is re-parsed with the new command's cap.
         self.decode_needs = 0;
         Ok(())
@@ -122,6 +186,14 @@ impl<R: Read + Write + Unpin> ImapStream<R> {
         &mut self.inner
     }
 
+    fn search_budget(&self) -> Option<&SearchBudget> {
+        self.command_limits.as_ref()?.search.as_ref()
+    }
+
+    pub(crate) fn close(&mut self) {
+        self.read_closed = true;
+    }
+
     /// Attempts to decode a single response from the buffer.
     ///
     /// Returns `None` if the buffer does not contain enough data.
@@ -138,21 +210,77 @@ impl<R: Read + Write + Unpin> ImapStream<R> {
         let res = ResponseData::try_new_or_recover(block, |buf| {
             let buf = &buf[..self.buffer.used()];
             let structure_limits = imap_proto::bounded::BodyStructureLimits::default();
-            let parsed = match &self.command_limits {
-                Some((_, limits)) => imap_proto::Response::parse_bounded_with_fetch_limit(
+            let parsed = if let Some(search) = self.search_budget() {
+                imap_proto::Response::parse_bounded_with_search_limit(
                     buf,
                     &structure_limits,
-                    limits.body_section_literal_bytes,
-                ),
-                None => imap_proto::Response::parse_bounded(buf, &structure_limits),
+                    search.uids - search.uids_used,
+                )
+            } else if let Some(limit) = self
+                .command_limits
+                .as_ref()
+                .and_then(|command| command.fetch_literal_bytes)
+            {
+                imap_proto::Response::parse_bounded_with_fetch_limit(buf, &structure_limits, limit)
+            } else {
+                imap_proto::Response::parse_bounded(buf, &structure_limits)
             };
             match parsed {
                 Ok((remaining, response)) => {
-                    if let (Some((expected, _)), Response::Done { tag, .. }) =
-                        (&self.command_limits, &response)
-                    {
-                        if tag == expected {
+                    if let Some(command) = &mut self.command_limits {
+                        let completed =
+                            matches!(&response, Response::Done { tag, .. } if tag == &command.tag);
+                        if let Some(search) = &mut command.search {
+                            match &response {
+                                Response::Done { .. }
+                                    if !completed || search.precommand_bytes != 0 =>
+                                {
+                                    return Err(Some(io::Error::other(
+                                        "Unexpected IMAP SEARCH command tag",
+                                    )));
+                                }
+                                Response::Done { status, .. }
+                                    if !matches!(status, Status::Ok | Status::No | Status::Bad) =>
+                                {
+                                    return Err(Some(io::Error::other(
+                                        "Invalid IMAP SEARCH completion status",
+                                    )));
+                                }
+                                Response::Data {
+                                    status: Status::Bye,
+                                    ..
+                                } => {
+                                    return Err(Some(io::Error::other(
+                                        "IMAP disconnected during SEARCH",
+                                    )));
+                                }
+                                Response::Continue(_) => {
+                                    return Err(Some(io::Error::other(
+                                        "Unexpected IMAP SEARCH continuation",
+                                    )));
+                                }
+                                Response::MailboxData(MailboxDatum::Search(uids)) => {
+                                    if search.precommand_bytes != 0 || search.seen_search {
+                                        return Err(Some(io::Error::other(
+                                            "Unexpected IMAP SEARCH data",
+                                        )));
+                                    }
+                                    search.seen_search = true;
+                                    search.uids_used += uids.len();
+                                }
+                                _ => {}
+                            }
+                            let consumed = buf.len() - remaining.len();
+                            search.bytes_used += consumed;
+                            search.precommand_bytes =
+                                search.precommand_bytes.saturating_sub(consumed);
+                            self.buffer.set_command_capacity(Some(
+                                search.response_bytes - search.bytes_used,
+                            ));
+                        }
+                        if completed {
                             self.command_limits = None;
+                            self.buffer.set_command_capacity(None);
                         }
                     }
                     // TODO: figure out if we can use a minimum required size for a response.
@@ -168,13 +296,35 @@ impl<R: Read + Write + Unpin> ImapStream<R> {
                     self.decode_needs = 0;
                     Err(Some(io::Error::other(error)))
                 }
+                Err(imap_proto::bounded::ParseError::SearchLimit(mut error)) => {
+                    self.decode_needs = 0;
+                    if let Some(search) = self.search_budget() {
+                        match error.kind {
+                            SearchLimitKind::UidCount => {
+                                error.limit = search.uids;
+                                error.actual += search.uids_used;
+                            }
+                            SearchLimitKind::ResponseBytes => {
+                                error.limit = search.response_bytes;
+                                error.actual = error.actual.saturating_add(search.bytes_used);
+                            }
+                            SearchLimitKind::ParserBytes => {}
+                        }
+                    }
+                    Err(Some(io::Error::other(error)))
+                }
                 Err(imap_proto::bounded::ParseError::Syntax(nom::Err::Incomplete(
                     Needed::Size(min),
                 ))) => {
                     log::trace!("decode: incomplete data, need minimum {min} bytes");
                     let needed = self.buffer.used().checked_add(usize::from(min));
+                    if let Some(search) = self.search_budget() {
+                        search
+                            .ensure_bytes(needed.unwrap_or(usize::MAX))
+                            .map_err(Some)?;
+                    }
                     match needed {
-                        Some(needed) if needed <= self.buffer.max_capacity => {
+                        Some(needed) if needed <= self.buffer.capacity_limit() => {
                             self.decode_needs = needed;
                         }
                         _ => return Err(Some(io::Error::other("IMAP parser buffer limit"))),
@@ -188,6 +338,9 @@ impl<R: Read + Write + Unpin> ImapStream<R> {
                 }
                 Err(imap_proto::bounded::ParseError::Syntax(other)) => {
                     self.decode_needs = 0;
+                    if self.search_budget().is_some() {
+                        return Err(Some(io::Error::other("Invalid IMAP SEARCH response")));
+                    }
                     Err(Some(io::Error::other(format!(
                         "{:?} during parsing of {:?}",
                         other,
@@ -217,8 +370,16 @@ impl<R: Read + Write + Unpin> ImapStream<R> {
             return Poll::Ready(Some(Ok(response)));
         }
         loop {
+            let read_limit = if let Some(search) = this.search_budget() {
+                search.ensure_bytes(this.buffer.used().saturating_add(1))?;
+                search.response_bytes - search.bytes_used - this.buffer.used()
+            } else {
+                usize::MAX
+            };
             this.buffer.ensure_capacity(this.decode_needs)?;
             let buf = this.buffer.free_as_mut_slice();
+            let len = buf.len().min(read_limit);
+            let buf = &mut buf[..len];
 
             // The buffer should have at least one byte free
             // before we try reading into it
@@ -239,7 +400,7 @@ impl<R: Read + Write + Unpin> ImapStream<R> {
             };
 
             if num_bytes_read == 0 {
-                if this.buffer.used() > 0 {
+                if this.buffer.used() > 0 || this.search_budget().is_some() {
                     return Poll::Ready(Some(Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "bytes remaining in stream",
@@ -262,6 +423,7 @@ struct Buffer {
     /// Offset where used bytes range ends.
     offset: usize,
     max_capacity: usize,
+    command_capacity: Option<usize>,
 }
 
 impl Buffer {
@@ -279,6 +441,22 @@ impl Buffer {
             block: BytesMut::zeroed(Self::BLOCK_SIZE.min(max_capacity)),
             offset: 0,
             max_capacity,
+            command_capacity: None,
+        }
+    }
+
+    fn capacity_limit(&self) -> usize {
+        self.command_capacity
+            .map_or(self.max_capacity, |limit| self.max_capacity.min(limit))
+    }
+
+    fn set_command_capacity(&mut self, limit: Option<usize>) {
+        self.command_capacity = limit;
+        let capacity = self.capacity_limit();
+        if self.block.len() > capacity {
+            let mut block = BytesMut::zeroed(capacity);
+            block[..self.offset].copy_from_slice(&self.block[..self.offset]);
+            self.block = block;
         }
     }
 
@@ -312,7 +490,7 @@ impl Buffer {
     /// Ensure the buffer has free capacity, optionally ensuring minimum buffer size.
     fn ensure_capacity(&mut self, required: usize) -> io::Result<()> {
         let required = required.max(self.offset.saturating_add(1));
-        if required > self.max_capacity {
+        if required > self.capacity_limit() {
             return Err(io::Error::other("IMAP parser buffer limit"));
         }
         if required > self.block.len() {
@@ -330,9 +508,9 @@ impl Buffer {
             .block
             .len()
             .checked_add(num_bytes)
-            .filter(|size| *size <= self.max_capacity)
+            .filter(|size| *size <= self.capacity_limit())
             .ok_or_else(|| io::Error::other("IMAP parser buffer limit"))?;
-        let new_size = Self::rounded_size(min_size, self.max_capacity);
+        let new_size = Self::rounded_size(min_size, self.capacity_limit());
         let mut block = BytesMut::zeroed(new_size);
         block[..self.offset].copy_from_slice(&self.block[..self.offset]);
         self.block = block;
@@ -362,7 +540,7 @@ impl Buffer {
     /// Remaining bytes are already within the current bounded block. The new
     /// allocation is rounded without exceeding the same limit.
     fn reset_with_data(&mut self, data: &[u8]) {
-        let new_size = Self::rounded_size(data.len().saturating_add(1), self.max_capacity);
+        let new_size = Self::rounded_size(data.len().saturating_add(1), self.capacity_limit());
         self.block = BytesMut::zeroed(new_size);
         self.block[..data.len()].copy_from_slice(data);
 

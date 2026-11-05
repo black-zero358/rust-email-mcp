@@ -168,3 +168,33 @@ registry imap-proto 0.17.0. Existing tagged-completion regressions remain requir
 This parser foundation provides typed detection. Application mapping to
 `LIMIT_EXCEEDED/mime_structure` and the controlled fresh-connection raw fallback
 are integrated with the subsequent PartManifest reader work package.
+
+## Bounded UID SEARCH (R09 foundation)
+
+`CommandReadLimits::search` adds an opt-in 128 KiB command response ceiling
+and at most 200 UID entries. The byte count includes complete untagged
+notifications and the matching tagged completion. Each read and parser buffer
+growth is checked against the remaining budget before receiving more bytes.
+Bytes buffered beyond the matching completion remain available to the next
+read. Buffered unsolicited notifications can precede the new command's reply.
+Pre-command SEARCH data and tagged completions cannot satisfy the new command.
+
+`Session::uid_search_bounded` requires exactly one untagged SEARCH result and
+matching tagged OK. An empty SEARCH result is valid. Unexpected continuation,
+duplicate results, wrong tag, BYE and EOF fail the command. The high-level
+method closes the parser/command stream on failure. The existing UID SEARCH,
+FETCH limits and UTF-8 literal command methods retain their behavior.
+
+The local parser budgets nested FLAGS/FETCH allocation before reserving
+capacity. It consumes status text and response codes without constructing
+their AST and rejects unrelated response types. The convenience collector
+forwards scalar mailbox notifications and releases other response owners
+when consumed, including legitimate FETCH flag updates.
+
+`error::search_limit` recovers typed UID-count, parser allocation or command
+response-byte failures. The errors contain numeric limits only. Terminal
+parser failures stop later reads and command writes.
+
+Run `cargo test --locked --test thread_search_budget` for the public parser and
+isolated async session checks. Upstream versions, checksums, licenses and
+dependency resolution remain unchanged.

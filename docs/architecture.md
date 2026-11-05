@@ -74,6 +74,10 @@ R06 的协议基础在本地 `imap-proto` 中增加 `Response::parse_bounded`，
 
 预算错误仅携带固定类别、上限和单位。async-imap 通过 `error::body_structure_limit` 识别该类型，预算错误路径直接返回静态信息；读取路径使用统一错误映射生成 `LIMIT_EXCEEDED/mime_structure`。原连接字节/缓冲限制与 tagged completion 规则继续生效。来源和维护规则见 [imap-proto 补丁记录](../vendor/imap-proto/PATCHES.md)。
 
+R09 搜索基础提供 opt-in 的 `Response::parse_bounded_with_search_limit`、`CommandReadLimits::search` 与 `Session::uid_search_bounded`。每条命令从响应开始到匹配 tagged completion 共用 128 KiB 字节上限，SEARCH 最多 200 个 UID，在分配结果向量前检查。异步 FLAGS/FETCH 的嵌套容器以独立 128 KiB 解析分配预算核算容量；状态文本和响应码只扫描，标量 EXISTS/RECENT/EXPUNGE 可以转交，其他通知在消费后释放，防止通知队列保留多块原始响应。普通 SEARCH/FETCH 入口沿用原契约。
+
+有界搜索必须收到一条显式 SEARCH 和匹配 tagged OK；空 SEARCH 合法。重复 SEARCH/UID、错误 tag、BYE/EOF、意外 continuation 和预算错误终止当前读取及后续命令写入。开始前已缓冲的 SEARCH/完成响应不参与新命令，匹配完成后的缓冲尾部保留供后续读取。typed `SearchLimitError` 只携带类别和数字上限。该基础接口由后续跨文件夹编排按最多 200 个 UID 数值的闭区间调用，窗口检查点在命令成功后推进。
+
 IMAP 文本模式固定为 rev1：所有邮箱参数编码为 modified UTF-7，LIST 名称解码为 Unicode 后验证规范往返。不得直接把 UTF-8 字节放入 quoted search；非 ASCII 查询使用 `CHARSET UTF-8` 与同步 literal，等待 continuation 和对应命令的 tagged OK。`BADCHARSET` 返回 `UNSUPPORTED_CHARSET`，不降级为含义不同的查询。当前未协商 `UTF8=ACCEPT` 或 IMAP4rev2。
 
 async-imap 0.12 的 APPEND flags 原样序列化，必须传入 `(\Draft)` 这样的带括号列表。合成 duplex 回归覆盖 literal continuation 及 OK/NO/BAD。vendored completion-status 补丁只允许匹配 tag 的 OK 成功；NO/BAD、缺失终结响应和错误 tag 均失败。SELECT/EXAMINE（含 CONDSTORE）和 STATUS 共用这一完成边界；无响应或只有 `0 EXISTS`/部分元数据的断连不能解释成成功空邮箱，列表/搜索不得在未完成 EXAMINE 时返回空页。来源、退出条件与审计方式见 [PATCHES.md](../vendor/async-imap/PATCHES.md)。
@@ -185,6 +189,8 @@ SMTPUTF8 需求与确定拒绝对应 D3/D4：`mime::requires_smtputf8`、`smtp::
 ## Decision records
 
 R06 parser 基础对应 D2/D3/D5：`tests/body_structure_budget.rs` 在默认根测试中覆盖结构预算、分配记账、正常响应分段、typed 错误及 Client 终止；`scripts/test-audit-dependencies.sh` 核对两个 path 包的上游审计视图与失败清理，`scripts/test-docker-context.sh` 核对两个允许的 vendor 目录。原完成状态、字节预算和邮件回归继续执行。解析器的预算限制与流式附件/PartManifest 功能分工作包交付。
+
+R09 搜索基础的 D2/D3/D5 入口为 `tests/thread_search_budget.rs`：覆盖 199/200/201 个结果、合法前缀分片、显式空 SEARCH 与缺失响应、完整命令字节阈值、密集 FLAGS 的分配预算、通知消费后释放、错 tag/断连/失败闭锁，以及命令前数据隔离和完成后尾部恢复。普通 SEARCH 超过 200 个结果及既有 BODYSTRUCTURE/部件 FETCH 测试继续检查兼容性。
 
 R06 附件映射对应 D2/D3/D5：`mail::parts` 的 mapping/raw 差分与 reader 回归核对原 DFS 索引、每节点头证据、特殊 multipart 和头预算；`server::output_tests::structure` 使用本地 TLS IMAP 与认证 HTTP MCP 核对实际命令、一次新连接回退、世代变化和协议失败。账户测试继续检查同 UID 的引用隔离；`imap_text` 回归覆盖 ASCII/Unicode 搜索及 STATUS 的结构预算错误分类。
 

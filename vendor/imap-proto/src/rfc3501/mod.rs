@@ -8,19 +8,18 @@ use std::borrow::Cow;
 use std::str::from_utf8;
 
 use nom::{
+    IResult, Parser,
     branch::alt,
     bytes::streaming::{tag, tag_no_case, take_while, take_while1},
     character::streaming::char,
     combinator::{map, map_res, opt, recognize, value},
     multi::{many0, many1},
     sequence::{delimited, pair, preceded, terminated},
-    IResult, Parser,
 };
 
 use crate::{
-    core::*, rfc2087, rfc2971, rfc3501::body::*, rfc3501::body_structure::*, rfc4314, rfc4315,
-    rfc4315::UidSetMember, rfc4551, rfc5161, rfc5256, rfc5464, rfc5464::Metadata, rfc7162,
-    Response,
+    Response, core::*, rfc2087, rfc2971, rfc3501::body::*, rfc3501::body_structure::*, rfc4314,
+    rfc4315, rfc4315::UidSetMember, rfc4551, rfc5161, rfc5256, rfc5464, rfc5464::Metadata, rfc7162,
 };
 
 use super::gmail;
@@ -28,7 +27,7 @@ use super::gmail;
 pub mod body;
 pub mod body_structure;
 
-fn is_tag_char(c: u8) -> bool {
+pub(crate) fn is_tag_char(c: u8) -> bool {
     c != b'+' && is_astring_char(c)
 }
 
@@ -58,7 +57,7 @@ pub enum Status {
 }
 
 impl Status {
-    fn parse(i: &[u8]) -> IResult<&[u8], Self> {
+    pub(crate) fn parse(i: &[u8]) -> IResult<&[u8], Self> {
         alt((status_ok, status_no, status_bad, status_preauth, status_bye)).parse(i)
     }
 }
@@ -113,7 +112,7 @@ fn flag_list(i: &[u8]) -> IResult<&[u8], Vec<Cow<'_, str>>> {
     parenthesized_list(map(flag_perm, Cow::Borrowed)).parse(i)
 }
 
-fn flag_perm(i: &[u8]) -> IResult<&[u8], &str> {
+pub(crate) fn flag_perm(i: &[u8]) -> IResult<&[u8], &str> {
     alt((map_res(tag("\\*"), from_utf8), flag)).parse(i)
 }
 

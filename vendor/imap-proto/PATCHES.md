@@ -92,6 +92,32 @@ The existing upstream parser vectors are also compared across both entry points
 in the isolated parser validation harness; record the final command and count
 with the candidate's validation evidence.
 
+## Bounded SEARCH responses (R09 foundation)
+
+`Response::parse_bounded_with_search_limit` applies an opt-in ceiling of at
+most 200 UID entries to an untagged SEARCH response. It parses into fixed
+scratch space and creates the exact result vector only after the complete
+CRLF. Valid split prefixes retain `Incomplete`. Zero, leading zeros and
+overflow are syntax errors. The ordinary SEARCH parser and the other bounded
+entry points retain their previous behavior.
+
+The opt-in path also parses mailbox notifications with bounded allocations.
+It accounts for FLAGS list capacities and nested FETCH attribute storage
+before reserving, including supported UID, FLAGS, MODSEQ and BODY section
+attributes. EXISTS, RECENT and EXPUNGE use scalar data. Status text and codes
+are consumed without allocating an outcome, and unrelated response grammars
+are excluded from the SEARCH scope.
+
+`SearchLimitError` holds the kind, configured limit and observed lower bound.
+The parser reports `UidCount`, `ParserBytes` and oversized literal declarations.
+The companion async client reports cumulative `ResponseBytes` against the
+active command.
+
+Root regression `tests/thread_search_budget.rs` covers complete and fragmented
+SEARCH responses, 199/200/201 entries, untagged noise and tagged completion
+through the async client. Protocol grammar reference
+[RFC 3501 §§6.4.4, 7.2.5 and 9](https://www.rfc-editor.org/rfc/rfc3501#section-6.4.4).
+
 ## Advisory auditing and maintenance
 
 Run `bash scripts/test-audit-dependencies.sh`, then

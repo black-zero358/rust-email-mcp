@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use nom::{branch::alt, IResult, Parser};
+use nom::{IResult, Parser, branch::alt};
 
 pub mod bounded;
 pub mod core;
@@ -100,6 +100,17 @@ impl<'a> Response<'a> {
         max_literal_bytes: usize,
     ) -> bounded::ParseResult<'a> {
         bounded::parse_response_with_fetch_limit(msg, limits, Some(max_literal_bytes)).0
+    }
+
+    /// Parse SEARCH with a bounded UID list and allocation limits on the
+    /// supported mailbox notifications. Status response text is consumed
+    /// without building its optional code or information.
+    pub fn parse_bounded_with_search_limit(
+        msg: &'a [u8],
+        limits: &bounded::BodyStructureLimits,
+        max_uids: usize,
+    ) -> bounded::ParseResult<'a> {
+        bounded::parse_response_with_search_limit(msg, limits, max_uids)
     }
 
     pub fn into_owned(self) -> Response<'static> {
