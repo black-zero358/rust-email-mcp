@@ -322,10 +322,19 @@ pub(in crate::mail) async fn download(
         &json!({"uid_validity":reference.validity}),
         state.uid_validity,
     )?;
+    let observe = |error| {
+        service.observe_fetch_error(
+            reference.mailbox,
+            Some(reference.validity),
+            state.uid_next,
+            reference.uid,
+            error,
+        )
+    };
     let known_size = activity
         .network(reader::size(&mut session, reference.uid))
         .await
-        .map_err(reader::FetchFailure::mail)?;
+        .map_err(|error| observe(error.mail()))?;
     let manifest = match activity
         .network(reader::manifest(&mut session, reference.uid))
         .await
@@ -352,28 +361,49 @@ pub(in crate::mail) async fn download(
                 &json!({"uid_validity":reference.validity}),
                 state.uid_validity,
             )?;
+            let observe_fresh = |error| {
+                service.observe_fetch_error(
+                    reference.mailbox,
+                    Some(reference.validity),
+                    state.uid_next,
+                    reference.uid,
+                    error,
+                )
+            };
             let decoded = {
                 let raw = activity
                     .network(service.raw_attachment(&mut fresh, reference.uid))
-                    .await?;
+                    .await
+                    .map_err(observe_fresh)?;
                 if raw.len() != known_size {
                     return Err(MailError::backend());
                 }
                 let parsed = mime::parse(&raw)?;
                 let manifest = from_raw(&parsed)?;
-                service.persist_manifest(
+                service.persist_raw(
                     reference.mailbox,
                     Some(reference.validity),
                     reference.uid,
-                    &manifest.manifest,
+                    &raw,
+                    &parsed,
                 );
-                attachments::decode_part(
+                let decoded = attachments::decode_part(
                     manifest
                         .entities
                         .get(reference.index)
                         .ok_or_else(attachments::attachment_missing)?,
                     max,
-                )?
+                );
+                if let Some(permit) = service.content_capture(reference.mailbox) {
+                    service.capture_raw(
+                        reference.mailbox,
+                        Some(reference.validity),
+                        reference.uid,
+                        raw,
+                        permit,
+                    );
+                }
+                decoded?
             };
             drop(fresh);
             for bytes in decoded.chunks(FETCH_BYTES) {
@@ -383,7 +413,7 @@ pub(in crate::mail) async fn download(
                     .map_err(storage_error)?;
             }
             let proof = CompletionEvidence { stage: stage.id() };
-            return stage
+            let ready = stage
                 .finish(
                     proof,
                     ExpectedFile {
@@ -392,16 +422,44 @@ pub(in crate::mail) async fn download(
                     },
                 )
                 .await
-                .map_err(storage_error);
+                .map_err(storage_error)?;
+            if let Some(permit) = service.content_capture(reference.mailbox) {
+                service.capture_attachment(
+                    reference.mailbox,
+                    reference.validity,
+                    reference.uid,
+                    reference.index,
+                    ready.metadata(),
+                    staging::Capture {
+                        bytes: decoded,
+                        _permit: permit,
+                    },
+                );
+            }
+            return Ok(ready);
         }
-        Err(error) => return Err(error.mail()),
+        Err(error) => return Err(observe(error.mail())),
     };
-    service.persist_manifest(
+    service.persist_structured_manifest(
         reference.mailbox,
         Some(reference.validity),
         reference.uid,
         &manifest,
     );
+    if known_size
+        > service
+            .config
+            .max_message
+            .min(crate::config::DEFAULT_MAX_MESSAGE)
+    {
+        service.cache_artifact_state(
+            reference.mailbox,
+            Some(reference.validity),
+            reference.uid,
+            crate::cache::ArtifactKey::Raw,
+            crate::cache::ArtifactState::Omitted(crate::cache::Omission::RawLimit),
+        );
+    }
     let part = manifest
         .parts
         .get(reference.index)
@@ -425,6 +483,9 @@ pub(in crate::mail) async fn download(
         ));
     }
     let mut decoder = Decoder::new(encoding, limit);
+    if let Some(permit) = service.content_capture(reference.mailbox) {
+        stage.capture(encoded_size.min(limit), permit);
+    }
     let mut offset = 0;
     while offset < encoded_size {
         let expected = (encoded_size - offset).min(FETCH_BYTES);
@@ -437,7 +498,8 @@ pub(in crate::mail) async fn download(
                 FETCH_BYTES,
                 expected,
             ))
-            .await?;
+            .await
+            .map_err(observe)?;
         stage = decoded_chunk(stage, &mut decoder, &bytes, false).await?.0;
         offset = offset
             .checked_add(bytes.len())
@@ -446,14 +508,15 @@ pub(in crate::mail) async fn download(
     // Also validates empty attachments and guards against an understated manifest size.
     activity
         .network(chunk(&mut session, reference.uid, part, encoded_size, 1, 0))
-        .await?;
+        .await
+        .map_err(observe)?;
     let (stage, finished) = decoded_chunk(stage, &mut decoder, &[], true).await?;
     if !finished {
         return Err(MailError::backend());
     }
     drop(session);
     let proof = CompletionEvidence { stage: stage.id() };
-    stage
+    let ready = stage
         .finish(
             proof,
             ExpectedFile {
@@ -462,5 +525,24 @@ pub(in crate::mail) async fn download(
             },
         )
         .await
-        .map_err(storage_error)
+        .map_err(storage_error)?;
+    Ok(capture_completed(service, reference, ready))
+}
+
+fn capture_completed(
+    service: &MailService,
+    reference: PartReference<'_>,
+    mut ready: Ready,
+) -> Ready {
+    if let Some(capture) = ready.take_capture() {
+        service.capture_attachment(
+            reference.mailbox,
+            reference.validity,
+            reference.uid,
+            reference.index,
+            ready.metadata(),
+            capture,
+        );
+    }
+    ready
 }

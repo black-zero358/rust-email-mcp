@@ -131,11 +131,25 @@
 
 默认内存头缓存保存完整邮件头，全实例所有账户合计最多 256 项、16 MiB，TTL 为 60 秒。键包含内部账户身份与世代、文件夹、UIDVALIDITY 和 UID；每次会话先获取当前 UIDVALIDITY，只失效相应账户和文件夹的旧缓存。正文、附件、可变标记和统计结果不进入缓存。
 
-持久元数据由管理员通过 `CACHE_CONFIG_PATH` 选择账户和目录，模式为 off 或 metadata。在线读取完成后，有界后台队列记录邮件头、已核对部件清单与索引；部分头保留完整性标记。`get_cache_status({"account_id":"work"})` 先授权，再查询本地写入屏障之后的状态，返回 off、ready 或 unavailable，以及该账户的磁盘额度、当前目录世代、检查时间、dirty、邮件数、完整头数、索引头数及已核对清单数。当前收集范围随实际在线调用逐步增长。
+持久缓存由管理员通过 `CACHE_CONFIG_PATH` 选择账户和目录，模式为 off、metadata 或 full。在线读取完成后，有界后台队列记录邮件头、已核对部件清单与索引；部分头保留完整性标记。full 另保存完整正文、原始邮件及附件。`get_cache_status({"account_id":"work"})` 先授权，再查询本地状态，返回 off、ready 或 unavailable，以及该账户的磁盘额度、当前目录世代、检查时间、dirty、邮件数、完整头数、索引头数及已核对清单数。full 还提供 content_pending 和各目录 raw/full_body/attachments 层的物化、可派生、缺失、省略及不支持计数。当前收集范围随实际在线调用逐步增长。
 
 `write_health` 记录当前进程的失败证据任务数 `failed_writes`、最后固定原因 `last_error`（quota、queue_full、storage 或 null）及粘滞额度标记 `quota_blocked`。一批证据写入计一个任务；重启后重新评估。额度不足时仍可读取已保存的覆盖和额度信息，普通在线邮件读取继续返回其实际结果。
 
-跨文件夹会话的冻结范围全部被缓存配置选中时，`cursor_storage` 为 persistent，保存检查点和最近输入的重放快照；关闭缓存或包含未选目录时为 memory。持久范围遇存储故障返回固定游标错误，修复后可重试原已提交 token；已确认的世代变化使旧 token 失效。后台元数据写入失败保留已完成的普通在线读取结果。full 模式、正文附件离线交付和全量回填分别按后续工作包接入；配置与恢复见[缓存设计](cache-design.md)。
+跨文件夹会话的冻结范围全部被缓存配置选中时，`cursor_storage` 为 persistent，保存检查点和最近输入的重放快照；关闭缓存或包含未选目录时为 memory。持久范围遇存储故障返回固定游标错误，修复后可重试原已提交 token；已确认的世代变化使旧 token 失效。后台元数据写入失败保留已完成的普通在线读取结果。配置与恢复见[缓存设计](cache-design.md)，全量历史回填由 R12 接入。
+
+full 支持以下显式来源参数，默认值沿用在线行为：
+
+| 工具 | 离线参数 |
+| --- | --- |
+| list_mailboxes、list_emails、get_email、get_emails、read_conversation | `read_source:"cache"` |
+| list_attachments、download_attachment、prepare_attachment_download | `read_source:"cache"` |
+| search_emails、locate_message | `search_source:"cache"` |
+
+cache 请求使用当前账户授权和本地证据，零 IMAP；在线退避期间仍可读取。结果的 cache 对象标明 stale、remote_generation_unverified、最后观察时间和覆盖范围。列表的 FLAGS、INTERNALDATE、SIZE 保存各自观察时间，缺失字段按未知值报告；筛选跳过缺少所需证据的邮件并计入覆盖缺口。`get_email_status`、`get_mailbox_statistics` 和 `diagnose_connectivity` 继续执行在线命令，`get_cache_status` 查询本地状态。
+
+正文支持原有 body_mode、html_display 和完整响应预算。附件保留原 MIME index、字节长度和 SHA-256；离线 download_url 继续要求同主体 Bearer，GET 复核当前账户权限、过期、目录状态和文件完整性。缺少完整副本返回 CACHE_MISS；未配置 full 或请求超出范围返回 CACHE_UNAVAILABLE；恢复、异常退出或写操作影响的范围返回 CACHE_NEEDS_VERIFICATION。网络错误后可另行选择 cache。
+
+全文搜索使用完整头和完整正文索引，支持中文长词与短词，并返回匹配层及索引覆盖。存在 next_cache_cursor 时，使用 cache_cursor 和相同查询、范围、筛选条件继续；数据修订变化后重新搜索。离线会话游标绑定来源和本地范围修订，正常清洁重启保留原到期时间。各工具的完整矩阵见[内容缓存设计](cache-content-design.md#显式离线契约)。
 
 ## 协议依据
 

@@ -57,7 +57,9 @@ async fn publish(store: &CursorStore, binding: Binding) -> Cursor {
         .unwrap();
     let prepared = lease.prepare(lease.state().plan_delta()).unwrap();
     lease
-        .commit_async(prepared, Instant::now(), CancellationToken::new())
+        .commit_async(prepared, Instant::now(), CancellationToken::new(), |_| {
+            false
+        })
         .await
         .unwrap()
         .next
@@ -126,7 +128,7 @@ async fn restart_restores_no_progress_page_and_its_original_expiry() {
         .unwrap();
     let coverage = prepared.coverage();
     let next = lease
-        .commit_async(prepared, Instant::now(), CancellationToken::new())
+        .commit_async(prepared, Instant::now(), CancellationToken::new(), |_| true)
         .await
         .unwrap()
         .next
@@ -218,7 +220,7 @@ async fn cancellation_at_transaction_commit_preserves_old_cursor_and_undelivered
     checks.store(0, Ordering::SeqCst);
     assert!(matches!(
         lease
-            .commit_async(prepared, Instant::now(), CancellationToken::new())
+            .commit_async(prepared, Instant::now(), CancellationToken::new(), |_| true)
             .await,
         Err(StoreError::Unavailable)
     ));
@@ -234,7 +236,7 @@ async fn cancellation_at_transaction_commit_preserves_old_cursor_and_undelivered
     assert_eq!(lease.state().plan_delta().items(), delivery.items());
     let prepared = lease.prepare(delivery).unwrap();
     let next = lease
-        .commit_async(prepared, Instant::now(), CancellationToken::new())
+        .commit_async(prepared, Instant::now(), CancellationToken::new(), |_| true)
         .await
         .unwrap()
         .next
@@ -247,6 +249,116 @@ async fn cancellation_at_transaction_commit_preserves_old_cursor_and_undelivered
         panic!("expected replay");
     };
     assert!(replayed.replay().unwrap().next == Some(next));
+}
+
+#[tokio::test]
+async fn pending_live_tombstone_blocks_offline_cas_before_sqlite_observes_it() {
+    use crate::{
+        accounts::{CacheRun, open_catalog},
+        config::{self, ValidatedAccountSet},
+        journal::Journal,
+        mail::{
+            MailRuntime, MailService,
+            conversation::{offline, state::CacheStamp},
+        },
+    };
+    use serde_json::json;
+
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = (*config::fixture()).clone();
+    config.account_registry = Some(directory.path().join("accounts.sqlite"));
+    config.attachment_staging_dir = Some(directory.path().join("attachments"));
+    let accounts = ValidatedAccountSet::legacy(Arc::new(config));
+    let settings = directory.path().join("cache.json");
+    std::fs::write(
+        &settings,
+        serde_json::to_vec(&json!({
+            "version":1,"mode":"full","directory":"cache","max_bytes":8 * 1024 * 1024,
+            "accounts":[{"account_id":"default","mailboxes":["INBOX"],"max_bytes":8 * 1024 * 1024}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let settings = config::load_cache_file(&settings, &accounts).unwrap();
+    let catalog = open_catalog(accounts).unwrap();
+    let run = CacheRun::begin(catalog.config()).unwrap();
+    let cache =
+        MailRuntime::prepare_cache_for_run(&catalog, settings, Some(run.identity())).unwrap();
+    let account = catalog.read_account("owner", None).unwrap().key;
+    let storage = cache.full_storage(&account).unwrap();
+    storage
+        .observe_folder(&account, "INBOX", 7, Some(501), 1)
+        .unwrap();
+    let snapshot = storage.freeze_scope(&account, "INBOX").unwrap();
+    let binding = Binding::new(account.reference_namespace(), "owner");
+    let backend = storage.cursor_backend();
+    let store = cache.cursor_store();
+    let mut service = MailService::with_account(
+        catalog.config().clone(),
+        Arc::new(Journal::open(Path::new(":memory:")).unwrap()),
+        account.clone(),
+    )
+    .unwrap();
+    service.persistent = cache.clone();
+
+    let start = store
+        .open_lease(binding, Instant::now(), |limit| {
+            let mut state = state(binding.namespace, limit)?;
+            let mut stamps = [None; MAX_FOLDERS];
+            stamps[0] = Some(CacheStamp {
+                checked_at_ms: snapshot.checked_at_ms,
+                index_revision: snapshot.index_revision,
+                dirty_revision: snapshot.dirty_revision,
+                restore_epoch: snapshot.restore_epoch,
+                complete_headers: snapshot.complete_headers,
+                indexed_threads: snapshot.indexed_threads,
+                known_messages: snapshot.known_messages,
+            });
+            state.set_cache_stamps(stamps, limit)?;
+            Ok(state)
+        })
+        .unwrap();
+    let prepared = start.prepare(start.state().plan_delta()).unwrap();
+    let input = start
+        .commit_async(prepared, Instant::now(), CancellationToken::new(), |_| true)
+        .await
+        .unwrap()
+        .next
+        .unwrap();
+    let original = backend
+        .validate(binding.into(), *input.0.as_bytes(), utc_millis().unwrap())
+        .unwrap();
+    let lease = advance(&store, binding, input).await;
+    let prepared = lease.prepare(lease.state().plan_delta()).unwrap();
+    let checks = Arc::new(AtomicUsize::new(0));
+    let calls = checks.clone();
+    assert!(matches!(
+        lease
+            .commit_async(
+                prepared,
+                Instant::now(),
+                CancellationToken::new(),
+                move |state| {
+                    // Allow the lease and storage preflights. At the final
+                    // SQLite transaction gate the worker cannot yet acquire
+                    // the database mutex to record this verified live miss.
+                    if calls.fetch_add(1, Ordering::SeqCst) == 2 {
+                        service.cache_tombstone("INBOX", Some(7), Some(502), 1);
+                    }
+                    offline::scopes_current(&service.persistent, &account, state)
+                },
+            )
+            .await,
+        Err(StoreError::Unavailable)
+    ));
+    assert_eq!(checks.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        backend
+            .validate(binding.into(), *input.0.as_bytes(), utc_millis().unwrap())
+            .unwrap(),
+        original,
+    );
+    cache.finish().await;
 }
 
 #[tokio::test]
@@ -362,7 +474,7 @@ async fn dormant_rows_share_the_same_slot_budget_as_unpublished_leases() {
 }
 
 #[tokio::test]
-async fn near_full_cursor_restores_with_its_existing_validation_reservation() {
+async fn near_full_r11a_live_cursor_restores_at_its_original_owned_charge() {
     let directory = tempfile::tempdir().unwrap();
     let account = AccountKey::synthetic();
     let binding = Binding::new(account.reference_namespace(), "owner");
@@ -385,6 +497,10 @@ async fn near_full_cursor_restores_with_its_existing_validation_reservation() {
         .unwrap();
 
     let padding = "a".repeat(920);
+    // Measured from an isolated rustc build of d2673f7. The other retained
+    // container and replay layouts did not change, and live codec v1 still
+    // writes the archived wire format byte for byte.
+    let old_layout_delta = 440 - size_of::<State>();
     let mut verified = 0;
     while let Some(Work::Verify(candidate)) = lease.state().next_work() {
         let mut count = 1000;
@@ -397,7 +513,9 @@ async fn near_full_cursor_restores_with_its_existing_validation_reservation() {
                 .unwrap()
                 .unwrap()
             }));
-            match lease.update(|state, limit| state.apply_facts(candidate, observed, limit)) {
+            match lease.update(|state, limit| {
+                state.apply_facts(candidate, observed, limit - old_layout_delta)
+            }) {
                 Ok(true) => {
                     verified += 1;
                     break;
@@ -416,13 +534,49 @@ async fn near_full_cursor_restores_with_its_existing_validation_reservation() {
         "cursor charged only {charge} bytes"
     );
     assert_eq!(lease.state().plan_delta().items().len(), verified);
-    let prepared = lease.prepare(lease.state().plan_delta()).unwrap();
-    let next = lease
-        .commit_async(prepared, Instant::now(), CancellationToken::new())
-        .await
-        .unwrap()
-        .next
+    let prepared = lease
+        .prepare_with_outcome(lease.state().plan_delta(), false, true)
         .unwrap();
+    let next = prepared.next().unwrap();
+    let backend = database.cursor_backend();
+    let now_ms = utc_millis().unwrap();
+    let initial = backend
+        .validate(binding.into(), *input.0.as_bytes(), now_ms)
+        .unwrap();
+    let old_charge = charge + old_layout_delta + size_of::<Replay>() + 2 * size_of::<usize>();
+    let encoded_len =
+        persist::encode(&mut std::io::sink(), lease.state(), &prepared, true).unwrap();
+    backend
+        .save(
+            CursorWrite {
+                binding: binding.into(),
+                expected: Some(CursorExpected {
+                    token: *input.0.as_bytes(),
+                    revision: initial.revision,
+                }),
+                active: Some(*next.0.as_bytes()),
+                replay: Some(*input.0.as_bytes()),
+                codec_version: 1,
+                owned_bytes: old_charge,
+                encoded_len,
+                expires_ms: now_ms + TTL_MS,
+                last_progress_ms: now_ms,
+                now_ms,
+                frozen: &[CursorScope {
+                    mailbox: "INBOX",
+                    uid_validity: 7,
+                }],
+                cancelled: &|| false,
+            },
+            |writer| {
+                persist::encode(writer, lease.state(), &prepared, true)
+                    .map_err(|_| CursorError::Corrupt)?;
+                Ok(())
+            },
+        )
+        .unwrap();
+    drop(lease);
+    drop(backend);
     drop(store);
     drop(database);
 
@@ -434,6 +588,18 @@ async fn near_full_cursor_restores_with_its_existing_validation_reservation() {
         |_, _| true,
     )
     .unwrap();
+    let Checkout::Replay(replayed) = store
+        .checkout_async(binding, input, Instant::now())
+        .await
+        .unwrap()
+    else {
+        panic!("expected legacy replay");
+    };
+    let view = replayed.replay().unwrap();
+    assert!(view.next == Some(next));
+    assert_eq!(view.delivery.items().len(), verified);
+    assert!(view.wire_omitted);
+    drop(replayed);
     let restored = advance(&store, binding, next).await;
     assert!(restored.state().owned_bytes() <= charge);
     assert!(restored.state().plan_delta().items().is_empty());
@@ -464,7 +630,7 @@ async fn a_temporarily_unavailable_durable_scope_keeps_its_old_revision() {
     available.store(false, Ordering::SeqCst);
     assert!(matches!(
         lease
-            .commit_async(prepared, Instant::now(), CancellationToken::new())
+            .commit_async(prepared, Instant::now(), CancellationToken::new(), |_| true)
             .await,
         Err(StoreError::Unavailable)
     ));

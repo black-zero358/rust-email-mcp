@@ -398,6 +398,7 @@ async fn download_begin_timeout_keeps_transfer_permit_until_blocking_io_finishes
         uid: 7,
         validity: 9,
         part: Part::default(),
+        cache: None,
         expires: std::time::Instant::now() + Duration::from_secs(600),
     };
     let response = tokio::spawn(async move {

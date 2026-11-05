@@ -1,7 +1,9 @@
 //! Filesystem ownership, recovery marker, and physical SQLite reservations.
 use super::{CacheError, Namespace, PAGE_BYTES};
+use crate::accounts::CacheRunIdentity;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs::{self, File, Metadata, OpenOptions},
@@ -35,14 +37,26 @@ struct Manifest {
     clean: bool,
     restore_epoch: u64,
     partitions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    receipt: Option<CleanReceipt>,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CleanReceipt {
+    instance: [u8; 16],
+    run: [u8; 16],
+    root_digest: [u8; 32],
+    scope_digest: [u8; 32],
 }
 
 pub(super) struct Root {
     path: PathBuf,
     identity: Identity,
-    _lock: File,
+    lock: File,
     was_unclean: bool,
     restore_epoch: AtomicU64,
+    receipt: Option<CleanReceipt>,
     blobs: Mutex<BTreeMap<String, BlobUsage>>,
 }
 
@@ -58,7 +72,12 @@ struct Usage {
 }
 
 impl Root {
-    pub(super) fn open(path: &Path, reserved: &[PathBuf], limit: u64) -> Result<Self, CacheError> {
+    pub(super) fn open(
+        path: &Path,
+        reserved: &[PathBuf],
+        limit: u64,
+        witness: Option<(CacheRunIdentity, [u8; 32])>,
+    ) -> Result<Self, CacheError> {
         let path = checked_path(path)?;
         for other in reserved {
             if other == Path::new(":memory:") {
@@ -73,12 +92,19 @@ impl Root {
         let identity = identity(&fs::symlink_metadata(&path)?);
         let lock = open_lock(&path.join(LOCK), identity)?;
         lock.try_lock().map_err(|_| CacheError::Storage)?;
+        let receipt = witness.map(|(run, scope_digest)| CleanReceipt {
+            instance: *run.instance.as_bytes(),
+            run: *run.current.as_bytes(),
+            root_digest: root_digest(&path),
+            scope_digest,
+        });
         let mut root = Self {
             path,
             identity,
-            _lock: lock,
+            lock,
             was_unclean: false,
             restore_epoch: AtomicU64::new(0),
+            receipt,
             blobs: Mutex::default(),
         };
         let usage = root.usage()?;
@@ -88,6 +114,20 @@ impl Root {
         }
         if let Some(state) = &manifest {
             root.was_unclean = !state.clean;
+            if !usage.partitions.is_empty() {
+                root.was_unclean |= match (state.receipt, receipt, witness) {
+                    (Some(prior), Some(next), Some((run, _))) => {
+                        prior.instance != next.instance
+                            || run
+                                .previous
+                                .is_none_or(|previous| prior.run != *previous.as_bytes())
+                            || prior.root_digest != next.root_digest
+                            || prior.scope_digest != next.scope_digest
+                    }
+                    (None, None, None) => false,
+                    _ => true,
+                };
+            }
             root.restore_epoch
                 .store(state.restore_epoch, Ordering::Relaxed);
         }
@@ -115,6 +155,10 @@ impl Root {
 
     pub(super) fn was_unclean(&self) -> bool {
         self.was_unclean
+    }
+
+    pub(super) fn has_witness(&self) -> bool {
+        self.receipt.is_some()
     }
 
     pub(super) fn prepare_partition(&self, name: &str, limit: u64) -> Result<PathBuf, CacheError> {
@@ -532,6 +576,7 @@ impl Root {
             clean,
             restore_epoch,
             partitions: usage.partitions.into_keys().collect(),
+            receipt: if clean { self.receipt } else { None },
         };
         let bytes = serde_json::to_vec(&manifest).map_err(|_| CacheError::Storage)?;
         if usage
@@ -555,6 +600,27 @@ impl Root {
         }
         result
     }
+}
+
+impl Drop for Root {
+    fn drop(&mut self) {
+        // A concurrent fork can briefly keep a copy of this open file
+        // description even though the descriptor is closed on exec.
+        let _ = self.lock.unlock();
+    }
+}
+
+fn root_digest(path: &Path) -> [u8; 32] {
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStrExt;
+    #[cfg(unix)]
+    let path = path.as_os_str().as_bytes();
+    #[cfg(not(unix))]
+    let path = path.to_string_lossy();
+    let mut hash = Sha256::new();
+    hash.update(b"email-mcp-full-cache-root-v1\0");
+    hash.update(path);
+    hash.finalize().into()
 }
 
 pub(super) fn parse_blob_name(name: &std::ffi::OsStr) -> Option<(uuid::Uuid, bool)> {
@@ -734,4 +800,25 @@ fn validate_file(metadata: &Metadata, parent: Identity) -> Result<(), CacheError
     #[cfg(not(unix))]
     let _ = (metadata, parent);
     Err(CacheError::Storage)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropping_root_releases_lock_with_an_inherited_descriptor() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cache");
+        let open = || Root::open(&path, &[], 1024 * 1024, None);
+        let root = open().unwrap();
+        // A child between fork and exec shares this open file description.
+        let inherited = root.lock.try_clone().unwrap();
+        assert!(matches!(open(), Err(CacheError::Storage)));
+        drop(root);
+        let reopened = open().unwrap();
+        assert!(matches!(open(), Err(CacheError::Storage)));
+        drop(inherited);
+        drop(reopened);
+    }
 }

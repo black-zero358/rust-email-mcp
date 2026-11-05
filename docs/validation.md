@@ -2,6 +2,41 @@
 
 本文件保存带版本与环境边界的证据。每次新增记录注明提交/tag、日期与时区、环境、命令、结果、CI 链接及未覆盖项；保留历史结果，不把其测试数量或部署状态当作当前版本的证明。验证要求见 [贡献指南](../CONTRIBUTING.md#验证与完成标准)。
 
+## 2026-11-05 R11 完整离线读取
+
+源码 `4a14cfef5f0fd957f42c0386f6de0457e59f2439`；环境为 WSL Ubuntu、固定 Rust 1.99.1、Node 24.15.0。所有邮箱、SMTP、身份、文件及故障输入均为合成数据，使用本地模拟服务与私有临时目录。
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo +1.99.1 fmt --check` | 通过 |
+| `cargo +1.99.1 test --locked --quiet` | 482 单元、44 集成通过；2 项显式测试默认忽略；单元 37.66 秒 |
+| `cargo +1.99.1 clippy --locked --all-targets -- -D warnings` | 通过，10.58 秒 |
+| `cargo +1.99.1 build --locked --release` | 通过，29.68 秒 |
+| 显式 Rust→Node 附件客户端测试 | 8 文件下载、摘要与内容读取通过，9.90 秒 |
+| 最终 UID 水位定向回归 | 缓存签名 HTTP 13、缓存会话 3、生产写入口 3、存储水位 1、持久队列 3，全部通过并纳入全量测试 |
+| 发布程序隔离恢复烟测 | full schema v3、恢复世代 1/2/3、运行见证、文件权限及操作库隔离全部通过 |
+| 独立交叉审阅与文档 | 实现与最终水位修复审阅闭环；137 个本地链接/锚点、diff 检查通过 |
+
+full 工具矩阵覆盖本地列表、单封/批量正文、附件清单/内联/认证 GET、中文全文搜索、精确 Message-ID 定位、原单目录与跨目录会话。签名 HTTP 用真实账户 ACL 与 JSON-RPC 预算核对断开模拟 IMAP 后零连接、正常重启、双账户同 UID 隔离、在线退避期间的离线读取、HTML 展示、完整正文索引和被裁减响应。大邮件中的小附件验证 raw omitted、单部件物化及离线摘要一致；原始邮件派生路径保留二进制/NUL 字节与原 MIME 索引。
+
+V3 是独立于已发布 V2 的新事务迁移，完整正文文本与有界叶元数据分别保存。正文可见性和筛选证据改变时更新搜索修订；重复相同证据保持修订。会话 source 绑定格式与线上 v1 分离，454 字节旧 codec fixture 验证原字段及容量记账；最终 SQLite CAS 还核对未落盘的删除观察，拒绝提交时保留原 token/replay。
+
+真实生产调用入口连接本地 TLS IMAP/SMTP，验证 MOVE、软删除、APPEND、目录操作和发送在首个实际副作用前登记 dirty；APPEND 拒绝不发送 literal。SMTP 先持久 claim，再登记缓存范围，再连接；accepted/unknown、已接受后 Journal 更新失败及操作键重放均保留原结果。批量写前 UID 存在性查询按原会话 UIDNEXT 处理缺失，保留 unknown/unprocessed。Sent 角色阻塞查询与取消清理持有共享许可至实际结束。
+
+已完成的严格 FETCH 缺失观察覆盖列表筛选、预览、正文、附件、头部、指纹及批量写前检查。未来 UID、缺少原会话 UIDNEXT、UID 仍存在但缺必要属性和 tagged NO 保持各自语义；水位以内尚未落库的 UID 留下持久墓碑，阻止迟到旧证据。回归模拟未来 UID 先获得新内容，再处理早先空结果的时序，确认新内容继续可读。旧 UIDVALIDITY 的队列失败仅清除原引用的 pending 标记。
+
+根目录锁释放回归通过克隆锁描述符确定性重现原重开失败，修复为全部 SQLite 连接关闭后显式 unlock，活动实例继续互斥。完整测试使用默认线程栈；大异步分支使用明确的 Box 边界。所有启动（包括 off 和初始化失败）推进注册库旁运行见证；关闭核对写准入、后台阻塞任务、下载、载荷、租约和 dirty claim 后再登记清洁凭据。
+
+恢复烟测以 `uv run --no-project python` 启动隔离脚本，在 `unshare --user --map-root-user --net` 与 `env -i` 环境运行实际 release 程序。三次 `--cache-restored` 依次得到 epoch 1、2、3；off 模式遇到合成无效 Journal 时仍推进见证，缓存 epoch 保持；损坏见证在 Journal 前拒绝。操作库哨兵字节保持，无 sidecar 和附件暂存目录；缓存目录 0700、文件 0600。二进制 SHA-256 为 `d97f73452647f66a18c400441518036f1f6c2e5bbf021d23e2a3beded389bcfa`。
+
+[PR #77](https://github.com/black-zero358/rust-email-mcp/pull/77) 首次最终 head `ec2ed442441d668f8f86d92431880a812a81bfe9` 的 [CI 42019754751](https://github.com/black-zero358/rust-email-mcp/actions/runs/42019754751) 中 audit/container 通过，check 的取消请求测试在旧 2 秒连接就绪窗口失败（active=0、accepted=0）；其余 481 项单元通过。原用例只等待四条连接，随后即假设全部二十条请求已准入。
+
+测试修复 `6a5c2c45600d257f918a33e763a409606a9d06d5` 使用只在测试构建存在的调度快照，分别等待 `(admitted,running)=(4,4)` 和 `(20,4)`，JoinSet 立即报告提前返回的 HTTP 请求，再检查 overflow BUSY。排队就绪与 overflow 共用 8 秒截止点，短于真实 10 秒队列上限；取消和资源归零也共用独立截止点。只为该用例延长刻意阻塞的模拟 greeting 期限，生产调度及请求限额保持原值。
+
+修复从 `git archive ec2ed44` 的隔离源码仅覆盖三份测试相关文件验证：默认线程栈、单 CPU、12 个测试线程的账户组连续两轮各 9 项通过（8.48/8.28 秒）；普通并发全量 482 单元、44 集成通过（38.67 秒）。最后共用截止点微调后，最终三文件快照的 fmt、all-target Clippy 及单 CPU/12 线程账户组 9 项通过（9.47 秒）。独立差异审阅通过；新的最终 PR CI 与合并结果在完成后追加。
+
+全历史回填、周期增量/删除核对和运行期自动回收继续由 R12 交付；R13 执行至少 10,000 封合成邮件与 30 分钟负载。附件验收继续采用离线客户端，真实 ChatGPT 接入及生产操作按单独流程安排。此批依赖、Cargo.lock 与 Docker 构建配置保持原值。
+
 ## 2026-11-05 R11 文件缓存与失效基础
 
 源码 `d2673f7bf6c5e49d768b80be7b5132a56ee3bb44`；WSL Ubuntu / Rust 1.99.1 / Node 24.15.0。R11 第一批提供内部 full 存储 API 和 test-only 写入 guard。用户 full 配置、生产写路径及显式离线工具由后续应用批次接入。
@@ -22,7 +57,9 @@
 
 5 项 guard 回归使用真实 cache 和 SQLite，覆盖首个副作用前多目录保护、活跃 claim 阻止取得核对 stamp、过时 stamp 的 CAS 拒绝、容量/期限失败先关闭离线，以及真实 SQLite 写锁阻塞超时后许可由阻塞任务持有至清理完成。生产调用尚未接入。
 
-源码独立复核关闭了并发核对清 dirty、原文损坏后旧派生内容保留、同摘要幂等校验、已知 Missing 覆盖丢失、坏 raw 驱逐、实例/恢复世代绑定及租约释放顺序等问题。现有主库与 journal 联合 max_page_count 上界涵盖初始化的连续短事务。GC 每批最多处理 200 个候选，后续后台调度继续限制扫描工作量。依赖版本、Cargo.lock、生产配置和工具契约保持 R10 值。最终 PR head 的 CI 与合并结果随后登记。
+源码独立复核关闭了并发核对清 dirty、原文损坏后旧派生内容保留、同摘要幂等校验、已知 Missing 覆盖丢失、坏 raw 驱逐、实例/恢复世代绑定及租约释放顺序等问题。现有主库与 journal 联合 max_page_count 上界涵盖初始化的连续短事务。GC 每批最多处理 200 个候选，后续后台调度继续限制扫描工作量。依赖版本、Cargo.lock、生产配置和工具契约保持 R10 值。
+
+[PR #76](https://github.com/black-zero358/rust-email-mcp/pull/76) 最终 head `979a507eb8238c22c42a421095285f8be1e02da6` 只追加进度与验证记录，独立复核通过。[CI 42009840047](https://github.com/black-zero358/rust-email-mcp/actions/runs/42009840047) 的 check/audit/container 全部成功，包含实际生产 Dockerfile 构建。GitHub 自动代码及安全审阅遇到账户额度限制；合并前 reviews/review threads 均为空。合并提交为 `f4031879fdde1ae77164ef19f9fb44586fa94db9`，本地 main、开发分支和对应远端全部同步，R11 应用层改动保留在工作区。
 
 ## 2026-11-05 R10 持久元数据与会话游标
 

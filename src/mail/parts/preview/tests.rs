@@ -76,7 +76,7 @@ async fn run(script: Vec<Exchange>, mut remaining: usize) -> (Result<Preview, Re
         .login("synthetic", "test")
         .await
         .unwrap();
-    let result = read(&mut session, 7, &mut remaining).await;
+    let result = read(&mut session, 7, &mut remaining, |error| error).await;
     drop(session);
     task.await.unwrap();
     (result, remaining)

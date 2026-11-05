@@ -6,6 +6,7 @@ pub use account_config::{
     AccountConfigSource, ValidatedAccountConfig, ValidatedAccountSet, load_runtime,
 };
 mod cache_config;
+pub(crate) use cache_config::Mode as CacheMode;
 #[cfg(test)]
 pub(crate) use cache_config::load_cache_file;
 pub use cache_config::{CacheSettings, load_cache_configuration};

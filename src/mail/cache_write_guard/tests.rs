@@ -133,10 +133,13 @@ async fn storage_rejection_does_not_return_an_armed_guard_or_hold_the_permit() {
     assert!(pool.drain(WAIT).await);
 }
 
-#[tokio::test]
-async fn a_timed_out_blocking_fence_keeps_its_permit_until_cleanup() {
-    let (_directory, account, cache) = storage();
-    let pool = WriteGuardPool::with_capacity(1);
+async fn block_storage(
+    cache: &Arc<Cache>,
+    account: &AccountKey,
+) -> (
+    tokio::task::JoinHandle<Result<(), CursorError>>,
+    std::sync::mpsc::Sender<()>,
+) {
     let (locked, lock_ready) = tokio::sync::oneshot::channel();
     let (release, unlocked) = std::sync::mpsc::channel();
     let backend = cache.cursor_backend();
@@ -176,7 +179,14 @@ async fn a_timed_out_blocking_fence_keeps_its_permit_until_cleanup() {
         .await
         .unwrap()
         .unwrap();
+    (blocker, release)
+}
 
+#[tokio::test]
+async fn a_timed_out_blocking_fence_keeps_its_permit_until_cleanup() {
+    let (_directory, account, cache) = storage();
+    let pool = WriteGuardPool::with_capacity(1);
+    let (blocker, release) = block_storage(&cache, &account).await;
     assert!(
         pool.begin(&cache, &account, &["Drafts"], Duration::from_millis(20))
             .await
@@ -187,5 +197,49 @@ async fn a_timed_out_blocking_fence_keeps_its_permit_until_cleanup() {
     blocker.await.unwrap().unwrap();
     assert!(pool.drain(WAIT).await);
     assert!(cache.offline_scope_allowed(&account, "INBOX", 7).is_err());
+    assert!(cache.dirty_stamp(&account, "Drafts").is_ok());
+}
+
+#[tokio::test]
+async fn shutdown_seals_future_writes_and_waits_for_already_queued_work() {
+    let pool = WriteGuardPool::default();
+    let queued = pool.admit().unwrap();
+    assert!(!pool.seal_and_drain(Duration::ZERO).await);
+    assert!(pool.admit().is_none());
+    drop(queued);
+    assert!(pool.seal_and_drain(WAIT).await);
+    assert!(pool.admit().is_none());
+}
+
+#[tokio::test]
+async fn cancelled_write_keeps_detached_fence_inside_shutdown_barrier() {
+    let (_directory, account, cache) = storage();
+    let pool = Arc::new(WriteGuardPool::with_capacity(1));
+    let (blocker, release) = block_storage(&cache, &account).await;
+    let write = {
+        let pool = pool.clone();
+        let cache = cache.clone();
+        let account = account.clone();
+        let admitted = pool.admit().unwrap();
+        tokio::spawn(async move {
+            let _admitted = admitted;
+            pool.begin(&cache, &account, &["Drafts"], WAIT).await
+        })
+    };
+    tokio::time::timeout(WAIT, async {
+        while pool.permits.available_permits() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    write.abort();
+    assert!(matches!(write.await, Err(error) if error.is_cancelled()));
+    assert!(!pool.seal_and_drain(Duration::ZERO).await);
+    assert!(pool.admit().is_none());
+    release.send(()).unwrap();
+    blocker.await.unwrap().unwrap();
+    assert!(pool.seal_and_drain(WAIT).await);
+    assert!(cache.offline_scope_allowed(&account, "Drafts", 7).is_err());
     assert!(cache.dirty_stamp(&account, "Drafts").is_ok());
 }

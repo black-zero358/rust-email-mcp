@@ -180,17 +180,40 @@ impl Cache {
         let full_schema = database.full_schema;
         self.write(namespace, database, |tx| {
             let id = message_id(tx, reference)?;
-            if full_schema {
-                tx.execute("DELETE FROM artifacts WHERE message_id=?1", [id])?;
-            }
-            tx.execute("DELETE FROM message_index WHERE rowid=?1", [id])?;
-            tx.execute(
-                "UPDATE messages SET tombstone=1,header=NULL,complete_header=0,index_text=NULL,parts=NULL
-                 WHERE id=?1",
-                [id],
-            )?;
-            Ok(())
+            mark_tombstone(tx, id, full_schema)
         })
+    }
+
+    /// Record a completed live FETCH miss using the selected session's UIDNEXT.
+    /// A UID at or above that boundary can still be assigned in this generation.
+    pub fn tombstone_observed(&self, reference: Ref<'_>, uid_next: u32) -> Result<(), CacheError> {
+        if reference.uid == 0 || reference.uid >= uid_next {
+            return Ok(());
+        }
+        let namespace = self.scope(reference.account, reference.mailbox)?;
+        let mut databases = self.lock()?;
+        let database = databases
+            .get_mut(&namespace)
+            .ok_or(CacheError::OutOfScope)?;
+        let pending: bool = database.connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM mailboxes f LEFT JOIN messages m
+                  ON m.mailbox=f.mailbox AND m.uid_validity=f.uid_validity AND m.uid=?3
+                WHERE f.mailbox=?1 AND f.uid_validity=?2 AND NOT coalesce(m.tombstone,0)
+             )",
+            params![reference.mailbox, reference.uid_validity, reference.uid],
+            |row| row.get(0),
+        )?;
+        if pending {
+            let full_schema = database.full_schema;
+            self.write(namespace, database, |tx| {
+                // The selected session can be ahead of the stored watermark.
+                // Keep the deletion fence without rewriting folder observations.
+                let id = ensure_message_row(tx, reference)?;
+                mark_tombstone(tx, id, full_schema)
+            })?;
+        }
+        Ok(())
     }
 
     /// Only a completed reconciliation can clear a folder's dirty marker.
@@ -390,7 +413,7 @@ impl Cache {
         })
     }
 
-    fn update_message(
+    pub(super) fn update_message(
         &self,
         reference: Ref<'_>,
         apply: impl FnOnce(&Transaction<'_>, i64) -> Result<(), CacheError>,
@@ -442,6 +465,19 @@ impl Cache {
     }
 }
 
+fn mark_tombstone(tx: &Transaction<'_>, id: i64, full_schema: bool) -> Result<(), CacheError> {
+    if full_schema {
+        tx.execute("DELETE FROM artifacts WHERE message_id=?1", [id])?;
+    }
+    tx.execute("DELETE FROM message_index WHERE rowid=?1", [id])?;
+    tx.execute(
+        "UPDATE messages SET tombstone=1,header=NULL,complete_header=0,index_text=NULL,parts=NULL
+         WHERE id=?1",
+        [id],
+    )?;
+    Ok(())
+}
+
 pub(super) fn message_id(tx: &Transaction<'_>, reference: Ref<'_>) -> Result<i64, CacheError> {
     let exists: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM mailboxes WHERE mailbox=?1 AND uid_validity=?2 AND (high_uid IS NULL OR high_uid>=?3))",
@@ -451,6 +487,10 @@ pub(super) fn message_id(tx: &Transaction<'_>, reference: Ref<'_>) -> Result<i64
     if !exists || reference.uid == 0 {
         return Err(CacheError::OutOfScope);
     }
+    ensure_message_row(tx, reference)
+}
+
+fn ensure_message_row(tx: &Transaction<'_>, reference: Ref<'_>) -> Result<i64, CacheError> {
     tx.execute(
         "INSERT INTO messages(mailbox,uid_validity,uid) VALUES(?1,?2,?3)
          ON CONFLICT(mailbox,uid_validity,uid) DO NOTHING",

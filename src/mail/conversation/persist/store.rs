@@ -152,7 +152,7 @@ impl CursorStore {
         {
             let mut inner = store.0.lock().map_err(|_| StoreError::Unavailable)?;
             for (index, (binding, row)) in reservations.into_iter().enumerate() {
-                if row.codec_version != persist::CODEC_VERSION {
+                if !persist::supported(row.codec_version) {
                     continue;
                 }
                 let state_bytes = row
@@ -200,7 +200,9 @@ impl CursorStore {
             return self.checkout(binding, cursor, now);
         };
         let store = self.clone();
+        let admission = crate::mail::runtime::read_admission();
         tokio::task::spawn_blocking(move || {
+            let _admission = admission;
             store.checkout_durable(binding, cursor, now, &persistence)
         })
         .await
@@ -247,7 +249,9 @@ impl CursorStore {
                             binding.namespace,
                         )
                         .map_err(|_| CursorError::Corrupt)?;
-                        if replay.as_ref().map(|item| *item.input.0.as_bytes()) != row.replay
+                        if persist::codec_version(&state) != row.codec_version
+                            || state.cache_stamps().is_some() != cursor.cached()
+                            || replay.as_ref().map(|item| *item.input.0.as_bytes()) != row.replay
                             || replay.as_ref().is_some_and(|item| {
                                 item.next.map(|next| *next.0.as_bytes()) != row.active
                             })
@@ -329,8 +333,12 @@ impl Lease {
         prepared: Prepared,
         now: Instant,
         cancellation: CancellationToken,
+        cache_current: impl Fn(&State) -> bool + Send + 'static,
     ) -> Result<Commit, StoreError> {
-        if cancellation.is_cancelled() || !self.generation_matches() {
+        if cancellation.is_cancelled()
+            || !self.generation_matches()
+            || (self.state().cache_stamps().is_some() && !cache_current(self.state()))
+        {
             return Err(StoreError::Unavailable);
         }
         let Some(persistence) = self.store.1.clone() else {
@@ -346,8 +354,10 @@ impl Lease {
         // its storage commit point. The job keeps the exclusive lease.
         let cancellation = cancellation.child_token();
         let _cancel_on_drop = cancellation.clone().drop_guard();
+        let admission = crate::mail::runtime::read_admission();
         tokio::task::spawn_blocking(move || {
-            self.commit_durable(prepared, now, cancellation, &persistence)
+            let _admission = admission;
+            self.commit_durable(prepared, now, cancellation, &persistence, cache_current)
         })
         .await
         .map_err(|_| StoreError::Unavailable)?
@@ -359,6 +369,7 @@ impl Lease {
         now: Instant,
         cancellation: CancellationToken,
         persistence: &Persistence,
+        cache_current: impl Fn(&State) -> bool,
     ) -> Result<Commit, StoreError> {
         if self.replay.is_some()
             || prepared.input != self.input
@@ -435,43 +446,47 @@ impl Lease {
         let revision = old
             .map_or(Some(1), |row| row.revision.checked_add(1))
             .ok_or(StoreError::Unavailable)?;
-        persistence
-            .backend
-            .save(
-                CursorWrite {
-                    binding: binding.into(),
-                    expected,
-                    active,
-                    replay,
-                    now_ms,
-                    last_progress_ms,
-                    expires_ms,
-                    codec_version: persist::CODEC_VERSION,
-                    owned_bytes,
-                    encoded_len,
-                    frozen: &frozen[..count],
-                    cancelled: &|| {
-                        cancellation.is_cancelled()
-                            || !self.generation_matches()
-                            || !persistence.available(self.state())
-                    },
-                },
-                |writer| {
-                    let written =
-                        persist::encode(writer, self.state(), &prepared, replay.is_some())
-                            .map_err(|_| CursorError::Storage)?;
-                    if written != encoded_len {
-                        return Err(CursorError::Corrupt);
-                    }
-                    Ok(())
-                },
-            )
-            .map_err(cursor_error)?;
+        let codec_version = persist::codec_version(self.state());
+        let cancelled = || {
+            cancellation.is_cancelled()
+                || !self.generation_matches()
+                || !persistence.available(self.state())
+                || (self.state().cache_stamps().is_some() && !cache_current(self.state()))
+        };
+        let write = CursorWrite {
+            binding: binding.into(),
+            expected,
+            active,
+            replay,
+            now_ms,
+            last_progress_ms,
+            expires_ms,
+            codec_version,
+            owned_bytes,
+            encoded_len,
+            frozen: &frozen[..count],
+            cancelled: &cancelled,
+        };
+        let encode = |writer: &mut dyn std::io::Write| {
+            let written = persist::encode(writer, self.state(), &prepared, replay.is_some())
+                .map_err(|_| CursorError::Storage)?;
+            if written != encoded_len {
+                return Err(CursorError::Corrupt);
+            }
+            Ok(())
+        };
+        if self.state().cache_stamps().is_some() {
+            let scopes = super::super::offline::scope_snapshots(self.state());
+            persistence.backend.save_offline(write, &scopes, encode)
+        } else {
+            persistence.backend.save(write, encode)
+        }
+        .map_err(cursor_error)?;
         let durable = CursorRow {
             active,
             replay,
             revision,
-            codec_version: persist::CODEC_VERSION,
+            codec_version,
             owned_bytes,
             encoded_len,
             expires_ms,
@@ -492,7 +507,9 @@ impl Lease {
         let Some(persistence) = self.store.1.clone() else {
             return self.invalidate();
         };
+        let admission = crate::mail::runtime::read_admission();
         tokio::task::spawn_blocking(move || {
+            let _admission = admission;
             let (binding, row) = {
                 let inner = self.store.0.lock().map_err(|_| StoreError::Unavailable)?;
                 let slot = inner.slots[self.index]

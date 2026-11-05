@@ -5,3 +5,5 @@ tests/fixtures/attachment_delivery/*.pdf binary
 tests/fixtures/attachment_delivery/*.xlsx binary
 # IMAP response fixtures require exact CRLF and literal lengths.
 tests/fixtures/body_structure/*.imap binary
+# Archived conversation codecs are byte-exact compatibility fixtures.
+src/mail/conversation/tests/fixtures/*.bin binary

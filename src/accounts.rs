@@ -9,8 +9,10 @@ use std::{
 };
 use uuid::Uuid;
 
+mod cache_run;
 #[path = "accounts/catalog.rs"]
 mod catalog;
+pub use cache_run::{CacheRun, CacheRunIdentity};
 pub use catalog::{AccountCatalog, AccountLease, open_catalog};
 
 pub const DEFAULT_ACCOUNT_ID: &str = "default";
@@ -178,6 +180,9 @@ fn paths_conflict(operation: &Path, registry: &Path) -> anyhow::Result<bool> {
             ".v1-backup",
             ".previous",
             ".previous-staging",
+            ".cache-run",
+            ".cache-run.lock",
+            ".cache-run.stage",
         ] {
             if same_file(&operation_file, &sidecar(registry, registry_suffix))? {
                 return Ok(true);

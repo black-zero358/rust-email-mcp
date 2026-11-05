@@ -717,7 +717,7 @@ impl ServerHandler for EmailServer {
                 }))
                 .await
             } else {
-                service.execute(&name, &args, &principal).await
+                Box::pin(service.execute(&name, &args, &principal)).await
             };
             let code = result.as_ref().err().map(|e| e.code).unwrap_or("OK");
             let delivery = result

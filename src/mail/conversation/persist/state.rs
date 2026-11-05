@@ -26,11 +26,12 @@ impl State {
             }
         }
         e.reference(self.seed)?;
-        e.index(self.options.candidate_limit)?;
-        e.index(self.options.result_limit)?;
-        e.option(self.options.max_body_length, Encoder::index)?;
-        e.boolean(self.options.trimmed)?;
-        e.boolean(self.options.readable_html)?;
+        let options = self.options();
+        e.index(options.candidate_limit)?;
+        e.index(options.result_limit)?;
+        e.option(options.max_body_length, Encoder::index)?;
+        e.boolean(options.trimmed)?;
+        e.boolean(options.readable_html)?;
         e.index(self.next_slot)?;
         e.u8(self.folder_probe)?;
         e.u64(self.checkpoint)?;
@@ -204,9 +205,10 @@ impl State {
         Ok(Self {
             namespace,
             durable: true,
+            cached: None,
             folders: folders.into_boxed_slice(),
             seed,
-            options,
+            options: options.into(),
             targets,
             pending,
             graph,
@@ -223,7 +225,7 @@ impl State {
         &self,
         delivery: &Delivery,
     ) -> CodecResult<()> {
-        if delivery.items().len() > self.options.result_limit {
+        if delivery.items().len() > self.options.result_limit as usize {
             return Err(Invalid);
         }
         self.graph.validate_replay(delivery)

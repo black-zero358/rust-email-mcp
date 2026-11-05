@@ -1,4 +1,4 @@
-//! Explicit metadata cache configuration, validated before opening any database.
+//! Explicit cache configuration, validated before opening any database.
 use super::ValidatedAccountSet;
 use crate::{
     accounts::valid_account_id,
@@ -18,9 +18,20 @@ const CONFIG_ERROR: &str =
     "Cache configuration is invalid. Check its mode, paths, accounts, folders and byte quotas.";
 const MAX_CONFIG_BYTES: u64 = 256 * 1024;
 
-#[derive(Debug, thiserror::Error)]
-#[error("Cache mode full is unavailable in this version. Use metadata or off.")]
-struct FullMode;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Mode {
+    Metadata,
+    Full,
+}
+
+impl Mode {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Metadata => "metadata",
+            Self::Full => "full",
+        }
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
@@ -35,14 +46,10 @@ enum Document {
         accounts: Vec<AccountSettings>,
     },
     Full {
-        #[serde(rename = "version")]
-        _version: u32,
-        #[serde(rename = "directory")]
-        _directory: Option<PathBuf>,
-        #[serde(rename = "max_bytes")]
-        _max_bytes: Option<u64>,
-        #[serde(rename = "accounts")]
-        _accounts: Option<Vec<AccountSettings>>,
+        version: u32,
+        directory: PathBuf,
+        max_bytes: u64,
+        accounts: Vec<AccountSettings>,
     },
 }
 
@@ -55,6 +62,7 @@ pub(crate) struct AccountSettings {
 }
 
 pub struct CacheSettings {
+    pub(crate) mode: Mode,
     pub(crate) directory: PathBuf,
     pub(crate) max_bytes: u64,
     pub(crate) accounts: Vec<AccountSettings>,
@@ -75,13 +83,7 @@ pub(crate) fn load_cache_file(
     path: &Path,
     registered: &ValidatedAccountSet,
 ) -> anyhow::Result<Option<CacheSettings>> {
-    load(path, registered).map_err(|error| {
-        if error.is::<FullMode>() {
-            error
-        } else {
-            anyhow::anyhow!(CONFIG_ERROR)
-        }
-    })
+    load(path, registered).map_err(|_| anyhow::anyhow!(CONFIG_ERROR))
 }
 
 fn load(path: &Path, registered: &ValidatedAccountSet) -> anyhow::Result<Option<CacheSettings>> {
@@ -91,18 +93,24 @@ fn load(path: &Path, registered: &ValidatedAccountSet) -> anyhow::Result<Option<
     let mut bytes = Vec::new();
     file.take(MAX_CONFIG_BYTES + 1).read_to_end(&mut bytes)?;
     anyhow::ensure!(bytes.len() as u64 <= MAX_CONFIG_BYTES);
-    let (version, directory, max_bytes, mut accounts) = match serde_json::from_slice(&bytes)? {
+    let (mode, version, directory, max_bytes, mut accounts) = match serde_json::from_slice(&bytes)?
+    {
         Document::Off { version } => {
             anyhow::ensure!(version == 1);
             return Ok(None);
         }
-        Document::Full { .. } => return Err(FullMode.into()),
+        Document::Full {
+            version,
+            directory,
+            max_bytes,
+            accounts,
+        } => (Mode::Full, version, directory, max_bytes, accounts),
         Document::Metadata {
             version,
             directory,
             max_bytes,
             accounts,
-        } => (version, directory, max_bytes, accounts),
+        } => (Mode::Metadata, version, directory, max_bytes, accounts),
     };
     anyhow::ensure!(version == 1 && !directory.as_os_str().is_empty());
     anyhow::ensure!((MIN_BYTES..=MAX_BYTES).contains(&max_bytes));
@@ -176,6 +184,9 @@ fn load(path: &Path, registered: &ValidatedAccountSet) -> anyhow::Result<Option<
             ".v1-backup",
             ".previous",
             ".previous-staging",
+            ".cache-run",
+            ".cache-run.lock",
+            ".cache-run.stage",
         ],
     )?;
     reserved.extend(staging);
@@ -185,6 +196,7 @@ fn load(path: &Path, registered: &ValidatedAccountSet) -> anyhow::Result<Option<
             .any(|path| { directory.starts_with(path) || path.starts_with(&directory) })
     );
     Ok(Some(CacheSettings {
+        mode,
         directory,
         max_bytes,
         accounts,
@@ -280,12 +292,12 @@ mod tests {
         let mut full = settings();
         full["mode"] = json!("full");
         write(&path, &full);
-        assert!(
-            load_cache_file(&path, &registered)
-                .err()
-                .unwrap()
-                .is::<FullMode>()
+        assert_eq!(
+            load_cache_file(&path, &registered).unwrap().unwrap().mode,
+            Mode::Full,
         );
+        write(&path, &json!({"version":1,"mode":"full"}));
+        assert!(load_cache_file(&path, &registered).is_err());
         write(&path, &json!({"version":1,"mode":"off"}));
         assert!(load_cache_file(&path, &registered).unwrap().is_none());
         write(&path, &json!({"version":2,"mode":"off"}));

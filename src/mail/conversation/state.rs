@@ -32,6 +32,45 @@ impl Default for Options {
     }
 }
 
+/// Stored limits are validated before packing. Keeping these fields compact
+/// leaves room for the optional cache stamp without increasing the owned
+/// capacity charged by pre-existing live cursor records.
+#[derive(Clone, Copy)]
+struct StoredOptions {
+    body_limit_plus_one: u32,
+    candidate_limit: u8,
+    result_limit: u8,
+    trimmed: bool,
+    readable_html: bool,
+}
+
+impl From<Options> for StoredOptions {
+    fn from(options: Options) -> Self {
+        Self {
+            body_limit_plus_one: options.max_body_length.map_or(0, |limit| limit as u32 + 1),
+            candidate_limit: options.candidate_limit as u8,
+            result_limit: options.result_limit as u8,
+            trimmed: options.trimmed,
+            readable_html: options.readable_html,
+        }
+    }
+}
+
+impl From<StoredOptions> for Options {
+    fn from(options: StoredOptions) -> Self {
+        Self {
+            max_body_length: options
+                .body_limit_plus_one
+                .checked_sub(1)
+                .map(|limit| limit as usize),
+            candidate_limit: options.candidate_limit as usize,
+            result_limit: options.result_limit as usize,
+            trimmed: options.trimmed,
+            readable_html: options.readable_html,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Position {
     next_high: u32,
@@ -113,12 +152,26 @@ pub(super) struct Reference<'a> {
     pub uid: u32,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct CacheStamp {
+    pub checked_at_ms: i64,
+    pub index_revision: u64,
+    pub dirty_revision: u64,
+    pub restore_epoch: u64,
+    pub complete_headers: u64,
+    pub indexed_threads: u64,
+    pub known_messages: u64,
+}
+
+pub(super) type CacheStamps = [Option<CacheStamp>; MAX_FOLDERS];
+
 pub(super) struct State {
     namespace: [u8; 32],
     durable: bool,
+    cached: Option<Box<CacheStamps>>,
     folders: Box<[Folder]>,
     seed: RefKey,
-    options: Options,
+    options: StoredOptions,
     targets: Vec<Target>,
     pending: Vec<Pending>,
     graph: Graph,
@@ -186,9 +239,10 @@ impl State {
         let mut state = Self {
             namespace,
             durable: false,
+            cached: None,
             folders: folders.into_boxed_slice(),
             seed,
-            options,
+            options: options.into(),
             targets: Vec::new(),
             pending: Vec::new(),
             graph: Graph::default(),
@@ -211,6 +265,36 @@ impl State {
         self.durable
     }
 
+    pub(super) fn cache_stamps(&self) -> Option<&CacheStamps> {
+        self.cached.as_deref()
+    }
+
+    pub(super) fn set_cache_stamps(
+        &mut self,
+        stamps: CacheStamps,
+        limit: usize,
+    ) -> Result<(), StateError> {
+        if self.cached.is_some()
+            || stamps.iter().enumerate().any(|(index, stamp)| {
+                let frozen = self
+                    .folders
+                    .get(index)
+                    .is_some_and(|folder| matches!(folder.boundary, Boundary::Frozen { .. }));
+                frozen != stamp.is_some()
+                    || stamp.is_some_and(|stamp| {
+                        stamp.checked_at_ms < 0
+                            || stamp.indexed_threads > stamp.complete_headers
+                            || stamp.complete_headers > stamp.known_messages
+                    })
+            })
+        {
+            return Err(StateError::InvalidScope);
+        }
+        self.check_growth(size_of::<CacheStamps>(), limit)?;
+        self.cached = Some(Box::new(stamps));
+        Ok(())
+    }
+
     pub(super) fn reserve_restore_scratch(&mut self) {
         self.durable = true;
     }
@@ -227,7 +311,7 @@ impl State {
         self.seed
     }
     pub(super) fn options(&self) -> Options {
-        self.options
+        self.options.into()
     }
     pub(super) fn message_id(&self, target: usize) -> Option<&MessageId> {
         self.targets.get(target).map(|target| &target.id)
@@ -555,7 +639,8 @@ impl State {
     }
 
     pub(super) fn plan_delta_for_folders(&self, folders: [bool; MAX_FOLDERS]) -> Delivery {
-        self.graph.plan_delivery(self.options.result_limit, folders)
+        self.graph
+            .plan_delivery(self.options.result_limit as usize, folders)
     }
     pub(super) fn event(&self, item: EmitKey) -> Option<Event> {
         self.graph.event(item)
@@ -708,6 +793,7 @@ impl State {
             + capacity_bytes(&self.targets)
             + capacity_bytes(&self.pending)
             + self.graph.allocated_bytes()
+            + self.cached.as_ref().map_or(0, |_| size_of::<CacheStamps>())
             + self.restore_scratch(self.targets.len(), self.pending.len(), self.graph.count())
             + self
                 .targets

@@ -25,6 +25,12 @@ pub struct DirtyStamp {
 }
 
 impl Cache {
+    pub(super) fn require_offline_health(&self) -> Result<(), CacheError> {
+        if self.offline_disabled.load(Ordering::Acquire) {
+            return Err(CacheError::NeedsVerification);
+        }
+        self.write_health()
+    }
     /// Block explicit offline reads for this process before proceeding with a
     /// mailbox mutation whose durable cache claim could not be recorded.
     pub fn disable_offline(&self) {
@@ -182,10 +188,7 @@ impl Cache {
         uid_validity: u32,
         namespace: Namespace,
     ) -> Result<DirtyStamp, CacheError> {
-        if self.offline_disabled.load(Ordering::Acquire) {
-            return Err(CacheError::NeedsVerification);
-        }
-        self.write_health()?;
+        self.require_offline_health()?;
         let (validity, revision, dirty) = observation(db, mailbox)?;
         if validity != Some(uid_validity) || dirty {
             return Err(CacheError::NeedsVerification);
@@ -211,6 +214,12 @@ impl Cache {
         let database = databases.get(&namespace).ok_or(CacheError::OutOfScope)?;
         self.check_offline(&database.connection, mailbox, uid_validity, namespace)?;
         Ok(())
+    }
+}
+
+impl DirtyStamp {
+    pub(super) fn revision(&self) -> u64 {
+        self.revision as u64
     }
 }
 
@@ -244,4 +253,12 @@ pub(super) fn has_dirty(db: &Connection) -> Result<bool, CacheError> {
         [],
         |row| row.get(0),
     )?)
+}
+
+pub(super) fn has_claims(db: &Connection) -> Result<bool, CacheError> {
+    Ok(
+        db.query_row("SELECT EXISTS(SELECT 1 FROM mutation_claims)", [], |row| {
+            row.get(0)
+        })?,
+    )
 }

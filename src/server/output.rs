@@ -44,6 +44,48 @@ fn account_id() -> Value {
     json!({"type":"string","minLength":1,"maxLength":ACCOUNT_ID_MAX_CHARACTERS,"pattern":format!("^[A-Za-z0-9][A-Za-z0-9._-]{{0,{}}}$",ACCOUNT_ID_MAX_CHARACTERS-1)})
 }
 
+fn layer_coverage() -> Value {
+    let layer = all_required(json!({
+        "materialized":count(),"materialized_bytes":count(),"derivable_from_raw":count(),
+        "missing":count(),"omitted":count(),"unsupported":count()
+    }));
+    all_required(json!({"raw":layer,"full_body":layer,"attachments":layer}))
+}
+
+fn cache_context() -> Value {
+    let coverage = object(
+        json!({
+            "remote_complete":{"const":false},"known_messages":count(),"complete_headers":count(),
+            "indexed_threads":count(),"list_observed":boolean(),"filter_unknown":count(),"headers_missing":count(),
+            "search_index":all_required(json!({"indexed_metadata":count(),"indexed_body":count(),"version":{"const":1}})),
+            "layers":layer_coverage(),
+        }),
+        &["remote_complete"],
+    );
+    let scope = object(
+        json!({
+            "mailbox":string(),"checked_at_ms":nullable(count()),"uid_validity":uid(),"high_uid":count(),
+            "coverage":coverage,
+        }),
+        &["mailbox", "checked_at_ms", "coverage"],
+    );
+    all_required(json!({
+        "stale":{"const":true},"remote_generation_unverified":{"const":true},
+        "scopes":{"type":"array","maxItems":64,"items":scope}
+    }))
+}
+
+fn source_properties(schema: &mut Value, field: &str, default: &str) {
+    schema["properties"][field] = enumeration(&[default, "cache"]);
+    schema["properties"]["cache"] = cache_context();
+    schema["dependentRequired"]["cache"] = json!([field]);
+    schema["allOf"] = json!([{
+        "if":{"properties":{field:{"const":"cache"}},"required":[field]},
+        "then":{"required":["cache"]},
+        "else":{"not":{"required":["cache"]}}
+    }]);
+}
+
 fn cross_conversation() -> Value {
     let message_ref = all_required(
         json!({"account_id":account_id(),"mailbox":string(),"uid_validity":uid(),"uid":uid()}),
@@ -74,7 +116,7 @@ fn cross_conversation() -> Value {
         all_required(json!({"stage":{"const":"header"},"ref":message_ref,"error":reference("error")})),
         all_required(json!({"stage":{"const":"cursor"},"error":reference("error")}))
     ]});
-    object(
+    let mut schema = object(
         json!({
             "mode":{"const":"cross_mailbox"},"account_id":account_id(),"seed":message_ref,
             "folders":{"type":"array","minItems":1,"maxItems":20,"items":folder},
@@ -100,7 +142,9 @@ fn cross_conversation() -> Value {
             "response_budget_omitted",
             "content_trust",
         ],
-    )
+    );
+    source_properties(&mut schema, "read_source", "live");
+    schema
 }
 
 fn account_context(mut schema: Value, mailbox: bool) -> Value {
@@ -188,7 +232,7 @@ fn error() -> Value {
     details["dependentRequired"] = dependencies;
     object(
         json!({
-            "code":enumeration(&["INVALID_INPUT","MAIL_BACKEND","STORAGE_UNAVAILABLE","ATTACHMENT_STORAGE_UNAVAILABLE","LIMIT_EXCEEDED","TIMEOUT","BUSY","STALE_UID","NOT_FOUND","UNSUPPORTED_BODY","UNSUPPORTED_CHARSET","UNSUPPORTED_TRANSFER_ENCODING","ATTACHMENT_DECODE_FAILED","ATTACHMENT_NOT_FOUND","ACCOUNT_UNAVAILABLE","CURSOR_UNAVAILABLE","INTERNAL"]),
+            "code":enumeration(&["INVALID_INPUT","MAIL_BACKEND","STORAGE_UNAVAILABLE","ATTACHMENT_STORAGE_UNAVAILABLE","LIMIT_EXCEEDED","TIMEOUT","BUSY","STALE_UID","NOT_FOUND","UNSUPPORTED_BODY","UNSUPPORTED_CHARSET","UNSUPPORTED_TRANSFER_ENCODING","ATTACHMENT_DECODE_FAILED","ATTACHMENT_NOT_FOUND","ACCOUNT_UNAVAILABLE","CURSOR_UNAVAILABLE","CACHE_UNAVAILABLE","CACHE_NEEDS_VERIFICATION","CACHE_MISS","INTERNAL"]),
             "message":string(),"retryable":boolean(),"details":details
         }),
         &["code", "message", "retryable"],
@@ -221,13 +265,14 @@ fn message(conversation: bool) -> Value {
         ]);
     }
     schema["properties"]["read_diagnostics"] = read_diagnostics();
+    source_properties(&mut schema, "read_source", "live");
     schema
 }
 
 fn listing_summary() -> Value {
     let mut schema = all_required(json!({
         "account_id":account_id(),"mailbox":string(),"uid_validity":nullable(uid()),"uid":uid(),
-        "subject":nullable(string()),"from":nullable(string()),"date":nullable(string()),"size":nullable(count()),"flags":array(string()),
+        "subject":nullable(string()),"from":nullable(string()),"date":nullable(string()),"size":nullable(count()),"flags":nullable(array(string())),
         "classification":{"type":"array","items":enumeration(&["newsletter","automated","unclassified"]),"minItems":1,"maxItems":2,"uniqueItems":true},
         "classification_signals":{"type":"array","items":all_required(json!({
             "field":enumeration(&["list-id","list-unsubscribe","list-unsubscribe-post","auto-submitted","precedence"]),
@@ -242,6 +287,14 @@ fn listing_summary() -> Value {
     properties.insert("preview".into(), json!({"type":"string","maxLength":200}));
     properties.insert("preview_truncated".into(), boolean());
     properties.insert("preview_error".into(), reference("error"));
+    properties.insert("cache_evidence".into(), all_required(json!({
+        "header_complete":boolean(),"flags_checked_at_ms":nullable(count()),"internal_date":nullable(string()),
+        "internal_date_checked_at_ms":nullable(count()),"size_checked_at_ms":nullable(count())
+    })));
+    properties.insert(
+        "cache_match".into(),
+        all_required(json!({"metadata":boolean(),"body":boolean()})),
+    );
     properties.insert(
         "preview_status".into(),
         enumeration(&[
@@ -256,8 +309,11 @@ fn listing_summary() -> Value {
     schema["dependentRequired"] = json!({
         "preview":["preview_status","preview_truncated"],
         "preview_truncated":["preview_status","preview"],
-        "preview_error":["preview_status"]
+        "preview_error":["preview_status"],
+        "cache_match":["cache_evidence"]
     });
+    schema["if"] = json!({"not":{"required":["cache_evidence"]}});
+    schema["then"] = json!({"properties":{"flags":array(string())}});
     schema["dependentSchemas"] = json!({"preview_status":{"oneOf":[
         {"properties":{"preview_status":{"const":"ok"}},"required":["preview","preview_truncated"],"not":{"required":["preview_error"]}},
         {"properties":{"preview_status":{"const":"empty"},"preview":{"const":""},"preview_truncated":{"const":false}},"required":["preview","preview_truncated"],"not":{"required":["preview_error"]}},
@@ -295,14 +351,22 @@ fn attachment_descriptor() -> Value {
         "filename":nullable(string()),"safe_filename":string(),"content_type":string(),"declared_content_type":string(),"detected_content_type":{"type":"null"},
         "encoded_size":count(),"decoded_size":nullable(count()),"size_accuracy":enumeration(&["exact","estimate","unknown"]),
         "disposition":nullable(string()),"content_id":nullable(string()),"downloadable":boolean(),
-        "unavailable_reason":nullable(enumeration(&["unsupported_transfer_encoding","decoded_attachment_bytes","connection_bytes"])),
+        "unavailable_reason":nullable(enumeration(&["unsupported_transfer_encoding","decoded_attachment_bytes","connection_bytes","cache_miss","cache_omitted"])),
         "delivery":delivery(),"checksum":nullable(checksum())
     }).as_object().unwrap().clone());
-    all_required(properties)
+    let mut schema = all_required(properties);
+    schema["properties"]["cache_state"] = enumeration(&[
+        "materialized",
+        "derivable_from_raw",
+        "missing",
+        "omitted",
+        "unsupported",
+    ]);
+    schema
 }
 fn read_diagnostics() -> Value {
     all_required(json!({
-        "source":enumeration(&["bodystructure","raw"]),
+        "source":enumeration(&["bodystructure","raw","cache"]),
         "fallback_reason":nullable(enumeration(&["structure_limit","structure_rejected","mapping_unverified","metadata_conflict","whole_multipart_attachment","header_budget","charset_utf7"])),
         "limit_kind":nullable(enumeration(&["mime_structure"]))
     }))
@@ -311,7 +375,7 @@ fn read_diagnostics() -> Value {
 fn accounts() -> Value {
     let capabilities = all_required(json!({
         "attachment_delivery_modes":{"const":["inline_base64","authenticated_http"]},"part_fetch":{"const":true},
-        "cross_mailbox_conversation":{"const":true},"cache_modes":{"enum":[["off"],["off","metadata"]]}
+        "cross_mailbox_conversation":{"const":true},"cache_modes":{"enum":[["off"],["off","metadata"],["off","metadata","full"]]}
     }));
     let mut limits = json!({});
     for name in [
@@ -360,20 +424,21 @@ fn data(name: &str) -> Value {
             "inbox", "all", "archive", "drafts", "flagged", "junk", "sent", "trash",
         ]))
     };
-    let schema = match name {
+    let mut schema = match name {
         "list_accounts" => accounts(),
         "get_cache_status" => {
-            let folders = all_required(json!({
+            let mut folders = all_required(json!({
                 "mailbox":string(),"uid_validity":nullable(uid()),"high_uid":nullable(count()),
                 "checked_at_ms":nullable(count()),"dirty":boolean(),"messages":count(),
                 "complete_headers":count(),"indexed_headers":count(),"verified_parts":count()
             }));
+            folders["properties"]["layers"] = layer_coverage();
             let storage = all_required(json!({
                 "max_bytes":count(),"used_bytes":count(),"global_max_bytes":count(),
                 "startup_unclean":boolean(),"folders":{"type":"array","maxItems":64,"items":folders}
             }));
-            all_required(json!({
-                "mode":enumeration(&["off","metadata"]),
+            let mut schema = all_required(json!({
+                "mode":enumeration(&["off","metadata","full"]),
                 "status":enumeration(&["off","ready","unavailable"]),
                 "storage":nullable(storage),
                 "write_health":all_required(json!({
@@ -381,7 +446,9 @@ fn data(name: &str) -> Value {
                     "last_error":nullable(enumeration(&["quota","queue_full","storage"])),
                     "quota_blocked":boolean()
                 }))
-            }))
+            }));
+            schema["properties"]["content_pending"] = count();
+            schema
         }
         "list_mailboxes" => all_required(
             json!({"mailboxes":{"type":"array","maxItems":200,"items":all_required(json!({
@@ -433,13 +500,14 @@ fn data(name: &str) -> Value {
         }
         "get_operation" => all_required(json!({"operation":nullable(reference("operation"))})),
         "read_conversation" => {
-            let legacy = all_required(json!({
+            let mut legacy = all_required(json!({
             "mailbox":string(),"uid_validity":uid(),"messages":{"type":"array","maxItems":20,"items":reference("conversation_message")},"omitted_uids":array(uid()),
             "threading":{"const":"Message-ID/References/In-Reply-To exact identifier graph; no subject matching"},
             "scope":all_required(json!({"start_uid":uid(),"end_uid":count(),"candidates_checked":count(),"seed_uid":uid()})),
             "next_before_uid":nullable(uid()),"candidate_limit_reached":boolean(),"messages_omitted":boolean(),"response_budget_omitted":boolean(),
             "older_uids_omitted":boolean(),"total_body_byte_limit":count(),"skipped_candidates":array(reference("uid_error")),"message_errors":array(reference("uid_error")),"complete":boolean(),"content_trust":trust
             }));
+            source_properties(&mut legacy, "read_source", "live");
             return json!({"oneOf":[account_context(legacy,true),cross_conversation()]});
         }
         "locate_message" => all_required(json!({
@@ -480,6 +548,16 @@ fn data(name: &str) -> Value {
         }
         _ => unreachable!("only read tools have output schemas"),
     };
+    if let Some((field, default)) = crate::mail::read_source::source_field(name)
+        && schema.get("$ref").is_none()
+    {
+        source_properties(&mut schema, field, default);
+    }
+    if name == "search_emails" {
+        schema["properties"]["next_cache_cursor"] =
+            json!({"type":"string","minLength":51,"maxLength":51,"pattern":"^[A-Za-z0-9_-]+$"});
+        schema["dependentRequired"]["next_cache_cursor"] = json!(["cache", "search_source"]);
+    }
     if super::is_account_read(name) {
         account_context(
             schema,

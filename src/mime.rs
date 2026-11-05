@@ -346,55 +346,8 @@ impl Part<'_> {
         remaining: &mut usize,
         context: &mut crate::html::DisplayContext,
     ) -> Result<()> {
-        let mut selected = Vec::new();
-        if self.select_text(&mut selected, true) {
-            return Err(crate::html::unsupported());
-        }
-        for part in selected {
-            part.append_plain_leaf(out, remaining, context)?;
-        }
-        Ok(())
-    }
-
-    fn select_text<'a>(&'a self, out: &mut Vec<&'a Self>, html: bool) -> bool {
-        // Raw entities always have known encoded emptiness.
-        selection::select(self, out, html).unwrap_or(true)
-    }
-
-    fn append_plain_leaf(
-        &self,
-        out: &mut String,
-        remaining: &mut usize,
-        context: &mut crate::html::DisplayContext,
-    ) -> Result<()> {
-        if matches!(self.ctype.mimetype.as_str(), "text/plain" | "text/html") {
-            if !self.body.is_empty()
-                && charset::Charset::for_label_no_replacement(self.ctype.charset.as_bytes())
-                    .is_none()
-            {
-                return Err(crate::html::unsupported());
-            }
-            // Reserve conservatively before decoding: transfer output <= input,
-            // and charset-to-UTF8 conversion needs at most four bytes per input
-            // byte. All leaves share one budget, including temporary strings.
-            let reserve = self
-                .body
-                .len()
-                .checked_mul(4)
-                .ok_or_else(|| MailError::limit_kind(LimitKind::DecodedBodyBytes))?;
-            *remaining = remaining
-                .checked_sub(reserve)
-                .ok_or_else(|| MailError::limit_kind(LimitKind::DecodedBodyBytes))?;
-            let text = match self.encoded()? {
-                Body::Base64(b) | Body::QuotedPrintable(b) => b.get_decoded_as_string(),
-                Body::SevenBit(b) | Body::EightBit(b) => b.get_as_string(),
-                Body::Binary(b) => b.get_as_string(),
-            }
-            .map_err(|_| MailError::backend())?;
-            if text.len() > reserve {
-                return Err(MailError::limit_kind(LimitKind::DecodedBodyBytes));
-            }
-            let text = if self.ctype.mimetype == "text/html" {
+        self.decoded_display_leaves(remaining, |text, html, reserve| {
+            let text = if html {
                 crate::html::render_selected(&text, context)?
             } else {
                 text
@@ -403,12 +356,51 @@ impl Part<'_> {
             // indentation/address bytes beyond encoded*4; its shared formatter
             // independently enforces the 1 MiB output cap across selected leaves.
             if text.len() > reserve
-                && !(self.ctype.mimetype == "text/html"
-                    && context.format() == crate::html::HtmlDisplay::Readable)
+                && !(html && context.format() == crate::html::HtmlDisplay::Readable)
             {
                 return Err(MailError::limit_kind(LimitKind::DecodedBodyBytes));
             }
             out.push_str(&text);
+            Ok(())
+        })
+    }
+
+    pub(crate) fn decoded_display_leaves(
+        &self,
+        remaining: &mut usize,
+        mut consume: impl FnMut(String, bool, usize) -> Result<()>,
+    ) -> Result<()> {
+        let mut selected = Vec::new();
+        // Raw entities always have known encoded emptiness.
+        if selection::select(self, &mut selected, true).unwrap_or(true) {
+            return Err(crate::html::unsupported());
+        }
+        for part in selected {
+            let html = part.ctype.mimetype == "text/html";
+            if !html && part.ctype.mimetype != "text/plain" {
+                continue;
+            }
+            if !part.body.is_empty()
+                && charset::Charset::for_label_no_replacement(part.ctype.charset.as_bytes())
+                    .is_none()
+            {
+                return Err(crate::html::unsupported());
+            }
+            // Transfer output never exceeds input. UTF-8 can require up to
+            // four bytes per input byte, charged across all selected leaves.
+            let limit = || MailError::limit_kind(LimitKind::DecodedBodyBytes);
+            let reserve = part.body.len().checked_mul(4).ok_or_else(limit)?;
+            *remaining = remaining.checked_sub(reserve).ok_or_else(limit)?;
+            let text = match part.encoded()? {
+                Body::Base64(b) | Body::QuotedPrintable(b) => b.get_decoded_as_string(),
+                Body::SevenBit(b) | Body::EightBit(b) => b.get_as_string(),
+                Body::Binary(b) => b.get_as_string(),
+            }
+            .map_err(|_| MailError::backend())?;
+            if text.len() > reserve {
+                return Err(limit());
+            }
+            consume(text, html, reserve)?;
         }
         Ok(())
     }

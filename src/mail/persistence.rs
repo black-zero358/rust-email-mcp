@@ -1,25 +1,33 @@
 //! Admission and provenance for write-through metadata observations.
 use super::*;
 use crate::{
-    cache::{AccountScope, Cache, CacheError, Ref as CacheRef},
-    config::CacheSettings,
+    cache::{
+        AccountScope, ArtifactKey, ArtifactState, Cache, CacheError, ListingEvidence,
+        MailboxEvidence, Omission, Ref as CacheRef, ThreadId,
+    },
+    config::{CacheMode, CacheSettings},
 };
 use std::{
     collections::{HashMap, HashSet},
     sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 const CACHE_JOBS: usize = EXECUTION_SLOTS * 4;
 const CACHE_JOB_BYTES: usize = 8 * 1024 * 1024;
 const INDEX_BYTES: usize = 8 * 1024;
 const PARTS_BYTES: usize = 256 * 1024;
+const WRITE_FENCE_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+// Two retained payloads plus one 32 MiB conversion buffer on the single FIFO
+// worker. The worker releases raw before constructing the full-text index.
+const CONTENT_PAYLOADS: usize = 2;
 
 #[derive(Clone, Default)]
 pub struct PreparedCache(Option<Arc<Persistent>>);
 
 struct Persistent {
+    mode: CacheMode,
     storage: Option<Arc<Cache>>,
     queue: Option<mpsc::Sender<CacheMessage>>,
     folders: HashMap<AccountKey, HashSet<String>>,
@@ -27,9 +35,13 @@ struct Persistent {
     generations: Arc<Generations>,
     job_count: Arc<Semaphore>,
     job_bytes: Arc<Semaphore>,
+    content_jobs: Arc<Semaphore>,
+    content_pending: HashMap<AccountKey, Arc<AtomicUsize>>,
+    cache_read_jobs: Arc<Semaphore>,
+    pending_tombstones: Arc<Mutex<HashSet<(GenerationKey, u32, u32)>>>,
 }
 
-type CacheJob = Box<dyn FnOnce(&Cache) + Send>;
+type CacheJob = Box<dyn FnOnce(&Arc<Cache>) + Send>;
 enum CacheMessage {
     Work(CacheJob),
     Finish(Arc<Persistent>, oneshot::Sender<()>),
@@ -40,6 +52,17 @@ type Generations = Mutex<HashMap<GenerationKey, Generation>>;
 struct Generation {
     current: u32,
     blocked: bool,
+}
+
+pub(super) struct ContentAdmission {
+    _permit: OwnedSemaphorePermit,
+    pending: Arc<AtomicUsize>,
+}
+
+impl Drop for ContentAdmission {
+    fn drop(&mut self) {
+        self.pending.fetch_sub(1, Ordering::Release);
+    }
 }
 
 type WriteHealthByAccount = Mutex<HashMap<AccountKey, WriteHealth>>;
@@ -65,8 +88,10 @@ impl PreparedCache {
     pub(super) fn open(
         catalog: &crate::accounts::AccountCatalog,
         settings: CacheSettings,
+        run: Option<crate::accounts::CacheRunIdentity>,
     ) -> anyhow::Result<Self> {
         let CacheSettings {
+            mode,
             directory,
             max_bytes,
             accounts,
@@ -88,8 +113,20 @@ impl PreparedCache {
                 max_bytes: account.max_bytes,
             });
         }
-        let (storage, queue) = Cache::open(&directory, max_bytes, scopes, &reserved)
-            .ok()
+        let storage = match mode {
+            CacheMode::Metadata => Cache::open(&directory, max_bytes, scopes, &reserved).ok(),
+            CacheMode::Full => Some(
+                Cache::open_full_with_run(
+                    &directory,
+                    max_bytes,
+                    scopes,
+                    &reserved,
+                    run.ok_or_else(|| anyhow::anyhow!("Full cache requires a runtime witness"))?,
+                )
+                .map_err(|_| anyhow::anyhow!("Could not open the full cache"))?,
+            ),
+        };
+        let (storage, queue) = storage
             .and_then(|storage| {
                 let (queue, mut jobs) = mpsc::channel::<CacheMessage>(CACHE_JOBS);
                 let worker = storage.clone();
@@ -116,17 +153,84 @@ impl PreparedCache {
             })
             .unwrap_or_default();
         if storage.is_none() {
+            anyhow::ensure!(
+                mode != CacheMode::Full,
+                "Could not start the full cache worker"
+            );
             tracing::warn!(event = "cache_unavailable");
         }
         Ok(Self(Some(Arc::new(Persistent {
+            mode,
             storage,
             queue,
+            content_pending: folders
+                .keys()
+                .map(|key| (key.clone(), Arc::default()))
+                .collect(),
             folders,
             health: Arc::new(Mutex::new(HashMap::new())),
             generations: Arc::new(Mutex::new(HashMap::new())),
             job_count: Arc::new(Semaphore::new(CACHE_JOBS)),
             job_bytes: Arc::new(Semaphore::new(CACHE_JOB_BYTES)),
+            content_jobs: Arc::new(Semaphore::new(CONTENT_PAYLOADS)),
+            cache_read_jobs: Arc::new(Semaphore::new(EXECUTION_SLOTS)),
+            pending_tombstones: Arc::new(Mutex::new(HashSet::new())),
         }))))
+    }
+
+    pub(super) fn full_storage(&self, account: &AccountKey) -> Option<&Arc<Cache>> {
+        let state = self.0.as_ref()?;
+        (state.mode == CacheMode::Full && state.folders.contains_key(account))
+            .then_some(state.storage.as_ref())
+            .flatten()
+    }
+
+    pub(super) fn cache_read_permit(&self) -> Option<OwnedSemaphorePermit> {
+        self.0
+            .as_ref()?
+            .cache_read_jobs
+            .clone()
+            .try_acquire_owned()
+            .ok()
+    }
+
+    pub(super) fn full_folder(&self, account: &AccountKey, mailbox: &str) -> Option<&Arc<Cache>> {
+        self.enabled_for_folder(account, mailbox)
+            .then(|| self.full_storage(account))
+            .flatten()
+    }
+
+    pub(super) fn configured_folders(&self, account: &AccountKey) -> impl Iterator<Item = &str> {
+        self.0
+            .as_ref()
+            .and_then(|state| state.folders.get(account))
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+    }
+
+    pub(super) fn offline_current(
+        &self,
+        account: &AccountKey,
+        mailbox: &str,
+        validity: u32,
+        uid: Option<u32>,
+    ) -> bool {
+        let Some(state) = &self.0 else { return false };
+        if !state.enabled(account, mailbox) {
+            return false;
+        }
+        let mailbox = canonical_mailbox(mailbox);
+        let namespace = account.reference_namespace();
+        state.generation_matches(&namespace, mailbox, validity)
+            && state.pending_tombstones.lock().is_ok_and(|pending| {
+                !pending.iter().any(|((key, folder), epoch, tombstone)| {
+                    *key == namespace
+                        && folder == mailbox
+                        && *epoch == validity
+                        && uid.is_none_or(|uid| uid == *tombstone)
+                })
+            })
     }
 
     pub(super) fn configured(&self, account: &AccountKey) -> bool {
@@ -195,6 +299,7 @@ impl PreparedCache {
         if let Some(state) = &self.0
             && let Some(queue) = &state.queue
         {
+            state.cache_read_jobs.close();
             let (done, wait) = oneshot::channel();
             if queue
                 .send(CacheMessage::Finish(state.clone(), done))
@@ -226,11 +331,27 @@ impl PreparedCache {
             return json!({"account_id":alias,"mode":"off","status":"off","storage":null,"write_health":WriteHealth::default()});
         };
         let health = state.health.clone();
+        let mode = state.mode.name();
+        let full = state.mode == CacheMode::Full;
         let (done, wait) = oneshot::channel();
         let submitted = self.submit(account, 4096, false, move |cache, account| {
             match cache.status(account) {
                 Ok(status) => {
-                    let _ = done.send((status, read_health(&health, account)));
+                    let mut folders =
+                        serde_json::to_value(&status.folders).map_err(|_| CacheError::Corrupt)?;
+                    if full {
+                        for (folder, value) in status
+                            .folders
+                            .iter()
+                            .zip(folders.as_array_mut().ok_or(CacheError::Corrupt)?)
+                        {
+                            if let Some(validity) = folder.uid_validity {
+                                value["layers"] =
+                                    coverage(cache, account, &folder.mailbox, validity)?;
+                            }
+                        }
+                    }
+                    let _ = done.send((status, folders, read_health(&health, account)));
                     Ok(())
                 }
                 Err(error) => Err(error),
@@ -244,22 +365,32 @@ impl PreparedCache {
         } else {
             None
         };
-        let result = result.filter(|(status, _)| state.account_current(account, &status.folders));
-        match result {
-            Some((status, health)) => json!({
-                "account_id":alias,"mode":"metadata","status":"ready",
+        let result =
+            result.filter(|(status, _, _)| state.account_current(account, &status.folders));
+        let mut value = match result {
+            Some((status, folders, health)) => json!({
+                "account_id":alias,"mode":mode,"status":"ready",
                 "write_health":health,
                 "storage":{
                     "max_bytes":status.max_bytes, "used_bytes":status.used_bytes,
                     "global_max_bytes":status.global_max_bytes, "startup_unclean":status.startup_unclean,
-                    "folders":status.folders
+                    "folders":folders
                 }
             }),
             None => {
-                json!({"account_id":alias,"mode":"metadata","status":"unavailable","storage":null,
+                json!({"account_id":alias,"mode":mode,"status":"unavailable","storage":null,
                     "write_health":read_health(&state.health, account)})
             }
+        };
+        if full {
+            value["content_pending"] = json!(
+                state
+                    .content_pending
+                    .get(account)
+                    .map_or(0, |count| count.load(Ordering::Acquire))
+            );
         }
+        value
     }
 
     fn enabled_for_folder(&self, account: &AccountKey, mailbox: &str) -> bool {
@@ -273,7 +404,7 @@ impl PreparedCache {
         account: &AccountKey,
         bytes: usize,
         record_write: bool,
-        operation: impl FnOnce(&Cache, &AccountKey) -> std::result::Result<(), CacheError>
+        operation: impl FnOnce(&Arc<Cache>, &AccountKey) -> std::result::Result<(), CacheError>
         + Send
         + 'static,
     ) -> bool {
@@ -423,6 +554,11 @@ impl Persistent {
     }
 
     fn can_mark_clean(&self) -> bool {
+        if self.cache_read_jobs.available_permits() != EXECUTION_SLOTS
+            || self.content_jobs.available_permits() != CONTENT_PAYLOADS
+        {
+            return false;
+        }
         self.health
             .lock()
             .is_ok_and(|keys| keys.values().all(|health| !health.unavailable))
@@ -462,8 +598,458 @@ impl HeaderObservation {
 }
 
 impl MailService {
+    pub(super) fn observe_fetch_error(
+        &self,
+        mailbox: &str,
+        validity: Option<u32>,
+        uid_next: Option<u32>,
+        uid: u32,
+        error: MailError,
+    ) -> MailError {
+        // These callers have verified the selected generation. NOT_FOUND
+        // means the command completed successfully without the target UID.
+        if error.code == "NOT_FOUND" {
+            self.cache_tombstone(mailbox, validity, uid_next, uid);
+        }
+        error
+    }
+
     pub(super) fn persists(&self, mailbox: &str) -> bool {
         self.persistent.enabled_for_folder(&self.account, mailbox)
+    }
+
+    pub(super) async fn cache_before_write(
+        &self,
+        folders: &[&str],
+    ) -> Option<cache_write_guard::DirtyWriteGuard> {
+        let cache = self.persistent.full_storage(&self.account)?;
+        let folders = folders
+            .iter()
+            .map(|folder| canonical_mailbox(folder))
+            .filter(|folder| self.persistent.configured_folder(&self.account, folder))
+            .collect::<std::collections::BTreeSet<_>>();
+        let folders = folders.into_iter().collect::<Vec<_>>();
+        self.write_guards
+            .begin(cache, &self.account, &folders, WRITE_FENCE_WAIT)
+            .await
+    }
+
+    pub(super) async fn cache_before_folder_tree_write(
+        &self,
+    ) -> Option<cache_write_guard::DirtyWriteGuard> {
+        let folders = self
+            .persistent
+            .configured_folders(&self.account)
+            .collect::<Vec<_>>();
+        self.cache_before_write(&folders).await
+    }
+
+    pub(super) async fn cache_before_send(&self) -> Option<cache_write_guard::DirtyWriteGuard> {
+        let cache = self.persistent.full_storage(&self.account)?;
+        let (storage, account) = (cache.clone(), self.account.clone());
+        let Some(folders) = self
+            .lookup_sent(move || storage.confirmed_sent(&account))
+            .await
+        else {
+            cache.disable_offline();
+            return None;
+        };
+        let folders = folders.iter().map(String::as_str).collect::<Vec<_>>();
+        self.cache_before_write(&folders).await
+    }
+
+    async fn lookup_sent(
+        &self,
+        lookup: impl FnOnce() -> std::result::Result<Vec<String>, CacheError> + Send + 'static,
+    ) -> Option<Vec<String>> {
+        let permit = self.persistent.cache_read_permit()?;
+        let admission = runtime::read_admission();
+        let task = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let _admission = admission;
+            lookup()
+        });
+        tokio::time::timeout(WRITE_FENCE_WAIT, task)
+            .await
+            .ok()?
+            .ok()?
+            .ok()
+    }
+
+    pub(super) fn persist_mailboxes(&self, rows: &[Value]) {
+        if self.persistent.full_storage(&self.account).is_none() {
+            return;
+        }
+        let Some(time) = checked_at_ms() else { return };
+        let rows = rows
+            .iter()
+            .filter(|row| {
+                row["name"]
+                    .as_str()
+                    .is_some_and(|folder| self.persistent.configured_folder(&self.account, folder))
+            })
+            .filter_map(|row| serde_json::from_value::<MailboxEvidence>(row.clone()).ok())
+            .map(|mut row| {
+                row.name = canonical_mailbox(&row.name).into();
+                row
+            })
+            .collect::<Vec<_>>();
+        let bytes = rows.iter().try_fold(4096usize, |used, row| {
+            Some(used.saturating_add(serde_json::to_vec(row).ok()?.len().saturating_mul(2)))
+        });
+        if let Some(bytes) = bytes {
+            self.persistent
+                .submit(&self.account, bytes, true, move |cache, account| {
+                    cache.remember_mailboxes(account, &rows, time)
+                });
+        }
+    }
+
+    pub(super) fn persist_listing(
+        &self,
+        mailbox: &str,
+        validity: Option<u32>,
+        items: Vec<ListingObservation>,
+    ) {
+        let Some(uid_validity) = validity.filter(|value| *value > 0) else {
+            return;
+        };
+        if items.is_empty()
+            || self
+                .persistent
+                .full_folder(&self.account, mailbox)
+                .is_none()
+        {
+            return;
+        }
+        let Some(time) = checked_at_ms() else { return };
+        let mailbox = canonical_mailbox(mailbox).to_owned();
+        let bytes = 4096
+            + mailbox.capacity()
+            + items.capacity() * std::mem::size_of::<ListingObservation>()
+            + items
+                .iter()
+                .map(|item| {
+                    item.internal_date.as_ref().map_or(0, String::capacity)
+                        + item.flags.as_ref().map_or(0, |flags| {
+                            flags.capacity() * std::mem::size_of::<String>()
+                                + flags.iter().map(String::capacity).sum::<usize>()
+                        })
+                })
+                .sum::<usize>();
+        self.persistent
+            .submit(&self.account, bytes, true, move |cache, account| {
+                for item in items {
+                    cache.remember_listing(
+                        CacheRef {
+                            account,
+                            mailbox: &mailbox,
+                            uid_validity,
+                            uid: item.uid,
+                        },
+                        ListingEvidence {
+                            flags: item.flags.as_deref(),
+                            internal_date: item.internal_date.as_deref(),
+                            size: item.size,
+                            observed_at_ms: time,
+                        },
+                    )?;
+                }
+                Ok(())
+            });
+    }
+
+    pub(super) fn content_capture(&self, mailbox: &str) -> Option<ContentAdmission> {
+        self.persistent.full_folder(&self.account, mailbox)?;
+        let state = self.persistent.0.as_ref()?;
+        let permit = match state.content_jobs.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                record_failure(&state.health, &self.account, true, WriteFailure::QueueFull);
+                return None;
+            }
+        };
+        let pending = state.content_pending.get(&self.account)?.clone();
+        pending.fetch_add(1, Ordering::Release);
+        Some(ContentAdmission {
+            _permit: permit,
+            pending,
+        })
+    }
+
+    pub(super) fn cache_tombstone(
+        &self,
+        mailbox: &str,
+        validity: Option<u32>,
+        uid_next: Option<u32>,
+        uid: u32,
+    ) {
+        let Some(uid_validity) = validity.filter(|value| *value > 0) else {
+            return;
+        };
+        // A UID at or above this connection's observed UIDNEXT could be
+        // allocated while this absence is waiting for the cache worker.
+        let Some(uid_next) = uid_next.filter(|next| uid != 0 && uid < *next) else {
+            return;
+        };
+        let Some(storage) = self.persistent.full_folder(&self.account, mailbox) else {
+            return;
+        };
+        let mailbox = canonical_mailbox(mailbox).to_owned();
+        let storage = storage.clone();
+        // Fence offline content before returning a confirmed live miss. The
+        // worker records the durable tombstone under the same account/epoch.
+        let Some(state) = &self.persistent.0 else {
+            return;
+        };
+        let reference = (
+            (self.account.reference_namespace(), mailbox.clone()),
+            uid_validity,
+            uid,
+        );
+        if !current_generation(&state.generations, &reference.0, uid_validity) {
+            return;
+        }
+        let generations = state.generations.clone();
+        let pending = state.pending_tombstones.clone();
+        let inserted = pending.lock().is_ok_and(|mut pending| {
+            (pending.len() < CACHE_JOBS * BATCH_READ_ITEMS || pending.contains(&reference)) && {
+                pending.insert(reference.clone());
+                true
+            }
+        });
+        if !inserted
+            || !self
+                .persistent
+                .submit(&self.account, 4096 + mailbox.capacity(), true, {
+                    let reference = reference.clone();
+                    move |cache, account| {
+                        let result = if current_generation(&generations, &reference.0, uid_validity)
+                        {
+                            cache.tombstone_observed(
+                                CacheRef {
+                                    account,
+                                    mailbox: &mailbox,
+                                    uid_validity,
+                                    uid,
+                                },
+                                uid_next,
+                            )
+                        } else {
+                            Ok(())
+                        };
+                        if result.is_ok() {
+                            if let Ok(mut pending) = pending.lock() {
+                                pending.remove(&reference);
+                            }
+                        } else {
+                            cache.disable_offline();
+                        }
+                        result
+                    }
+                })
+        {
+            if current_generation(&state.generations, &reference.0, uid_validity) {
+                storage.disable_offline();
+            } else if let Ok(mut pending) = state.pending_tombstones.lock() {
+                pending.remove(&reference);
+            }
+        }
+    }
+
+    pub(super) fn capture_body(
+        &self,
+        mailbox: &str,
+        validity: Option<u32>,
+        uid: u32,
+        record: parts::cached_body::Record,
+        permit: ContentAdmission,
+    ) {
+        let retained = (record, permit);
+        let Some(uid_validity) = validity.filter(|value| *value > 0) else {
+            return;
+        };
+        let mailbox = canonical_mailbox(mailbox).to_owned();
+        self.persistent.submit(
+            &self.account,
+            4096 + mailbox.capacity(),
+            true,
+            move |cache, account| {
+                let payload = retained;
+                let reference = CacheRef {
+                    account,
+                    mailbox: &mailbox,
+                    uid_validity,
+                    uid,
+                };
+                write_body(cache, reference, &payload.0)
+            },
+        );
+    }
+
+    pub(super) fn capture_attachment(
+        &self,
+        mailbox: &str,
+        uid_validity: u32,
+        uid: u32,
+        index: usize,
+        metadata: attachments::staging::ReadyMetadata,
+        capture: attachments::staging::Capture,
+    ) {
+        let mailbox = canonical_mailbox(mailbox).to_owned();
+        self.persistent.submit(
+            &self.account,
+            4096 + mailbox.capacity(),
+            true,
+            move |cache, account| {
+                use std::io::Write;
+                let payload = capture;
+                let bytes = &payload.bytes;
+                let digest: [u8; 32] = Sha256::digest(bytes).into();
+                if bytes.len() != metadata.decoded_size || digest != metadata.sha256 {
+                    return Err(CacheError::Corrupt);
+                }
+                let reference = CacheRef {
+                    account,
+                    mailbox: &mailbox,
+                    uid_validity,
+                    uid,
+                };
+                let kind = ArtifactKey::Attachment {
+                    original_index: index as u32,
+                    mime_version: 1,
+                };
+                let mut stage = cache.begin_blob(
+                    reference,
+                    kind,
+                    Some(bytes.len() as u64),
+                    crate::config::DEFAULT_MAX_MESSAGE as u64,
+                )?;
+                stage.write_all(bytes)?;
+                let stored = stage.publish(&|| false)?;
+                if stored.sha256 != digest {
+                    return Err(CacheError::Corrupt);
+                }
+                Ok(())
+            },
+        );
+    }
+
+    pub(super) fn capture_raw(
+        &self,
+        mailbox: &str,
+        validity: Option<u32>,
+        uid: u32,
+        raw: Vec<u8>,
+        permit: ContentAdmission,
+    ) {
+        let retained = (raw, permit);
+        let Some(uid_validity) = validity.filter(|value| *value > 0) else {
+            return;
+        };
+        let mailbox = canonical_mailbox(mailbox).to_owned();
+        self.persistent.submit(
+            &self.account,
+            4096 + mailbox.capacity(),
+            true,
+            move |cache, account| {
+                use std::io::Write;
+                let (_permit, raw) = (retained.1, retained.0);
+                let reference = CacheRef {
+                    account,
+                    mailbox: &mailbox,
+                    uid_validity,
+                    uid,
+                };
+                let mut stage = cache.begin_blob(
+                    reference,
+                    ArtifactKey::Raw,
+                    Some(raw.len() as u64),
+                    crate::config::DEFAULT_MAX_MESSAGE as u64,
+                )?;
+                stage.write_all(&raw)?;
+                let published = stage.publish(&|| false)?;
+                let Ok(parsed) = mime::parse(&raw) else {
+                    return Ok(());
+                };
+                let mut states = Vec::new();
+                if let Ok(parts) = parts::from_raw(&parsed) {
+                    for part in parts
+                        .manifest
+                        .parts
+                        .iter()
+                        .filter(|part| part.is_attachment && part.downloadable)
+                    {
+                        states.push((
+                            ArtifactKey::Attachment {
+                                original_index: part.attachment_index as u32,
+                                mime_version: 1,
+                            },
+                            ArtifactState::Derivable { raw: published.id },
+                        ));
+                    }
+                }
+                let mut record = parts::cached_body::Record::default();
+                let mut remaining = parts::cached_body::LIMIT;
+                let decoded = parsed
+                    .decoded_display_leaves(&mut remaining, |text, html, reserve| {
+                        record.push(text, html, reserve);
+                        Ok(())
+                    })
+                    .is_ok();
+                drop(parsed);
+                drop(raw);
+                if decoded {
+                    states.push((
+                        parts::cached_body::KEY,
+                        ArtifactState::Derivable { raw: published.id },
+                    ));
+                    cache.record_artifact_states(reference, &states)?;
+                    write_body(cache, reference, &record)?;
+                } else {
+                    cache.record_artifact_states(reference, &states)?;
+                }
+                Ok(())
+            },
+        );
+    }
+
+    pub(super) fn cache_artifact_state(
+        &self,
+        mailbox: &str,
+        validity: Option<u32>,
+        uid: u32,
+        kind: ArtifactKey,
+        value: ArtifactState,
+    ) {
+        let Some(uid_validity) = validity.filter(|value| *value > 0) else {
+            return;
+        };
+        if self
+            .persistent
+            .full_folder(&self.account, mailbox)
+            .is_none()
+        {
+            return;
+        }
+        let mailbox = canonical_mailbox(mailbox).to_owned();
+        self.persistent.submit(
+            &self.account,
+            4096 + mailbox.capacity(),
+            true,
+            move |cache, account| {
+                cache.record_artifact_state(
+                    CacheRef {
+                        account,
+                        mailbox: &mailbox,
+                        uid_validity,
+                        uid,
+                    },
+                    kind,
+                    value,
+                )
+            },
+        );
     }
 
     pub(super) fn observe_mailbox(&self, mailbox: &str, state: &async_imap::types::Mailbox) {
@@ -474,12 +1060,7 @@ impl MailService {
             return;
         };
         let high_uid = state.uid_next.and_then(|next| next.checked_sub(1));
-        let Ok(time) = SystemTime::now().duration_since(UNIX_EPOCH) else {
-            return;
-        };
-        let Ok(time) = i64::try_from(time.as_millis()) else {
-            return;
-        };
+        let Some(time) = checked_at_ms() else { return };
         let mailbox = canonical_mailbox(mailbox).to_owned();
         let Some(cache) = &self.persistent.0 else {
             return;
@@ -520,6 +1101,10 @@ impl MailService {
             return;
         }
         let mailbox = canonical_mailbox(mailbox).to_owned();
+        let full = self
+            .persistent
+            .full_folder(&self.account, &mailbox)
+            .is_some();
         let bytes = 4096
             + mailbox.capacity()
             + observations.capacity() * std::mem::size_of::<HeaderObservation>()
@@ -542,6 +1127,22 @@ impl MailService {
                         &item.bytes,
                         item.index.as_deref(),
                     )?;
+                    if full
+                        && item.complete
+                        && let Ok(headers) = mime::headers(&item.bytes)
+                        && let Ok(ids) = conversation::thread_index_ids(&headers)
+                    {
+                        let ids = ids
+                            .iter()
+                            .map(|(role, id)| ThreadId { role: *role, id })
+                            .collect::<Vec<_>>();
+                        cache.remember_thread_ids(
+                            reference,
+                            conversation::THREAD_INDEX_VERSION,
+                            &item.bytes,
+                            &ids,
+                        )?;
+                    }
                 }
                 Ok(())
             });
@@ -564,22 +1165,74 @@ impl MailService {
             return;
         };
         let mailbox = canonical_mailbox(mailbox).to_owned();
+        let expected = self
+            .persistent
+            .full_folder(&self.account, &mailbox)
+            .map(|_| {
+                manifest
+                    .parts
+                    .iter()
+                    .filter(|part| part.is_attachment)
+                    .map(|part| {
+                        (
+                            ArtifactKey::Attachment {
+                                original_index: part.attachment_index as u32,
+                                mime_version: 1,
+                            },
+                            if part.downloadable {
+                                ArtifactState::Missing
+                            } else {
+                                ArtifactState::Unsupported(Omission::UnsupportedEncoding)
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            });
+        let expected_bytes = expected.as_ref().map_or(0, |parts| {
+            parts.capacity() * std::mem::size_of::<(ArtifactKey, ArtifactState)>()
+        });
         self.persistent.submit(
             &self.account,
-            4096 + mailbox.capacity() + bytes.capacity(),
+            4096 + mailbox.capacity() + bytes.capacity() + expected_bytes,
             true,
             move |cache, account| {
-                cache.remember_parts(
-                    CacheRef {
-                        account,
-                        mailbox: &mailbox,
-                        uid_validity: validity,
-                        uid,
-                    },
-                    &bytes,
-                )
+                let reference = CacheRef {
+                    account,
+                    mailbox: &mailbox,
+                    uid_validity: validity,
+                    uid,
+                };
+                if let Some(expected) = expected {
+                    cache.remember_full_manifest(reference, &bytes, &expected)
+                } else {
+                    cache.remember_parts(reference, &bytes)
+                }
             },
         );
+    }
+
+    pub(super) fn persist_structured_manifest(
+        &self,
+        mailbox: &str,
+        validity: Option<u32>,
+        uid: u32,
+        manifest: &parts::PartManifest,
+    ) {
+        self.persist_manifest(mailbox, validity, uid, manifest);
+        if self.persists(mailbox)
+            && let Ok(headers) = mime::headers(manifest.root_headers())
+        {
+            self.persist_headers(
+                mailbox,
+                validity,
+                vec![HeaderObservation::new(
+                    uid,
+                    manifest.root_headers(),
+                    true,
+                    &headers,
+                )],
+            );
+        }
     }
 
     pub(super) fn persist_raw(
@@ -603,6 +1256,57 @@ impl MailService {
             self.persist_manifest(mailbox, validity, uid, &parsed.manifest);
         }
     }
+}
+
+fn write_body(
+    cache: &Arc<Cache>,
+    reference: CacheRef<'_>,
+    record: &parts::cached_body::Record,
+) -> std::result::Result<(), CacheError> {
+    let mut stage = cache.begin_blob(
+        reference,
+        parts::cached_body::KEY,
+        Some(record.bytes() as u64),
+        parts::cached_body::LIMIT as u64,
+    )?;
+    let metadata = record.encode(&mut stage)?;
+    let blob = stage.publish_body(&metadata, &|| false)?;
+    if let Ok(rendered) = record.display(crate::html::HtmlDisplay::Legacy) {
+        cache.remember_full_body_index(
+            reference,
+            parts::cached_body::KEY,
+            blob.id,
+            &rendered.text,
+            &|| false,
+        )?;
+    }
+    Ok(())
+}
+
+pub(super) fn coverage(
+    cache: &Cache,
+    account: &AccountKey,
+    mailbox: &str,
+    validity: u32,
+) -> std::result::Result<Value, CacheError> {
+    use crate::cache::ArtifactLayer;
+    let mut value = json!({});
+    for (name, layer) in [
+        ("raw", ArtifactLayer::Raw),
+        ("full_body", parts::cached_body::LAYER),
+        (
+            "attachments",
+            ArtifactLayer::Attachments { mime_version: 1 },
+        ),
+    ] {
+        let layer = cache.layer_coverage(account, mailbox, validity, layer)?;
+        value[name] = json!({
+            "materialized":layer.materialized,"materialized_bytes":layer.materialized_bytes,
+            "derivable_from_raw":layer.derivable_from_raw,"missing":layer.missing,
+            "omitted":layer.omitted,"unsupported":layer.unsupported
+        });
+    }
+    Ok(value)
 }
 
 fn observe_epoch(generations: &Generations, key: &GenerationKey, validity: u32) -> Option<bool> {
@@ -629,6 +1333,14 @@ fn observe_epoch(generations: &Generations, key: &GenerationKey, validity: u32) 
     }
 }
 
+fn current_generation(generations: &Generations, key: &GenerationKey, validity: u32) -> bool {
+    generations.lock().is_ok_and(|epochs| {
+        epochs
+            .get(key)
+            .is_none_or(|epoch| !epoch.blocked && epoch.current == validity)
+    })
+}
+
 fn block_generation(generations: &Generations, key: &GenerationKey, validity: u32) {
     if let Ok(mut epochs) = generations.lock()
         && let Some(epoch) = epochs.get_mut(key)
@@ -638,12 +1350,29 @@ fn block_generation(generations: &Generations, key: &GenerationKey, validity: u3
     }
 }
 
-fn canonical_mailbox(mailbox: &str) -> &str {
+pub(super) fn canonical_mailbox(mailbox: &str) -> &str {
     if mailbox.eq_ignore_ascii_case("INBOX") {
         "INBOX"
     } else {
         mailbox
     }
+}
+
+fn checked_at_ms() -> Option<i64> {
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_millis(),
+    )
+    .ok()
+}
+
+pub(super) struct ListingObservation {
+    pub(super) uid: u32,
+    pub(super) flags: Option<Vec<String>>,
+    pub(super) internal_date: Option<String>,
+    pub(super) size: Option<u32>,
 }
 
 fn index_text(headers: &[mailparse::MailHeader<'_>]) -> Option<String> {
@@ -724,6 +1453,197 @@ fn encode_manifest(manifest: &parts::PartManifest) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn full_cache_fixture(
+        root: &std::path::Path,
+    ) -> (
+        MailRuntime,
+        PreparedCache,
+        Arc<crate::accounts::AccountCatalog>,
+        crate::accounts::CacheRun,
+    ) {
+        use crate::{accounts, config};
+        let mut config = (*config::fixture()).clone();
+        config.account_registry = Some(root.join("accounts.sqlite"));
+        let set = config::ValidatedAccountSet::legacy(Arc::new(config));
+        let path = root.join("cache.json");
+        std::fs::write(&path, br#"{"version":1,"mode":"full","directory":"cache","max_bytes":8388608,"accounts":[{"account_id":"default","mailboxes":["INBOX"],"max_bytes":8388608}]}"#).unwrap();
+        let settings = config::load_cache_file(&path, &set).unwrap();
+        let catalog = accounts::open_catalog(set).unwrap();
+        let witness = accounts::CacheRun::begin(catalog.config()).unwrap();
+        let cache =
+            MailRuntime::prepare_cache_for_run(&catalog, settings, Some(witness.identity()))
+                .unwrap();
+        let runtime = MailRuntime::with_cache(
+            catalog.clone(),
+            Arc::new(Journal::open(std::path::Path::new(":memory:")).unwrap()),
+            cache.clone(),
+        )
+        .unwrap();
+        (runtime, cache, catalog, witness)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_sent_lookup_holds_write_and_cache_permits_until_worker_exits() {
+        use crate::mail::scheduler::WorkClass;
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().unwrap();
+        let (runtime, cache, catalog, _witness) = full_cache_fixture(root.path());
+        let account = catalog.write_account("owner").unwrap();
+        let service = runtime.service_for(&account.key).unwrap();
+        let (unblock, blocked) = std::sync::mpsc::channel();
+        let (started, entering) = oneshot::channel();
+        runtime
+            .run_write(&account, async {
+                let result = service
+                    .lookup_sent(move || {
+                        let _ = started.send(());
+                        blocked.recv().unwrap();
+                        Ok(Vec::new())
+                    })
+                    .await;
+                assert!(result.is_none());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        entering.await.unwrap();
+        let cache_reads = &cache.0.as_ref().unwrap().cache_read_jobs;
+        assert_eq!(cache_reads.available_permits(), EXECUTION_SLOTS - 1);
+        let namespace = account.key.reference_namespace();
+        let token = &account.cancellation;
+        let mut permits = Vec::new();
+        for _ in 1..EXECUTION_SLOTS {
+            permits.push(
+                runtime
+                    .scheduler
+                    .acquire(namespace, WorkClass::Foreground, token)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let waiting = runtime
+            .scheduler
+            .acquire(namespace, WorkClass::Foreground, token);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), waiting)
+                .await
+                .is_err()
+        );
+        unblock.send(()).unwrap();
+        let recovered = tokio::time::timeout(
+            Duration::from_secs(2),
+            runtime
+                .scheduler
+                .acquire(namespace, WorkClass::Foreground, token),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(recovered);
+        drop(permits);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while cache_reads.available_permits() != EXECUTION_SLOTS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        runtime.finish_cache(cache).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delayed_old_generation_absence_preserves_new_offline_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let (runtime, cache, catalog, _witness) = full_cache_fixture(root.path());
+        let account = catalog.read_account("owner", None).unwrap();
+        let service = runtime.service_for(&account.key).unwrap();
+        let observe = |validity| {
+            service.observe_mailbox(
+                "INBOX",
+                &async_imap::types::Mailbox {
+                    uid_validity: Some(validity),
+                    uid_next: Some(8),
+                    ..Default::default()
+                },
+            )
+        };
+        observe(9);
+        assert_eq!(
+            cache.status(&account.key, "default").await["storage"]["folders"][0]["uid_validity"],
+            9
+        );
+
+        let (unblock, blocked) = std::sync::mpsc::channel();
+        assert!(cache.submit(&account.key, 4096, false, move |_, _| {
+            blocked.recv().unwrap();
+            Ok(())
+        }));
+        let missing = || MailError {
+            code: "NOT_FOUND",
+            message: "The referenced email is no longer available.",
+            retryable: false,
+            details: None,
+        };
+        service.observe_fetch_error("INBOX", Some(9), Some(8), 7, missing());
+        observe(10);
+        service.observe_fetch_error("INBOX", Some(9), Some(8), 7, missing());
+        unblock.send(()).unwrap();
+
+        let header = b"Subject: new generation\r\n\r\n";
+        let parsed = mime::headers(header).unwrap();
+        service.persist_headers(
+            "INBOX",
+            Some(10),
+            vec![HeaderObservation::new(7, header, true, &parsed)],
+        );
+        assert_eq!(
+            cache.status(&account.key, "default").await["storage"]["folders"][0]["uid_validity"],
+            10
+        );
+        let storage = cache.full_storage(&account.key).unwrap();
+        // The UIDVALIDITY transition itself leaves the scope dirty until
+        // reconciliation. Simulate that verified step for the new generation.
+        let stamp = storage.dirty_stamp(&account.key, "INBOX").unwrap();
+        storage.clear_dirty_if_verified(&stamp, 10).unwrap();
+        let reference = CacheRef {
+            account: &account.key,
+            mailbox: "INBOX",
+            uid_validity: 10,
+            uid: 7,
+        };
+        assert_eq!(
+            storage
+                .cached_message(reference)
+                .unwrap()
+                .unwrap()
+                .header
+                .as_deref(),
+            Some(header.as_slice())
+        );
+        assert!(matches!(
+            storage.cached_message(CacheRef {
+                uid_validity: 9,
+                ..reference
+            }),
+            Err(CacheError::NeedsVerification)
+        ));
+        assert!(
+            cache
+                .0
+                .as_ref()
+                .unwrap()
+                .pending_tombstones
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        runtime.finish_cache(cache).await;
+    }
+
     #[test]
     fn first_observations_arriving_out_of_order_keep_the_newest_generation() {
         let generations = Generations::default();
@@ -745,5 +1665,7 @@ mod tests {
         });
         assert_eq!(observe_epoch(&generations, &key, 10), Some(false));
         assert_eq!(generations.lock().unwrap()[&key].current, 10);
+        assert!(!current_generation(&generations, &key, 9));
+        assert!(current_generation(&generations, &key, 10));
     }
 }

@@ -290,22 +290,46 @@ fn cross_account_stage_reservations_and_per_file_limit_are_enforced_before_write
     let dir = tempfile::tempdir().unwrap();
     let a = AccountKey::synthetic();
     let b = AccountKey::synthetic();
+    let limit = 2 * MIB;
+    let reserve_a = MIB / 4;
     let cache = Cache::open_full(
         &dir.path().join("cache"),
-        MIB,
-        vec![scope(&a, MIB), scope(&b, MIB)],
+        limit,
+        vec![scope(&a, limit), scope(&b, limit)],
         &[],
     )
     .unwrap();
     observe(&cache, &a);
     observe(&cache, &b);
+    // The current schema and filesystem determine how much space remains
+    // after SQLite's rollback reserve. Find an admissible request at that
+    // boundary before adding the other account's in-flight reservation.
+    drop(
+        cache
+            .begin_blob(message(&a, 7), ArtifactKey::Raw, None, 0)
+            .unwrap(),
+    );
+    let reserve_b = (1..=limit / 65536)
+        .rev()
+        .map(|blocks| blocks * 65536)
+        .find(
+            |&bytes| match cache.begin_blob(message(&b, 7), ArtifactKey::Raw, None, bytes) {
+                Ok(stage) => {
+                    drop(stage);
+                    true
+                }
+                Err(CacheError::Quota) => false,
+                Err(error) => panic!("Unexpected stage failure: {error}"),
+            },
+        )
+        .expect("one account has room to stage a blob");
     let before = cache.status(&a).unwrap().global_used_bytes;
     let stage = cache
-        .begin_blob(message(&a, 7), ArtifactKey::Raw, None, MIB / 4)
+        .begin_blob(message(&a, 7), ArtifactKey::Raw, None, reserve_a)
         .unwrap();
-    assert!(cache.status(&a).unwrap().global_used_bytes >= before + MIB / 4);
+    assert!(cache.status(&a).unwrap().global_used_bytes >= before + reserve_a);
     assert!(matches!(
-        cache.begin_blob(message(&b, 7), ArtifactKey::Raw, None, MIB / 4),
+        cache.begin_blob(message(&b, 7), ArtifactKey::Raw, None, reserve_b),
         Err(CacheError::Quota)
     ));
     assert!(matches!(
@@ -317,7 +341,7 @@ fn cross_account_stage_reservations_and_per_file_limit_are_enforced_before_write
     assert_eq!(count_files(&cache, &a), 0);
     assert!(
         cache
-            .begin_blob(message(&b, 7), ArtifactKey::Raw, None, MIB / 4)
+            .begin_blob(message(&b, 7), ArtifactKey::Raw, None, reserve_b)
             .is_ok()
     );
 }

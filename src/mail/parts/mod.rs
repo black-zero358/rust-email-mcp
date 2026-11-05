@@ -1,6 +1,7 @@
 //! One attachment traversal contract for bounded BODYSTRUCTURE and raw MIME.
 pub(in crate::mail) mod body;
 mod body_tree;
+pub(in crate::mail) mod cached_body;
 pub(super) mod charset_decode;
 pub(in crate::mail) mod fetch;
 mod mapping;

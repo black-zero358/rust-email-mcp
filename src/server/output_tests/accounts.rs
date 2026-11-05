@@ -18,18 +18,36 @@ async fn wait_for(mut condition: impl FnMut() -> bool) {
     .expect("fixture state did not settle");
 }
 
-async fn wait_for_cancel_test_connections(harness: &Harness, expected: usize, phase: &str) {
-    let result = tokio::time::timeout(Duration::from_secs(2), async {
-        while harness.active_connections.load(Ordering::SeqCst) != expected {
+const CANCEL_TEST_WATCHDOG: Duration = Duration::from_secs(8);
+
+async fn wait_for_cancel_test_state(
+    harness: &MultiAccount,
+    requests: &mut tokio::task::JoinSet<Value>,
+    expected: (usize, usize),
+    phase: &str,
+    deadline: tokio::time::Instant,
+) {
+    let ready = async {
+        while harness.runtime.admission_counts_for_test() != expected
+            || harness.a.active_connections.load(Ordering::SeqCst) != expected.1
+        {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-    })
-    .await;
+    };
+    let has_requests = !requests.is_empty();
+    let result = tokio::select! {
+        biased;
+        finished = requests.join_next(), if has_requests => {
+            panic!("phase={phase}; an HTTP request finished before cancellation: {finished:?}");
+        }
+        result = tokio::time::timeout_at(deadline, ready) => result,
+    };
     assert!(
         result.is_ok(),
-        "phase={phase}; expected_active={expected}; active={}; accepted={}",
-        harness.active_connections.load(Ordering::SeqCst),
-        harness.connections.load(Ordering::SeqCst)
+        "phase={phase}; expected_admission={expected:?}; actual_admission={:?}; active={}; accepted={:?}",
+        harness.runtime.admission_counts_for_test(),
+        harness.a.active_connections.load(Ordering::SeqCst),
+        harness.connections()
     );
 }
 
@@ -137,7 +155,7 @@ impl MultiAccount {
         b_body: &str,
         default_read: &str,
     ) -> Self {
-        Self::configured(max_output, a_body, b_body, default_read, None).await
+        Self::configured(max_output, a_body, b_body, default_read, None, None).await
     }
     async fn configured(
         max_output: usize,
@@ -145,6 +163,7 @@ impl MultiAccount {
         b_body: &str,
         default_read: &str,
         fatal_a_uid: Option<u32>,
+        timeout: Option<Duration>,
     ) -> Self {
         let a = Harness::new(
             BTreeMap::from([(7, account_message(a_body))]),
@@ -159,6 +178,9 @@ impl MultiAccount {
         )
         .await;
         let mut configuration = (**a.service.config()).clone();
+        if let Some(timeout) = timeout {
+            configuration.timeout = timeout;
+        }
         let staging = tempfile::tempdir().unwrap();
         configuration.attachment_staging_dir = Some(staging.path().join("mail-downloads"));
         configuration.subjects = ["alice", "bob", "both", "journal_only"]
@@ -267,13 +289,24 @@ impl MultiAccount {
 
 #[tokio::test]
 async fn cancelled_http_reads_release_admission_backend_slots_and_connections() {
-    let h = MultiAccount::new(64 * 1024).await;
+    let h = MultiAccount::configured(
+        64 * 1024,
+        "account-a",
+        "account-b",
+        DEFAULT_ACCOUNT_ID,
+        None,
+        // Keep the deliberately stalled greeting alive while both readiness
+        // phases run. The independent watchdog still bounds fixture failures.
+        Some(Duration::from_secs(25)),
+    )
+    .await;
     h.a.stall_greeting.store(true, Ordering::SeqCst);
-    let mut requests = Vec::new();
-    for _ in 0..20 {
+    let token = h.token("alice");
+    let mut requests = tokio::task::JoinSet::new();
+    let launch = |requests: &mut tokio::task::JoinSet<Value>| {
         let app = h.app.clone();
-        let token = h.token("alice");
-        requests.push(tokio::spawn(async move {
+        let token = token.clone();
+        requests.spawn(async move {
             attachments::call(
                 &app,
                 &token,
@@ -281,15 +314,37 @@ async fn cancelled_http_reads_release_admission_backend_slots_and_connections() 
                 json!({"uid":7,"uid_validity":9}),
             )
             .await
-        }));
+        });
+    };
+    let running_deadline = tokio::time::Instant::now() + CANCEL_TEST_WATCHDOG;
+    for _ in 0..4 {
+        launch(&mut requests);
     }
-    wait_for_cancel_test_connections(&h.a, 4, "admission_four_running").await;
-    // All four connections are blocked at the greeting. The remaining sixteen
-    // calls must occupy queue admission before the overflow call is rejected.
-    let overflow = tokio::time::timeout(
-        Duration::from_secs(1),
-        h.call(
-            "alice",
+    wait_for_cancel_test_state(
+        &h,
+        &mut requests,
+        (4, 4),
+        "admission_four_running",
+        running_deadline,
+    )
+    .await;
+    let queue_deadline = tokio::time::Instant::now() + CANCEL_TEST_WATCHDOG;
+    for _ in 4..20 {
+        launch(&mut requests);
+    }
+    wait_for_cancel_test_state(
+        &h,
+        &mut requests,
+        (20, 4),
+        "admission_twenty_total",
+        queue_deadline,
+    )
+    .await;
+    let overflow = tokio::time::timeout_at(
+        queue_deadline,
+        attachments::call(
+            &h.app,
+            &token,
             "get_email_status",
             json!({"uid":7,"uid_validity":9}),
         ),
@@ -298,16 +353,30 @@ async fn cancelled_http_reads_release_admission_backend_slots_and_connections() 
     .expect("all twenty calls should already be admitted");
     assert_eq!(overflow["error"]["code"], "BUSY");
     assert_eq!(h.connections(), (4, 0));
-    for request in &requests {
-        request.abort();
-    }
-    for request in requests {
-        assert!(request.await.unwrap_err().is_cancelled());
-    }
-    wait_for_cancel_test_connections(&h.a, 0, "cancel_all_connections").await;
-    // Cancelled waiters must never start a replacement connection after one of
-    // the original running calls releases a backend slot.
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    requests.abort_all();
+    let cancel_deadline = tokio::time::Instant::now() + CANCEL_TEST_WATCHDOG;
+    tokio::time::timeout_at(cancel_deadline, async {
+        for _ in 0..20 {
+            assert!(
+                requests
+                    .join_next()
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .is_cancelled()
+            );
+        }
+    })
+    .await
+    .expect("cancelled HTTP requests did not finish");
+    wait_for_cancel_test_state(
+        &h,
+        &mut requests,
+        (0, 0),
+        "cancel_all_connections",
+        cancel_deadline,
+    )
+    .await;
     assert_eq!(h.connections(), (4, 0));
     h.a.stall_greeting.store(false, Ordering::SeqCst);
     let next = h
@@ -654,6 +723,7 @@ async fn backend_failure_backoff_is_local_to_one_account_and_never_retries() {
         "account-a",
         "account-b",
         DEFAULT_ACCOUNT_ID,
+        None,
         None,
     )
     .await;

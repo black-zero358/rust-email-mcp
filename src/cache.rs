@@ -1,6 +1,7 @@
 //! Private, quota-bounded storage for administrator-selected account scopes.
-use crate::accounts::AccountKey;
+use crate::accounts::{AccountKey, CacheRunIdentity};
 use rusqlite::{Connection, ErrorCode, Transaction, TransactionBehavior};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -11,22 +12,32 @@ use std::{
 };
 
 mod blob;
+mod body_index;
+#[cfg(all(test, unix))]
+mod content_tests;
 pub mod cursor;
 mod dirty;
 mod disk;
+mod evidence;
 #[cfg(all(test, unix))]
 mod full_tests;
 mod metadata;
 mod schema;
 #[cfg(all(test, unix))]
 mod tests;
+mod thread_index;
 
 pub use blob::{
     Access, ArtifactKey, ArtifactLayer, ArtifactState, BlobId, BlobInfo, BlobLease, BlobStage,
     LayerCoverage, Omission,
 };
+pub use body_index::{CachedSearchHit, CachedSearchPage, SearchPosition};
 pub use dirty::{DirtyStamp, DirtyTicket};
+pub use evidence::{
+    CachedListingPage, CachedMailbox, CachedMessage, ListingEvidence, MailboxEvidence,
+};
 pub use metadata::{AccountStatus, FolderStatus, SearchHit, SearchPage};
+pub use thread_index::{ScopeSnapshot, THREAD_INDEX_VERSION, ThreadId, ThreadRole};
 
 const MAX_ACCOUNTS: usize = 16;
 const PAGE_BYTES: u64 = 4096;
@@ -114,7 +125,7 @@ impl Cache {
         accounts: Vec<AccountScope>,
         reserved: &[PathBuf],
     ) -> Result<Arc<Self>, CacheError> {
-        Self::open_mode(directory, max_bytes, accounts, reserved, false)
+        Self::open_mode(directory, max_bytes, accounts, reserved, false, None)
     }
 
     /// Open a full storage instance after administrator and runtime setup.
@@ -125,7 +136,18 @@ impl Cache {
         accounts: Vec<AccountScope>,
         reserved: &[PathBuf],
     ) -> Result<Arc<Self>, CacheError> {
-        Self::open_mode(directory, max_bytes, accounts, reserved, true)
+        Self::open_mode(directory, max_bytes, accounts, reserved, true, None)
+    }
+
+    /// Open full storage using the process's durable runtime witness.
+    pub fn open_full_with_run(
+        directory: &Path,
+        max_bytes: u64,
+        accounts: Vec<AccountScope>,
+        reserved: &[PathBuf],
+        run: CacheRunIdentity,
+    ) -> Result<Arc<Self>, CacheError> {
+        Self::open_mode(directory, max_bytes, accounts, reserved, true, Some(run))
     }
 
     fn open_mode(
@@ -134,6 +156,7 @@ impl Cache {
         accounts: Vec<AccountScope>,
         reserved: &[PathBuf],
         full: bool,
+        run: Option<CacheRunIdentity>,
     ) -> Result<Arc<Self>, CacheError> {
         if accounts.is_empty()
             || accounts.len() > MAX_ACCOUNTS
@@ -168,7 +191,20 @@ impl Cache {
                 return Err(CacheError::OutOfScope);
             }
         }
-        let disk = disk::Root::open(directory, reserved, max_bytes)?;
+        let witness = run.map(|run| {
+            let mut hash = Sha256::new();
+            hash.update(b"email-mcp-full-cache-scope-v1\0");
+            for (namespace, scope) in &scopes {
+                hash.update(namespace);
+                hash.update((scope.mailboxes.len() as u32).to_be_bytes());
+                for mailbox in &scope.mailboxes {
+                    hash.update((mailbox.len() as u32).to_be_bytes());
+                    hash.update(mailbox.as_bytes());
+                }
+            }
+            (run, hash.finalize().into())
+        });
+        let disk = disk::Root::open(directory, reserved, max_bytes, witness)?;
         let startup_unclean = disk.was_unclean();
         let cache = Arc::new(Self {
             disk,
@@ -240,11 +276,29 @@ impl Cache {
         let databases = self.lock()?;
         self.write_health()?;
         if self.full
-            && (self.offline_disabled.load(Ordering::Acquire) || self.disk.has_staged_blobs()?)
+            && (self.offline_disabled.load(Ordering::Acquire)
+                || !self
+                    .blob_leases
+                    .lock()
+                    .map_err(|_| CacheError::Storage)?
+                    .is_empty()
+                || self.disk.has_staged_blobs()?)
         {
             return Ok(());
         }
-        for database in databases.values() {
+        for (namespace, database) in databases.iter() {
+            if self.disk.has_witness() {
+                let selected = &self.scopes[namespace].mailboxes;
+                for mailbox in selected {
+                    if dirty::scope_dirty(&database.connection, mailbox)? {
+                        return Ok(());
+                    }
+                }
+                if dirty::has_claims(&database.connection)? {
+                    return Ok(());
+                }
+                continue;
+            }
             let dirty: bool = database.connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM mailboxes WHERE dirty)",
                 [],

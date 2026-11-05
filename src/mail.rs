@@ -9,7 +9,7 @@ use crate::{
     smtp::SmtpSender,
 };
 pub mod attachments;
-#[cfg(test)]
+mod cache_read;
 mod cache_write_guard;
 mod classification;
 pub(crate) mod conversation;
@@ -17,6 +17,7 @@ pub mod insights;
 mod listing;
 mod parts;
 mod persistence;
+pub(crate) mod read_source;
 mod runtime;
 pub(crate) mod scheduler;
 use futures::TryStreamExt;
@@ -119,6 +120,7 @@ pub struct MailService {
     backend_backoff: std::sync::Mutex<Option<std::time::Instant>>,
     metadata_cache: Arc<std::sync::Mutex<insights::MetadataCache>>,
     persistent: PreparedCache,
+    write_guards: Arc<cache_write_guard::WriteGuardPool>,
     #[cfg(test)]
     test_imap_roots: Option<RootCertStore>,
 }
@@ -163,6 +165,7 @@ impl MailService {
             attachments,
             metadata_cache,
             persistent: PreparedCache::default(),
+            write_guards: Arc::default(),
             config,
             journal,
             account,
@@ -373,7 +376,7 @@ impl MailService {
     }
     async fn imap_operation(&self, name: &str, a: &Value) -> Result<Value> {
         if matches!(name, "get_email" | "get_emails" | "read_conversation") {
-            return self.body_operation(name, a).await;
+            return Box::pin(self.body_operation(name, a)).await;
         }
         let mut s = if runtime::account_read(name) {
             self.connect_read().await?
@@ -389,6 +392,19 @@ impl MailService {
         s: &mut async_imap::Session<S>,
         name: &str,
         a: &Value,
+    ) -> Result<Value>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
+    {
+        Box::pin(self.with_session_guarded(s, name, a, &mut None)).await
+    }
+
+    async fn with_session_guarded<S>(
+        &self,
+        s: &mut async_imap::Session<S>,
+        name: &str,
+        a: &Value,
+        dirty: &mut Option<Option<cache_write_guard::DirtyWriteGuard>>,
     ) -> Result<Value>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
@@ -418,6 +434,7 @@ impl MailService {
                     .iter()
                     .map(|m| mailbox_metadata(m, &self.config))
                     .collect::<Result<Vec<_>>>()?;
+                self.persist_mailboxes(&mailboxes);
                 Ok(json!({"mailboxes":mailboxes}))
             }
             "get_email_status" | "download_attachment" => {
@@ -429,11 +446,16 @@ impl MailService {
                     .map_err(imap_error)?;
                 self.observe_mailbox(folder, &state);
                 check_validity(a, state.uid_validity)?;
+                let observe = |error| {
+                    self.observe_fetch_error(folder, state.uid_validity, state.uid_next, uid, error)
+                };
                 if name == "get_email_status" {
-                    return email_status(s, uid, state.uid_validity).await;
+                    return email_status(s, uid, state.uid_validity)
+                        .await
+                        .map_err(observe);
                 }
-                let raw = self.raw_attachment(s, uid).await?;
-                attachments::inline_download(
+                let raw = self.raw_attachment(s, uid).await.map_err(observe)?;
+                let value = attachments::inline_download(
                     &raw,
                     a,
                     &self.account,
@@ -441,39 +463,43 @@ impl MailService {
                     uid,
                     state.uid_validity.ok_or_else(MailError::backend)?,
                     self.config.max_output / 4,
-                )
+                );
+                if let Some(permit) = self.content_capture(folder) {
+                    if let Ok(part) = mime::parse(&raw) {
+                        self.persist_raw(folder, state.uid_validity, uid, &raw, &part);
+                    }
+                    self.capture_raw(folder, state.uid_validity, uid, raw, permit);
+                }
+                value
             }
-            "save_draft" => save_draft(s, &self.config, a).await,
+            "save_draft" => save_draft(s, &self.config, a, Some(self)).await,
             "create_mailbox" => {
-                s.create(mailbox_name(text(a, "name")?, InputLimits::LegacyWrite)?)
-                    .await
-                    .map_err(imap_error)?;
+                let name = text(a, "name")?;
+                let wire = mailbox_name(name, InputLimits::LegacyWrite)?;
+                let _dirty = self.cache_before_write(&[name]).await;
+                s.create(wire).await.map_err(imap_error)?;
                 Ok(json!({"status":"created"}))
             }
             "rename_mailbox" => {
-                s.rename(
-                    mailbox_name(text(a, "name")?, InputLimits::LegacyWrite)?,
-                    mailbox_name(text(a, "new_name")?, InputLimits::LegacyWrite)?,
-                )
-                .await
-                .map_err(imap_error)?;
+                let source = mailbox_name(text(a, "name")?, InputLimits::LegacyWrite)?;
+                let destination = mailbox_name(text(a, "new_name")?, InputLimits::LegacyWrite)?;
+                let _dirty = self.cache_before_folder_tree_write().await;
+                s.rename(source, destination).await.map_err(imap_error)?;
                 Ok(json!({"status":"renamed"}))
             }
             "delete_mailbox" => {
                 if a["confirm"] != true {
                     return Err(MailError::input());
                 }
-                s.delete(mailbox_name(text(a, "name")?, InputLimits::LegacyWrite)?)
-                    .await
-                    .map_err(imap_error)?;
+                let wire = mailbox_name(text(a, "name")?, InputLimits::LegacyWrite)?;
+                let _dirty = self.cache_before_folder_tree_write().await;
+                s.delete(wire).await.map_err(imap_error)?;
                 Ok(json!({"status":"deleted"}))
             }
             "move_email" | "delete_email" | "mark_email" => {
+                let source = folder(a, InputLimits::LegacyWrite)?;
                 let state = s
-                    .select(mailbox_name(
-                        folder(a, InputLimits::LegacyWrite)?,
-                        InputLimits::LegacyWrite,
-                    )?)
+                    .select(mailbox_name(source, InputLimits::LegacyWrite)?)
                     .await
                     .map_err(imap_error)?;
                 check_validity(a, state.uid_validity)?;
@@ -491,6 +517,9 @@ impl MailService {
                         } else {
                             "-FLAGS.SILENT"
                         };
+                        if dirty.is_none() {
+                            *dirty = Some(self.cache_before_write(&[source]).await);
+                        }
                         s.uid_store(uid, format!("{op} ({flag})"))
                             .await
                             .map_err(imap_error)?
@@ -510,6 +539,9 @@ impl MailService {
                                 retryable: false,
                                 details: None,
                             });
+                        }
+                        if dirty.is_none() {
+                            *dirty = Some(self.cache_before_write(&[source]).await);
                         }
                         s.uid_store(&uid, "+FLAGS.SILENT (\\Deleted)")
                             .await
@@ -539,9 +571,11 @@ impl MailService {
                                 details: None,
                             });
                         }
-                        s.uid_mv(&uid, mailbox_name(dest, InputLimits::LegacyWrite)?)
-                            .await
-                            .map_err(imap_error)?;
+                        let wire = mailbox_name(dest, InputLimits::LegacyWrite)?;
+                        if dirty.is_none() {
+                            *dirty = Some(self.cache_before_write(&[source, dest]).await);
+                        }
+                        s.uid_mv(&uid, wire).await.map_err(imap_error)?;
                     }
                 }
                 Ok(json!({"status":"updated"}))
@@ -568,6 +602,7 @@ impl MailService {
             session: s,
             name: single,
             args: a,
+            dirty: None,
         };
         Ok(run_batch(&mut executor, &ids, deadline).await)
     }
@@ -721,6 +756,7 @@ impl MailService {
         if let Some(old) = self.claim_send(principal, key, &fingerprint, &message_id, &raw)? {
             return Ok(json!({"operation":old}));
         }
+        let _dirty = self.cache_before_send().await;
         let submission = smtp.submit(&envelope, &raw).await;
         let operation = record_send(
             &self.journal,
@@ -758,20 +794,20 @@ struct SessionBatch<'a> {
     session: &'a mut Session,
     name: &'a str,
     args: &'a Value,
+    dirty: Option<Option<cache_write_guard::DirtyWriteGuard>>,
 }
 impl BatchExecutor for SessionBatch<'_> {
     async fn apply(&mut self, id: u32) -> Result<Value> {
         let mut args = self.args.clone();
         args["uid"] = json!(id);
         args.as_object_mut().unwrap().remove("uids");
+        let mailbox = folder(&args, InputLimits::LegacyWrite)?;
         let state = self
             .session
-            .select(mailbox_name(
-                folder(&args, InputLimits::LegacyWrite)?,
-                InputLimits::LegacyWrite,
-            )?)
+            .select(mailbox_name(mailbox, InputLimits::LegacyWrite)?)
             .await
             .map_err(|_| MailError::backend())?;
+        self.service.observe_mailbox(mailbox, &state);
         check_validity(&args, state.uid_validity)?;
         let found = self
             .session
@@ -782,11 +818,19 @@ impl BatchExecutor for SessionBatch<'_> {
             .await
             .map_err(|_| MailError::backend())?;
         if !found.iter().any(|f| f.uid == Some(id)) {
+            if found.is_empty() {
+                self.service
+                    .cache_tombstone(mailbox, state.uid_validity, state.uid_next, id);
+            }
             return Ok(json!({"uid":id,"status":"not_found"}));
         }
-        self.service
-            .with_session(self.session, self.name, &args)
-            .await?;
+        Box::pin(self.service.with_session_guarded(
+            self.session,
+            self.name,
+            &args,
+            &mut self.dirty,
+        ))
+        .await?;
         Ok(json!({"uid":id,"status":"updated"}))
     }
 }
@@ -1204,7 +1248,12 @@ where
     )
 }
 
-async fn save_draft<S>(s: &mut async_imap::Session<S>, config: &Config, a: &Value) -> Result<Value>
+async fn save_draft<S>(
+    s: &mut async_imap::Session<S>,
+    config: &Config,
+    a: &Value,
+    service: Option<&MailService>,
+) -> Result<Value>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
 {
@@ -1212,15 +1261,16 @@ where
     if raw.len() > config.max_message {
         return Err(MailError::limit());
     }
+    let mailbox = mailbox_name(&config.drafts, InputLimits::LegacyWrite)?;
+    let _dirty = if let Some(service) = service {
+        service.cache_before_write(&[&config.drafts]).await
+    } else {
+        None
+    };
     // async-imap serializes flags verbatim; RFC 3501 APPEND requires a flag list.
-    s.append(
-        mailbox_name(&config.drafts, InputLimits::LegacyWrite)?,
-        Some("(\\Draft)"),
-        None,
-        &raw,
-    )
-    .await
-    .map_err(|_| MailError::backend())?;
+    s.append(mailbox, Some("(\\Draft)"), None, &raw)
+        .await
+        .map_err(|_| MailError::backend())?;
     Ok(json!({"status":"saved","mailbox":config.drafts}))
 }
 
@@ -2037,7 +2087,7 @@ mod tests {
         };
         let (ids, next) = scan.unfiltered();
         let emails = service
-            .fetch_summaries(session, mailbox, state.uid_validity, &ids)
+            .fetch_summaries(session, mailbox, state.uid_validity, state.uid_next, &ids)
             .await?;
         Ok(json!({"emails":emails,"next_before_uid":next,"uid_validity":state.uid_validity}))
     }
@@ -2498,7 +2548,7 @@ mod tests {
                         }
                     });
                     let mut session = async_imap::Client::new(client).login("synthetic", "test-only").await.unwrap();
-                    let result = save_draft(&mut session, &crate::config::fixture(), &json!({"to":["recipient@example.test"],"subject":"synthetic draft","body":"synthetic body"})).await;
+                    let result = save_draft(&mut session, &crate::config::fixture(), &json!({"to":["recipient@example.test"],"subject":"synthetic draft","body":"synthetic body"}), None).await;
                     if outcome == "OK" {
                         assert_eq!(result.unwrap(), json!({"status":"saved","mailbox":"Drafts"}), "{notices} notifications");
                         assert_eq!(session.unsolicited_responses.len(), notices);
@@ -2574,6 +2624,7 @@ mod tests {
             let result = tokio::time::timeout(std::time::Duration::from_secs(2), save_draft(
                 &mut session, &crate::config::fixture(),
                 &json!({"to":["recipient@example.com"],"bcc":["hidden@example.com"],"subject":"synthetic draft","body":"synthetic body"}),
+                None,
             )).await.unwrap();
             server.await.unwrap();
             if status == "OK" {
