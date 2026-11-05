@@ -2,7 +2,69 @@
 
 本文件保存带版本与环境边界的证据。每次新增记录注明提交/tag、日期与时区、环境、命令、结果、CI 链接及未覆盖项；保留历史结果，不把其测试数量或部署状态当作当前版本的证明。验证要求见 [贡献指南](../CONTRIBUTING.md#验证与完成标准)。
 
+## 2026-11-05 R13 整体验收与 0.2.2 候选
+
+源码提交 `706cbdc4fc6f8d60cb71cf109cfce2356d3879f0`，父提交为 R12D 合并 `c4bdfc293123bd648068c4ce6dd426dfd86d9a4b`。本次增加独立进程的 Linux release 验收、实际 musl 打包与恢复脚本，并将版本提升至兼容新增的 0.2.2。服务与验收共用 `server::http_router`，认证客户端共用生产发现逻辑；根证书注入及资源观测仅在 Linux 测试构建中启用。
+
+### 精确输入与本地质量检查
+
+长跑使用提前冻结的树 `55d6e1c28597f29d099fd2450056f2c0c5a2d247`。最终源码提交的 `src`、`vendor`、Cargo.toml、Cargo.lock、rust-toolchain.toml、入口 Python 及整个 `scripts/r13` 的 Git 对象均与该树逐项一致；后来增加的文档和发布脚本单独审阅。harness SHA-256 为 `cd1788d510b5f19a6c566e96d3e0732e3d3c14550cacbf9ab4ab16d6e8217688`，driver.py 为 `9b42da2562079a38268c0b345f4cbe9fdd6db49a406396d17e32f4a9ac9c3b8d`；运行前后均核对 harness 与五份 Python 文件的摘要。
+
+WSL Ubuntu 24.04.4、Linux 6.18.54.1-microsoft-standard-WSL2、16 vCPU、Rust 1.99.1、Node 24.15.0。R13 默认整仓测试通过 **560 单元 + 57 集成**，4 项显式测试默认忽略；fmt、all-target Clippy 通过，显式 Rust→Node 八文件下载与内容读取通过，pnpm 客户端适配器 7/7 通过。最终 harness 构建前再次通过 fmt、Clippy 及缓存组 13/13。此前 130 秒联调通过，两阶段容量与双账户尾部推进均成功。测量期间暂停本机 Cargo/Docker 重编译。
+
+### 30 分钟持续验收
+
+运行窗口为 2026-11-05 22:28:49–22:59:15（Asia/Shanghai），完整模式返回 `passed:true`，驱动退出码 0，模拟服务与邮件服务正常关闭。独立网络命名空间仅启用 loopback；IMAP、HTTPS OIDC、MCP、主体及全部邮件均为本地合成数据。两账户各管理 INBOX 2500 封和 Archive 2532 封，总计 **10,064 封、1,006 个附件**；包含长中文折叠头、多层 MIME、跨目录副本和另设的 32 MiB 边界附件。验收配置为全局 10 GiB、每账户 5 GiB、同步间隔 1 秒、核对间隔 45 秒、auto 协议。
+
+持续混合负载为 **1812.164 秒**。在第 **1812.163 秒**重新取得四个初始冻结范围的完整状态：存在性/FLAGS、完整列表事实、头部、精确线程索引、部件清单、raw、full body 和正文索引各覆盖 10,064 封，附件实际物化 1,006 个；缺口、待处理、重试、配额阻塞、终止错误均为零。期间六次常规新增波次加一次慢下载重叠注入，两账户最终确认到 UID 2507；各执行 91 次 QRESYNC FETCH。JWKS 请求由 1 增至 7，沿用实际五分钟缓存期限。
+
+| 观测项 | default | second |
+| --- | --- | --- |
+| 冷 live get，8 个实际 cache miss 后的样本，p50/p95 ms | 25.375 / 39.373 | 27.484 / 34.594 |
+| 热显式 cache get，942 个成功样本，p50/p95 ms | 25.102 / 40.203 | 25.030 / 43.456 |
+| 预热 UID 的 live get，p50/p95 ms | 25.983 / 38.439 | 25.656 / 36.390 |
+| 持续窗口内成功前台请求 | 3808 | 3805 |
+| 持续窗口内最长成功间隔，秒 | 0.956 | 0.967 |
+| IMAP 完整命令/匹配完成 | 106769 / 106769 | 106765 / 106765 |
+| IMAP 连接数 | 28832 | 28828 |
+| 应用发送/接收明文字节 | 5347236 / 86846470 | 5404624 / 86728404 |
+
+冷/热表按请求类别分别统计；预热 UID 的 live 调用允许原有缓存探测和 BODYSTRUCTURE 路径。持续期间记录 39 次 `CACHE_NEEDS_VERIFICATION`（两账户 18/21），单独归入失败计数；启动阶段另记录 16 次冷探测 cache miss、1 次预热 miss 和容量测试的一次 BUSY。以上延迟是该合成负载与主动同步频率下的实测值。
+
+持续阶段服务进程 CPU 消耗 406.17 秒，折合单核平均 22.414%；峰值 RSS/HWM 为 **69,283,840 字节（66.1 MiB）**，低于 1 GiB 额度。1780 条采样独立复算一致，服务 PID 的 start_ticks 全程相同。缓存物理计费峰值 **170,135,552 字节**，含暂存/操作库在内的全部磁盘分配峰值 **237,219,840 字节**；缓存 SQLite 侧车峰值 225,280 字节。暂存最多 4 个文件、单文件最大 32 MiB；运行/后台/传输许可峰值分别 4/1/4。持续窗口内前台 7910 次、后台 114623 次已授予调度的排队 p50/p95 均落在不超过 10 微秒的直方图区间。
+
+初段与中段各执行两种容量场景：先由模拟 IMAP 挂起四个真实 GET 的首块 BODY.PEEK 回复，占满四个后端与传输许可；再让四个 HTTP 客户端停读并持有文件/传输许可，后端槽位已释放。两种状态的第五路均返回 429，取消后暂存清空，额外下载及摘要校验成功。初段排队请求在 10017.032 ms 返回 BUSY；中段释放后排队请求在 186.245 ms 成功。中段四个停读 lease 仍持有时，两账户前台读取成功，新增 UID 2504 均已同步完成。65,537 字节、16 MiB、32 MiB 及 257 字节多层附件摘要全部匹配；尾部中文正文检索得到 5 个命中，并找到 INBOX/Archive 的关联副本。
+
+### 验收矩阵与审阅
+
+R13 长跑覆盖规模、完整物化、双账户、持续鉴权刷新、冷热读取、中文索引、跨目录副本及慢下载公平性。其余场景由同一源码的专项回归补齐：
+
+- HTML 链接/列表/表格及 Unicode/预算由 readable、body_parts、listing 和 input 回归验证；HTML 使用纯本地 tokenizer 渲染，签名样例核对 tracking 内容处理，长跑使用仅 loopback 的网络隔离。
+- 成功、partial、错误和 wire fallback 的 outputSchema 由真实签名 HTTP 回归核验。账户同 UID/Message-ID/附件身份、撤权与零越权连接由 accounts 回归覆盖。
+- raw/parts 字节一致、无关部件省读、chunk/EOF 和协议错误由 body_parts、structure、parts 及 vendored 预算回归覆盖。
+- 精确在线缓存命中的 EXAMINE+SIZE 路径、断 IMAP 的离线正文/附件、重启、配额恢复、FLAGS/移动/删除和 UIDVALIDITY 由 cache、sync_acceptance、qresync_acceptance 与账户回归覆盖。
+- 八文件客户端下载复核相同 fixture 摘要；CSV/XLSX 金额与 PDF 文本解析沿用对应摘要的隔离解析探针证据，详见 R04 验证。此次长跑另核验边界和多层附件摘要。
+
+独立审阅逐项核对计划要求、生产接线、脚本、冻结输入、最终 JSON 和 1780 条采样，未发现待修复问题。报告 SHA-256 为 `3b6e67bd20ca231f1cc1bdf51039d3f774d933e50d0da5e3033541a319c742bb`，NDJSON 为 `d2bd66ea6bce80cbc950e3f4d265a5dab50a65e61c2f389306c5cc012d28b120`，退出日志为 `21b65750e9dbf614591a6b2c5d2654d4a8814acde3ffceb22f84c42725645acf`。完整证据私有保存于运行目录 `r13-acceptance-0.2.2-cd1788d5.gP4XSN`；目录 0700、报告/采样/日志 0600。附件客户端验收范围保持离线，真实 ChatGPT 接入和生产部署按独立流程安排。
+
+### 提交绑定的 musl 候选
+
+正式产物从 `706cbdc4fc6f8d60cb71cf109cfce2356d3879f0` 的 Git archive 导出，在脚本创建的独立 Cargo target 中执行 `cargo +1.99.1 build --release --locked --target x86_64-unknown-linux-musl`。环境为 Ubuntu 24.04.4 amd64、rustc/cargo 1.99.1、musl-gcc GCC 13.3、GNU ld/readelf 2.42、uv 0.11.18。首次命令因缺少 rustup shim PATH 在编译前退出；补齐 PATH 后正式构建用时 1 分 18 秒，退出码 0。
+
+命令为 `bash scripts/package-release.sh --source-sha 706cbdc4fc6f8d60cb71cf109cfce2356d3879f0 --output <新的绝对目录> --schema-version 6`。产物解包后再次核验为 ELF64 amd64 static PIE，程序头无 PT_INTERP，动态段无 DT_NEEDED；实际 V6 恢复代次 1/2/3、off 启动见证更新、损坏见证先于 Journal 拒绝、操作库哨兵及 0700/0600 均通过。
+
+| 产物 | 字节 | SHA-256 |
+| --- | --- | --- |
+| `rust-email-mcp-0.2.2-x86_64-unknown-linux-musl.tar.gz` | 9206385 | `f9c92c10c6d0d835d0c73c2ccfefc3ed1de0f8086579dde6e3459aaf0ba42bc4` |
+| 归档内 `rust-email-mcp` | 21738544 | `d9b307af1cdec85549b596016135f02915419d5ce9ad144dafce4558c95cd758` |
+
+归档含程序、README、LICENSE、SOURCE.txt 四个文件；SOURCE 标识 `source_kind=commit` 和完整源码 SHA，README/LICENSE 与该提交逐字节一致。Linux `sha256sum -c` 和 Windows 副本摘要均通过。构建/复验日志保存于私有目录 `r13-release-build-706cbdc`，候选包及 SHA256SUMS 交付目录为 `rust-email-mcp-r13/release-706cbdc`。快照模式另外验证了相同输入归档与校验文件逐字节一致，以及动态 ELF、已存在目录/符号链接和无效提交参数的拒绝。
+
+源码、持续验收和候选包由 [PR #82](https://github.com/black-zero358/rust-email-mcp/pull/82) 统一交付；该 PR 用于记录最终提交的 check/audit/container、独立审阅与合并结果。候选包绑定上述源码提交，随后文档提交仅补充交付证据。
+
 ## 2026-11-05 R12 QRESYNC 标记与删除同步
+
+[PR #81](https://github.com/black-zero358/rust-email-mcp/pull/81) 最终 head `4eaa8440b59095a3ed0f0e946da0abf2fac5fe23` 的 [CI 42049072675](https://github.com/black-zero358/rust-email-mcp/actions/runs/42049072675) 中 check、audit、container 全部通过。精确源码与最终文档独立审阅闭环；GitHub 自动审阅遇到账户限流，评论及空 review threads 已核对。合并为 `c4bdfc293123bd648068c4ce6dd426dfd86d9a4b`，本地与远端 main/开发分支四个引用同步，R13 工作区保留。
 
 源码 `4963b8b6f24fcc7678516f3e8579be1938d1b111`，父提交为 CONDSTORE 合并 `62f353bdc297836aae72b27cd46f44a4cb9c44d9`。独立验证树为 `e658583e89a49d15c90ca287005db7daf9060c5c`；最终提交的全部 QRESYNC 生产、协议、存储和测试与该树一致，另继承 PR #80 已验证的缓存就绪测试修复及两份文档。环境为 WSL Ubuntu、Rust 1.99.1、Node 24.15.0；使用本地模拟服务、签名 HTTP 客户端和合成邮件。
 
