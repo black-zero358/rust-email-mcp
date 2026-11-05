@@ -33,6 +33,8 @@ mod conversation;
 mod listing;
 mod parts;
 mod qresync_acceptance;
+#[cfg(target_os = "linux")]
+mod r13_acceptance;
 mod structure;
 mod sync_acceptance;
 
