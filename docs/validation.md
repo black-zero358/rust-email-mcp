@@ -26,6 +26,12 @@
 
 实际镜像从 `git archive b5366fd6f66fb2f182d5c656a60f6866b67c5910` 的独立目录构建通过，标签 `rust-email-mcp:r12-condstore-local`，manifest list digest 为 `sha256:7666fde3a0df79a7cec106317ab55079c9afc05de171178a1538ad901554da6b`。Docker release 步骤共 16 分 24 秒，其中索引和依赖下载约 15 分钟；同一次构建持续完成。QRESYNC 与 R13 持续负载由后续批次验收；真实 ChatGPT 接入与生产部署按各自流程安排。
 
+### CI 修复与复验
+
+[PR #80](https://github.com/black-zero358/rust-email-mcp/pull/80) 的文档 head `f56087f9353e0d583323a6047c39da515dfa6025` 在 [CI 42037937705](https://github.com/black-zero358/rust-email-mcp/actions/runs/42037937705) 中通过 audit/container，check 出现两项缓存快照争用及一项配额恢复 fixture 网络等待失败。修复提交 `656861b634f0084bb225a6e14fed85d6279251b3` 仅修改两份测试文件：离线列表只对 `CACHE_NEEDS_VERIFICATION` 在原等待期限内重试，成功后继续严格核对 FLAGS；模拟 TLS IMAP 在 greeting、登录和完整 tagged 回复边界调用 flush。生产源码、邮件样本大小及操作期限保持原值。刷新语义依据 [tokio-rustls 0.26.6 文档](https://docs.rs/tokio-rustls/0.26.6/tokio_rustls/#why-do-i-need-to-call-poll_flush)。
+
+隔离诊断在 4 MiB 邮件最后一块 `BODY.PEEK[]<4194304.184>` 的底层密文写入处注入一次 Pending：无 flush 时 28.33 秒失败并复现相同 network 缺口；增加 flush 后 10.36 秒通过。相同补丁的精确快照在默认并发下通过 fmt、539 单元与 53 集成（2 项默认忽略）、all-target Clippy 和 release；单元 52.09 秒、Clippy 12.02 秒、release 32.34 秒。额外单 CPU 并发诊断中配额恢复通过，两项原先通过的后台测试达到各自 25 秒等待上限；本次保留其等待期限。独立补丁审阅完成，后续合并以新 head 的三项 CI 为准。
+
 ## 2026-11-05 R12 后台同步与有界回收
 
 [PR #79](https://github.com/black-zero358/rust-email-mcp/pull/79) 最终 head `80fd706f7852982dcc99f010eabe94d81213b7c7` 的 [CI 42030094273](https://github.com/black-zero358/rust-email-mcp/actions/runs/42030094273) 中 check、audit、container 全部通过。精确源码及最终文档 head 的独立交叉审阅完成；GitHub 自动审阅遇到账户限流，已核对评论和空 review threads。合并提交为 `68b32353c2214b238c6f4ed33768316254d1275e`，本地 main、开发分支及对应远端引用已同步；R12C 工作区改动保留。
