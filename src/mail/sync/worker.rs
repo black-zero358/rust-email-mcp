@@ -22,6 +22,7 @@ use tokio::{task::JoinHandle, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 mod condstore;
+mod qresync;
 
 const PAGE: usize = 200;
 const BACKOFF: Duration = Duration::from_secs(5);
@@ -57,6 +58,7 @@ enum ActiveProtocol {
     #[default]
     Rev1,
     Condstore,
+    Qresync,
 }
 
 #[derive(Clone, Copy, serde::Serialize)]
@@ -66,6 +68,9 @@ enum ProtocolFallback {
     ExtensionFailed,
     Nomodseq,
     ModseqRollback,
+    QresyncEnableFailed,
+    QresyncFailed,
+    QresyncReconciliationRequired,
 }
 
 #[derive(Clone, Copy, serde::Serialize)]
@@ -442,6 +447,7 @@ async fn execute(
         mailbox: folder.name.clone(),
         cancellation,
         transport: Arc::new(AtomicUsize::new(service.config.max_message * 4)),
+        connections: AtomicUsize::new(0),
         deadline: Instant::now() + service.config.timeout,
         negotiated: Mutex::default(),
     };
@@ -499,7 +505,8 @@ impl Error {
                 SyncError::Stale
                 | SyncError::Cancelled
                 | SyncError::NotReady
-                | SyncError::ClaimActive,
+                | SyncError::ClaimActive
+                | SyncError::ReconcileRequired,
             ) => Turn::Deferred,
             Self::Mail(error) if matches!(error.code, "BUSY" | "TIMEOUT") => {
                 Turn::Failed(Failure::Network)
@@ -519,6 +526,7 @@ struct Batch<'a> {
     mailbox: String,
     cancellation: CancellationToken,
     transport: Arc<AtomicUsize>,
+    connections: AtomicUsize,
     deadline: Instant,
     negotiated: Mutex<Option<ProtocolHealth>>,
 }
@@ -547,6 +555,22 @@ impl Scope {
         self.persistent
             .sync_commit_epoch(&self.account, &self.mailbox, observation.uid_validity);
         Ok(scan)
+    }
+
+    fn observe_delta(&self, observation: DeltaObservation) -> Result<()> {
+        if !self.current(observation.uid_validity) {
+            return Err(Error::Deferred);
+        }
+        self.cache.observe_folder(
+            &self.account,
+            &self.mailbox,
+            observation.uid_validity,
+            Some(observation.uid_next - 1),
+            observation.checked_at_ms,
+        )?;
+        self.persistent
+            .sync_commit_epoch(&self.account, &self.mailbox, observation.uid_validity);
+        Ok(())
     }
 
     fn apply_delta_invalidation(
@@ -626,6 +650,14 @@ impl Batch<'_> {
             return Err(MailError::account_unavailable());
         }
         self.service.backend_ready()?;
+        // An extension fallback and SEARCH narrowing use the same turn.
+        if self
+            .connections
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            >= 2
+        {
+            return Err(MailError::backend());
+        }
         self.service
             .connect_inner(true, Some(self.transport.clone()))
             .await
@@ -706,12 +738,42 @@ impl Batch<'_> {
     }
 
     async fn reconciliation_fence(&self) -> Result<Arc<ReconcileFence>> {
+        // A foreground result which began executing before the deletion
+        // fence must settle before the new audit freezes its known UID set.
+        if self
+            .service
+            .persistent
+            .qresync_recovery(&self.lease.key, &self.mailbox)?
+            .is_some_and(|recovery| !recovery.auditing)
+        {
+            self.service.persistent.sync_write_barrier().await?;
+        }
         self.local(|scope| {
-            Ok(Arc::new(
-                scope
+            let mut fence = scope
+                .cache
+                .sync_reconcile_fence(&scope.account, &scope.mailbox)?;
+            if let Some(recovery) = scope
+                .persistent
+                .qresync_recovery(&scope.account, &scope.mailbox)?
+                && !recovery.auditing
+            {
+                scope.cache.require_qresync_reconcile(
+                    &scope.account,
+                    &scope.mailbox,
+                    recovery.validity,
+                    &fence,
+                    &|| !scope.current(recovery.validity),
+                )?;
+                scope.persistent.start_qresync_recovery(
+                    &scope.account,
+                    &scope.mailbox,
+                    recovery.validity,
+                )?;
+                fence = scope
                     .cache
-                    .sync_reconcile_fence(&scope.account, &scope.mailbox)?,
-            ))
+                    .sync_reconcile_fence(&scope.account, &scope.mailbox)?;
+            }
+            Ok(Arc::new(fence))
         })
         .await
     }
@@ -832,6 +894,14 @@ impl Batch<'_> {
             let state = proof.commit_reconcile(&scope.cache, &stamp, &page, now()?, &|| {
                 !scope.current(stamp.uid_validity)
             })?;
+            if state.complete {
+                scope.persistent.finish_qresync_recovery(
+                    &scope.account,
+                    &scope.mailbox,
+                    stamp.uid_validity,
+                    true,
+                );
+            }
             if state.complete || new_fence {
                 scope.persistent.sync_finish_reconcile(
                     &scope.account,

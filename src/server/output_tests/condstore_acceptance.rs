@@ -49,12 +49,12 @@ struct Remote {
 impl Remote {
     fn reply(&mut self, mailbox: &str, command: &str) -> Option<(Vec<u8>, &'static str)> {
         if command == "CAPABILITY" {
-            // QRESYNC implies CONDSTORE. This release must still avoid ENABLE.
+            // Keep this fixture focused on a server offering CONDSTORE alone.
             return Some((
                 if matches!(self.mode, Mode::Unsupported) {
                     b"* CAPABILITY IMAP4rev1 UIDPLUS\r\n".to_vec()
                 } else {
-                    b"* CAPABILITY IMAP4rev1 UIDPLUS ENABLE QRESYNC\r\n".to_vec()
+                    b"* CAPABILITY IMAP4rev1 UIDPLUS CONDSTORE\r\n".to_vec()
                 },
                 "OK",
             ));

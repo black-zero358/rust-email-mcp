@@ -18,10 +18,17 @@ pub struct MailRuntime {
 
 tokio::task_local! {
     pub(super) static READ_ADMISSION: Arc<BackendPermit>;
+    pub(super) static WRITE_THROUGH_REVISION: u64;
 }
 
 pub(super) fn read_admission() -> Option<Arc<BackendPermit>> {
     READ_ADMISSION.try_with(Arc::clone).ok()
+}
+
+pub(super) fn write_through_revision() -> u64 {
+    WRITE_THROUGH_REVISION
+        .try_with(|revision| *revision)
+        .unwrap_or(0)
 }
 
 impl MailRuntime {
@@ -265,7 +272,16 @@ impl MailRuntime {
             .map_err(admission_error)?;
         // Admission can be shared with blocking preflight work. After the
         // write starts, ACL cancellation never cuts its outcome handling.
-        READ_ADMISSION.scope(Arc::new(permit), operation).await
+        let revision = self
+            .service_for(&lease.key)?
+            .persistent
+            .write_through_revision();
+        READ_ADMISSION
+            .scope(
+                Arc::new(permit),
+                WRITE_THROUGH_REVISION.scope(revision, operation),
+            )
+            .await
     }
 
     pub(crate) async fn cross_conversation(
@@ -304,7 +320,9 @@ impl MailRuntime {
         service.backend_ready()?;
         self.run_cached(lease, async {
             service.backend_ready()?;
-            operation.await
+            WRITE_THROUGH_REVISION
+                .scope(service.persistent.write_through_revision(), operation)
+                .await
         })
         .await
     }

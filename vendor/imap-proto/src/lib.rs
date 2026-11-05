@@ -40,6 +40,7 @@ mod tests;
 #[non_exhaustive]
 pub enum Response<'a> {
     Capabilities(Vec<Capability<'a>>),
+    Enabled(Vec<Capability<'a>>),
     Continue(Outcome<'a>),
     Done {
         tag: RequestId,
@@ -131,9 +132,23 @@ impl<'a> Response<'a> {
         bounded::parse_condstore(msg, limits)
     }
 
+    /// Parse bounded synchronization responses, including ENABLED and VANISHED.
+    pub fn parse_bounded_qresync(
+        msg: &'a [u8],
+        limits: &bounded::BodyStructureLimits,
+    ) -> bounded::ParseResult<'a> {
+        bounded::parse_qresync(msg, limits)
+    }
+
     pub fn into_owned(self) -> Response<'static> {
         match self {
             Response::Capabilities(capabilities) => Response::Capabilities(
+                capabilities
+                    .into_iter()
+                    .map(Capability::into_owned)
+                    .collect(),
+            ),
+            Response::Enabled(capabilities) => Response::Enabled(
                 capabilities
                     .into_iter()
                     .map(Capability::into_owned)

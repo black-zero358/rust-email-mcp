@@ -43,6 +43,24 @@ struct Persistent {
     sync_absence: Mutex<HashMap<GenerationKey, u32>>,
     sync_epochs: Mutex<HashMap<GenerationKey, u32>>,
     delta_invalidations: Mutex<HashMap<GenerationKey, (u32, DeltaInvalidation)>>,
+    qresync_fences: Arc<Mutex<QresyncFences>>,
+}
+
+#[derive(Default)]
+struct QresyncFences {
+    revision: u64,
+    scopes: HashMap<GenerationKey, QresyncScope>,
+}
+
+struct QresyncScope {
+    revision: u64,
+    recovery: Option<QresyncRecovery>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct QresyncRecovery {
+    pub(super) validity: u32,
+    pub(super) auditing: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -54,6 +72,7 @@ pub(super) enum DeltaInvalidation {
 type CacheJob = Box<dyn FnOnce(&Arc<Cache>) + Send>;
 enum CacheMessage {
     Work(CacheJob),
+    Barrier(oneshot::Sender<()>),
     Finish(Arc<Persistent>, oneshot::Sender<()>),
 }
 type GenerationKey = ([u8; 32], String);
@@ -147,6 +166,9 @@ impl PreparedCache {
                         while let Some(job) = jobs.blocking_recv() {
                             match job {
                                 CacheMessage::Work(job) => job(&worker),
+                                CacheMessage::Barrier(done) => {
+                                    let _ = done.send(());
+                                }
                                 CacheMessage::Finish(state, done) => {
                                     if state.can_mark_clean() {
                                         let _ = worker.mark_clean();
@@ -190,6 +212,7 @@ impl PreparedCache {
             sync_absence: Mutex::default(),
             sync_epochs: Mutex::default(),
             delta_invalidations: Mutex::default(),
+            qresync_fences: Arc::default(),
         }))))
     }
 
@@ -241,6 +264,13 @@ impl PreparedCache {
                     .sync_absence
                     .lock()
                     .is_ok_and(|fences| fences.get(&key) != Some(&validity))
+                    && state.qresync_fences.lock().is_ok_and(|fences| {
+                        fences
+                            .scopes
+                            .get(&key)
+                            .and_then(|scope| scope.recovery)
+                            .is_none_or(|proof| proof.validity < validity)
+                    })
             })
     }
 
@@ -312,6 +342,131 @@ impl PreparedCache {
                 .is_some_and(|(epoch, _)| *epoch < validity)
         {
             invalidations.remove(&key);
+        }
+        if let Ok(mut fences) = state.qresync_fences.lock()
+            && let Some(scope) = fences.scopes.get_mut(&key)
+            && scope
+                .recovery
+                .is_some_and(|proof| proof.validity < validity)
+        {
+            scope.recovery = None;
+        }
+    }
+
+    pub(super) fn write_through_revision(&self) -> u64 {
+        self.0
+            .as_ref()
+            .and_then(|state| state.qresync_fences.lock().ok())
+            .map_or(0, |fences| fences.revision)
+    }
+
+    pub(super) async fn sync_write_barrier(&self) -> std::result::Result<(), CacheError> {
+        let queue = self
+            .0
+            .as_ref()
+            .and_then(|state| state.queue.as_ref())
+            .ok_or(CacheError::Storage)?;
+        let (done, wait) = oneshot::channel();
+        queue
+            .send(CacheMessage::Barrier(done))
+            .await
+            .map_err(|_| CacheError::Storage)?;
+        wait.await.map_err(|_| CacheError::Storage)
+    }
+
+    pub(super) fn qresync_recovery(
+        &self,
+        account: &AccountKey,
+        mailbox: &str,
+    ) -> std::result::Result<Option<QresyncRecovery>, CacheError> {
+        let Some(state) = &self.0 else {
+            return Ok(None);
+        };
+        let key = (account.reference_namespace(), mailbox.into());
+        Ok(state
+            .qresync_fences
+            .lock()
+            .map_err(|_| CacheError::Storage)?
+            .scopes
+            .get(&key)
+            .and_then(|scope| scope.recovery))
+    }
+
+    pub(super) fn fence_qresync_deletion(
+        &self,
+        account: &AccountKey,
+        mailbox: &str,
+        validity: u32,
+    ) -> bool {
+        let Some(state) = &self.0 else { return false };
+        let key = (account.reference_namespace(), mailbox.into());
+        current_generation(&state.generations, &key, validity)
+            && state.qresync_fences.lock().is_ok_and(|mut fences| {
+                if fences
+                    .scopes
+                    .get(&key)
+                    .and_then(|scope| scope.recovery)
+                    .is_some_and(|proof| proof.validity > validity)
+                {
+                    return false;
+                }
+                fences.revision += 1;
+                let revision = fences.revision;
+                fences.scopes.insert(
+                    key,
+                    QresyncScope {
+                        revision,
+                        recovery: Some(QresyncRecovery {
+                            validity,
+                            auditing: false,
+                        }),
+                    },
+                );
+                true
+            })
+    }
+
+    pub(super) fn start_qresync_recovery(
+        &self,
+        account: &AccountKey,
+        mailbox: &str,
+        validity: u32,
+    ) -> std::result::Result<(), CacheError> {
+        let state = self.0.as_ref().ok_or(CacheError::Storage)?;
+        let key = (account.reference_namespace(), mailbox.into());
+        let mut fences = state
+            .qresync_fences
+            .lock()
+            .map_err(|_| CacheError::Storage)?;
+        if let Some(proof) = fences
+            .scopes
+            .get_mut(&key)
+            .and_then(|scope| scope.recovery.as_mut())
+            .filter(|proof| proof.validity == validity)
+        {
+            proof.auditing = true;
+        }
+        Ok(())
+    }
+
+    pub(super) fn finish_qresync_recovery(
+        &self,
+        account: &AccountKey,
+        mailbox: &str,
+        validity: u32,
+        auditing: bool,
+    ) {
+        if let Some(state) = &self.0
+            && let Ok(mut fences) = state.qresync_fences.lock()
+        {
+            let key = (account.reference_namespace(), mailbox.into());
+            if let Some(scope) = fences.scopes.get_mut(&key)
+                && scope
+                    .recovery
+                    .is_some_and(|proof| proof.validity == validity && proof.auditing == auditing)
+            {
+                scope.recovery = None;
+            }
         }
     }
 
@@ -565,12 +720,14 @@ impl PreparedCache {
                             == Some(DeltaInvalidation::All)
                     }) {
                         progress["condstore"] = Value::Null;
+                        progress["qresync"] = Value::Null;
                     }
                     if folder.uid_validity.is_some_and(|validity| {
                         !self.offline_current(account, &folder.mailbox, validity, None)
                     }) {
                         progress["progress"] = Value::Null;
                         progress["condstore"] = Value::Null;
+                        progress["qresync"] = Value::Null;
                         progress["error"] = json!("verification_pending");
                     }
                 }
@@ -612,6 +769,66 @@ impl PreparedCache {
         self.0
             .as_ref()
             .is_some_and(|state| state.enabled(account, mailbox))
+    }
+
+    fn submit_evidence(
+        &self,
+        account: &AccountKey,
+        mailbox: String,
+        bytes: usize,
+        operation: impl FnOnce(&Arc<Cache>, &AccountKey) -> std::result::Result<(), CacheError>
+        + Send
+        + 'static,
+    ) {
+        let Some(state) = &self.0 else { return };
+        let fences = state.qresync_fences.clone();
+        let key = (account.reference_namespace(), mailbox);
+        let revision = runtime::write_through_revision();
+        let current = move || {
+            fences.lock().is_ok_and(|fences| {
+                fences
+                    .scopes
+                    .get(&key)
+                    .is_none_or(|scope| revision >= scope.revision)
+            })
+        };
+        if current() {
+            self.submit(account, bytes, true, move |cache, account| {
+                if current() {
+                    operation(cache, account)
+                } else {
+                    Ok(())
+                }
+            });
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_header_write_for_test(
+        &self,
+        account: &AccountKey,
+        uid: u32,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (enter, entered) = oneshot::channel();
+        let (release, wait) = oneshot::channel();
+        self.submit_evidence(account, "INBOX".into(), 4096, move |cache, account| {
+            let _ = enter.send(());
+            if wait.blocking_recv().is_ok() {
+                cache.remember_headers(
+                    CacheRef {
+                        account,
+                        mailbox: "INBOX",
+                        uid_validity: 9,
+                        uid,
+                    },
+                    true,
+                    b"Subject: old FIFO evidence\r\n\r\n",
+                    None,
+                )?;
+            }
+            Ok(())
+        });
+        (entered, release)
     }
 
     fn submit(
@@ -702,16 +919,19 @@ fn sync_folder_status(
     let status = cache
         .sync_scope_status(account, mailbox)
         .and_then(|progress| {
-            let delta = if protocol == SyncProtocol::Auto {
-                cache.delta_status(account, mailbox, DeltaLane::Flags)?
+            let (flags, deletions) = if protocol == SyncProtocol::Auto {
+                (
+                    cache.delta_status(account, mailbox, DeltaLane::Flags)?,
+                    cache.delta_status(account, mailbox, DeltaLane::FlagsAndExpunges)?,
+                )
             } else {
-                None
+                (None, None)
             };
-            Ok((progress, delta))
+            Ok((progress, flags, deletions))
         });
     match status {
-        Ok((progress, delta)) => {
-            json!({"mailbox":mailbox,"progress":progress,"condstore":delta,"error":null})
+        Ok((progress, flags, deletions)) => {
+            json!({"mailbox":mailbox,"progress":progress,"condstore":flags,"qresync":deletions,"error":null})
         }
         Err(error) => {
             let error = if matches!(error, SyncError::Cache(CacheError::Quota)) {
@@ -719,7 +939,7 @@ fn sync_folder_status(
             } else {
                 "storage"
             };
-            json!({"mailbox":mailbox,"progress":null,"condstore":null,"error":error})
+            json!({"mailbox":mailbox,"progress":null,"condstore":null,"qresync":null,"error":error})
         }
     }
 }
@@ -813,6 +1033,10 @@ impl Persistent {
                 .delta_invalidations
                 .lock()
                 .is_ok_and(|scopes| scopes.is_empty())
+            && self
+                .qresync_fences
+                .lock()
+                .is_ok_and(|fences| fences.scopes.values().all(|scope| scope.recovery.is_none()))
             && self
                 .sync_absence
                 .lock()
@@ -996,8 +1220,11 @@ impl MailService {
                         })
                 })
                 .sum::<usize>();
-        self.persistent
-            .submit(&self.account, bytes, true, move |cache, account| {
+        self.persistent.submit_evidence(
+            &self.account,
+            mailbox.clone(),
+            bytes,
+            move |cache, account| {
                 for item in items {
                     cache.remember_listing(
                         CacheRef {
@@ -1015,7 +1242,8 @@ impl MailService {
                     )?;
                 }
                 Ok(())
-            });
+            },
+        );
     }
 
     pub(super) fn content_capture(&self, mailbox: &str) -> Option<ContentAdmission> {
@@ -1129,10 +1357,10 @@ impl MailService {
             return;
         };
         let mailbox = canonical_mailbox(mailbox).to_owned();
-        self.persistent.submit(
+        self.persistent.submit_evidence(
             &self.account,
+            mailbox.clone(),
             4096 + mailbox.capacity(),
-            true,
             move |cache, account| {
                 let payload = retained;
                 let reference = CacheRef {
@@ -1156,10 +1384,10 @@ impl MailService {
         capture: attachments::staging::Capture,
     ) {
         let mailbox = canonical_mailbox(mailbox).to_owned();
-        self.persistent.submit(
+        self.persistent.submit_evidence(
             &self.account,
+            mailbox.clone(),
             4096 + mailbox.capacity(),
-            true,
             move |cache, account| {
                 use std::io::Write;
                 let payload = capture;
@@ -1207,10 +1435,10 @@ impl MailService {
             return;
         };
         let mailbox = canonical_mailbox(mailbox).to_owned();
-        self.persistent.submit(
+        self.persistent.submit_evidence(
             &self.account,
+            mailbox.clone(),
             4096 + mailbox.capacity(),
-            true,
             move |cache, account| {
                 use std::io::Write;
                 let (_permit, raw) = (retained.1, retained.0);
@@ -1292,10 +1520,10 @@ impl MailService {
             return;
         }
         let mailbox = canonical_mailbox(mailbox).to_owned();
-        self.persistent.submit(
+        self.persistent.submit_evidence(
             &self.account,
+            mailbox.clone(),
             4096 + mailbox.capacity(),
-            true,
             move |cache, account| {
                 cache.record_artifact_state(
                     CacheRef {
@@ -1371,8 +1599,11 @@ impl MailService {
                 .iter()
                 .map(HeaderObservation::owned_bytes)
                 .sum::<usize>();
-        self.persistent
-            .submit(&self.account, bytes, true, move |cache, account| {
+        self.persistent.submit_evidence(
+            &self.account,
+            mailbox.clone(),
+            bytes,
+            move |cache, account| {
                 for item in observations {
                     let reference = CacheRef {
                         account,
@@ -1404,7 +1635,8 @@ impl MailService {
                     }
                 }
                 Ok(())
-            });
+            },
+        );
     }
 
     pub(super) fn persist_manifest(
@@ -1450,10 +1682,10 @@ impl MailService {
         let expected_bytes = expected.as_ref().map_or(0, |parts| {
             parts.capacity() * std::mem::size_of::<(ArtifactKey, ArtifactState)>()
         });
-        self.persistent.submit(
+        self.persistent.submit_evidence(
             &self.account,
+            mailbox.clone(),
             4096 + mailbox.capacity() + bytes.capacity() + expected_bytes,
-            true,
             move |cache, account| {
                 let reference = CacheRef {
                     account,

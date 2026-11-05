@@ -144,6 +144,21 @@ grammar is enabled. The ordinary response parser retains its original grammar.
 Run `cargo test --locked --test sync_delta_budget`. See
 [RFC 7162 §§3.1.2, 3.1.4 and 6](https://www.rfc-editor.org/rfc/rfc7162#section-3.1.2).
 
+### Opt-in QRESYNC responses
+
+`Response::parse_bounded_qresync` adds typed ENABLED atoms and VANISHED
+intervals to the bounded CONDSTORE profile. It limits each raw response to
+200 range entries before retaining their allocation. Endpoints are nonzero
+32-bit decimals, with no wildcard expansion. Descending endpoints normalize
+to ascending intervals. The parser retains raw interval entries so the
+collector can enforce a cumulative count before merging overlaps. The wire
+grammar preserves EARLIER as distinct from realtime removals. Legacy
+response parsing keeps its existing ENABLED and VANISHED behavior.
+
+Run `cargo test --locked --test sync_qresync_budget`. See
+[RFC 5161 §3.2](https://www.rfc-editor.org/rfc/rfc5161#section-3.2) and
+[RFC 7162 §§3.2.6 and 3.2.10](https://www.rfc-editor.org/rfc/rfc7162#section-3.2.6).
+
 ## Advisory auditing and maintenance
 
 Run `bash scripts/test-audit-dependencies.sh`, then

@@ -1,7 +1,10 @@
 //! Durable, scope-bound modification sequence baselines and page receipts.
 use super::*;
-use crate::cache::{Database, dirty::scope_dirty};
-use std::collections::BTreeMap;
+use crate::cache::{Database, dirty::scope_dirty, metadata::ensure_message_row};
+use std::collections::{BTreeMap, BTreeSet};
+
+mod qresync;
+pub use qresync::{QresyncChanges, QresyncPreview};
 
 const FLAGS_BUDGET: usize = 128 * 1024;
 
@@ -101,6 +104,18 @@ struct RoundState {
     revision: i64,
     proof_revision: i64,
     known_after: u32,
+}
+
+struct DeltaSource<'a> {
+    namespace: Namespace,
+    mailbox: &'a str,
+    lane: DeltaLane,
+    preview: Option<&'a QresyncPreview>,
+}
+
+struct PreparedChanges {
+    flags: BTreeMap<u32, Vec<u8>>,
+    vanished: BTreeSet<u32>,
 }
 
 impl LaneState {
@@ -284,12 +299,36 @@ impl Cache {
         fence: &ReconcileFence,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<DeltaStart, SyncError> {
+        let source = DeltaSource {
+            namespace: self.scope(account, mailbox)?,
+            mailbox,
+            lane,
+            preview: None,
+        };
+        self.start_delta_inner(source, observation, fence, cancelled)
+    }
+
+    fn start_delta_inner(
+        &self,
+        source: DeltaSource<'_>,
+        observation: DeltaObservation,
+        fence: &ReconcileFence,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<DeltaStart, SyncError> {
         let highest = observation.validate()?;
         check_cancel(cancelled)?;
-        if lane != DeltaLane::Flags || !self.full {
+        if !self.full {
             return Err(SyncError::Invalid);
         }
-        let namespace = self.scope(account, mailbox)?;
+        let DeltaSource {
+            namespace,
+            mailbox,
+            lane,
+            preview,
+        } = source;
+        if !self.namespace_has_folder(&namespace, mailbox) {
+            return Err(CacheError::OutOfScope.into());
+        }
         let mut databases = self.lock()?;
         let database = databases
             .get_mut(&namespace)
@@ -310,6 +349,9 @@ impl Cache {
         };
         if scope_dirty(db, mailbox)? {
             return Ok(DeltaStart::NeedsBaseline);
+        }
+        if let Some(preview) = preview {
+            qresync::check_preview(self, db, preview, &state, observation.uid_validity)?;
         }
         let highest_known: i64 = db.query_row(
             "SELECT max(committed_modseq) FROM sync_delta
@@ -402,32 +444,31 @@ impl Cache {
         changed: &[DeltaFlags<'_>],
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Option<DeltaRound>, SyncError> {
-        let highest = observation.validate()?;
         check_cancel(cancelled)?;
-        if round.lane != DeltaLane::Flags
-            || observation.uid_validity != round.uid_validity
-            || observation.uid_next <= round.high_uid
-            || (highest as u64) < round.target_modseq
-            || changed.len() > PAGE_UIDS
-        {
+        if round.lane != DeltaLane::Flags {
             return Err(SyncError::Invalid);
         }
-        let mut flags = BTreeMap::new();
-        let mut encoded_bytes = 0;
-        for fact in changed {
-            positive(fact.modseq)?;
-            if fact.modseq <= round.base_modseq
-                || page.uids.binary_search(&fact.uid).is_err()
-                || flags.contains_key(&fact.uid)
-            {
-                return Err(SyncError::Invalid);
-            }
-            let value = encode_flags(fact.flags)?;
-            encoded_bytes += value.len();
-            if encoded_bytes > FLAGS_BUDGET {
-                return Err(SyncError::Invalid);
-            }
-            flags.insert(fact.uid, value);
+        let changes = PreparedChanges {
+            flags: prepare_flags(round.base_modseq, &page.uids, changed)?,
+            vanished: BTreeSet::new(),
+        };
+        self.commit_prepared_delta_page(round, page, observation, changes, cancelled)
+    }
+
+    fn commit_prepared_delta_page(
+        &self,
+        round: &DeltaRound,
+        page: &DeltaPage,
+        observation: DeltaObservation,
+        changes: PreparedChanges,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<DeltaRound>, SyncError> {
+        let highest = observation.validate()?;
+        if observation.uid_validity != round.uid_validity
+            || observation.uid_next <= round.high_uid
+            || (highest as u64) < round.target_modseq
+        {
+            return Err(SyncError::Invalid);
         }
         let mut databases = self.lock()?;
         let database = databases
@@ -440,21 +481,7 @@ impl Cache {
             return Err(SyncError::Stale);
         }
         self.write_checked(round.namespace, database, |tx| {
-            for (uid, value) in flags {
-                let (id, checked_at): (i64, Option<i64>) = tx.query_row(
-                    "SELECT m.id,l.flags_checked_at_ms FROM messages m
-                     LEFT JOIN listing_evidence l ON l.message_id=m.id
-                     WHERE m.mailbox=?1 AND m.uid_validity=?2 AND m.uid=?3 AND NOT m.tombstone",
-                    params![round.mailbox,round.uid_validity,uid],
-                    |row| Ok((row.get(0)?,row.get(1)?)),
-                )?;
-                if checked_at.is_some_and(|current| current > observation.checked_at_ms) {
-                    return Err(SyncError::Stale);
-                }
-                write_listing(tx,id,ListingEvidence {
-                    flags:None, internal_date:None, size:None, observed_at_ms:observation.checked_at_ms,
-                },Some(&value))?;
-            }
+            apply_changes(tx,&round.mailbox,observation,changes)?;
             if page.complete {
                 tx.execute(
                     "UPDATE sync_delta SET committed_modseq=target_modseq,round_id=NULL,target_modseq=NULL,
@@ -556,6 +583,71 @@ impl Cache {
             checked_at_ms: state.checked_at_ms,
         }))
     }
+}
+
+fn prepare_flags(
+    base: u64,
+    known: &[u32],
+    changed: &[DeltaFlags<'_>],
+) -> Result<BTreeMap<u32, Vec<u8>>, SyncError> {
+    if changed.len() > PAGE_UIDS {
+        return Err(SyncError::Invalid);
+    }
+    let mut flags = BTreeMap::new();
+    let mut encoded_bytes = 0;
+    for fact in changed {
+        positive(fact.modseq)?;
+        if fact.modseq <= base
+            || known.binary_search(&fact.uid).is_err()
+            || flags.contains_key(&fact.uid)
+        {
+            return Err(SyncError::Invalid);
+        }
+        let value = encode_flags(fact.flags)?;
+        encoded_bytes += value.len();
+        if encoded_bytes > FLAGS_BUDGET {
+            return Err(SyncError::Invalid);
+        }
+        flags.insert(fact.uid, value);
+    }
+    Ok(flags)
+}
+
+fn apply_changes(
+    tx: &rusqlite::Transaction<'_>,
+    mailbox: &str,
+    observation: DeltaObservation,
+    changes: PreparedChanges,
+) -> Result<(), SyncError> {
+    let validity = observation.uid_validity;
+    for (uid, value) in changes.flags {
+        let (id, checked_at): (i64, Option<i64>) = tx.query_row(
+            "SELECT m.id,l.flags_checked_at_ms FROM messages m
+             LEFT JOIN listing_evidence l ON l.message_id=m.id
+             WHERE m.mailbox=?1 AND m.uid_validity=?2 AND m.uid=?3 AND NOT m.tombstone",
+            params![mailbox, validity, uid],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if checked_at.is_some_and(|current| current > observation.checked_at_ms) {
+            return Err(SyncError::Stale);
+        }
+        write_listing(
+            tx,
+            id,
+            ListingEvidence {
+                flags: None,
+                internal_date: None,
+                size: None,
+                observed_at_ms: observation.checked_at_ms,
+            },
+            Some(&value),
+        )?;
+    }
+    for uid in changes.vanished {
+        let id = ensure_message_row(tx, mailbox, validity, uid)?;
+        mark_tombstone(tx, id, true)?;
+    }
+    Ok(())
 }
 
 /// Called in the same transaction as the final rev1 reconciliation receipt.
@@ -709,22 +801,14 @@ fn known_delta_page(
     round: &DeltaRound,
     limit: usize,
 ) -> Result<DeltaPage, SyncError> {
-    let mut query = db.prepare_cached(
-        "SELECT uid FROM messages WHERE mailbox=?1 AND uid_validity=?2
-         AND uid>?3 AND uid<=?4 AND NOT tombstone ORDER BY uid LIMIT ?5",
+    let mut uids = known_uids(
+        db,
+        &round.mailbox,
+        round.uid_validity,
+        round.known_after,
+        round.high_uid,
+        limit + 1,
     )?;
-    let mut uids = query
-        .query_map(
-            params![
-                round.mailbox,
-                round.uid_validity,
-                round.known_after,
-                round.high_uid,
-                limit as u32 + 1
-            ],
-            |row| row.get(0),
-        )?
-        .collect::<Result<Vec<_>, _>>()?;
     let complete = uids.len() <= limit;
     uids.truncate(limit);
     Ok(DeltaPage {
@@ -733,6 +817,26 @@ fn known_delta_page(
         limit,
         round_id: round.id,
     })
+}
+
+fn known_uids(
+    db: &Connection,
+    mailbox: &str,
+    uid_validity: u32,
+    after: u32,
+    high_uid: u32,
+    limit: usize,
+) -> Result<Vec<u32>, SyncError> {
+    let mut query = db.prepare_cached(
+        "SELECT uid FROM messages WHERE mailbox=?1 AND uid_validity=?2
+         AND uid>?3 AND uid<=?4 AND NOT tombstone ORDER BY uid LIMIT ?5",
+    )?;
+    Ok(query
+        .query_map(
+            params![mailbox, uid_validity, after, high_uid, limit as u32],
+            |row| row.get(0),
+        )?
+        .collect::<Result<Vec<_>, _>>()?)
 }
 
 fn clear_delta(tx: &rusqlite::Transaction<'_>, mailbox: &str) -> Result<(), SyncError> {

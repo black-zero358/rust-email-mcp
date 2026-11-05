@@ -549,6 +549,10 @@ fn reopening_with_a_narrower_scope_rejects_old_round_and_reconciliation_stamps()
     let scan = reconcile(&cache, &account, 111);
     let known = cache.sync_known_page(&scan.stamp, 200).unwrap();
     let fence = cache.sync_reconcile_fence(&account, INBOX).unwrap();
+    let qresync = cache
+        .preview_qresync(&account, INBOX, &fence)
+        .unwrap()
+        .unwrap();
     cache.mark_clean().unwrap();
     drop(cache);
 
@@ -591,6 +595,443 @@ fn reopening_with_a_narrower_scope_rejects_old_round_and_reconciliation_stamps()
         cache.invalidate_delta(&account, INBOX, 9, &fence, &|| false),
         Err(SyncError::Cache(CacheError::OutOfScope))
     ));
+    assert!(matches!(
+        cache.start_qresync(&qresync, selected(80, 112), &fence, &|| false),
+        Err(SyncError::Cache(CacheError::OutOfScope))
+    ));
+}
+
+#[test]
+fn qresync_large_scope_keeps_its_own_anchor_and_resumes_after_page_external_deletions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache");
+    let account = AccountKey::synthetic();
+    let cache = open(&path, &account, true).unwrap();
+    let mailbox = MailboxObservation {
+        uid_next: 203,
+        ..observation(100)
+    };
+    let history = cache
+        .start_sync(&account, INBOX, ScanKind::History, mailbox)
+        .unwrap();
+    let history = cache
+        .record_sync_search(
+            &history.stamp,
+            1,
+            200,
+            &(1..=200).collect::<Vec<_>>(),
+            &|| false,
+        )
+        .unwrap();
+    cache
+        .record_sync_search(&history.stamp, 201, 202, &[201, 202], &|| false)
+        .unwrap();
+    let fence = cache.sync_reconcile_fence(&account, INBOX).unwrap();
+    let scan = cache
+        .start_sync_reconcile(&account, INBOX, mailbox, &fence)
+        .unwrap();
+    let observation = |modseq, time| DeltaObservation {
+        uid_next: 203,
+        ..selected(modseq, time)
+    };
+    cache
+        .prepare_delta_seed(&scan.stamp, observation(50, 100), &|| false)
+        .unwrap();
+    let scan = commit_rev1(&cache, &scan, 200, 101, &|| false).unwrap();
+    assert!(
+        commit_rev1(&cache, &scan, 200, 102, &|| false)
+            .unwrap()
+            .complete
+    );
+    let DeltaStart::Round(flags) = cache
+        .start_delta(
+            &account,
+            INBOX,
+            DeltaLane::Flags,
+            observation(70, 110),
+            &fence,
+            &|| false,
+        )
+        .unwrap()
+    else {
+        panic!("FLAGS round expected");
+    };
+    let page = cache.delta_page(&flags, 200).unwrap();
+    let flags = cache
+        .commit_delta_page(&flags, &page, observation(70, 111), &[], &|| false)
+        .unwrap()
+        .unwrap();
+    let page = cache.delta_page(&flags, 200).unwrap();
+    assert!(
+        cache
+            .commit_delta_page(&flags, &page, observation(70, 112), &[], &|| false)
+            .unwrap()
+            .is_none()
+    );
+    let preview = cache
+        .preview_qresync(&account, INBOX, &fence)
+        .unwrap()
+        .unwrap();
+    assert_eq!(preview.base_modseq, 50);
+    assert_eq!(preview.known.len(), 200);
+    assert!(!preview.complete && preview.examine_uids().is_none());
+    let DeltaStart::Round(round) = cache
+        .start_qresync(&preview, observation(80, 113), &fence, &|| false)
+        .unwrap()
+    else {
+        panic!("QRESYNC round expected");
+    };
+    let page = cache.delta_page(&round, 200).unwrap();
+    let changed = [DeltaFlags {
+        uid: 7,
+        modseq: 75,
+        flags: &["\\Seen".into()],
+    }];
+    let next = cache
+        .commit_qresync_page(
+            &round,
+            &page,
+            observation(80, 114),
+            QresyncChanges {
+                flags: &changed,
+                earlier: std::slice::from_ref(&(1..=2)),
+                live: std::slice::from_ref(&(201..=201)),
+            },
+            &|| false,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        status(&cache, &account, DeltaLane::FlagsAndExpunges)
+            .unwrap()
+            .committed_modseq,
+        "50"
+    );
+    assert!(
+        cache
+            .cached_message(reference(&account, 201))
+            .unwrap()
+            .is_none()
+    );
+    cache.mark_clean().unwrap();
+    drop(cache);
+    let cache = open(&path, &account, true).unwrap();
+    let fence = cache.sync_reconcile_fence(&account, INBOX).unwrap();
+    let preview = cache
+        .preview_qresync(&account, INBOX, &fence)
+        .unwrap()
+        .unwrap();
+    assert!(preview.complete && preview.examine_uids().is_none());
+    let DeltaStart::Round(resumed) = cache
+        .start_qresync(&preview, observation(90, 115), &fence, &|| false)
+        .unwrap()
+    else {
+        panic!("QRESYNC round expected");
+    };
+    assert_eq!(resumed, next);
+    let page = cache.delta_page(&resumed, 200).unwrap();
+    assert_eq!(page.uids, [202]);
+    assert!(
+        cache
+            .commit_qresync_page(
+                &resumed,
+                &page,
+                observation(90, 116),
+                QresyncChanges {
+                    earlier: std::slice::from_ref(&(202..=202)),
+                    ..QresyncChanges::default()
+                },
+                &|| false
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        status(&cache, &account, DeltaLane::FlagsAndExpunges)
+            .unwrap()
+            .committed_modseq,
+        "80"
+    );
+    assert_eq!(
+        status(&cache, &account, DeltaLane::Flags)
+            .unwrap()
+            .committed_modseq,
+        "70"
+    );
+    assert!(
+        cache
+            .cached_message(reference(&account, 202))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        cache
+            .cached_message(reference(&account, 7))
+            .unwrap()
+            .unwrap()
+            .flags
+            .unwrap(),
+        ["\\Seen"]
+    );
+    let fresh = cache
+        .preview_qresync(&account, INBOX, &fence)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        cache
+            .start_qresync(&fresh, observation(79, 117), &fence, &|| false)
+            .unwrap(),
+        DeltaStart::Rollback
+    ));
+    assert!(status(&cache, &account, DeltaLane::FlagsAndExpunges).is_none());
+    assert!(status(&cache, &account, DeltaLane::Flags).is_none());
+}
+
+#[test]
+fn qresync_exact_preview_rejects_concurrent_membership_and_conflicting_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountKey::synthetic();
+    let cache = open(&dir.path().join("cache"), &account, true).unwrap();
+    seeded(&cache, &account);
+    let fence = cache.sync_reconcile_fence(&account, INBOX).unwrap();
+    let preview = cache
+        .preview_qresync(&account, INBOX, &fence)
+        .unwrap()
+        .unwrap();
+    assert_eq!(preview.examine_uids(), Some(&[1, 3, 7][..]));
+    cache
+        .remember_headers(
+            reference(&account, 2),
+            true,
+            b"Subject: new evidence\r\n\r\n",
+            None,
+        )
+        .unwrap();
+    assert!(matches!(
+        cache.start_qresync(&preview, selected(80, 110), &fence, &|| false),
+        Err(SyncError::Stale)
+    ));
+    let preview = cache
+        .preview_qresync(&account, INBOX, &fence)
+        .unwrap()
+        .unwrap();
+    let DeltaStart::Round(round) = cache
+        .start_qresync(&preview, selected(80, 110), &fence, &|| false)
+        .unwrap()
+    else {
+        panic!("QRESYNC round expected");
+    };
+    let page = cache.delta_page(&round, 200).unwrap();
+    assert_eq!(page.uids, [1, 2, 3, 7]);
+    for invalid in [
+        QresyncChanges {
+            earlier: std::slice::from_ref(&(3..=7)),
+            ..QresyncChanges::default()
+        },
+        QresyncChanges {
+            flags: &[DeltaFlags {
+                uid: 3,
+                modseq: 70,
+                flags: &[],
+            }],
+            live: std::slice::from_ref(&(3..=3)),
+            ..QresyncChanges::default()
+        },
+    ] {
+        assert!(matches!(
+            cache.commit_qresync_page(&round, &page, selected(80, 111), invalid, &|| false),
+            Err(SyncError::Invalid)
+        ));
+    }
+    let calls = Cell::new(0);
+    let deletion = || QresyncChanges {
+        earlier: std::slice::from_ref(&(3..=3)),
+        ..QresyncChanges::default()
+    };
+    assert!(matches!(
+        cache.commit_qresync_page(&round, &page, selected(80, 111), deletion(), &|| {
+            calls.set(calls.get() + 1);
+            calls.get() == 2
+        }),
+        Err(SyncError::Cancelled)
+    ));
+    assert!(
+        cache
+            .cached_message(reference(&account, 3))
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        cache
+            .commit_qresync_page(&round, &page, selected(80, 111), deletion(), &|| false)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        cache
+            .cached_message(reference(&account, 3))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn qresync_empty_preview_keeps_current_watermark_and_records_explicit_live_removal() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountKey::synthetic();
+    let cache = open(&dir.path().join("cache"), &account, true).unwrap();
+    let observation = MailboxObservation {
+        uid_next: 1,
+        ..observation(100)
+    };
+    assert!(
+        cache
+            .start_sync(&account, INBOX, ScanKind::History, observation)
+            .unwrap()
+            .complete
+    );
+    let fence = cache.sync_reconcile_fence(&account, INBOX).unwrap();
+    let scan = cache
+        .start_sync_reconcile(&account, INBOX, observation, &fence)
+        .unwrap();
+    cache
+        .prepare_delta_seed(
+            &scan.stamp,
+            DeltaObservation {
+                uid_next: 1,
+                ..selected(50, 100)
+            },
+            &|| false,
+        )
+        .unwrap();
+    assert!(
+        commit_rev1(&cache, &scan, 200, 101, &|| false)
+            .unwrap()
+            .complete
+    );
+    let preview = cache
+        .preview_qresync(&account, INBOX, &fence)
+        .unwrap()
+        .unwrap();
+    assert!(preview.complete && preview.known.is_empty() && preview.examine_uids().is_none());
+    let observed = DeltaObservation {
+        uid_next: 2,
+        ..selected(50, 110)
+    };
+    assert!(matches!(
+        cache
+            .start_qresync(&preview, observed, &fence, &|| false)
+            .unwrap(),
+        DeltaStart::Current
+    ));
+    cache
+        .commit_qresync_current(
+            &preview,
+            observed,
+            QresyncChanges {
+                live: std::slice::from_ref(&(1..=1)),
+                ..QresyncChanges::default()
+            },
+            &|| false,
+        )
+        .unwrap();
+    cache
+        .observe_folder(&account, INBOX, 9, Some(1), 111)
+        .unwrap();
+    assert!(matches!(
+        cache.remember_headers(
+            reference(&account, 1),
+            true,
+            b"Subject: stale evidence\r\n\r\n",
+            None,
+        ),
+        Err(CacheError::OutOfScope)
+    ));
+    assert!(
+        cache
+            .cached_message(reference(&account, 1))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        status(&cache, &account, DeltaLane::FlagsAndExpunges)
+            .unwrap()
+            .committed_modseq,
+        "50"
+    );
+}
+
+#[test]
+fn qresync_oversized_deletion_defers_to_a_fresh_rev1_audit_without_advancing() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountKey::synthetic();
+    let cache = open(&dir.path().join("cache"), &account, true).unwrap();
+    seeded(&cache, &account);
+    let scan = reconcile(&cache, &account, 110);
+    let scan = commit_rev1(&cache, &scan, 1, 111, &|| false).unwrap();
+    let fence = cache.sync_reconcile_fence(&account, INBOX).unwrap();
+    let DeltaStart::Round(round) = cache
+        .start_delta(
+            &account,
+            INBOX,
+            DeltaLane::FlagsAndExpunges,
+            selected(80, 112),
+            &fence,
+            &|| false,
+        )
+        .unwrap()
+    else {
+        panic!("QRESYNC round expected");
+    };
+    let page = cache.delta_page(&round, 200).unwrap();
+    let observation = DeltaObservation {
+        uid_next: 2_000_000,
+        ..selected(80, 113)
+    };
+    for live in [1..=1_000_000, 2_000_000..=2_000_000] {
+        assert!(matches!(
+            cache.commit_qresync_page(
+                &round,
+                &page,
+                observation,
+                QresyncChanges {
+                    live: &[live],
+                    ..QresyncChanges::default()
+                },
+                &|| false
+            ),
+            Err(SyncError::ReconcileRequired)
+        ));
+    }
+    assert_eq!(
+        status(&cache, &account, DeltaLane::FlagsAndExpunges)
+            .unwrap()
+            .committed_modseq,
+        "50"
+    );
+    assert!(
+        cache
+            .cached_message(reference(&account, 1))
+            .unwrap()
+            .is_some()
+    );
+    cache
+        .require_qresync_reconcile(&account, INBOX, 9, &fence, &|| false)
+        .unwrap();
+    assert!(matches!(
+        cache.delta_page(&round, 200),
+        Err(SyncError::Stale)
+    ));
+    assert!(matches!(
+        cache.sync_known_page(&scan.stamp, 200),
+        Err(SyncError::Stale)
+    ));
+    let restarted = reconcile(&cache, &account, 114);
+    assert_ne!(restarted.stamp.scan_id, scan.stamp.scan_id);
+    assert_eq!(
+        cache.sync_known_page(&restarted.stamp, 200).unwrap().uids,
+        [1, 3, 7]
+    );
 }
 
 #[test]

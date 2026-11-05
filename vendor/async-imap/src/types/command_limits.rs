@@ -15,6 +15,7 @@ pub(crate) enum CommandLimit {
         header_bytes: usize,
     },
     Condstore,
+    Qresync,
 }
 
 impl CommandReadLimits {
@@ -48,5 +49,10 @@ impl CommandReadLimits {
     /// Use the bounded CONDSTORE response grammar and a 128 KiB wire budget.
     pub fn condstore() -> Self {
         Self(CommandLimit::Condstore)
+    }
+
+    /// Bound QRESYNC commands, including ENABLED and compressed VANISHED data.
+    pub fn qresync() -> Self {
+        Self(CommandLimit::Qresync)
     }
 }

@@ -7,9 +7,8 @@ enum Selection {
 }
 
 pub(super) struct ScopeFloors {
-    // CONDSTORE is the only advancing lane. QRESYNC must also consult its
-    // independent flags-and-expunges lane before deciding rollback.
     lane: Option<DeltaStatus>,
+    deletion_lane: Option<DeltaStatus>,
     seed: Option<(u32, u64)>,
 }
 
@@ -37,6 +36,11 @@ impl ScopeFloors {
             lane: scope
                 .cache
                 .delta_status(&scope.account, &scope.mailbox, DeltaLane::Flags)?,
+            deletion_lane: scope.cache.delta_status(
+                &scope.account,
+                &scope.mailbox,
+                DeltaLane::FlagsAndExpunges,
+            )?,
             seed: scope
                 .cache
                 .pending_delta_floor(&scope.account, &scope.mailbox)?,
@@ -44,16 +48,17 @@ impl ScopeFloors {
     }
 
     pub(super) fn for_epoch(&self, validity: u32) -> Result<EpochFloors> {
-        let committed = self
-            .lane
-            .as_ref()
-            .filter(|lane| lane.uid_validity == validity)
-            .map(|lane| {
-                lane.committed_modseq
-                    .parse::<u64>()
-                    .map_err(|_| CacheError::Corrupt)
-            })
-            .transpose()?;
+        let floor = |lane: &Option<DeltaStatus>| {
+            lane.as_ref()
+                .filter(|lane| lane.uid_validity == validity)
+                .map(|lane| {
+                    lane.committed_modseq
+                        .parse::<u64>()
+                        .map_err(|_| CacheError::Corrupt)
+                })
+                .transpose()
+        };
+        let committed = floor(&self.lane)?.max(floor(&self.deletion_lane)?);
         let pending = self
             .seed
             .filter(|(epoch, _)| *epoch == validity)
@@ -116,9 +121,12 @@ impl Batch<'_> {
         }
     }
 
-    async fn negotiate_condstore(&self) -> Result<Selection> {
-        let mut session = self.login().await?;
-        let failure = match delta::supports_condstore(&mut session).await {
+    async fn select_condstore(
+        &self,
+        mut session: Session,
+        capability: crate::error::Result<bool>,
+    ) -> Result<Selection> {
+        let failure = match capability {
             Ok(false) => {
                 self.report_protocol(
                     ActiveProtocol::Rev1,
@@ -154,13 +162,84 @@ impl Batch<'_> {
     }
 
     pub(super) async fn delta_turn(&self) -> Result<Turn> {
-        self.condstore(true).await
+        let fence = self.reconciliation_fence().await?;
+        let floors = self.local(|scope| ScopeFloors::read(&scope)).await?;
+        let mut session = self.login().await?;
+        let capabilities = delta::capabilities(&mut session).await;
+        if capabilities
+            .as_ref()
+            .is_ok_and(|caps| caps.qresync && caps.enable)
+            && floors.deletion_lane.is_some()
+        {
+            let preview_fence = fence.clone();
+            let preview = self
+                .local(move |scope| {
+                    Ok(scope.cache.preview_qresync(
+                        &scope.account,
+                        &scope.mailbox,
+                        &preview_fence,
+                    )?)
+                })
+                .await?;
+            if let Some(preview) = preview {
+                return Box::pin(self.qresync_turn(session, fence, floors, preview)).await;
+            }
+        }
+        let missing_enable = capabilities
+            .as_ref()
+            .is_ok_and(|caps| caps.qresync && !caps.enable);
+        let selected = self
+            .select_condstore(session, capabilities.map(|caps| caps.condstore))
+            .await?;
+        let result = self.condstore_selected(true, fence, floors, selected).await;
+        if missing_enable {
+            self.record_qresync_fallback(ProtocolFallback::QresyncEnableFailed);
+        }
+        result
     }
 
     async fn condstore(&self, advance: bool) -> Result<Turn> {
         let fence = self.reconciliation_fence().await?;
         let floors = self.local(|scope| ScopeFloors::read(&scope)).await?;
-        let (mut session, selected, highest_modseq) = match self.negotiate_condstore().await? {
+        let mut session = self.login().await?;
+        let capabilities = delta::supports_condstore(&mut session).await;
+        let selected = self.select_condstore(session, capabilities).await?;
+        self.condstore_selected(advance, fence, floors, selected)
+            .await
+    }
+
+    pub(super) async fn condstore_fallback(
+        &self,
+        fence: Arc<ReconcileFence>,
+        floors: ScopeFloors,
+        reason: ProtocolFallback,
+    ) -> Result<Turn> {
+        self.report_protocol(ActiveProtocol::Rev1, Some(reason));
+        let mut session = self.login().await?;
+        let capabilities = delta::supports_condstore(&mut session).await;
+        let selected = self.select_condstore(session, capabilities).await?;
+        let result = self.condstore_selected(true, fence, floors, selected).await;
+        self.record_qresync_fallback(reason);
+        result
+    }
+
+    fn record_qresync_fallback(&self, reason: ProtocolFallback) {
+        if let Ok(mut negotiated) = self.negotiated.lock() {
+            let status = negotiated.get_or_insert_with(ProtocolHealth::default);
+            if status.protocol_fallback.is_none() {
+                status.protocol_fallback = Some(reason);
+            }
+        }
+    }
+
+    async fn condstore_selected(
+        &self,
+        advance: bool,
+        fence: Arc<ReconcileFence>,
+        floors: ScopeFloors,
+        selected: Selection,
+    ) -> Result<Turn> {
+        let (mut session, selected, highest_modseq) = match selected {
             Selection::Plain(session, selected) => {
                 return self
                     .reconcile_selected(session, selected, fence, None)
@@ -219,21 +298,7 @@ impl Batch<'_> {
         let start_fence = fence.clone();
         let start = self
             .local(move |scope| {
-                if !scope.current(observation.uid_validity) {
-                    return Err(Error::Deferred);
-                }
-                scope.cache.observe_folder(
-                    &scope.account,
-                    &scope.mailbox,
-                    observation.uid_validity,
-                    Some(observation.uid_next - 1),
-                    observation.checked_at_ms,
-                )?;
-                scope.persistent.sync_commit_epoch(
-                    &scope.account,
-                    &scope.mailbox,
-                    observation.uid_validity,
-                );
+                scope.observe_delta(observation)?;
                 let result = scope.cache.start_delta(
                     &scope.account,
                     &scope.mailbox,

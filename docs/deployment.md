@@ -173,7 +173,7 @@ R11 在注册库完整文件名后追加 `.cache-run` 保存独立运行见证�
 
 后台同步使用 full 配置中的可选 `sync`，完整 JSON 见[配置示例](cache-design.md#配置示例)。启用时设 `enabled:true` 并重启；暂停时设 `enabled:false` 并正常重启，保留同一缓存目录和账户注册。旧配置省略 `sync` 时维持暂停。`interval_seconds` 默认 60 秒，`reconcile_interval_seconds` 默认 900 秒，两者范围均为 1 至 86400 秒。
 
-需要标记增量加速时增加 `protocol:"auto"` 并正常重启；省略 protocol 或设为 `rev1` 时使用基础同步。通过 `get_cache_status` 查看目录实际协议、固定回退原因及 CONDSTORE 水位；支持情况在后台连接上重新探测。启用 auto 后仍保留周期标记与存在性核对。R12C full 缓存独立迁移至 V6，回退程序按其支持的 schema 和配置选择私有缓存目录，具体步骤见[维护规范](maintenance.md#版本与兼容性)。
+需要增量加速时增加 `protocol:"auto"` 并正常重启；省略 protocol 或设为 `rev1` 时使用基础同步。通过 `get_cache_status` 查看目录实际协议、固定回退原因及 CONDSTORE/QRESYNC 独立水位；后台连接重新探测支持情况，优先协商 QRESYNC。启用 auto 后仍保留周期标记与存在性核对。大范围删除触发完整核对时，该范围离线读取暂时返回 `CACHE_NEEDS_VERIFICATION`，核对完成后自动恢复。R12C full 缓存独立迁移至 V6，R12D 沿用 V6；回退程序按其支持的 schema 和配置选择私有缓存目录，具体步骤见[维护规范](maintenance.md#版本与兼容性)。
 
 管理员选定的账户和文件夹就是回填范围；添加范围或调整额度后重启生效。账户仍须具有有效读取授权，撤回全部有效读取授权会停止该账户同步。使用 `get_cache_status` 核对各目录的发现、内容物化、标记与存在性进度；配额不足时保留任务和已提交检查点，扩容后从保存位置继续。部署时继续保留 1 GiB 内存 allowance，监控缓存根实际占用及宿主剩余磁盘。
 

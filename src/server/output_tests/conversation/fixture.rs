@@ -715,6 +715,9 @@ async fn serve(
             .or_else(|| command.strip_prefix("SELECT "))
         {
             let mailbox = mailbox.strip_suffix(" (CONDSTORE)").unwrap_or(mailbox);
+            let mailbox = mailbox
+                .rsplit_once(" (QRESYNC (")
+                .map_or(mailbox, |(name, _)| name);
             selected = unquote(mailbox).unwrap_or_else(|| mailbox.to_owned());
         }
         {

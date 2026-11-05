@@ -8,6 +8,14 @@ const MAX_STATUS_TEXT: usize = 4096;
 const MAX_PADDING: usize = 64;
 
 pub(crate) fn parse<'a>(i: &'a [u8], limits: &BodyStructureLimits) -> ParseResult<'a> {
+    parse_profile(i, limits, false)
+}
+
+pub(crate) fn parse_qresync<'a>(i: &'a [u8], limits: &BodyStructureLimits) -> ParseResult<'a> {
+    parse_profile(i, limits, true)
+}
+
+fn parse_profile<'a>(i: &'a [u8], limits: &BodyStructureLimits, qresync: bool) -> ParseResult<'a> {
     let mut limits = *limits;
     limits.aggregate_bytes = limits.aggregate_bytes.min(MAX_SEARCH_RESPONSE_BYTES);
     let budget = Budget::new(&limits);
@@ -20,6 +28,20 @@ pub(crate) fn parse<'a>(i: &'a [u8], limits: &BodyStructureLimits) -> ParseResul
                     |(status, outcome)| Response::Data { status, outcome },
                 ),
                 |i| capabilities(i, &budget),
+                |i| {
+                    if qresync {
+                        alt((
+                            map(
+                                preceded(tag_no_case("ENABLED"), |i| atoms(i, &budget)),
+                                Response::Enabled,
+                            ),
+                            |i| vanished(i, &budget),
+                        ))
+                        .parse(i)
+                    } else {
+                        Err(nom::Err::Error(Error::new(i, ErrorKind::Tag)))
+                    }
+                },
                 map(
                     preceded(tag_no_case("FLAGS "), |i| flags(i, &budget)),
                     |flags| Response::MailboxData(MailboxDatum::Flags(flags)),
@@ -141,7 +163,14 @@ fn response_code(text: &[u8]) -> Result<Option<ResponseCode<'_>>, nom::Err<Error
 }
 
 fn capabilities<'a>(i: &'a [u8], budget: &Budget<'_>) -> IResult<&'a [u8], Response<'a>> {
-    let (mut rest, _) = tag_no_case("CAPABILITY")(i)?;
+    map(
+        preceded(tag_no_case("CAPABILITY"), |i| atoms(i, budget)),
+        Response::Capabilities,
+    )
+    .parse(i)
+}
+
+fn atoms<'a>(mut rest: &'a [u8], budget: &Budget<'_>) -> IResult<&'a [u8], Vec<Capability<'a>>> {
     let mut items = Vec::new();
     while let Some(atom) = rest.strip_prefix(b" ") {
         if atom.first() == Some(&b'\r') {
@@ -163,7 +192,40 @@ fn capabilities<'a>(i: &'a [u8], budget: &Budget<'_>) -> IResult<&'a [u8], Respo
         budget.push(atom, &mut items, capability)?;
         rest = next;
     }
-    Ok((rest, Response::Capabilities(items)))
+    Ok((rest, items))
+}
+
+fn vanished<'a>(i: &'a [u8], budget: &Budget<'_>) -> IResult<&'a [u8], Response<'a>> {
+    let (mut rest, _) = tag_no_case("VANISHED ")(i)?;
+    let earlier = rest.first() == Some(&b'(');
+    if earlier {
+        (rest, _) = tag_no_case("(EARLIER) ")(rest)?;
+    }
+    let mut uids = Vec::new();
+    loop {
+        if uids.len() == MAX_VANISHED_RANGES {
+            return budget.fail(rest, LimitKind::Nodes);
+        }
+        let (tail, start) = uid(rest)?;
+        let (tail, end) = if let Some(tail) = tail.strip_prefix(b":") {
+            uid(tail)?
+        } else {
+            (tail, start)
+        };
+        budget.push(rest, &mut uids, start.min(end)..=start.max(end))?;
+        let Some(next) = tail.strip_prefix(b",") else {
+            return Ok((tail, Response::Vanished { earlier, uids }));
+        };
+        rest = next;
+    }
+}
+
+fn uid(i: &[u8]) -> IResult<&[u8], u32> {
+    let (rest, digits) = take_while_m_n(1, 10, |b: u8| b.is_ascii_digit())(i)?;
+    if rest.first().is_some_and(u8::is_ascii_digit) {
+        return Err(invalid(rest));
+    }
+    Ok((rest, positive_uid(digits)?))
 }
 
 fn flags<'a>(i: &'a [u8], budget: &Budget<'_>) -> IResult<&'a [u8], Vec<Cow<'a, str>>> {
@@ -258,14 +320,7 @@ fn numeric<'a>(i: &'a [u8], budget: &Budget<'_>) -> IResult<&'a [u8], Response<'
 
 fn attribute<'a>(i: &'a [u8], budget: &Budget<'_>) -> IResult<&'a [u8], AttributeValue<'a>> {
     alt((
-        |i: &'a [u8]| {
-            let (rest, _) = tag_no_case("UID ")(i)?;
-            let (rest, digits) = take_while_m_n(1, 10, |b: u8| b.is_ascii_digit())(rest)?;
-            if rest.first().is_some_and(u8::is_ascii_digit) {
-                return Err(invalid(rest));
-            }
-            Ok((rest, AttributeValue::Uid(positive_uid(digits)?)))
-        },
+        map(preceded(tag_no_case("UID "), uid), AttributeValue::Uid),
         map(
             preceded(tag_no_case("FLAGS "), |i| flags(i, budget)),
             AttributeValue::Flags,
