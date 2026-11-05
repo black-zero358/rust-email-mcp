@@ -29,6 +29,10 @@ R09 保留原单目录会话调用和版本 1 账户 JSON。`ARCHIVE_MAILBOX` �
 
 `0.1.1` 的工作流扩展为兼容新增：旧 `download_attachment` 继续返回内联 Base64，认证 URL 由独立的 `prepare_attachment_download` 提供；无需数据迁移或新增配置。只有支持同主体 Bearer GET 的客户端才能使用新二进制通道。该源码版本号不表示产物已发布或生产已部署。
 
+R10 通过可选 `CACHE_CONFIG_PATH` 新增独立的 metadata 缓存和持久会话游标，默认 off，旧账户与操作库格式保留。缓存按 AccountKey 命名空间分区，每份 SQLite 使用统一的 cache 专用 application_id、schema 版本及各自 namespace 绑定；配置、目录所有权或版本异常使用固定错误。已提交的游标状态保留已知结果，提交后磁盘诊断异常停止后续写入并报告存储故障。正常重启沿用原 token 到期时间，备份恢复使用[专用命令](deployment.md#持久缓存备份与恢复)清除旧游标和标记范围待核对。
+
+当前 R10 schema 为 v1。新建时在短事务中创建完整 schema，已有库核验版本、账户绑定和 quick_check；未知版本或损坏保留原文件并停用该缓存。后续版本升级继续提供完整事务迁移和失败恢复回归。缓存可按独立目录重建，发送操作记录保持原恢复流程。回滚应用前关闭持久缓存配置并保留目录，重新启用前执行匹配版本的恢复检查。
+
 ## 发布检查
 
 发布源码、发布二进制和部署生产是三个独立动作。合入 PR 或创建 Release 不代表批准生产部署或真实邮件写入。
@@ -56,6 +60,8 @@ R07 局部正文读取将已有传递依赖 `encoding_rs 0.8.42` 声明为直接
 R09 搜索基础继续使用现有两份 vendored 版本、许可证及校验和，增加 opt-in 的命令字节、SEARCH UID 数量及异步通知解析分配预算。升级替换时运行 `tests/thread_search_budget.rs`，核对完整 tagged completion、预读隔离、尾部恢复、通知释放和 typed 错误后的读写闭锁，并重跑原 BODYSTRUCTURE/部件 FETCH 回归。接口及补丁范围分别记录在两库 PATCHES.md。
 
 R09 签名 HTTP 回归在 dev-dependencies 中为锁定的 Tokio 版本启用 `test-util`，使用虚拟时钟核对 60 秒请求期限与 10 分钟游标有效期。生产构建沿用原有 Tokio 功能集。
+
+R10 为现有锁定的 `rusqlite 0.41.0` 启用 `blob` 功能，使用 SQLite 增量 BLOB 接口有界读写游标，包版本、许可证及 Cargo.lock 保持原值。采用 bundled FTS5 trigram，并以实际锁定库测试中文匹配和有界分页。数据库升级时同时复核 `src/cache` 的物理主库/回滚日志预算、已知提交结果、schema/恢复世代和 `src/mail/conversation` 的 codec/CAS/TTL 回归。
 
 专用审计脚本在同一临时锁文件中恢复 async-imap 与 imap-proto 的精确上游 registry 身份，再运行 cargo-audit；原 Cargo.lock 保持原字节。版本、校验和、缺失/重复记录、意外 source/checksum 及未登记的 path/git 包均触发拒绝。`scripts/test-audit-dependencies.sh` 在 CI 中验证这些边界和失败清理。Docker builder 与上下文仅允许这两个 vendored 目录，context 回归同时验证两个允许项及其他文件拒绝项。
 

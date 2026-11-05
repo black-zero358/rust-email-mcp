@@ -32,7 +32,7 @@
 
 ## 附件与兼容性
 
-全部 15 个读取工具声明 `outputSchema`，覆盖实际 `{data, request_id}`、`{error, request_id}`、逐项失败和完整响应预算降级。写工具沿用原契约。常用顺序为 `list_accounts → list_mailboxes → search_emails → get_emails`，再按需调用 `read_conversation` 或 `list_attachments → prepare_attachment_download`。附件当前仅做本地离线测试，核对完整下载和文件内容读取；ChatGPT 实际连接测试后移。
+全部 16 个读取工具声明 `outputSchema`，覆盖实际 `{data, request_id}`、`{error, request_id}`、逐项失败和完整响应预算降级。写工具沿用原契约。常用顺序为 `list_accounts → list_mailboxes → search_emails → get_emails`，再按需调用 `read_conversation` 或 `list_attachments → prepare_attachment_download`。附件当前仅做本地离线测试，核对完整下载和文件内容读取；ChatGPT 实际连接测试后移。
 
 `list_accounts` 的 `default_account_id` 与账户的 `default` 指示默认项；`capabilities` 和 `limits` 给出当前实现及配置值。`list_mailboxes` 保留 `attributes`，增加 `attribute_flags`、`delimiter`、`selectable`、`special_use`、`role_source` 和 `role_candidates`。服务器用途、管理员配置和 INBOX 协议角色分别标记 `server`、`configuration`、`protocol`；只有名称候选时 `special_use` 为空、`role_source` 为 null。
 
@@ -119,15 +119,23 @@
 
 完整 JSON-RPC 预算计入真实 id、结构化内容及转义文本副本。预算不足先省略正文，再减少本页位置增量；未交付位置留在游标，`response_budget_omitted` 标记首次交付的响应裁减。基础元数据仍超限时返回 `LIMIT_EXCEEDED`，原游标保留待交付结果。客户端重试最近一次已使用的 token 可重放该页的位置、覆盖、错误快照和原裁减标记。重放仍复核冻结目录；原已裁减页保持精简结果，其他页重新读取正文，新增正文省略通过 `omitted_refs` 与正文覆盖计数报告。目录暂不可访问时返回可重试错误并保留 token。并发使用同一个 token 返回 `CURSOR_UNAVAILABLE`，应等待正在执行的调用完成。
 
-游标绑定请求主体和账户世代，全实例共享最多 64 项、8 MiB，租出执行中的状态也计入。成功推进刷新 10 分钟空闲 TTL，过期或重启后用种子重新查询。配额不足返回部分结果及 `cursor_action`：`resume_or_restart_with_narrower_scope` 可继续或缩小范围，`restart_later_or_with_narrower_scope` 要求稍后或缩小范围重启。初始目录不可用且其余工作已结束时也会提示重启。`cursor:null` 且 `complete:false` 时按动作重启；已有错误和正文遗漏也应分别处理。
+游标绑定请求主体和账户世代，全实例共享最多 64 项、8 MiB，租出执行中的状态也计入。成功推进刷新 10 分钟空闲 TTL，过期后用种子重新查询。`cursor_storage:memory` 在重启后失效；`persistent` 保存原到期时间和最近重放页，重启后仍在线复核全部冻结目录。配额不足返回部分结果及 `cursor_action`：`resume_or_restart_with_narrower_scope` 可继续或缩小范围，`restart_later_or_with_narrower_scope` 要求稍后或缩小范围重启。初始目录不可用且其余工作已结束时也会提示重启。`cursor:null` 且 `complete:false` 时按动作重启；已有错误和正文遗漏也应分别处理。
 
 ## 诊断、统计和缓存
+
+上述部分结果及 cursor_action 对应内存状态容量不足。持久 SQLite 提交因磁盘额度拒绝时返回 `LIMIT_EXCEEDED`，details.limit_kind 为 cache_quota，原已发布 token 和未交付位置保留，扩容恢复后可继续。
 
 `diagnose_connectivity` 分阶段报告当前认证调用、TCP、TLS、IMAP greeting、登录和能力检查。只返回固定阶段、状态及允许展示的能力，不返回服务器 banner、邮箱身份、主机名或原始错误。缺失或无效令牌由 HTTP 401 表达，JWKS 暂不可用由 HTTP 503 与 Retry-After 表达，工具只有在认证通过后才执行；SMTP 不在诊断范围内。
 
 `get_mailbox_statistics` 以 STATUS 返回文件夹邮件数量、未读数量等。统计必须收到匹配文件夹的全部请求字段和匹配 tag 的 OK；断连、缺失字段及拒绝均返回 MAIL_BACKEND，不把缺失响应解释为零。可选 `date_start` 和 `date_end` 统计最多 31 天的 INTERNALDATE 日分布，结束日期不包含在内。分布只覆盖本次 500 UID 窗口，结果附带范围和游标；总量与分布不是原子快照，不能混为同一时刻的全量统计。
 
-元数据缓存仅保存完整邮件头，全实例所有账户合计最多 256 项、16 MiB，TTL 为 60 秒。键包含内部账户身份与世代、文件夹、UIDVALIDITY 和 UID；每次会话先获取当前 UIDVALIDITY，只失效相应账户和文件夹的旧缓存。正文、附件、可变标记和统计结果不进入缓存。
+默认内存头缓存保存完整邮件头，全实例所有账户合计最多 256 项、16 MiB，TTL 为 60 秒。键包含内部账户身份与世代、文件夹、UIDVALIDITY 和 UID；每次会话先获取当前 UIDVALIDITY，只失效相应账户和文件夹的旧缓存。正文、附件、可变标记和统计结果不进入缓存。
+
+持久元数据由管理员通过 `CACHE_CONFIG_PATH` 选择账户和目录，模式为 off 或 metadata。在线读取完成后，有界后台队列记录邮件头、已核对部件清单与索引；部分头保留完整性标记。`get_cache_status({"account_id":"work"})` 先授权，再查询本地写入屏障之后的状态，返回 off、ready 或 unavailable，以及该账户的磁盘额度、当前目录世代、检查时间、dirty、邮件数、完整头数、索引头数及已核对清单数。当前收集范围随实际在线调用逐步增长。
+
+`write_health` 记录当前进程的失败证据任务数 `failed_writes`、最后固定原因 `last_error`（quota、queue_full、storage 或 null）及粘滞额度标记 `quota_blocked`。一批证据写入计一个任务；重启后重新评估。额度不足时仍可读取已保存的覆盖和额度信息，普通在线邮件读取继续返回其实际结果。
+
+跨文件夹会话的冻结范围全部被缓存配置选中时，`cursor_storage` 为 persistent，保存检查点和最近输入的重放快照；关闭缓存或包含未选目录时为 memory。持久范围遇存储故障返回固定游标错误，修复后可重试原已提交 token；已确认的世代变化使旧 token 失效。后台元数据写入失败保留已完成的普通在线读取结果。full 模式、正文附件离线交付和全量回填分别按后续工作包接入；配置与恢复见[缓存设计](cache-design.md)。
 
 ## 协议依据
 
