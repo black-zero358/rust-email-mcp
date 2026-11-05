@@ -10,6 +10,7 @@ use crate::{
 };
 pub mod attachments;
 mod classification;
+pub(crate) mod conversation;
 pub mod insights;
 mod listing;
 mod parts;
@@ -266,13 +267,13 @@ impl MailService {
     }
 
     fn account_discovery(&self) -> Value {
-        json!({
+        let mut discovery = json!({
             "default_account_id":"default",
             "accounts":[{
                 "id":"default", "address":self.config.address, "mode":self.config.mode, "default":true,
                 "capabilities":{
                     "attachment_delivery_modes":["inline_base64","authenticated_http"],
-                    "part_fetch":true, "cross_mailbox_conversation":false, "cache_modes":["off"]
+                    "part_fetch":true, "cross_mailbox_conversation":true, "cache_modes":["off"]
                 },
                 "limits":{
                     "mailbox_characters":ReadInputLimits::MAILBOX_CHARACTERS,
@@ -293,7 +294,14 @@ impl MailService {
                     "operation_timeout_seconds":self.config.timeout.as_secs()
                 }
             }]
-        })
+        });
+        if let (Some(limits), Some(conversation)) = (
+            discovery["accounts"][0]["limits"].as_object_mut(),
+            conversation::public_limits(&self.config).as_object_mut(),
+        ) {
+            limits.append(conversation);
+        }
+        discovery
     }
     pub async fn execute(&self, name: &str, args: &Value, principal: &str) -> Result<Value> {
         if !["send_email", "send_draft", "reply_email", "forward_email"].contains(&name) {
@@ -1495,7 +1503,7 @@ mod tests {
         assert_eq!(account["mode"], config.mode);
         assert_eq!(account["default"], true);
         assert_eq!(account["capabilities"]["part_fetch"], true);
-        assert_eq!(account["capabilities"]["cross_mailbox_conversation"], false);
+        assert_eq!(account["capabilities"]["cross_mailbox_conversation"], true);
         assert_eq!(account["capabilities"]["cache_modes"], json!(["off"]));
         assert_eq!(account["limits"]["raw_message_bytes"], config.max_message);
         assert_eq!(

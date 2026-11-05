@@ -44,6 +44,63 @@ fn account_id() -> Value {
     json!({"type":"string","minLength":1,"maxLength":ACCOUNT_ID_MAX_CHARACTERS,"pattern":format!("^[A-Za-z0-9][A-Za-z0-9._-]{{0,{}}}$",ACCOUNT_ID_MAX_CHARACTERS-1)})
 }
 
+fn cross_conversation() -> Value {
+    let message_ref = all_required(
+        json!({"account_id":account_id(),"mailbox":string(),"uid_validity":uid(),"uid":uid()}),
+    );
+    let variant = object(
+        json!({
+            "variant_id":string(),"representative":message_ref,"locations":array(message_ref.clone()),"new_variant":boolean(),
+            "message":reference("conversation_message"),"body_error":reference("error"),
+        }),
+        &["variant_id", "representative", "locations", "new_variant"],
+    );
+    let entity = all_required(json!({
+        "entity_id":string(),"message_id":nullable(string()),"identity_status":enumeration(&["identity_unverified","verified","collision"]),
+        "new_entity":boolean(),"variants":array(variant)
+    }));
+    let folder = all_required(json!({
+        "mailbox":string(),"uid_validity":nullable(uid()),"high_uid":nullable(count()),"completed_windows":count(),"remaining_windows":count(),
+        "pending_candidates":count(),"unresolved_errors":count(),"complete":boolean(),"error":nullable(reference("error"))
+    }));
+    let coverage = all_required(json!({
+        "completed_windows":count(),"remaining_windows":count(),"pending_candidates":count(),"unresolved_errors":count(),"known_locations":count(),
+        "graph_complete":boolean(),"delivery_pending":boolean(),"body_requested":count(),"body_returned":count()
+    }));
+    let errors = json!({"oneOf":[
+        all_required(json!({"stage":{"const":"folder"},"mailbox":string(),"error":reference("error")})),
+        all_required(json!({"stage":{"const":"search"},"mailbox":string(),"field":enumeration(&["Message-ID","References","In-Reply-To"]),
+            "start_uid":uid(),"end_uid":uid(),"error":reference("error")})),
+        all_required(json!({"stage":{"const":"header"},"ref":message_ref,"error":reference("error")})),
+        all_required(json!({"stage":{"const":"cursor"},"error":reference("error")}))
+    ]});
+    object(
+        json!({
+            "mode":{"const":"cross_mailbox"},"account_id":account_id(),"seed":message_ref,
+            "folders":{"type":"array","minItems":1,"maxItems":20,"items":folder},
+            "messages":{"type":"array","maxItems":20,"items":entity},"cursor":nullable(json!({"type":"string","format":"uuid"})),
+            "coverage":coverage,"errors":{"type":"array","maxItems":20,"items":errors},"errors_omitted":count(),"omitted_refs":array(message_ref),
+            "complete":boolean(),"response_budget_omitted":boolean(),"content_trust":{"const":"untrusted"},
+            "cursor_action":enumeration(&["resume_or_restart_with_narrower_scope","restart_later_or_with_narrower_scope"]),
+        }),
+        &[
+            "mode",
+            "account_id",
+            "seed",
+            "folders",
+            "messages",
+            "cursor",
+            "coverage",
+            "errors",
+            "errors_omitted",
+            "omitted_refs",
+            "complete",
+            "response_budget_omitted",
+            "content_trust",
+        ],
+    )
+}
+
 fn account_context(mut schema: Value, mailbox: bool) -> Value {
     if let Some(branches) = schema.get_mut("oneOf").and_then(Value::as_array_mut) {
         for branch in branches {
@@ -77,8 +134,8 @@ fn violation() -> Value {
     object(
         json!({
             "field":{"type":"string","pattern":"^(?:/(?:[^~/]|~[01])*)*$"},
-            "reason":enumeration(&["type_mismatch","required_field","unknown_field","character_minimum","character_limit","utf8_byte_limit","wire_byte_limit","forbidden_control_character","integer_range","item_count","constant_mismatch","unsupported_value","invalid_date","conflicting_range","required_with_field","date_range_limit","invalid_message_id","resource_limit","attachment_reference_required","invalid_attachment_id","reference_mismatch","invalid_account_id"]),
-            "action":enumeration(&["use_expected_type","provide_field","remove_unknown_fields","provide_longer_field","shorten_field","remove_control_characters","use_expected_range","use_expected_item_count","use_required_value","use_supported_value","use_valid_calendar_date","adjust_range","provide_paired_field","shorten_date_range","use_message_id_header","reduce_request","provide_attachment_reference","relist_attachments","use_matching_reference","use_default_account","list_accounts"]),
+            "reason":enumeration(&["type_mismatch","required_field","unknown_field","character_minimum","character_limit","utf8_byte_limit","wire_byte_limit","forbidden_control_character","integer_range","item_count","constant_mismatch","unsupported_value","invalid_date","conflicting_range","required_with_field","date_range_limit","invalid_message_id","resource_limit","attachment_reference_required","invalid_attachment_id","reference_mismatch","invalid_account_id","conflicting_field"]),
+            "action":enumeration(&["use_expected_type","provide_field","remove_unknown_fields","provide_longer_field","shorten_field","remove_control_characters","use_expected_range","use_expected_item_count","use_required_value","use_supported_value","use_valid_calendar_date","adjust_range","provide_paired_field","shorten_date_range","use_message_id_header","reduce_request","provide_attachment_reference","relist_attachments","use_matching_reference","use_default_account","list_accounts","remove_conflicting_field"]),
             "expected":string(),"actual_type":enumeration(&["null","boolean","integer","number","string","array","object"]),
             "limit":count(),"actual":count(),"unit":enumeration(&["unicode_code_points","utf8_bytes","modified_utf7_bytes","items","days","bytes"]),
             "minimum":count(),"maximum":count(),"related_field":{"type":"string","pattern":"^(?:/(?:[^~/]|~[01])*)*$"}
@@ -129,7 +186,7 @@ fn error() -> Value {
     details["dependentRequired"] = dependencies;
     object(
         json!({
-            "code":enumeration(&["INVALID_INPUT","MAIL_BACKEND","STORAGE_UNAVAILABLE","ATTACHMENT_STORAGE_UNAVAILABLE","LIMIT_EXCEEDED","TIMEOUT","BUSY","STALE_UID","NOT_FOUND","UNSUPPORTED_BODY","UNSUPPORTED_CHARSET","UNSUPPORTED_TRANSFER_ENCODING","ATTACHMENT_DECODE_FAILED","ATTACHMENT_NOT_FOUND","ACCOUNT_UNAVAILABLE","INTERNAL"]),
+            "code":enumeration(&["INVALID_INPUT","MAIL_BACKEND","STORAGE_UNAVAILABLE","ATTACHMENT_STORAGE_UNAVAILABLE","LIMIT_EXCEEDED","TIMEOUT","BUSY","STALE_UID","NOT_FOUND","UNSUPPORTED_BODY","UNSUPPORTED_CHARSET","UNSUPPORTED_TRANSFER_ENCODING","ATTACHMENT_DECODE_FAILED","ATTACHMENT_NOT_FOUND","ACCOUNT_UNAVAILABLE","CURSOR_UNAVAILABLE","INTERNAL"]),
             "message":string(),"retryable":boolean(),"details":details
         }),
         &["code", "message", "retryable"],
@@ -252,7 +309,7 @@ fn read_diagnostics() -> Value {
 fn accounts() -> Value {
     let capabilities = all_required(json!({
         "attachment_delivery_modes":{"const":["inline_base64","authenticated_http"]},"part_fetch":{"const":true},
-        "cross_mailbox_conversation":{"const":false},"cache_modes":{"const":["off"]}
+        "cross_mailbox_conversation":{"const":true},"cache_modes":{"const":["off"]}
     }));
     let mut limits = json!({});
     for name in [
@@ -274,6 +331,16 @@ fn accounts() -> Value {
         "queue_wait_seconds",
         "backend_backoff_seconds",
         "operation_timeout_seconds",
+        "conversation_mailboxes",
+        "conversation_candidate_headers",
+        "conversation_result_locations",
+        "conversation_display_body_bytes",
+        "conversation_fingerprint_raw_bytes",
+        "conversation_search_windows",
+        "conversation_search_window_uids",
+        "conversation_search_response_bytes",
+        "conversation_ordinary_connections",
+        "conversation_timeout_seconds",
     ] {
         limits[name] = count();
     }
@@ -342,13 +409,16 @@ fn data(name: &str) -> Value {
             schema
         }
         "get_operation" => all_required(json!({"operation":nullable(reference("operation"))})),
-        "read_conversation" => all_required(json!({
+        "read_conversation" => {
+            let legacy = all_required(json!({
             "mailbox":string(),"uid_validity":uid(),"messages":{"type":"array","maxItems":20,"items":reference("conversation_message")},"omitted_uids":array(uid()),
             "threading":{"const":"Message-ID/References/In-Reply-To exact identifier graph; no subject matching"},
             "scope":all_required(json!({"start_uid":uid(),"end_uid":count(),"candidates_checked":count(),"seed_uid":uid()})),
             "next_before_uid":nullable(uid()),"candidate_limit_reached":boolean(),"messages_omitted":boolean(),"response_budget_omitted":boolean(),
             "older_uids_omitted":boolean(),"total_body_byte_limit":count(),"skipped_candidates":array(reference("uid_error")),"message_errors":array(reference("uid_error")),"complete":boolean(),"content_trust":trust
-        })),
+            }));
+            return json!({"oneOf":[account_context(legacy,true),cross_conversation()]});
+        }
         "locate_message" => all_required(json!({
             "matches":{"type":"array","maxItems":50,"items":all_required(json!({"account_id":account_id(),"mailbox":string(),"uid":uid(),"uid_validity":uid(),"message_id":string()}))},
             "scopes":{"type":"array","minItems":1,"maxItems":20,"items":all_required(json!({"account_id":account_id(),"mailbox":string(),"uid_validity":uid(),"start_uid":uid(),"end_uid":count(),"next_before_uid":nullable(uid()),"candidates_checked":count(),"candidate_limit_reached":boolean(),"older_uids_omitted":boolean()}))},

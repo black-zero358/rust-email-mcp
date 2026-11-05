@@ -95,6 +95,14 @@ pub struct ErrorDetails {
 }
 pub type Result<T> = std::result::Result<T, MailError>;
 impl MailError {
+    pub fn cursor_unavailable() -> Self {
+        Self {
+            code: "CURSOR_UNAVAILABLE",
+            message: "The conversation cursor is unavailable. Start a new conversation read or retry a concurrent request after it finishes.",
+            retryable: false,
+            details: None,
+        }
+    }
     pub fn attachment_storage_unavailable() -> Self {
         Self {
             code: "ATTACHMENT_STORAGE_UNAVAILABLE",

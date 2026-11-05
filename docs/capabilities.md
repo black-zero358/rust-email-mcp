@@ -67,7 +67,7 @@
 
 需要完整 MIME 或 UTF-7 解码时，在已确认的整封大小上限内，每 UID 最多回退一次新连接 raw 读取，重新核对 UIDVALIDITY 并沿用原期限。正文结果增加 `read_diagnostics`，字段与附件诊断一致，额外回退原因 `charset_utf7` 表示 UTF-7。批量中已完成命令后的局部正文错误只影响当前项；协议、目标数据或连接失败停止后续读取，后续项标记 `unprocessed`。重复 UID 按输入顺序保留逐项结果。
 
-`read_conversation` 从指定 `uid` 和 `uid_validity` 出发，按 Message-ID、References 和 In-Reply-To 的精确标识符关联同一文件夹的邮件，不使用相同主题作为关联依据。默认检查 100 个候选头，最多 200 个；默认返回 10 封，最多 20 封，累计正文最多 256 KiB。扫描范围、候选上限、遗漏邮件和后续 UID 游标均随结果返回。`next_before_uid` 仅推进候选扫描；`omitted_uids` 列出本次已关联但因数量、响应预算、正文错误或连接终止未返回的 UID，具体失败保存在 `message_errors`。可根据逐项错误处理后用 `get_emails` 分批读取。跨窗口关联由客户端继续查询并结合已有结果。
+`read_conversation` 未传 `mailboxes`、`scope` 或 `cursor` 时沿用单文件夹调用：从指定 `uid` 和 `uid_validity` 出发，按 Message-ID、References 和 In-Reply-To 的精确标识符关联同一文件夹的邮件，不使用相同主题作为关联依据。默认检查 100 个候选头，最多 200 个；默认返回 10 封，最多 20 封，累计正文最多 256 KiB。扫描范围、候选上限、遗漏邮件和后续 UID 游标均随结果返回。`next_before_uid` 仅推进候选扫描；`omitted_uids` 列出本次已关联但因数量、响应预算、正文错误或连接终止未返回的 UID，具体失败保存在 `message_errors`。可根据逐项错误处理后用 `get_emails` 分批读取。跨窗口关联由客户端继续查询并结合已有结果。
 
 `locate_message` 接受 `message_id` 和显式 `mailboxes` 列表，最多 20 个文件夹。先以服务端 HEADER 搜索缩小候选，再验证完整 Message-ID，避免子串误匹配。每个文件夹分别返回搜索范围及下一页游标；继续某个文件夹时应单独传入该文件夹和它自己的游标。
 
@@ -82,6 +82,44 @@
 ```
 
 可读格式最多 16 层缩进、256 个链接、每地址 2048 UTF-8 字节；多个所选 HTML 部件共用链接、32768 token 与 1 MiB 输出预算。相对地址、危险协议、控制字符、过长链接和超额层次通过 `omissions` 报告；无法支持的外来内容继续返回 `UNSUPPORTED_BODY`。MIME 候选选择及纯文本优先规则保持一致。
+
+## 跨文件夹会话
+
+`read_conversation` 首次传入 `mailboxes` 或 `scope:"standard"` 进入跨文件夹模式，两者互斥。指定种子 `mailbox`、`uid`、`uid_validity`，省略 mailbox 使用 INBOX；种子目录须包含在查询范围内，仅选择 Sent 等目录时应同时指定种子 mailbox。显式列表最多 20 个文件夹；standard 使用协议 INBOX、服务器明确标记的 Sent 和管理员 `ARCHIVE_MAILBOX` / `folders.archive`，排除 All、Junk、Trash、Drafts 和不可选择目录。普通名称候选不加入 standard，显式列表可选择需要检查的其他目录。
+
+```json
+{"account_id":"work","mailbox":"INBOX","uid":7,"uid_validity":9,"mailboxes":["INBOX","Sent","Archive"],"limit":20,"candidate_limit":200,"html_display":"readable"}
+```
+
+后续只传入返回的 cursor 和原账户；种子、范围、正文选项及分页设置保存在游标中。非默认账户每次均须传入 `account_id`，省略账户会按当前默认账户检查。`before_uid` 仅用于旧单文件夹模式。
+
+```json
+{"account_id":"work","cursor":"返回的不透明游标"}
+```
+
+首次读取固定实际目录、各自 UIDVALIDITY 和 UIDNEXT−1 水位。新到邮件留给下一次新查询；续页复核已冻结目录的 UIDVALIDITY，变化返回 `STALE_UID` 并使游标失效。起始不可访问的目录保持独立错误，健康目录继续；收到重启动作后新建查询，以重新确定范围。Message-ID、References、In-Reply-To 通过有界 HEADER 搜索和精确头解析双向展开，相同主题不参与关联。
+
+每页全范围共享以下预算，`list_accounts` 的 `data.accounts[].limits` 同时公开当前值：
+
+| 项目 | 上限 |
+| --- | --- |
+| 候选头读取 | 默认及最多 200 次，种子头单独读取 |
+| 返回结果位置 | 默认及最多 20 个；副本来源更新也计入 |
+| 展示正文 | 每个变体最多 64 KiB，每页共 256 KiB |
+| 搜索 | 256 个窗口，每窗口最多 200 个 UID 数值；单命令响应及解析分配各 128 KiB |
+| 身份指纹原始邮件读取 | 每页累计 256 KiB，同时遵守单封配置上限 |
+| 普通与故障恢复连接 | 8 个；另有每个结果位置至多一次正文 raw 回退 |
+| 总操作期限 | 进入邮箱执行槽后采用配置超时与 60 秒中的较小值，排队另限 10 秒；连接共用原传输预算 |
+
+响应 `data.mode` 为 `cross_mailbox`。`messages` 按实体和变体组织；`entity_id` / `variant_id` 供跨页合并，`new_entity` / `new_variant` 标记首次出现，`locations` 保留所有新增来源，每个引用包含 `account_id`、`mailbox`、`uid_validity`、`uid`。正文位于变体的 `message`，`representative` 标明本页已核对的来源。后续页返回新实体、新变体或新增位置，客户端累积这些增量。
+
+只有关键头原始字节和完整根 MIME 正文字节的 SHA-256 指纹均一致时，多个位置才折叠为同一变体。关键头包含发送/收件、日期、主题、关联头和 MIME 头，按固定字段顺序比较原始值，同名字段保留出现次序；不同折行或编码保留为独立证据。相同 Message-ID 的关键头或内容冲突标 `collision`，完整核对一致标 `verified`，尚缺内容指纹标 `identity_unverified`；合法 ID 缺失或重复时按邮件引用独立保留。正文仍可按部件读取，超出指纹额度的邮件保留未核验身份。
+
+`folders` 报各目录水位、完成/剩余窗口、待处理候选及错误；`coverage` 区分关联图、待交付位置、请求/已返回正文。`complete:true` 要求冻结范围内关联扫描结束、无未解决错误且位置增量已交付。正文因预算或内容错误省略时列入 `omitted_refs`，对应变体可含 `body_error`，客户端可用完整引用单独读取。`errors` 最多列 20 项，`errors_omitted` 报剩余数量。
+
+完整 JSON-RPC 预算计入真实 id、结构化内容及转义文本副本。预算不足先省略正文，再减少本页位置增量；未交付位置留在游标，`response_budget_omitted` 标记首次交付的响应裁减。基础元数据仍超限时返回 `LIMIT_EXCEEDED`，原游标保留待交付结果。客户端重试最近一次已使用的 token 可重放该页的位置、覆盖、错误快照和原裁减标记。重放仍复核冻结目录；原已裁减页保持精简结果，其他页重新读取正文，新增正文省略通过 `omitted_refs` 与正文覆盖计数报告。目录暂不可访问时返回可重试错误并保留 token。并发使用同一个 token 返回 `CURSOR_UNAVAILABLE`，应等待正在执行的调用完成。
+
+游标绑定请求主体和账户世代，全实例共享最多 64 项、8 MiB，租出执行中的状态也计入。成功推进刷新 10 分钟空闲 TTL，过期或重启后用种子重新查询。配额不足返回部分结果及 `cursor_action`：`resume_or_restart_with_narrower_scope` 可继续或缩小范围，`restart_later_or_with_narrower_scope` 要求稍后或缩小范围重启。初始目录不可用且其余工作已结束时也会提示重启。`cursor:null` 且 `complete:false` 时按动作重启；已有错误和正文遗漏也应分别处理。
 
 ## 诊断、统计和缓存
 

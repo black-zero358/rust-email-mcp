@@ -52,6 +52,55 @@ fn strict_json_extends_legacy_without_granting_new_global_subjects_old_mail_acce
 }
 
 #[test]
+fn archive_configuration_is_optional_and_isolated_per_account() {
+    let mut environment = environment();
+    environment.insert("ARCHIVE_MAILBOX".into(), "原邮箱归档".into());
+
+    let legacy = load_checked(&|key| environment.get(key).cloned()).unwrap();
+    assert_eq!(legacy.source, AccountConfigSource::Legacy);
+    assert_eq!(legacy.service_config.archive.as_deref(), Some("原邮箱归档"));
+
+    let mut document = document();
+    let extended = load_document(&document, &environment).unwrap();
+    assert_eq!(
+        extended.accounts[0].config.archive.as_deref(),
+        Some("原邮箱归档")
+    );
+    assert_eq!(extended.accounts[1].config.archive, None);
+
+    document["accounts"][0]["folders"] =
+        json!({"drafts":"Drafts","trash":"Trash","archive":"财务归档"});
+    let extended = load_document(&document, &environment).unwrap();
+    assert_eq!(
+        extended.accounts[0].config.archive.as_deref(),
+        Some("原邮箱归档")
+    );
+    assert_eq!(
+        extended.accounts[1].config.archive.as_deref(),
+        Some("财务归档")
+    );
+}
+
+#[test]
+fn invalid_archive_names_are_rejected_in_environment_and_json() {
+    let mut environment = environment();
+    let mut document = document();
+    for invalid in [String::new(), "private\tarchive".into(), "界".repeat(513)] {
+        environment.insert("ARCHIVE_MAILBOX".into(), invalid.clone().into());
+        let error = load_checked(&|key| environment.get(key).cloned())
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), CONFIG_ERROR);
+        environment.remove("ARCHIVE_MAILBOX");
+
+        document["accounts"][0]["folders"] =
+            json!({"drafts":"Drafts","trash":"Trash","archive":invalid});
+        let error = load_document(&document, &environment).err().unwrap();
+        assert_eq!(error.to_string(), CONFIG_ERROR);
+    }
+}
+
+#[test]
 fn shipped_configuration_example_matches_strict_schema() {
     let document: Value =
         serde_json::from_str(include_str!("../../../deploy/accounts.json.example")).unwrap();
@@ -181,7 +230,9 @@ fn json_count_and_file_bytes_are_bounded_before_registry_work() {
 
 #[test]
 fn file_only_requires_anchor_and_refuses_legacy_environment_precedence() {
-    let value = json!({"version":1,"mode":"file_only","default_account_id":"finance","legacy_default":{"display_name":"原邮箱","address":"owner@example.test","imap":{"host":"imap.example.test","port":993},"password":{"env":"PRIMARY_PASSWORD"},"smtp":{"host":"smtp.example.test","port":465,"starttls":false},"permission_mode":"full","read_subjects":["owner"],"write_subjects":["owner"]},"accounts":[extra()]});
+    let mut value = json!({"version":1,"mode":"file_only","default_account_id":"finance","legacy_default":{"display_name":"原邮箱","address":"owner@example.test","imap":{"host":"imap.example.test","port":993},"password":{"env":"PRIMARY_PASSWORD"},"smtp":{"host":"smtp.example.test","port":465,"starttls":false},"permission_mode":"full","read_subjects":["owner"],"write_subjects":["owner"]},"accounts":[extra()]});
+    value["legacy_default"]["folders"] =
+        json!({"drafts":"Drafts","trash":"Trash","archive":"JSON 归档"});
     assert!(load_document(&value, &environment()).is_err());
     let mut environment = environment();
     for key in ["EMAIL_ADDRESS", "EMAIL_PASSWORD", "IMAP_HOST", "SMTP_HOST"] {
@@ -193,6 +244,11 @@ fn file_only_requires_anchor_and_refuses_legacy_environment_precedence() {
     assert_eq!(set.default_read_account, "finance");
     assert_eq!(set.service_config.address, "owner@example.test");
     assert_eq!(set.service_config.mode, "full");
+    assert_eq!(set.service_config.archive.as_deref(), Some("JSON 归档"));
+    assert_eq!(set.accounts[1].config.archive, None);
+    environment.insert("ARCHIVE_MAILBOX".into(), "环境归档".into());
+    assert!(load_document(&value, &environment).is_err());
+    environment.remove("ARCHIVE_MAILBOX");
     let mut no_smtp = value.clone();
     no_smtp["legacy_default"]["smtp"] = Value::Null;
     assert!(load_document(&no_smtp, &environment).is_err());

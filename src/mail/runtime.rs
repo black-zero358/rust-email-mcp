@@ -11,6 +11,7 @@ pub struct MailRuntime {
     pub(super) scheduler: Arc<Scheduler>,
     services: HashMap<AccountKey, MailService>,
     pub attachments: Arc<attachments::AttachmentStore>,
+    conversations: conversation::CursorStore,
 }
 
 impl MailRuntime {
@@ -40,6 +41,7 @@ impl MailRuntime {
             scheduler: Scheduler::new(),
             services,
             attachments,
+            conversations: Default::default(),
         })
     }
 
@@ -147,6 +149,32 @@ impl MailRuntime {
         self.services
             .get(key)
             .ok_or_else(MailError::account_unavailable)
+    }
+
+    pub(crate) async fn cross_conversation(
+        &self,
+        args: &Value,
+        principal: &str,
+        fits: impl Fn(&Value) -> bool,
+    ) -> Result<Value> {
+        // Resolve the explicit/default read account before touching cursor state.
+        let requested = args
+            .get("account_id")
+            .map(|value| value.as_str().ok_or_else(MailError::input))
+            .transpose()?;
+        let lease = self.catalog.read_account(principal, requested)?;
+        let service = self.service_for(&lease.key)?;
+        self.run_read(
+            &lease,
+            Box::pin(service.cross_conversation(
+                &self.conversations,
+                args,
+                principal,
+                &lease.cancellation,
+                fits,
+            )),
+        )
+        .await
     }
 
     pub(super) async fn run_read<T>(

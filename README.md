@@ -42,7 +42,7 @@ JSON-RPC id 的序列化 JSON（包括引号、转义和 UTF-8 字节）最多 1
 MIME 在构建结构时限制为 1024 个节点、32 层嵌套，头部每段最多 128 KiB，累计最多 1 MiB、8192 行（含折行）。正文解码前按编码字节数的四倍预留共享的 32 MiB 预算，覆盖字符集转为 UTF-8 的放大；整封 MIME 附件解码先限制编码输入，按部件下载逐块计量编码和解码字节。超限返回 `LIMIT_EXCEEDED`，因此部分原始大小合规的复杂邮件或长正文仍会被拒绝。回复和草稿发送只解析有界头部，保留草稿正文原始字节。边界分隔行按完整 boundary 匹配，接受尾部空格和制表符；不再把仅具有相同前缀的行当作分隔符。
 
 文件夹名称在工具参数、LIST 返回值和 DRAFTS_MAILBOX/TRASH_MAILBOX 配置中使用 Unicode；返回的 name 可直接传给读取、移动或重命名工具。连接采用 IMAP4rev1，线路上的名称使用 modified UTF-7，包含 & 的名称也会正确转换。非规范或无法安全往返的服务端名称返回 MAIL_BACKEND，避免误引用其他文件夹。ASCII 搜索继续使用 US-ASCII；中文等非 ASCII 查询使用 CHARSET UTF-8 和同步 literal。服务器返回 BADCHARSET 时报告 UNSUPPORTED_CHARSET，不降级为含义不同的查询；未协商 UTF8=ACCEPT 或 IMAP4rev2。
-搜索支持日期、发件人、收件人、主题、已读、星标、已回复、附件和大小组合。会话根据关联头组织；跨文件夹定位使用精确 Message-ID。批量整理最多 50 个明确 UID，保留逐项结果，批量删除必须确认。
+搜索支持日期、发件人、收件人、主题、已读、星标、已回复、附件和大小组合。会话根据关联头组织；`read_conversation` 可用 `mailboxes` 或 `scope:"standard"` 聚合单账户内的跨文件夹往来，保留副本来源、冲突变体及续查游标。standard 选择收件箱、服务器标记的已发送目录及管理员配置的归档目录。跨文件夹定位使用精确 Message-ID。批量整理最多 50 个明确 UID，保留逐项结果，批量删除必须确认。
 
 列表和搜索可用 `preview:true` 附带最多 200 个 Unicode 码点的正文预览，每封编码取样最多 8 KiB、每页共用 128 KiB。预览失败或达到额度时保留摘要及分页游标，逐项状态说明原因。摘要同时按邮件头给出 newsletter、automated 或 unclassified 分类与固定规则信号；退订字段只提示是否有可用地址。附件筛选优先核对 MIME 结构与头部，必要时每页最多一次有界整封回退。详细状态与限制见[能力说明](docs/capabilities.md#筛选与分页)。
 
@@ -116,6 +116,7 @@ JWKS 暂不可用时认证返回 HTTP 503 和 `Retry-After: 10`，客户端可�
 | `SMTP_HOST`、`SMTP_PORT` | SMTP 地址，端口默认 465 |
 | `SMTP_STARTTLS` | `false` 使用隐式 TLS；`true` 使用必须成功的 STARTTLS |
 | `DRAFTS_MAILBOX`、`TRASH_MAILBOX` | 邮箱服务商的草稿和废纸篓名称 |
+| `ARCHIVE_MAILBOX` | 可选 Unicode 归档目录，用于 standard 会话范围；多账户 JSON 使用 `folders.archive` |
 | `MAIL_MODE` | `read`、`draft`、`send`、`full`，默认 `read` |
 | `MCP_RESOURCE` | 公网 MCP 完整 HTTPS 地址 |
 | `OIDC_ISSUER` | 身份服务发现文档中的精确 issuer，包含其尾部斜线 |
@@ -212,6 +213,8 @@ async-imap 0.12.0 的流式命令终结状态补丁位于 vendor/async-imap，�
 
 默认单封32 MiB、每连接累计128 MiB、完整工具响应2 MiB；4个邮箱执行槽，最多20个进入执行/等待的工具请求，等待槽位最多10秒，操作超时60秒。会话完整头与MIME单头块统一为128 KiB，缓存256项/16 MiB/60秒；正文长度参数最高512 KiB，批读每封最多64 KiB，会话累计正文最多256 KiB。HTTP请求体仍为256 KiB。
 
-会话扫描在完整FETCH后跳过超大或解析失败的候选，通过 `skipped_candidates` 返回UID及脱敏错误；已关联邮件的本地内容错误放入 `message_errors`，同时保留已读取邮件与 `omitted_uids`。种子头或传输/协议错误明确失败。`get_emails` 和会话正文按完整JSON-RPC预算截断UTF-8前缀，保留元数据和逐项结果；元数据本身超限仍返回有界错误。
+旧单文件夹会话扫描在完整FETCH后跳过超大或解析失败的候选，通过 `skipped_candidates` 返回UID及脱敏错误；已关联邮件的本地内容错误放入 `message_errors`，同时保留已读取邮件与 `omitted_uids`。种子头或传输/协议错误明确失败。`get_emails` 和旧会话正文按完整JSON-RPC预算截断UTF-8前缀，保留元数据和逐项结果；元数据本身超限仍返回有界错误。
+
+跨文件夹会话每页共享 200 个候选头、20 个结果位置、256 KiB 展示正文和最多 60 秒期限；每条搜索只扫描至多 200 个 UID 的数值区间。首次固定目录及 UID 水位，后续用 `cursor` 续查，非默认账户同时传入原 `account_id`。返回 `folders`、`coverage`、逐项错误和 `omitted_refs`，供客户端核对扫描、关联与正文覆盖。游标全实例共用 64 项/8 MiB，空闲 10 分钟或服务重启后重新查询。调用样例与去重规则见[跨文件夹会话](docs/capabilities.md#跨文件夹会话)。
 
 默认完整头上限扩大后，18 KiB级长邮件头可直接读取。配置无需迁移，SQLite结构与操作键不变。部署模板的mail内存额度提高为1 GiB。SMTP行格式、未知发送去重、UIDVALIDITY、JWT与TLS校验保持原规则。

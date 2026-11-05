@@ -15,7 +15,7 @@
       "address": "finance@example.test",
       "imap": {"host": "imap.example.test", "port": 993},
       "password": {"env": "FINANCE_MAIL_PASSWORD"},
-      "folders": {"drafts": "Drafts", "trash": "Trash"},
+      "folders": {"drafts": "Drafts", "trash": "Trash", "archive": "Archive"},
       "read_subjects": ["replace-with-finance-subject"]
     }
   ]

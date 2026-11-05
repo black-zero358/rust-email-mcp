@@ -21,6 +21,7 @@ pub struct Config {
     pub smtp_starttls: bool,
     pub drafts: String,
     pub trash: String,
+    pub archive: Option<String>,
     pub mode: String,
     pub timeout: Duration,
     pub max_message: usize,
@@ -48,6 +49,7 @@ pub(crate) fn fixture() -> Arc<Config> {
         smtp_starttls: false,
         drafts: "Drafts".into(),
         trash: "Trash".into(),
+        archive: None,
         mode: "full".into(),
         timeout: Duration::from_secs(2),
         max_message: 8 * 1024 * 1024,
@@ -87,6 +89,7 @@ impl Config {
                 smtp_starttls: value("SMTP_STARTTLS", "false")?.parse()?,
                 drafts: value("DRAFTS_MAILBOX", "Drafts")?,
                 trash: value("TRASH_MAILBOX", "Trash")?,
+                archive: lookup_string(lookup, "ARCHIVE_MAILBOX")?,
                 mode: value("MAIL_MODE", "read")?,
             },
             lookup,
@@ -112,6 +115,7 @@ impl Config {
             smtp_starttls: mail.smtp_starttls,
             drafts: mail.drafts,
             trash: mail.trash,
+            archive: mail.archive,
             mode: mail.mode,
             timeout: Duration::from_secs(60),
             max_message: DEFAULT_MAX_MESSAGE,
@@ -141,6 +145,7 @@ impl Config {
             !c.subjects.iter().any(String::is_empty),
             "Empty subject allowlist"
         );
+        validate_archive(c.archive.as_deref())?;
         Ok(Arc::new(c))
     }
 }
@@ -168,5 +173,19 @@ struct MailValues {
     smtp_starttls: bool,
     drafts: String,
     trash: String,
+    archive: Option<String>,
     mode: String,
+}
+
+fn validate_archive(archive: Option<&str>) -> anyhow::Result<()> {
+    if let Some(archive) = archive {
+        anyhow::ensure!(
+            !archive.is_empty() && !archive.chars().any(char::is_control),
+            "Invalid archive mailbox"
+        );
+        crate::input_limits::InputLimits::Read
+            .mailbox(archive, "/archive")
+            .map_err(|_| anyhow::anyhow!("Invalid archive mailbox"))?;
+    }
+    Ok(())
 }

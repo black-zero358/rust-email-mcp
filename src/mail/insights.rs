@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const HEADER_LIMIT: usize = 128 * 1024;
+pub(super) const HEADER_LIMIT: usize = 128 * 1024;
 const CACHE_BYTES: usize = 16 * 1024 * 1024;
 const CACHE_ITEMS: usize = 256;
 const CACHE_TTL: Duration = Duration::from_secs(60);
@@ -741,7 +741,7 @@ fn trim_body(body: &str) -> (&str, bool, bool) {
         signature_offset < body.len(),
     )
 }
-fn bound_conversation_metadata(value: &mut Value) {
+pub(super) fn bound_conversation_metadata(value: &mut Value) {
     let attachments = value["attachments"].as_array().map_or(0, Vec::len);
     value["attachments"] = json!([]);
     value["attachment_metadata_omitted"] = json!(attachments > 0);
@@ -847,9 +847,9 @@ pub(crate) fn tool_specs() -> Vec<(&'static str, &'static str, Value, Vec<&'stat
     vec![
         (
             "read_conversation",
-            "Read a bounded same-folder conversation linked by message identifiers; inspect scope and omission flags.",
-            json!({"mailbox":mailbox,"uid":uid,"uid_validity":uid,"before_uid":uid,"candidate_limit":{"type":"integer","minimum":1,"maximum":200},"limit":{"type":"integer","minimum":1,"maximum":20},"body_mode":{"type":"string","enum":["full","trimmed"]},"max_body_length":{"type":"integer","minimum":0,"maximum":524288}}),
-            vec!["uid", "uid_validity"],
+            "Read a conversation linked by message identifiers. Supply mailboxes or scope standard for a cross-folder scan, then pass its cursor and account_id to continue. Omit those fields for the original single-folder read.",
+            json!({"mailbox":mailbox,"uid":uid,"uid_validity":uid,"before_uid":uid,"candidate_limit":{"type":"integer","minimum":1,"maximum":200},"limit":{"type":"integer","minimum":1,"maximum":20},"body_mode":{"type":"string","enum":["full","trimmed"]},"max_body_length":{"type":"integer","minimum":0,"maximum":524288},"mailboxes":{"type":"array","minItems":1,"maxItems":20,"items":{"type":"string","minLength":1,"maxLength":512}},"scope":{"type":"string","const":"standard"},"cursor":{"type":"string","minLength":36,"maxLength":36}}),
+            vec![],
         ),
         (
             "locate_message",

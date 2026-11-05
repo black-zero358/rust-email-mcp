@@ -2,6 +2,30 @@
 
 本文件保存带版本与环境边界的证据。每次新增记录注明提交/tag、日期与时区、环境、命令、结果、CI 链接及未覆盖项；保留历史结果，不把其测试数量或部署状态当作当前版本的证明。验证要求见 [贡献指南](../CONTRIBUTING.md#验证与完成标准)。
 
+## 2026-11-05 R09 跨文件夹会话
+
+源码提交 `4e499e4ccbaf4278630c609ec4d09b4553f8718a`，基于搜索基础合并 `2a07f31360ceffdc4929fc5b765813ceefadcea7`。环境为 WSL Ubuntu、Rust 1.99.1、Node 24.15.0 和 Docker Desktop；邮件、账户、JWT 与 TLS IMAP 后端均使用合成数据。
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo fmt --check`、`git diff --check` | 通过；变更文档的本地链接目标已核对 |
+| `cargo test --locked --quiet` | 385 单元 + 44 集成通过；单元 33.37 秒，搜索专项 10 项 0.86 秒 |
+| `cargo clippy --locked --all-targets -- -D warnings` | 通过，7.72 秒；vendored async-imap 保留上游 4 条 deprecated 宏提示 |
+| `cargo build --locked --release` | 通过，35.65 秒 |
+| 显式 Rust→Node 附件联调 | 8 文件下载、SHA-256 及内容读取通过，9.81 秒 |
+| `pnpm --dir scripts/attachment-client-adapter test` | 7 项通过 |
+| `scripts/audit-dependencies.sh` | 1409 条公告、340 个依赖，退出 0；保留已登记的 pin-utils unmaintained 提示 |
+| `scripts/test-docker-context.sh` | 上下文白名单通过 |
+| 生产 Dockerfile | `git archive 4e499e4` 独立源码快照实际构建通过，镜像 `rust-email-mcp:r09-conversation-local`；依赖索引一次 TLS 重试，release 步骤合计 11 分 42 秒，最终镜像导出成功 |
+
+20 组签名 HTTP 回归覆盖旧参数兼容和 Schema、收件/已发送/管理员归档的精确关联、同 UID 跨目录来源、多副本和内容冲突、standard 用途排除、固定水位、失败窗口续查、候选/结果/正文全页预算、健康副本代表、UIDVALIDITY、主体和撤权、非默认账户与跨已授权账户游标隔离、过期/重启、并发/取消及 60 秒期限。虚拟时钟用于期限和 601 秒过期推进。完整输出预算用真实转义 JSON-RPC id 核验，失败后旧 token 可继续，已裁减页换短 id 重放仍保留完整元数据且不重复 FETCH。
+
+24 项纯状态/身份/存储回归覆盖 quoted/Unicode ID、原始关键头证据、完整指纹方法、循环图、逐字段窗口和候选检查点、变体/位置增量、实际容量及租出状态记账、租约取消、首次请求回收、原页错误/覆盖/裁减快照，以及无进展成功页的 token 轮换和原 TTL。两项新增配置测试并扩展既有 file_only 测试，通过真实环境/JSON 加载核对归档目录的账户隔离、空/控制/超长拒绝与环境混用拒绝。
+
+集成中修复了大型 async 状态导致默认测试线程栈溢出的问题，使用 Box 固定关键异步边界；最终全量测试采用默认线程栈。独立审阅修复了 raw 指纹读取上限、同页同引用重复失败读取、完成页重放目录复核、健康副本代表、响应裁减标记与无进展页重放，并复核最终源码与文档。新增 Tokio `test-util` 仅用于开发测试，Cargo.lock 和生产依赖版本保持原值。账户注册库、发送操作库和旧单目录调用沿用原格式；跨目录游标当前为有界内存状态。
+
+最终源码已通过交叉独立审阅。PR 最终 head 的 check/audit/container 与合并结果随后登记。
+
 ## 2026-11-05 R09 有界搜索基础
 
 源码提交 `f6b7c4c8d22e367d07f292268bc5bc420098df1d`。环境为 WSL Ubuntu、Rust 1.99.1、Docker Desktop 和 Node 24.15.0；仅使用合成协议输入及本地模拟 IMAP/MCP 客户端。
@@ -23,6 +47,8 @@
 独立审阅实测 20,027 字节的 FETCH/FLAGS 输入原可创建 393,216 字节的 flags 向量。本批为有界 SEARCH 引入专用通知解析，FLAGS/FETCH 嵌套容器分配前共用 128 KiB 记账；状态文本、响应码和尾空白仅扫描，其他扩展响应拒绝。高层 collector 只转交标量邮箱通知，120 条合法 FLAGS 回归核对原始响应不积留在通知队列。typed 错误只携带类别和数字，既有 BODYSTRUCTURE、部件 FETCH、完成状态回归全部通过。
 
 最终源码与契约文档已通过独立复核。两份 vendored 上游版本、校验和及 Cargo.lock 保持原值，PATCHES.md 同步接口与替换验证要求。本子包交付搜索解析与传输基础；跨文件夹会话、状态存储及客户端契约随后接线。
+
+最终 head `caf87844dfededaba97a989e74066dc27f726138` 的 [CI 41997378653](https://github.com/black-zero358/rust-email-mcp/actions/runs/41997378653) 中 check、audit、container 全部通过。[PR #73](https://github.com/black-zero358/rust-email-mcp/pull/73) 已合并为 `2a07f31360ceffdc4929fc5b765813ceefadcea7`，本地 main、开发分支及对应远端已同步。GitHub 自动 Codex review 遇到账户额度限制，独立最终源码及文档审阅已完成；合并前 reviews/review threads 均为空。
 
 ## 2026-11-05 R08 正文预览与邮件头分类
 
