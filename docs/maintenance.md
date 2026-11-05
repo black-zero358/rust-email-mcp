@@ -31,7 +31,7 @@ R09 保留原单目录会话调用和版本 1 账户 JSON。`ARCHIVE_MAILBOX` �
 
 R10 通过可选 `CACHE_CONFIG_PATH` 新增独立的 metadata 缓存和持久会话游标，默认 off，旧账户与操作库格式保留。缓存按 AccountKey 命名空间分区，每份 SQLite 使用统一的 cache 专用 application_id、schema 版本及各自 namespace 绑定；配置、目录所有权或版本异常使用固定错误。已提交的游标状态保留已知结果，提交后磁盘诊断异常停止后续写入并报告存储故障。正常重启沿用原 token 到期时间，备份恢复使用[专用命令](deployment.md#持久缓存备份与恢复)清除旧游标和标记范围待核对。
 
-metadata 默认新建 R10 schema v1。R11A 的内部 full 入口在短事务中升级到 v2，保留元数据和会话检查点，增加文件引用、原始内容指纹、分层状态与 dirty claim。R11B 的 full 入口继续以独立事务升级到 v3，增加列表观察、角色化 Message-ID 索引、完整正文元数据和分段全文索引；已发布的 v2 迁移内容保持原值。R12A 再以独立事务升级到 v4，增加同步检查点、工作缺口及存在性修订；R12B 以独立 v5 迁移增加派生文件访问顺序，v1/v2/v3/v4 的既有迁移内容保持。当前 metadata 入口兼容 v1–v5，旧程序按各自已支持的缓存版本处理。回退旧 full 程序时保留升级后的缓存目录，使用旧程序支持的配置并另设新的私有缓存目录，沿用原账户注册、运行见证和发送操作库；从备份恢复缓存仍执行恢复标记流程。
+metadata 默认新建 R10 schema v1。R11A 的内部 full 入口在短事务中升级到 v2，保留元数据和会话检查点，增加文件引用、原始内容指纹、分层状态与 dirty claim。R11B 的 full 入口继续以独立事务升级到 v3，增加列表观察、角色化 Message-ID 索引、完整正文元数据和分段全文索引；已发布的 v2 迁移内容保持原值。R12A 再以独立事务升级到 v4，增加同步检查点、工作缺口及存在性修订；R12B 以独立 v5 迁移增加派生文件访问顺序。R12C 的独立 v6 迁移增加扩展同步水位、基线及范围修订，v1–v5 的既有迁移内容保持。当前 metadata 入口兼容 v1–v6，旧程序按各自已支持的缓存版本处理。回退旧 full 程序时保留升级后的缓存目录，使用旧程序支持的配置并另设新的私有缓存目录，沿用原账户注册、运行见证和发送操作库；从备份恢复缓存仍执行恢复标记流程。
 
 R11B 每次启动在账户注册库旁推进独立运行见证，off 模式也执行该步骤。见证发布与配置校验先于 Journal，正常关闭凭据绑定前后相邻运行、缓存根和选定账户/目录范围。恢复缓存或跨越旧程序降级时，按[部署规程](deployment.md#持久缓存备份与恢复)执行 `--cache-restored`。发送操作库格式沿用原版本。
 
@@ -64,6 +64,8 @@ R07 局部正文读取将已有传递依赖 `encoding_rs 0.8.42` 声明为直接
 R09 搜索基础继续使用现有两份 vendored 版本、许可证及校验和，增加 opt-in 的命令字节、SEARCH UID 数量及异步通知解析分配预算。升级替换时运行 `tests/thread_search_budget.rs`，核对完整 tagged completion、预读隔离、尾部恢复、通知释放和 typed 错误后的读写闭锁，并重跑原 BODYSTRUCTURE/部件 FETCH 回归。接口及补丁范围分别记录在两库 PATCHES.md。
 
 R12A 延续相同上游身份，新增 opt-in metadata FETCH 的完整命令和 header literal 双预算，保留普通 FETCH/SEARCH 入口。同步只能对合法单条 SEARCH 的 UID 数量溢出缩窗；重复结果或 UID 提前归为协议错误。升级须同时运行同步、既有正文与根协议回归，核对严格 INTERNALDATE、空 FLAGS、header 原点与分配前限额；V4 检查点和持久收据还需迁移/取消/恢复验证。源码 API 与取代条件继续由两库 PATCHES.md 管理。
+
+R12C 在相同 vendored 上游身份上增加 opt-in CONDSTORE 命令 grammar 与终止接口，包版本、许可证及锁文件保持。升级须运行 `tests/sync_delta_budget.rs`、命令辅助层、V6 存储和签名 HTTP 同步回归，覆盖分片、命令预算、正 63 位水位、只读 EXAMINE、分页/重启/撤权和失败回退；并重跑普通 FETCH/SEARCH/APPEND 的完成状态与原 BODYSTRUCTURE 预算回归。V1–V5 迁移保持不可变，V6 升级失败保留原版本，QRESYNC 接线按后续工作包独立验收。
 
 R09 签名 HTTP 回归在 dev-dependencies 中为锁定的 Tokio 版本启用 `test-util`，使用虚拟时钟核对 60 秒请求期限与 10 分钟游标有效期。生产构建沿用原有 Tokio 功能集。
 

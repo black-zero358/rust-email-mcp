@@ -214,6 +214,10 @@ R12B 的 `mail/sync/worker` 接入 full 配置的可选后台循环，省略 syn
 
 V5 独立保存派生文件的访问顺序，前台成功读取更新顺序，后台验证保持原值；压力回收复核同版本原件、产物和访问序号，保留租约。GC 按有界候选 keyset 推进，过滤后空批仍保留继续位置。范围发现与存在性核对分别报告，数据层完成还核对对应内容及索引证据。D1/D2/D3/D5 对应 `src/cache/sync_state/tests.rs`、`src/mail/sync/tests.rs`、`src/mail/sync/content/tests.rs`、`src/server/output_tests/sync_acceptance.rs` 与 `tests/thread_search_budget.rs`。完整分期、恢复及验收条件见[同步设计](cache-sync-design.md)。
 
+R12C 通过可选 `sync.protocol:"auto"` 接入 CONDSTORE，默认 rev1。`mail/sync/delta` 在认证连接上执行有界 CAPABILITY、只读 EXAMINE 和 CHANGEDSINCE，每命令共用 128 KiB 线路预算，parser 独立约束 token、节点和 owned allocation；只接纳正 63 位 MODSEQ、完整选中证据与匹配 tagged OK，EXAMINE 必须确认 READ-ONLY。语义或解析失败关闭当前命令流，回退最多使用一个新连接并保留原期限及累计字节预算。普通前台协议接口保持原有语法。
+
+V6 独立持久化扩展水位与修订。基线只能来自同一完整 rev1 核对首个页面之前的 EXAMINE；FLAGS 与未来的删除加速分别使用独立水位。每轮冻结 base、target、UID 上界及恢复/dirty/事实修订，每页至多 200 个已知 UID，事实与下一位置原子提交，末页才将 committed 提升至 target。并发范围内成员或 FLAGS 变化使旧页失效；范围外新增 UID 留给后续覆盖。遗漏的 CHANGEDSINCE UID 保留原存在性，周期 rev1 核对负责删除和 dirty 收敛。明确 NOMODSEQ 或 committed 回退先撤销进程内水位可见性，再持久化；存储失败保留撤销标记并阻止 clean receipt。D1/D2/D3 对应 `src/cache/sync_state/delta/tests.rs`、`src/mail/sync/delta/tests.rs`、`src/server/output_tests/condstore_acceptance.rs` 和 `tests/sync_delta_budget.rs`。
+
 ## Local operation store
 
 发送操作数据库由 `journal` 独立管理。下面的 SQLite/WAL/FULL 契约专用于发送意图和结果；持久邮件元数据采用前述独立 cache 分区。

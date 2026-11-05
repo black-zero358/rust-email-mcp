@@ -29,6 +29,7 @@ struct SearchBudget {
     response_bytes: usize,
     uids: usize,
     metadata_header_bytes: Option<usize>,
+    condstore: bool,
     bytes_used: usize,
     uids_used: usize,
     precommand_bytes: usize,
@@ -136,17 +137,24 @@ impl<R: Read + Write + Unpin> ImapStream<R> {
             CommandLimit::Search {
                 response_bytes,
                 uids,
-            } => (None, Some((response_bytes, uids, None))),
+            } => (None, Some((response_bytes, uids, None, false))),
             CommandLimit::MailboxMetadata {
                 response_bytes,
                 header_bytes,
-            } => (None, Some((response_bytes, 0, Some(header_bytes)))),
+            } => (None, Some((response_bytes, 0, Some(header_bytes), false))),
+            CommandLimit::Condstore => (
+                None,
+                Some((CommandReadLimits::MAX_SEARCH_RESPONSE_BYTES, 0, None, true)),
+            ),
         };
-        let search = if let Some((response_bytes, uids, metadata_header_bytes)) = bounded_mailbox {
+        let search = if let Some((response_bytes, uids, metadata_header_bytes, condstore)) =
+            bounded_mailbox
+        {
             let search = SearchBudget {
                 response_bytes,
                 uids,
                 metadata_header_bytes,
+                condstore,
                 bytes_used: 0,
                 uids_used: 0,
                 precommand_bytes: self.buffer.used(),
@@ -220,7 +228,9 @@ impl<R: Read + Write + Unpin> ImapStream<R> {
             let buf = &buf[..self.buffer.used()];
             let structure_limits = imap_proto::bounded::BodyStructureLimits::default();
             let parsed = if let Some(search) = self.search_budget() {
-                if let Some(header_bytes) = search.metadata_header_bytes {
+                if search.condstore {
+                    imap_proto::Response::parse_bounded_condstore(buf, &structure_limits)
+                } else if let Some(header_bytes) = search.metadata_header_bytes {
                     imap_proto::Response::parse_bounded_mailbox_metadata(
                         buf,
                         &structure_limits,
@@ -290,11 +300,21 @@ impl<R: Read + Write + Unpin> ImapStream<R> {
                                     )));
                                 }
                                 Response::Fetch(..)
-                                    if search.metadata_header_bytes.is_some()
+                                    if (search.condstore
+                                        || search.metadata_header_bytes.is_some())
                                         && search.precommand_bytes != 0 =>
                                 {
                                     return Err(Some(io::Error::other(
                                         "Unexpected IMAP FETCH before metadata command",
+                                    )));
+                                }
+                                Response::Capabilities(_)
+                                | Response::Data {
+                                    outcome: imap_proto::Outcome { code: Some(_), .. },
+                                    ..
+                                } if search.condstore && search.precommand_bytes != 0 => {
+                                    return Err(Some(io::Error::other(
+                                        "Unexpected IMAP data before CONDSTORE command",
                                     )));
                                 }
                                 Response::MailboxData(MailboxDatum::Search(uids)) => {

@@ -9,7 +9,7 @@ mod cache_config;
 #[cfg(test)]
 pub(crate) use cache_config::load_cache_file;
 pub use cache_config::{CacheSettings, load_cache_configuration};
-pub(crate) use cache_config::{Mode as CacheMode, SyncPolicy};
+pub(crate) use cache_config::{Mode as CacheMode, SyncPolicy, SyncProtocol};
 
 pub const DEFAULT_MAX_MESSAGE: usize = 32 * 1024 * 1024;
 pub const DEFAULT_MAX_OUTPUT: usize = 2 * 1024 * 1024;

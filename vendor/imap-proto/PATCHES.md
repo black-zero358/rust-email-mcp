@@ -128,6 +128,22 @@ SEARCH responses, 199/200/201 entries, untagged noise and tagged completion
 through the async client. Protocol grammar reference
 [RFC 3501 §§6.4.4, 7.2.5 and 9](https://www.rfc-editor.org/rfc/rfc3501#section-6.4.4).
 
+### Opt-in CONDSTORE responses
+
+`Response::parse_bounded_condstore` parses capability atoms, fixed selection
+codes and UID/FLAGS/MODSEQ FETCH data. Capability and flag lists are limited to
+128 atoms of at most 256 bytes each. The parser charges actual vector capacity,
+allows at most three FETCH attributes, and caps whitespace runs at 64 bytes
+and borrowed status text at 4096 bytes. Lexical limits stop oversized tokens
+before their delimiter arrives. MODSEQ and HIGHESTMODSEQ are positive unsigned
+63-bit values. The
+selection grammar distinguishes explicit NOMODSEQ from missing evidence and
+preserves HIGHESTMODSEQ in tagged and untagged status. No literal or VANISHED
+grammar is enabled. The ordinary response parser retains its original grammar.
+
+Run `cargo test --locked --test sync_delta_budget`. See
+[RFC 7162 §§3.1.2, 3.1.4 and 6](https://www.rfc-editor.org/rfc/rfc7162#section-3.1.2).
+
 ## Advisory auditing and maintenance
 
 Run `bash scripts/test-audit-dependencies.sh`, then

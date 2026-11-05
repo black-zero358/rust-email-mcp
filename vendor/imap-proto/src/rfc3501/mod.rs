@@ -196,6 +196,7 @@ pub enum ResponseCode<'a> {
     BadCharset(Option<Vec<Cow<'a, str>>>),
     Capabilities(Vec<Capability<'a>>),
     HighestModSeq(u64), // RFC 4551, section 3.1.1
+    NoModSeq,           // RFC 7162, section 3.1.2.2
     Parse,
     PermanentFlags(Vec<Cow<'a, str>>),
     ReadOnly,
@@ -255,6 +256,7 @@ impl<'a> ResponseCode<'a> {
                 ResponseCode::Capabilities(v.into_iter().map(Capability::into_owned).collect())
             }
             ResponseCode::HighestModSeq(v) => ResponseCode::HighestModSeq(v),
+            ResponseCode::NoModSeq => ResponseCode::NoModSeq,
             ResponseCode::Parse => ResponseCode::Parse,
             ResponseCode::PermanentFlags(v) => {
                 ResponseCode::PermanentFlags(v.into_iter().map(to_owned_cow).collect())

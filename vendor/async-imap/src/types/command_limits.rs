@@ -14,6 +14,7 @@ pub(crate) enum CommandLimit {
         response_bytes: usize,
         header_bytes: usize,
     },
+    Condstore,
 }
 
 impl CommandReadLimits {
@@ -42,5 +43,10 @@ impl CommandReadLimits {
             response_bytes: max_response_bytes.min(2 * 1024 * 1024),
             header_bytes: max_header_bytes.min(128 * 1024 + 1),
         })
+    }
+
+    /// Use the bounded CONDSTORE response grammar and a 128 KiB wire budget.
+    pub fn condstore() -> Self {
+        Self(CommandLimit::Condstore)
     }
 }

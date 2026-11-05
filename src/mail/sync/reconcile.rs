@@ -1,6 +1,7 @@
 //! Complete targeted FETCH evidence for discovery and known-UID reconciliation.
 use super::{
     super::{conversation, insights::HEADER_LIMIT, map_read_imap_error, persistence::index_text},
+    delta::ModSeq,
     scan::Selected,
 };
 use crate::{
@@ -52,6 +53,7 @@ pub(super) struct Proof {
     selected: Selected,
     pub(super) present: Vec<Observation>,
     pub(super) absent: Vec<u32>,
+    pub(super) baseline_modseq: Option<ModSeq>,
 }
 
 impl Proof {
@@ -63,6 +65,7 @@ impl Proof {
             selected: selected.clone(),
             present: Vec::new(),
             absent: Vec::new(),
+            baseline_modseq: None,
         })
     }
 
@@ -165,6 +168,32 @@ pub(super) async fn collect<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
 {
+    collect_with_limits(session, selected, expected, mode, false).await
+}
+
+/// A full FLAGS reconciliation on a CONDSTORE-enabled selection also carries
+/// explicit mailbox watermarks observed while the page was being read.
+pub(super) async fn collect_condstore_flags<S>(
+    session: &mut async_imap::Session<S>,
+    selected: &Selected,
+    expected: &[u32],
+) -> Result<Proof>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
+{
+    collect_with_limits(session, selected, expected, Mode::Flags, true).await
+}
+
+async fn collect_with_limits<S>(
+    session: &mut async_imap::Session<S>,
+    selected: &Selected,
+    expected: &[u32],
+    mode: Mode,
+    condstore: bool,
+) -> Result<Proof>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
+{
     let (max_uids, bytes, header_bytes) = match mode {
         Mode::Flags => (MAX_SEARCH_UIDS, MAX_FLAGS_RESPONSE, 0),
         Mode::Facts => (MAX_FACT_UIDS, MAX_FACT_RESPONSE, HEADER_LIMIT + 1),
@@ -187,16 +216,19 @@ where
     } else {
         "UID FLAGS".into()
     };
+    let limits = if condstore {
+        CommandReadLimits::condstore()
+    } else {
+        CommandReadLimits::mailbox_metadata(bytes, header_bytes)
+    };
     let tag = session
-        .run_command_with_limits(
-            format!("UID FETCH {set} ({attributes})"),
-            CommandReadLimits::mailbox_metadata(bytes, header_bytes),
-        )
+        .run_command_with_limits(format!("UID FETCH {set} ({attributes})"), limits)
         .await
         .map_err(map_read_imap_error)?;
     let mut items = Vec::with_capacity(expected.len());
     items.resize_with(expected.len(), Item::default);
     let mut unidentified_update = false;
+    let mut baseline_modseq = None;
     loop {
         let response = session
             .read_response()
@@ -207,8 +239,13 @@ where
             Response::Done {
                 tag: received,
                 status: Status::Ok,
-                ..
-            } if received == &tag => break,
+                outcome,
+            } if received == &tag => {
+                if condstore {
+                    ModSeq::observe_minimum(&mut baseline_modseq, outcome.code.as_ref());
+                }
+                break;
+            }
             Response::Done { .. }
             | Response::Continue(_)
             | Response::Expunge(_)
@@ -217,6 +254,12 @@ where
                 ..
             } => {
                 return Err(MailError::backend());
+            }
+            Response::Data {
+                status: Status::Ok,
+                outcome,
+            } if condstore => {
+                ModSeq::observe_minimum(&mut baseline_modseq, outcome.code.as_ref());
             }
             Response::Fetch(_, attributes) => {
                 let mut ids = attributes.iter().filter_map(|attribute| match attribute {
@@ -283,6 +326,7 @@ where
         selected: selected.clone(),
         present,
         absent,
+        baseline_modseq,
     })
 }
 

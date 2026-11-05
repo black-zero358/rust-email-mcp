@@ -11,6 +11,7 @@ const FULL_VERSION: u32 = 2;
 const CONTENT_VERSION: u32 = 3;
 const SYNC_VERSION: u32 = 4;
 const RECLAIM_VERSION: u32 = 5;
+const DELTA_VERSION: u32 = 6;
 
 pub(super) fn open(path: &Path) -> Result<Connection, CacheError> {
     let connection = Connection::open_with_flags(
@@ -63,7 +64,8 @@ pub(super) fn initialize(
             tx.commit()?;
         }
         (
-            METADATA_VERSION | FULL_VERSION | CONTENT_VERSION | SYNC_VERSION | RECLAIM_VERSION,
+            METADATA_VERSION | FULL_VERSION | CONTENT_VERSION | SYNC_VERSION | RECLAIM_VERSION
+            | DELTA_VERSION,
             APPLICATION_ID,
         ) => {}
         _ => return Err(CacheError::Corrupt),
@@ -107,6 +109,12 @@ pub(super) fn initialize(
         tx.pragma_update(None, "user_version", RECLAIM_VERSION)?;
         tx.commit()?;
     }
+    if full && version < DELTA_VERSION {
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(V6)?;
+        tx.pragma_update(None, "user_version", DELTA_VERSION)?;
+        tx.commit()?;
+    }
     if (saved_epoch as u64) < restore_epoch {
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         restore(&tx, restore_epoch, full_schema)?;
@@ -118,6 +126,62 @@ pub(super) fn initialize(
     }
     Ok(full_schema)
 }
+
+const V6: &str = "
+CREATE TABLE sync_delta_seed (
+    mailbox TEXT PRIMARY KEY,
+    uid_validity INTEGER NOT NULL CHECK(uid_validity BETWEEN 1 AND 4294967295),
+    restore_epoch INTEGER NOT NULL CHECK(restore_epoch>=0),
+    dirty_revision INTEGER NOT NULL CHECK(dirty_revision>=0),
+    reconcile_id BLOB NOT NULL CHECK(length(reconcile_id)=16),
+    high_uid INTEGER NOT NULL CHECK(high_uid BETWEEN 0 AND 4294967294),
+    floor_modseq INTEGER CHECK(floor_modseq>0)
+) STRICT;
+CREATE TABLE sync_delta (
+    mailbox TEXT NOT NULL,
+    lane INTEGER NOT NULL CHECK(lane IN(0,1)),
+    uid_validity INTEGER NOT NULL CHECK(uid_validity BETWEEN 1 AND 4294967295),
+    restore_epoch INTEGER NOT NULL CHECK(restore_epoch>=0),
+    dirty_revision INTEGER NOT NULL CHECK(dirty_revision>=0),
+    high_uid INTEGER NOT NULL CHECK(high_uid BETWEEN 0 AND 4294967294),
+    committed_modseq INTEGER NOT NULL CHECK(committed_modseq>0),
+    checked_at_ms INTEGER NOT NULL CHECK(checked_at_ms>=0),
+    fact_revision INTEGER NOT NULL DEFAULT 0 CHECK(fact_revision>=0),
+    round_id BLOB CHECK(length(round_id)=16),
+    target_modseq INTEGER CHECK(target_modseq>committed_modseq),
+    round_revision INTEGER NOT NULL DEFAULT 0 CHECK(round_revision>=0),
+    proof_revision INTEGER CHECK(proof_revision>=0),
+    known_after INTEGER NOT NULL DEFAULT 0 CHECK(known_after BETWEEN 0 AND high_uid),
+    CHECK((round_id IS NULL AND target_modseq IS NULL AND proof_revision IS NULL AND known_after=0)
+       OR (round_id IS NOT NULL AND target_modseq IS NOT NULL AND proof_revision IS NOT NULL)),
+    PRIMARY KEY(mailbox,lane)
+) STRICT;
+CREATE TRIGGER delta_epoch_change AFTER UPDATE OF uid_validity ON mailboxes
+WHEN old.uid_validity<>new.uid_validity BEGIN
+    DELETE FROM sync_delta_seed WHERE mailbox=new.mailbox;
+    DELETE FROM sync_delta WHERE mailbox=new.mailbox;
+END;
+CREATE TRIGGER delta_member_insert AFTER INSERT ON messages WHEN NOT new.tombstone BEGIN
+    UPDATE sync_delta SET fact_revision=fact_revision+1
+    WHERE mailbox=new.mailbox AND uid_validity=new.uid_validity AND new.uid<=high_uid;
+END;
+CREATE TRIGGER delta_member_update AFTER UPDATE OF tombstone ON messages
+WHEN old.tombstone<>new.tombstone BEGIN
+    UPDATE sync_delta SET fact_revision=fact_revision+1
+    WHERE mailbox=new.mailbox AND uid_validity=new.uid_validity AND new.uid<=high_uid;
+END;
+CREATE TRIGGER delta_flags_insert AFTER INSERT ON listing_evidence WHEN new.flags IS NOT NULL BEGIN
+    UPDATE sync_delta SET fact_revision=fact_revision+1
+    WHERE (mailbox,uid_validity)=(SELECT mailbox,uid_validity FROM messages WHERE id=new.message_id AND NOT tombstone)
+      AND high_uid>=(SELECT uid FROM messages WHERE id=new.message_id);
+END;
+CREATE TRIGGER delta_flags_update AFTER UPDATE OF flags ON listing_evidence
+WHEN new.flags IS NOT old.flags BEGIN
+    UPDATE sync_delta SET fact_revision=fact_revision+1
+    WHERE (mailbox,uid_validity)=(SELECT mailbox,uid_validity FROM messages WHERE id=new.message_id AND NOT tombstone)
+      AND high_uid>=(SELECT uid FROM messages WHERE id=new.message_id);
+END;
+";
 
 const V5: &str = "
 CREATE TABLE blob_recency (
@@ -396,6 +460,10 @@ pub(super) fn restore(
     if version >= SYNC_VERSION {
         tx.execute("DELETE FROM sync_checkpoints", [])?;
         tx.execute("DELETE FROM sync_work", [])?;
+    }
+    if version >= DELTA_VERSION {
+        tx.execute("DELETE FROM sync_delta_seed", [])?;
+        tx.execute("DELETE FROM sync_delta", [])?;
     }
     flag_unclean(tx, full_schema)?;
     tx.execute(

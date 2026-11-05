@@ -4,6 +4,8 @@
 
 ## 2026-11-05 R12 后台同步与有界回收
 
+[PR #79](https://github.com/black-zero358/rust-email-mcp/pull/79) 最终 head `80fd706f7852982dcc99f010eabe94d81213b7c7` 的 [CI 42030094273](https://github.com/black-zero358/rust-email-mcp/actions/runs/42030094273) 中 check、audit、container 全部通过。精确源码及最终文档 head 的独立交叉审阅完成；GitHub 自动审阅遇到账户限流，已核对评论和空 review threads。合并提交为 `68b32353c2214b238c6f4ed33768316254d1275e`，本地 main、开发分支及对应远端引用已同步；R12C 工作区改动保留。
+
 源码 `506f877badaa3218b14f45c10c985b9e0cb0fd65`，父提交为 R12A 合并 `a226545df5d99424ba0bcfb51f78ecd3095abda8`。环境为 WSL Ubuntu、固定 Rust 1.99.1、Node 24.15.0 和 Docker Desktop。所有邮箱、身份、原件、附件及异常均使用合成数据、本地 TLS IMAP/HTTP 服务与隔离目录。
 
 | 检查 | 结果 |

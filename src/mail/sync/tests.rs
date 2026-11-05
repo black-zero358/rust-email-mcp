@@ -1,4 +1,5 @@
 use super::{
+    delta::ModSeq,
     reconcile::{self, Mode},
     scan::{self, Selected, Window},
 };
@@ -77,6 +78,49 @@ fn search_line(range: std::ops::RangeInclusive<u32>) -> Vec<u8> {
     }
     bytes.extend_from_slice(b"\r\n");
     bytes
+}
+
+#[tokio::test]
+async fn condstore_baseline_retains_explicit_floor_or_revocation_after_tagged_completion() {
+    let account = AccountKey::synthetic();
+    let flags = "UID FETCH 7,8 (UID FLAGS)";
+    for (data, status, expected) in [
+        (
+            "* OK [HIGHESTMODSEQ 90]\r\n* 1 FETCH (UID 7 FLAGS ())\r\n",
+            "OK [HIGHESTMODSEQ 110]",
+            Some(ModSeq::Highest(90)),
+        ),
+        (
+            "* OK [NOMODSEQ]\r\n* 1 FETCH (UID 7 FLAGS ())\r\n",
+            "OK [HIGHESTMODSEQ 110]",
+            Some(ModSeq::Unavailable),
+        ),
+        (
+            "* OK [HIGHESTMODSEQ 90]\r\n* 1 FETCH (UID 7 FLAGS ())\r\n",
+            "NO",
+            None,
+        ),
+    ] {
+        let (mut session, selected, peer) = selected(
+            &account,
+            9,
+            20,
+            Some((flags, data.as_bytes().to_vec(), status)),
+        )
+        .await;
+        let result = reconcile::collect_condstore_flags(&mut session, &selected, &[7, 8]).await;
+        if let Some(expected) = expected {
+            let proof = result.unwrap();
+            assert_eq!(proof.baseline_modseq, Some(expected));
+            assert_eq!(proof.absent, [8]);
+            assert_eq!(proof.present[0].uid, 7);
+            assert!(proof.present[0].flags.is_empty());
+        } else {
+            assert!(result.is_err());
+        }
+        drop(session);
+        peer.await.unwrap();
+    }
 }
 
 #[test]

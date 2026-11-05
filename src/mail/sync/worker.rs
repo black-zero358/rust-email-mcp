@@ -1,12 +1,14 @@
 //! One foreground-yielding supervisor for administrator-selected cache scopes.
-use super::{content, reconcile, scan};
+use super::{content, delta, reconcile, scan};
 use crate::{
     accounts::{AccountKey, AccountLease},
     cache::{Cache, CacheError, sync_state::*},
-    config::SyncPolicy,
+    config::{SyncPolicy, SyncProtocol},
     error::MailError,
     mail::{
-        MailRuntime, MailService, PreparedCache, Session, persistence::checked_at_ms, runtime,
+        MailRuntime, MailService, PreparedCache, Session,
+        persistence::{DeltaInvalidation, checked_at_ms},
+        runtime,
         scheduler::WorkClass,
     },
 };
@@ -18,6 +20,8 @@ use std::{
 };
 use tokio::{task::JoinHandle, time::Instant};
 use tokio_util::sync::CancellationToken;
+
+mod condstore;
 
 const PAGE: usize = 200;
 const BACKOFF: Duration = Duration::from_secs(5);
@@ -37,6 +41,31 @@ type HealthMap = Arc<Mutex<HashMap<(AccountKey, String), Health>>>;
 struct Health {
     last_error: Option<Failure>,
     quota_paused: bool,
+    #[serde(flatten)]
+    negotiated: ProtocolHealth,
+}
+
+#[derive(Clone, Copy, Default, serde::Serialize)]
+struct ProtocolHealth {
+    protocol: ActiveProtocol,
+    protocol_fallback: Option<ProtocolFallback>,
+}
+
+#[derive(Clone, Copy, Default, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ActiveProtocol {
+    #[default]
+    Rev1,
+    Condstore,
+}
+
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ProtocolFallback {
+    CapabilityUnavailable,
+    ExtensionFailed,
+    Nomodseq,
+    ModseqRollback,
 }
 
 #[derive(Clone, Copy, serde::Serialize)]
@@ -137,14 +166,16 @@ enum Phase {
     History,
     Tail,
     Reconcile,
+    Delta,
     Content,
     Maintain,
 }
 
-const PHASES: [Phase; 5] = [
+const PHASES: [Phase; 6] = [
     Phase::History,
     Phase::Tail,
     Phase::Reconcile,
+    Phase::Delta,
     Phase::Content,
     Phase::Maintain,
 ];
@@ -157,6 +188,7 @@ struct Folder {
     reclaim: Option<SyncReclaimPosition>,
     reclaim_active: bool,
     quota: QuotaMode,
+    probe_after: Instant,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -168,6 +200,10 @@ enum QuotaMode {
 }
 
 impl Folder {
+    fn may_probe(&self, policy: SyncPolicy) -> bool {
+        policy.protocol == SyncProtocol::Auto && Instant::now() >= self.probe_after
+    }
+
     fn new(name: &str, now: Instant) -> Self {
         Self {
             name: name.into(),
@@ -177,6 +213,7 @@ impl Folder {
             reclaim: None,
             reclaim_active: false,
             quota: QuotaMode::Startup,
+            probe_after: now,
         }
     }
 
@@ -301,9 +338,19 @@ async fn run(
             break;
         };
         let kind = PHASES[phase];
-        let turn = Box::pin(execute(&runtime, &stop, account, folder, kind, policy)).await;
+        let (turn, negotiated) =
+            Box::pin(execute(&runtime, &stop, account, folder, kind, policy)).await;
         let folder = &mut account.folders[folder];
         let interval = Duration::from_secs(policy.interval_seconds);
+        if let Some(negotiated) = negotiated {
+            folder.health.negotiated = negotiated;
+            if negotiated.protocol_fallback.is_some() {
+                folder.probe_after = Instant::now() + interval.max(BACKOFF);
+                if matches!(kind, Phase::Delta) && matches!(turn, Turn::More) {
+                    folder.due[Phase::Reconcile as usize] = Instant::now();
+                }
+            }
+        }
         let released = matches!(turn, Turn::Maintained { released: true, .. });
         if matches!(kind, Phase::Content)
             && folder.quota == QuotaMode::Recovering
@@ -363,24 +410,27 @@ async fn execute(
     folder: usize,
     phase: Phase,
     policy: SyncPolicy,
-) -> Turn {
+) -> (Turn, Option<ProtocolHealth>) {
     let key = &account.key;
     let folder = &account.folders[folder];
+    if matches!(phase, Phase::Delta) && !folder.may_probe(policy) {
+        return (Turn::Idle, None);
+    }
     let Some(lease) = runtime.catalog.sync_account(&account.alias, key) else {
-        return Turn::Idle;
+        return (Turn::Idle, None);
     };
     let Ok(service) = runtime.service_for(key) else {
-        return Turn::Idle;
+        return (Turn::Idle, None);
     };
     let Some(cache) = service.persistent.full_folder(key, &folder.name) else {
-        return Turn::Idle;
+        return (Turn::Idle, None);
     };
     let cancellation = lease.cancellation.child_token();
     let permit = tokio::select! {
         biased;
-        _ = stop.cancelled() => return Turn::Deferred,
+        _ = stop.cancelled() => return (Turn::Deferred, None),
         permit = runtime.scheduler.acquire(key.reference_namespace(), WorkClass::Background, &cancellation) => {
-            let Ok(permit) = permit else { return Turn::Deferred };
+            let Ok(permit) = permit else { return (Turn::Deferred, None) };
             Arc::new(permit)
         }
     };
@@ -393,6 +443,7 @@ async fn execute(
         cancellation,
         transport: Arc::new(AtomicUsize::new(service.config.max_message * 4)),
         deadline: Instant::now() + service.config.timeout,
+        negotiated: Mutex::default(),
     };
     let run = runtime::READ_ADMISSION.scope(permit.clone(), async {
         tokio::select! {
@@ -414,7 +465,7 @@ async fn execute(
     while Arc::strong_count(&permit) > 1 {
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
-    run
+    (run, batch.negotiated.into_inner().unwrap_or_default())
 }
 
 enum Error {
@@ -469,6 +520,7 @@ struct Batch<'a> {
     cancellation: CancellationToken,
     transport: Arc<AtomicUsize>,
     deadline: Instant,
+    negotiated: Mutex<Option<ProtocolHealth>>,
 }
 
 #[derive(Clone)]
@@ -495,6 +547,33 @@ impl Scope {
         self.persistent
             .sync_commit_epoch(&self.account, &self.mailbox, observation.uid_validity);
         Ok(scan)
+    }
+
+    fn apply_delta_invalidation(
+        &self,
+        stamp: &ScanStamp,
+        fence: &ReconcileFence,
+        invalidation: DeltaInvalidation,
+    ) -> Result<()> {
+        let validity = stamp.uid_validity;
+        let cancelled = || !self.current(validity);
+        match invalidation {
+            DeltaInvalidation::Seed => self.cache.discard_delta_seed(stamp, &cancelled)?,
+            DeltaInvalidation::All => self.cache.invalidate_delta(
+                &self.account,
+                &self.mailbox,
+                validity,
+                fence,
+                &cancelled,
+            )?,
+        }
+        self.persistent.commit_delta_invalidation(
+            &self.account,
+            &self.mailbox,
+            validity,
+            invalidation,
+        );
+        Ok(())
     }
 }
 
@@ -536,7 +615,7 @@ impl Batch<'_> {
         .map_err(|_| CacheError::Storage)?
     }
 
-    async fn connect(&self) -> crate::error::Result<(Session, scan::Selected)> {
+    async fn login(&self) -> crate::error::Result<Session> {
         if self.cancellation.is_cancelled()
             || self
                 .runtime
@@ -547,12 +626,26 @@ impl Batch<'_> {
             return Err(MailError::account_unavailable());
         }
         self.service.backend_ready()?;
-        let mut session = self
-            .service
+        self.service
             .connect_inner(true, Some(self.transport.clone()))
-            .await?;
+            .await
+    }
+
+    async fn connect(&self) -> crate::error::Result<(Session, scan::Selected)> {
+        self.select_plain(self.login().await?).await
+    }
+
+    async fn select_plain(
+        &self,
+        mut session: Session,
+    ) -> crate::error::Result<(Session, scan::Selected)> {
         let (selected, _) =
             scan::Selected::examine(&mut session, &self.lease.key, &self.mailbox).await?;
+        self.observe_selected(&selected)?;
+        Ok((session, selected))
+    }
+
+    fn observe_selected(&self, selected: &scan::Selected) -> crate::error::Result<()> {
         if !self.service.persistent.sync_observe(
             &self.lease.key,
             &self.mailbox,
@@ -560,7 +653,7 @@ impl Batch<'_> {
         ) {
             return Err(MailError::backend());
         }
-        Ok((session, selected))
+        Ok(())
     }
 
     async fn run(
@@ -573,7 +666,9 @@ impl Batch<'_> {
         match phase {
             Phase::History => Box::pin(self.discover(ScanKind::History)).await,
             Phase::Tail => Box::pin(self.discover(ScanKind::Tail)).await,
+            Phase::Reconcile if folder.may_probe(policy) => Box::pin(self.reconcile_auto()).await,
             Phase::Reconcile => Box::pin(self.reconcile()).await,
+            Phase::Delta => Box::pin(self.delta_turn()).await,
             Phase::Content => Box::pin(self.content(folder.quota, policy)).await,
             Phase::Maintain => self.maintain(folder, gc).await,
         }
@@ -610,35 +705,103 @@ impl Batch<'_> {
         })
     }
 
-    async fn reconcile(&self) -> Result<Turn> {
-        let fence = self
-            .local(|scope| {
-                Ok(scope
+    async fn reconciliation_fence(&self) -> Result<Arc<ReconcileFence>> {
+        self.local(|scope| {
+            Ok(Arc::new(
+                scope
                     .cache
-                    .sync_reconcile_fence(&scope.account, &scope.mailbox)?)
-            })
-            .await?;
-        let (mut session, selected) = self.connect().await?;
+                    .sync_reconcile_fence(&scope.account, &scope.mailbox)?,
+            ))
+        })
+        .await
+    }
+
+    async fn reconcile(&self) -> Result<Turn> {
+        let fence = self.reconciliation_fence().await?;
+        let (session, selected) = self.connect().await?;
+        self.reconcile_selected(session, selected, fence, None)
+            .await
+    }
+
+    async fn reconcile_selected(
+        &self,
+        mut session: Session,
+        selected: scan::Selected,
+        fence: Arc<ReconcileFence>,
+        highest_modseq: Option<u64>,
+    ) -> Result<Turn> {
         let observation = selected.observation(now()?);
-        let (stamp, page) = self
+        if highest_modseq.is_none() {
+            let pending = self
+                .local(|scope| {
+                    Ok(scope
+                        .cache
+                        .pending_delta_floor(&scope.account, &scope.mailbox)?)
+                })
+                .await?;
+            if pending.is_some_and(|(validity, _)| validity == selected.uid_validity) {
+                self.fence_invalidation(&selected, DeltaInvalidation::Seed)?;
+            }
+        }
+        let invalidation = self.delta_invalidation_pending(&selected);
+        let start_fence = fence.clone();
+        let (stamp, page, floor) = self
             .local(move |scope| {
                 let scan = scope.cache.start_sync_reconcile(
                     &scope.account,
                     &scope.mailbox,
                     observation,
-                    &fence,
+                    &start_fence,
                 )?;
                 scope.persistent.sync_commit_epoch(
                     &scope.account,
                     &scope.mailbox,
                     observation.uid_validity,
                 );
+                let cancelled = || !scope.current(observation.uid_validity);
+                if let Some(invalidation) = invalidation {
+                    scope.apply_delta_invalidation(&scan.stamp, &start_fence, invalidation)?;
+                }
+                if let Some(highest_modseq) = highest_modseq {
+                    scope.cache.prepare_delta_seed(
+                        &scan.stamp,
+                        DeltaObservation {
+                            uid_validity: observation.uid_validity,
+                            uid_next: observation.uid_next,
+                            highest_modseq,
+                            checked_at_ms: observation.checked_at_ms,
+                        },
+                        &cancelled,
+                    )?;
+                }
                 let page = scope.cache.sync_known_page(&scan.stamp, PAGE)?;
-                Ok((scan.stamp, page))
+                let floor = if highest_modseq.is_some() {
+                    condstore::ScopeFloors::read(&scope)?.for_epoch(observation.uid_validity)?
+                } else {
+                    condstore::EpochFloors::default()
+                };
+                Ok((scan.stamp, page, floor))
             })
             .await?;
         let proof = if page.uids.is_empty() {
             reconcile::Proof::empty_reconciliation(&selected, &page)?
+        } else if highest_modseq.is_some() {
+            match Box::pin(reconcile::collect_condstore_flags(
+                &mut session,
+                &selected,
+                &page.uids,
+            ))
+            .await
+            {
+                Ok(proof) => proof,
+                Err(_) => {
+                    self.report_protocol(
+                        ActiveProtocol::Rev1,
+                        Some(ProtocolFallback::ExtensionFailed),
+                    );
+                    return Box::pin(self.reconcile_fresh(session, fence)).await;
+                }
+            }
         } else {
             Box::pin(reconcile::collect(
                 &mut session,
@@ -649,8 +812,23 @@ impl Batch<'_> {
             .await?
         };
         drop(session);
+        let invalidation = match proof.baseline_modseq {
+            Some(delta::ModSeq::Unavailable) => {
+                Some((ProtocolFallback::Nomodseq, DeltaInvalidation::All))
+            }
+            Some(delta::ModSeq::Highest(highest)) => floor
+                .invalidation(highest)
+                .map(|level| (ProtocolFallback::ModseqRollback, level)),
+            _ => None,
+        };
+        if let Some((reason, level)) = invalidation {
+            self.fence_protocol_fallback(&selected, reason, level)?;
+        }
         let new_fence = self.fence_absence(!proof.absent.is_empty(), stamp.uid_validity)?;
         self.local(move |scope| {
+            if let Some((_, level)) = invalidation {
+                scope.apply_delta_invalidation(&stamp, &fence, level)?;
+            }
             let state = proof.commit_reconcile(&scope.cache, &stamp, &page, now()?, &|| {
                 !scope.current(stamp.uid_validity)
             })?;
@@ -1059,7 +1237,7 @@ mod tests {
                 SyncPolicy::default(),
             ))
             .await;
-            assert!(matches!(turn, Turn::More));
+            assert!(matches!(turn.0, Turn::More));
             assert_eq!(runtime.admission_counts_for_test(), (0, 0));
         }
         assert!(

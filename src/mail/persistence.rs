@@ -5,7 +5,7 @@ use crate::{
         AccountScope, ArtifactKey, ArtifactState, Cache, CacheError, ListingEvidence,
         MailboxEvidence, Omission, Ref as CacheRef, ThreadId,
     },
-    config::{CacheMode, CacheSettings, SyncPolicy},
+    config::{CacheMode, CacheSettings, SyncPolicy, SyncProtocol},
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -42,6 +42,13 @@ struct Persistent {
     pending_tombstones: Arc<Mutex<HashSet<(GenerationKey, u32, u32)>>>,
     sync_absence: Mutex<HashMap<GenerationKey, u32>>,
     sync_epochs: Mutex<HashMap<GenerationKey, u32>>,
+    delta_invalidations: Mutex<HashMap<GenerationKey, (u32, DeltaInvalidation)>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum DeltaInvalidation {
+    Seed,
+    All,
 }
 
 type CacheJob = Box<dyn FnOnce(&Arc<Cache>) + Send>;
@@ -182,6 +189,7 @@ impl PreparedCache {
             pending_tombstones: Arc::new(Mutex::new(HashSet::new())),
             sync_absence: Mutex::default(),
             sync_epochs: Mutex::default(),
+            delta_invalidations: Mutex::default(),
         }))))
     }
 
@@ -297,6 +305,72 @@ impl PreparedCache {
             && absences.get(&key).is_some_and(|epoch| *epoch < validity)
         {
             absences.remove(&key);
+        }
+        if let Ok(mut invalidations) = state.delta_invalidations.lock()
+            && invalidations
+                .get(&key)
+                .is_some_and(|(epoch, _)| *epoch < validity)
+        {
+            invalidations.remove(&key);
+        }
+    }
+
+    pub(super) fn delta_invalidation_pending(
+        &self,
+        account: &AccountKey,
+        mailbox: &str,
+        validity: u32,
+    ) -> Option<DeltaInvalidation> {
+        let Some(state) = &self.0 else {
+            return Some(DeltaInvalidation::All);
+        };
+        let key = (account.reference_namespace(), mailbox.into());
+        state
+            .delta_invalidations
+            .lock()
+            .map(|pending| {
+                pending
+                    .get(&key)
+                    .filter(|(epoch, _)| *epoch >= validity)
+                    .map(|(_, invalidation)| *invalidation)
+            })
+            .unwrap_or(Some(DeltaInvalidation::All))
+    }
+
+    pub(super) fn fence_delta_invalidation(
+        &self,
+        account: &AccountKey,
+        mailbox: &str,
+        validity: u32,
+        invalidation: DeltaInvalidation,
+    ) -> bool {
+        let Some(state) = &self.0 else { return false };
+        let key = (account.reference_namespace(), mailbox.into());
+        current_generation(&state.generations, &key, validity)
+            && state.delta_invalidations.lock().is_ok_and(|mut pending| {
+                let proof = pending.entry(key).or_insert((validity, invalidation));
+                *proof = (*proof).max((validity, invalidation));
+                proof.0 == validity
+            })
+    }
+
+    pub(super) fn commit_delta_invalidation(
+        &self,
+        account: &AccountKey,
+        mailbox: &str,
+        validity: u32,
+        applied: DeltaInvalidation,
+    ) {
+        if let Some(state) = &self.0
+            && let Ok(mut invalidations) = state.delta_invalidations.lock()
+        {
+            let key = (account.reference_namespace(), mailbox.into());
+            if invalidations
+                .get(&key)
+                .is_some_and(|proof| *proof <= (validity, applied))
+            {
+                invalidations.remove(&key);
+            }
         }
     }
 
@@ -459,13 +533,7 @@ impl PreparedCache {
                             .folders
                             .iter()
                             .map(|folder| {
-                                match cache.sync_scope_status(account, &folder.mailbox) {
-                                    Ok(progress) => json!({"mailbox":folder.mailbox,"progress":progress,"error":null}),
-                                    Err(crate::cache::sync_state::SyncError::Cache(CacheError::Quota)) => {
-                                        json!({"mailbox":folder.mailbox,"progress":null,"error":"quota"})
-                                    }
-                                    Err(_) => json!({"mailbox":folder.mailbox,"progress":null,"error":"storage"}),
-                                }
+                                sync_folder_status(cache, account, &folder.mailbox, sync.protocol)
                             })
                             .collect::<Vec<_>>()
                     } else {
@@ -493,9 +561,16 @@ impl PreparedCache {
             Some((status, folders, health, mut progress)) => {
                 for (folder, progress) in status.folders.iter().zip(&mut progress) {
                     if folder.uid_validity.is_some_and(|validity| {
+                        self.delta_invalidation_pending(account, &folder.mailbox, validity)
+                            == Some(DeltaInvalidation::All)
+                    }) {
+                        progress["condstore"] = Value::Null;
+                    }
+                    if folder.uid_validity.is_some_and(|validity| {
                         !self.offline_current(account, &folder.mailbox, validity, None)
                     }) {
                         progress["progress"] = Value::Null;
+                        progress["condstore"] = Value::Null;
                         progress["error"] = json!("verification_pending");
                     }
                 }
@@ -520,6 +595,7 @@ impl PreparedCache {
                 "enabled":sync.enabled,
                 "interval_seconds":sync.interval_seconds,
                 "reconcile_interval_seconds":sync.reconcile_interval_seconds,
+                "protocol":sync.protocol,
                 "folders":sync_folders
             });
             value["content_pending"] = json!(
@@ -616,6 +692,38 @@ impl PreparedCache {
     }
 }
 
+fn sync_folder_status(
+    cache: &Cache,
+    account: &AccountKey,
+    mailbox: &str,
+    protocol: SyncProtocol,
+) -> Value {
+    use crate::cache::sync_state::{DeltaLane, SyncError};
+    let status = cache
+        .sync_scope_status(account, mailbox)
+        .and_then(|progress| {
+            let delta = if protocol == SyncProtocol::Auto {
+                cache.delta_status(account, mailbox, DeltaLane::Flags)?
+            } else {
+                None
+            };
+            Ok((progress, delta))
+        });
+    match status {
+        Ok((progress, delta)) => {
+            json!({"mailbox":mailbox,"progress":progress,"condstore":delta,"error":null})
+        }
+        Err(error) => {
+            let error = if matches!(error, SyncError::Cache(CacheError::Quota)) {
+                "quota"
+            } else {
+                "storage"
+            };
+            json!({"mailbox":mailbox,"progress":null,"condstore":null,"error":error})
+        }
+    }
+}
+
 fn read_health(health: &WriteHealthByAccount, account: &AccountKey) -> WriteHealth {
     health.lock().map_or(
         WriteHealth {
@@ -701,6 +809,10 @@ impl Persistent {
         self.health
             .lock()
             .is_ok_and(|keys| keys.values().all(|health| !health.unavailable))
+            && self
+                .delta_invalidations
+                .lock()
+                .is_ok_and(|scopes| scopes.is_empty())
             && self
                 .sync_absence
                 .lock()

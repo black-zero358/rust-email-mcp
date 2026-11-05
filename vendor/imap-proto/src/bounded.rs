@@ -13,6 +13,9 @@ use nom::{
 };
 use std::{borrow::Cow, cell::Cell, mem::size_of};
 
+mod condstore;
+pub(crate) use condstore::parse as parse_condstore;
+
 #[derive(Clone, Copy, Debug)]
 pub struct BodyStructureLimits {
     pub depth: usize,
@@ -90,6 +93,8 @@ pub enum ParseError<'a> {
 /// Hard limit for the opt-in windowed SEARCH parser.
 pub const MAX_SEARCH_UIDS: usize = 200;
 pub const MAX_SEARCH_RESPONSE_BYTES: usize = 128 * 1024;
+/// The RFC 7162 maximum for a positive mailbox or message mod-sequence.
+pub const MAX_MODSEQ: u64 = i64::MAX as u64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SearchLimitKind {

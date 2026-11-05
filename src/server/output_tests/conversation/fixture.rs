@@ -15,6 +15,7 @@ use std::{
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 type GenerateRaw = fn(u32) -> Vec<u8>;
+type OverrideReply = dyn Fn(&str, &str) -> Option<(Vec<u8>, &'static str)> + Send + Sync;
 
 pub(in crate::server::output_tests) struct Folder {
     pub flags: &'static str,
@@ -184,6 +185,7 @@ struct Imap {
     folders: Mutex<BTreeMap<String, Folder>>,
     faults: Mutex<BTreeMap<(String, String), Fault>>,
     holds: Mutex<BTreeMap<(String, String), Arc<CommandHold>>>,
+    override_reply: Mutex<Option<Arc<OverrideReply>>>,
     commands: Mutex<Vec<Command>>,
     connections: AtomicUsize,
     commands_total: AtomicUsize,
@@ -394,6 +396,7 @@ impl Harness {
             ),
             faults: Mutex::default(),
             holds: Mutex::default(),
+            override_reply: Mutex::default(),
             commands: Mutex::default(),
             connections: AtomicUsize::new(0),
             commands_total: AtomicUsize::new(0),
@@ -462,6 +465,13 @@ impl Harness {
 
     pub fn commands(&self) -> Vec<Command> {
         self.imap.commands.lock().unwrap().clone()
+    }
+
+    pub fn override_replies(
+        &self,
+        reply: impl Fn(&str, &str) -> Option<(Vec<u8>, &'static str)> + Send + Sync + 'static,
+    ) {
+        *self.imap.override_reply.lock().unwrap() = Some(Arc::new(reply));
     }
 
     pub fn update(&self, mailbox: &str, apply: impl FnOnce(&mut Folder)) {
@@ -702,6 +712,7 @@ async fn serve(
             .strip_prefix("EXAMINE ")
             .or_else(|| command.strip_prefix("SELECT "))
         {
+            let mailbox = mailbox.strip_suffix(" (CONDSTORE)").unwrap_or(mailbox);
             selected = unquote(mailbox).unwrap_or_else(|| mailbox.to_owned());
         }
         {
@@ -742,19 +753,29 @@ async fn serve(
             let _ = stream.read_u8().await;
             return;
         }
-        let reply = {
-            let folders = protocol.folders.lock().unwrap();
-            respond(&folders, &selected, command)
-        };
-        let (mut reply, status) = match (reply, fault) {
-            (_, Some(Fault::NoDataOk)) => (Vec::new(), "OK"),
-            (_, Some(Fault::OnlyUid(uid))) => (
-                format!("* 1 FETCH (UID {uid} FLAGS ())\r\n").into_bytes(),
-                "OK",
-            ),
-            (Some(reply), Some(Fault::NoAfterData)) => (reply, "NO"),
-            (Some(reply), _) => (reply, "OK"),
-            (None, _) => (Vec::new(), "NO"),
+        let overridden = protocol
+            .override_reply
+            .lock()
+            .unwrap()
+            .clone()
+            .and_then(|reply| reply(&selected, command));
+        let (mut reply, status) = if let Some(overridden) = overridden {
+            overridden
+        } else {
+            let reply = {
+                let folders = protocol.folders.lock().unwrap();
+                respond(&folders, &selected, command)
+            };
+            match (reply, fault) {
+                (_, Some(Fault::NoDataOk)) => (Vec::new(), "OK"),
+                (_, Some(Fault::OnlyUid(uid))) => (
+                    format!("* 1 FETCH (UID {uid} FLAGS ())\r\n").into_bytes(),
+                    "OK",
+                ),
+                (Some(reply), Some(Fault::NoAfterData)) => (reply, "NO"),
+                (Some(reply), _) => (reply, "OK"),
+                (None, _) => (Vec::new(), "NO"),
+            }
         };
         reply.extend_from_slice(format!("{tag} {status} synthetic\r\n").as_bytes());
         if stream.write_all(&reply).await.is_err() {

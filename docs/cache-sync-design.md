@@ -8,7 +8,8 @@
 | --- | --- | --- |
 | R12A 基础 | V4 事务检查点、扫描与核对协议、可恢复内容工作单元 | 迁移、匹配 tagged OK 后提交、取消/配额/重启、实际文件与索引 |
 | R12B 后台接线 | 管理配置、共享调度、全量/增量循环、清理、只读状态 | 多账户公平、前台优先、暂停续跑、dirty 收敛、覆盖进度 |
-| R12 协议加速 | CONDSTORE；完整协商后的 QRESYNC/VANISHED | 只读 EXAMINE、MODSEQ、扩展回退和删除核对 |
+| R12C 标记加速 | 独立 V6 水位与 CONDSTORE 生产接线 | 只读 EXAMINE、分页 MODSEQ、取消/重启与 rev1 回退 |
+| R12D 删除加速 | 完整协商后的 QRESYNC/VANISHED | 连接级 ENABLE、独立删除水位、范围/事件顺序及预算 |
 
 基础协议必须完整支持 rev1。分批实现期间，未接入运行期的内部基础以合成测试验收；启用入口和实际支持的协议以已合并契约为准。生产同步继续使用 EXAMINE/PEEK。
 
@@ -56,9 +57,15 @@ R12B 的派生热缓存使用独立 V5 迁移保存访问顺序，V4 检查点�
 
 压力回收先验证同版本原件可重建相同字节，再释放未被租约保护的派生文件。实际释放额度后恢复原受阻任务；主动驱逐的派生层保留可派生状态和物化缺口，在后续重启或扩容时恢复物化，避免当前压力轮反复重建同一副本。清理按有界 keyset 候选页推进，再逐项检查依赖；无可删除行的页面同样保存继续位置。
 
-## 协议加速后续接入
+## 协议加速接入设计
 
-R12B 先完成 rev1 生产循环。后续加速批次按 [RFC 7162](https://datatracker.ietf.org/doc/html/rfc7162) 的 3.1.2、3.1.4、3.1.8、3.2.3、3.2.5 和 3.2.10 实施：CONDSTORE 使用只读 EXAMINE 参数及 CHANGEDSINCE；NOMODSEQ 返回基础核对。QRESYNC 在当前认证连接完成 ENABLE，并收到含 QRESYNC 的 ENABLED 与成功 tagged completion 后才启用。已保存 UIDVALIDITY 与 MODSEQ 绑定同一目录世代；VANISHED 的 EARLIER 与实时响应分别处理。
+R12B 提供 rev1 生产循环。加速批次按 [RFC 7162](https://datatracker.ietf.org/doc/html/rfc7162) 的 3.1.2、3.1.4、3.1.8、3.2.3、3.2.5 和 3.2.10 实施：CONDSTORE 使用只读 EXAMINE 参数及 CHANGEDSINCE；NOMODSEQ 返回基础核对。QRESYNC 在当前认证连接完成 ENABLE，并收到含 QRESYNC 的 ENABLED 与成功 tagged completion 后才启用。已保存 UIDVALIDITY 与 MODSEQ 绑定同一目录世代；VANISHED 的 EARLIER 与实时响应分别处理。
+
+R12C 将可选 `sync.protocol` 设为 rev1 或 auto，省略保持 rev1；auto 在后台认证连接上探测能力，C 批只接入 CONDSTORE。前台工具沿用各自既有协议。独立 Delta 阶段复用后台许可和原期限，定期 rev1 存在性审计与 dirty 清除继续运行。能力缺失时在当前认证连接继续基础核对；扩展命令失败时关闭该连接，在同一期限/累计线路预算内最多建立一次新连接做基础核对。状态用固定协议名与降级类别，公开 MODSEQ 时使用十进制字符串。
+
+V6 使用独立的 FLAGS 水位和 FLAGS/删除水位，两者分别推进。基线记录首个 rev1 核对页之前的只读 EXAMINE MODSEQ，并绑定该轮扫描身份；整轮核对成功后才生效。每个增量轮次冻结起始/目标 MODSEQ、UID 上界及范围修订，按最多 200 个已知 UID 分页；每页事实和位置原子提交，末页完成后才提升全范围水位至冻结目标。单个 FETCH 的较大 MODSEQ 只用于处理该页事件，不直接提升全范围进度。基线各页保留本次选择及命令内的显式水位观察；只低于候选、仍覆盖已提交水位时撤销候选并保留已提交值；低于已提交水位或 NOMODSEQ 撤销两条扩展水位及候选。同一轮后来回升也不能重新种入。某页退回无扩展证据的基础协议时，仅撤销当前候选，保留已有已提交水位；候选撤销失败时保留进程内阻断，等待成功持久化。
+
+成员与实质 FLAGS 变化使用持久修订隔离同毫秒竞争，页面自身提交后更新对应证明；冻结上界之外的新 UID 进入后续任务。恢复、dirty、活跃写 claim、撤权或陈旧页面均阻止推进。存储读页、提交和基线登记重新核对当前管理员目录范围，缩小范围并重启后拒绝旧凭据。CONDSTORE 未返回某 UID 时保留该 UID；成功且一致的 NOMODSEQ 撤销扩展水位，临时协议错误保留已提交点。后续 QRESYNC 使用独立删除水位，防止借用较新的纯 FLAGS 水位漏掉此前删除。
 
 本仓库锁定代码的接口核对（R12A `331775f`）：async-imap 提供 `select_condstore` 和普通 `examine`，需要补只读扩展入口；普通 parser 可解析 VANISHED，当前同步专用有界 parser 尚未接纳该响应。加速批次必须同时实现有界 UID 范围解析、完整 EXAMINE 证据、显式 NOMODSEQ、能力协商与独立版本的持久水位。范围不能展开成无界 UID 数组；CHANGEDSINCE 未返回的 UID 保留原存在性，删除由明确 VANISHED 或基础存在性核对提交。完整差分和水位在同一事务提交，失败回退从原持久点继续。
 

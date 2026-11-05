@@ -110,7 +110,7 @@ fn v2_to_v3_keeps_headers_and_a_failed_migration_does_not_publish_partial_tables
             .connection
             .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
             .unwrap(),
-        5
+        6
     );
 }
 
