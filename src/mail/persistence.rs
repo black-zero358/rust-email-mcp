@@ -5,7 +5,7 @@ use crate::{
         AccountScope, ArtifactKey, ArtifactState, Cache, CacheError, ListingEvidence,
         MailboxEvidence, Omission, Ref as CacheRef, ThreadId,
     },
-    config::{CacheMode, CacheSettings},
+    config::{CacheMode, CacheSettings, SyncPolicy},
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -28,6 +28,7 @@ pub struct PreparedCache(Option<Arc<Persistent>>);
 
 struct Persistent {
     mode: CacheMode,
+    sync: SyncPolicy,
     storage: Option<Arc<Cache>>,
     queue: Option<mpsc::Sender<CacheMessage>>,
     folders: HashMap<AccountKey, HashSet<String>>,
@@ -39,6 +40,8 @@ struct Persistent {
     content_pending: HashMap<AccountKey, Arc<AtomicUsize>>,
     cache_read_jobs: Arc<Semaphore>,
     pending_tombstones: Arc<Mutex<HashSet<(GenerationKey, u32, u32)>>>,
+    sync_absence: Mutex<HashMap<GenerationKey, u32>>,
+    sync_epochs: Mutex<HashMap<GenerationKey, u32>>,
 }
 
 type CacheJob = Box<dyn FnOnce(&Arc<Cache>) + Send>;
@@ -96,6 +99,7 @@ impl PreparedCache {
             max_bytes,
             accounts,
             reserved,
+            sync,
         } = settings;
         let registered = catalog.registered_accounts();
         let mut folders = HashMap::with_capacity(accounts.len());
@@ -161,6 +165,7 @@ impl PreparedCache {
         }
         Ok(Self(Some(Arc::new(Persistent {
             mode,
+            sync,
             storage,
             queue,
             content_pending: folders
@@ -175,6 +180,8 @@ impl PreparedCache {
             content_jobs: Arc::new(Semaphore::new(CONTENT_PAYLOADS)),
             cache_read_jobs: Arc::new(Semaphore::new(EXECUTION_SLOTS)),
             pending_tombstones: Arc::new(Mutex::new(HashSet::new())),
+            sync_absence: Mutex::default(),
+            sync_epochs: Mutex::default(),
         }))))
     }
 
@@ -216,6 +223,26 @@ impl PreparedCache {
         validity: u32,
         uid: Option<u32>,
     ) -> bool {
+        self.sync_current(account, mailbox, validity, uid)
+            && self.0.as_ref().is_some_and(|state| {
+                let key = (
+                    account.reference_namespace(),
+                    canonical_mailbox(mailbox).into(),
+                );
+                state
+                    .sync_absence
+                    .lock()
+                    .is_ok_and(|fences| fences.get(&key) != Some(&validity))
+            })
+    }
+
+    pub(super) fn sync_current(
+        &self,
+        account: &AccountKey,
+        mailbox: &str,
+        validity: u32,
+        uid: Option<u32>,
+    ) -> bool {
         let Some(state) = &self.0 else { return false };
         if !state.enabled(account, mailbox) {
             return false;
@@ -231,6 +258,79 @@ impl PreparedCache {
                         && uid.is_none_or(|uid| uid == *tombstone)
                 })
             })
+    }
+
+    pub(super) fn sync_policy(&self) -> Option<SyncPolicy> {
+        let state = self.0.as_ref()?;
+        (state.mode == CacheMode::Full).then_some(state.sync)
+    }
+
+    pub(super) fn sync_observe(&self, account: &AccountKey, mailbox: &str, validity: u32) -> bool {
+        let Some(state) = &self.0 else { return false };
+        if !state.enabled(account, mailbox) {
+            return false;
+        }
+        let key = (account.reference_namespace(), mailbox.into());
+        let Some(transition) = observe_epoch(&state.generations, &key, validity) else {
+            return false;
+        };
+        !transition
+            || state
+                .sync_epochs
+                .lock()
+                .map(|mut pending| {
+                    let epoch = pending.entry(key).or_insert(validity);
+                    *epoch = (*epoch).max(validity);
+                })
+                .is_ok()
+    }
+
+    pub(super) fn sync_commit_epoch(&self, account: &AccountKey, mailbox: &str, validity: u32) {
+        let Some(state) = &self.0 else { return };
+        let key = (account.reference_namespace(), mailbox.into());
+        if let Ok(mut pending) = state.sync_epochs.lock()
+            && pending.get(&key).is_some_and(|epoch| *epoch <= validity)
+        {
+            pending.remove(&key);
+        }
+        if let Ok(mut absences) = state.sync_absence.lock()
+            && absences.get(&key).is_some_and(|epoch| *epoch < validity)
+        {
+            absences.remove(&key);
+        }
+    }
+
+    // Keep the whole scope offline while an authenticated absence proof is
+    // waiting for SQLite. A failed commit preserves the fence until a complete
+    // reconciliation has applied the evidence for that generation.
+    pub(super) fn sync_fence_absence(
+        &self,
+        account: &AccountKey,
+        mailbox: &str,
+        validity: u32,
+    ) -> Option<bool> {
+        let state = self.0.as_ref()?;
+        let key = (account.reference_namespace(), mailbox.into());
+        let mut fences = state.sync_absence.lock().ok()?;
+        match fences.get(&key).copied() {
+            Some(previous) if previous > validity => None,
+            Some(previous) if previous == validity => Some(false),
+            _ => {
+                fences.insert(key, validity);
+                Some(true)
+            }
+        }
+    }
+
+    pub(super) fn sync_finish_reconcile(&self, account: &AccountKey, mailbox: &str, validity: u32) {
+        if let Some(state) = &self.0
+            && let Ok(mut fences) = state.sync_absence.lock()
+        {
+            let key = (account.reference_namespace(), mailbox.into());
+            if fences.get(&key).is_some_and(|fence| *fence <= validity) {
+                fences.remove(&key);
+            }
+        }
     }
 
     pub(super) fn configured(&self, account: &AccountKey) -> bool {
@@ -333,8 +433,11 @@ impl PreparedCache {
         let health = state.health.clone();
         let mode = state.mode.name();
         let full = state.mode == CacheMode::Full;
+        let sync = state.sync;
+        let admission = runtime::read_admission();
         let (done, wait) = oneshot::channel();
         let submitted = self.submit(account, 4096, false, move |cache, account| {
+            let _admission = admission;
             match cache.status(account) {
                 Ok(status) => {
                     let mut folders =
@@ -351,7 +454,25 @@ impl PreparedCache {
                             }
                         }
                     }
-                    let _ = done.send((status, folders, read_health(&health, account)));
+                    let sync_folders = if full {
+                        status
+                            .folders
+                            .iter()
+                            .map(|folder| {
+                                match cache.sync_scope_status(account, &folder.mailbox) {
+                                    Ok(progress) => json!({"mailbox":folder.mailbox,"progress":progress,"error":null}),
+                                    Err(crate::cache::sync_state::SyncError::Cache(CacheError::Quota)) => {
+                                        json!({"mailbox":folder.mailbox,"progress":null,"error":"quota"})
+                                    }
+                                    Err(_) => json!({"mailbox":folder.mailbox,"progress":null,"error":"storage"}),
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    };
+                    let _ =
+                        done.send((status, folders, read_health(&health, account), sync_folders));
                     Ok(())
                 }
                 Err(error) => Err(error),
@@ -366,9 +487,20 @@ impl PreparedCache {
             None
         };
         let result =
-            result.filter(|(status, _, _)| state.account_current(account, &status.folders));
+            result.filter(|(status, _, _, _)| state.account_current(account, &status.folders));
+        let mut sync_folders = None;
         let mut value = match result {
-            Some((status, folders, health)) => json!({
+            Some((status, folders, health, mut progress)) => {
+                for (folder, progress) in status.folders.iter().zip(&mut progress) {
+                    if folder.uid_validity.is_some_and(|validity| {
+                        !self.offline_current(account, &folder.mailbox, validity, None)
+                    }) {
+                        progress["progress"] = Value::Null;
+                        progress["error"] = json!("verification_pending");
+                    }
+                }
+                sync_folders = Some(progress);
+                json!({
                 "account_id":alias,"mode":mode,"status":"ready",
                 "write_health":health,
                 "storage":{
@@ -376,13 +508,20 @@ impl PreparedCache {
                     "global_max_bytes":status.global_max_bytes, "startup_unclean":status.startup_unclean,
                     "folders":folders
                 }
-            }),
+                })
+            }
             None => {
                 json!({"account_id":alias,"mode":mode,"status":"unavailable","storage":null,
                     "write_health":read_health(&state.health, account)})
             }
         };
         if full {
+            value["sync"] = json!({
+                "enabled":sync.enabled,
+                "interval_seconds":sync.interval_seconds,
+                "reconcile_interval_seconds":sync.reconcile_interval_seconds,
+                "folders":sync_folders
+            });
             value["content_pending"] = json!(
                 state
                     .content_pending
@@ -562,6 +701,14 @@ impl Persistent {
         self.health
             .lock()
             .is_ok_and(|keys| keys.values().all(|health| !health.unavailable))
+            && self
+                .sync_absence
+                .lock()
+                .is_ok_and(|fences| fences.is_empty())
+            && self
+                .sync_epochs
+                .lock()
+                .is_ok_and(|epochs| epochs.is_empty())
             && self
                 .generations
                 .lock()
@@ -1358,7 +1505,7 @@ pub(super) fn canonical_mailbox(mailbox: &str) -> &str {
     }
 }
 
-fn checked_at_ms() -> Option<i64> {
+pub(super) fn checked_at_ms() -> Option<i64> {
     i64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1481,6 +1628,54 @@ mod tests {
         )
         .unwrap();
         (runtime, cache, catalog, witness)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn observed_sync_generation_without_a_receipt_cannot_publish_clean_shutdown() {
+        let root = tempfile::tempdir().unwrap();
+        let (runtime, cache, catalog, witness) = full_cache_fixture(root.path());
+        let account = catalog.read_account("owner", None).unwrap();
+        let storage = cache.full_storage(&account.key).unwrap();
+        let reference = CacheRef {
+            account: &account.key,
+            mailbox: "INBOX",
+            uid_validity: 9,
+            uid: 7,
+        };
+        storage
+            .observe_folder(&account.key, "INBOX", 9, Some(7), 1)
+            .unwrap();
+        storage
+            .remember_headers(reference, true, b"Subject: old\r\n\r\n", None)
+            .unwrap();
+        assert!(storage.cached_message(reference).unwrap().is_some());
+
+        // EXAMINE succeeded, then shutdown cancelled the durable observation.
+        assert!(cache.sync_observe(&account.key, "INBOX", 10));
+        assert!(!cache.offline_current(&account.key, "INBOX", 9, Some(7)));
+        assert_eq!(
+            storage.status(&account.key).unwrap().folders[0].uid_validity,
+            Some(9)
+        );
+        runtime.finish_cache(cache).await;
+        drop(runtime);
+        drop(catalog);
+        drop(witness);
+
+        let (runtime, cache, catalog, _witness) = full_cache_fixture(root.path());
+        let account = catalog.read_account("owner", None).unwrap();
+        let storage = cache.full_storage(&account.key).unwrap();
+        let reference = CacheRef {
+            account: &account.key,
+            ..reference
+        };
+        assert!(storage.status(&account.key).unwrap().startup_unclean);
+        assert!(matches!(
+            storage.cached_message(reference),
+            Err(CacheError::NeedsVerification)
+        ));
+        runtime.finish_cache(cache).await;
     }
 
     #[cfg(unix)]

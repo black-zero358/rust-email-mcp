@@ -14,8 +14,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-const CONFIG_ERROR: &str =
-    "Cache configuration is invalid. Check its mode, paths, accounts, folders and byte quotas.";
+const CONFIG_ERROR: &str = "Cache configuration is invalid. Check its mode, paths, accounts, folders, byte quotas and synchronization policy.";
 const MAX_CONFIG_BYTES: u64 = 256 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,7 +49,37 @@ enum Document {
         directory: PathBuf,
         max_bytes: u64,
         accounts: Vec<AccountSettings>,
+        #[serde(default)]
+        sync: SyncPolicy,
     },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SyncPolicy {
+    pub(crate) enabled: bool,
+    #[serde(default = "sync_interval")]
+    pub(crate) interval_seconds: u64,
+    #[serde(default = "reconcile_interval")]
+    pub(crate) reconcile_interval_seconds: u64,
+}
+
+impl Default for SyncPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_seconds: sync_interval(),
+            reconcile_interval_seconds: reconcile_interval(),
+        }
+    }
+}
+
+const fn sync_interval() -> u64 {
+    60
+}
+
+const fn reconcile_interval() -> u64 {
+    900
 }
 
 #[derive(Deserialize)]
@@ -67,6 +96,7 @@ pub struct CacheSettings {
     pub(crate) max_bytes: u64,
     pub(crate) accounts: Vec<AccountSettings>,
     pub(crate) reserved: Vec<PathBuf>,
+    pub(crate) sync: SyncPolicy,
 }
 
 pub fn load_cache_configuration(
@@ -93,27 +123,37 @@ fn load(path: &Path, registered: &ValidatedAccountSet) -> anyhow::Result<Option<
     let mut bytes = Vec::new();
     file.take(MAX_CONFIG_BYTES + 1).read_to_end(&mut bytes)?;
     anyhow::ensure!(bytes.len() as u64 <= MAX_CONFIG_BYTES);
-    let (mode, version, directory, max_bytes, mut accounts) = match serde_json::from_slice(&bytes)?
-    {
-        Document::Off { version } => {
-            anyhow::ensure!(version == 1);
-            return Ok(None);
-        }
-        Document::Full {
-            version,
-            directory,
-            max_bytes,
-            accounts,
-        } => (Mode::Full, version, directory, max_bytes, accounts),
-        Document::Metadata {
-            version,
-            directory,
-            max_bytes,
-            accounts,
-        } => (Mode::Metadata, version, directory, max_bytes, accounts),
-    };
+    let (mode, version, directory, max_bytes, mut accounts, sync) =
+        match serde_json::from_slice(&bytes)? {
+            Document::Off { version } => {
+                anyhow::ensure!(version == 1);
+                return Ok(None);
+            }
+            Document::Full {
+                version,
+                directory,
+                max_bytes,
+                accounts,
+                sync,
+            } => (Mode::Full, version, directory, max_bytes, accounts, sync),
+            Document::Metadata {
+                version,
+                directory,
+                max_bytes,
+                accounts,
+            } => (
+                Mode::Metadata,
+                version,
+                directory,
+                max_bytes,
+                accounts,
+                SyncPolicy::default(),
+            ),
+        };
     anyhow::ensure!(version == 1 && !directory.as_os_str().is_empty());
     anyhow::ensure!((MIN_BYTES..=MAX_BYTES).contains(&max_bytes));
+    anyhow::ensure!((1..=86_400).contains(&sync.interval_seconds));
+    anyhow::ensure!((1..=86_400).contains(&sync.reconcile_interval_seconds));
     anyhow::ensure!(!accounts.is_empty() && accounts.len() <= registered.accounts.len());
 
     let mut selected = HashSet::with_capacity(accounts.len());
@@ -201,6 +241,7 @@ fn load(path: &Path, registered: &ValidatedAccountSet) -> anyhow::Result<Option<
         max_bytes,
         accounts,
         reserved,
+        sync,
     }))
 }
 
@@ -349,6 +390,56 @@ mod tests {
             std::os::unix::fs::symlink(&target, root.path().join("metadata")).unwrap();
             write(&path, &settings());
             assert!(load_cache_file(&path, &registered).is_err());
+        }
+    }
+
+    #[test]
+    fn synchronization_is_explicit_full_only_and_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("cache.json");
+        let registered = ValidatedAccountSet::legacy(crate::config::fixture());
+        let mut full = settings();
+        full["mode"] = json!("full");
+        write(&path, &full);
+        let read = || load_cache_file(&path, &registered);
+        assert!(!read().unwrap().unwrap().sync.enabled);
+        full["sync"] = json!({"enabled":true});
+        write(&path, &full);
+        let policy = read().unwrap().unwrap().sync;
+        assert!(policy.enabled);
+        assert_eq!(
+            (policy.interval_seconds, policy.reconcile_interval_seconds),
+            (60, 900)
+        );
+        full["sync"] =
+            json!({"enabled":false,"interval_seconds":1,"reconcile_interval_seconds":86_400});
+        write(&path, &full);
+        let policy = read().unwrap().unwrap().sync;
+        assert!(!policy.enabled);
+        assert_eq!(
+            (policy.interval_seconds, policy.reconcile_interval_seconds),
+            (1, 86_400)
+        );
+        for sync in [
+            json!(null),
+            json!({}),
+            json!({"enabled":true,"interval_seconds":0}),
+            json!({"enabled":true,"reconcile_interval_seconds":86_401}),
+            json!({"enabled":true,"unknown":1}),
+        ] {
+            full["sync"] = sync;
+            write(&path, &full);
+            assert!(read().is_err());
+        }
+        for mode in ["off", "metadata"] {
+            let mut other = if mode == "off" {
+                json!({"version":1,"mode":"off"})
+            } else {
+                settings()
+            };
+            other["sync"] = json!({"enabled":true});
+            write(&path, &other);
+            assert!(read().is_err());
         }
     }
 }

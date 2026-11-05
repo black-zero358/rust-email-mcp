@@ -10,6 +10,7 @@ const METADATA_VERSION: u32 = 1;
 const FULL_VERSION: u32 = 2;
 const CONTENT_VERSION: u32 = 3;
 const SYNC_VERSION: u32 = 4;
+const RECLAIM_VERSION: u32 = 5;
 
 pub(super) fn open(path: &Path) -> Result<Connection, CacheError> {
     let connection = Connection::open_with_flags(
@@ -61,7 +62,10 @@ pub(super) fn initialize(
             tx.pragma_update(None, "application_id", APPLICATION_ID)?;
             tx.commit()?;
         }
-        (METADATA_VERSION | FULL_VERSION | CONTENT_VERSION | SYNC_VERSION, APPLICATION_ID) => {}
+        (
+            METADATA_VERSION | FULL_VERSION | CONTENT_VERSION | SYNC_VERSION | RECLAIM_VERSION,
+            APPLICATION_ID,
+        ) => {}
         _ => return Err(CacheError::Corrupt),
     }
     let saved_epoch: i64 = connection
@@ -97,6 +101,12 @@ pub(super) fn initialize(
         tx.pragma_update(None, "user_version", SYNC_VERSION)?;
         tx.commit()?;
     }
+    if full && version < RECLAIM_VERSION {
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(V5)?;
+        tx.pragma_update(None, "user_version", RECLAIM_VERSION)?;
+        tx.commit()?;
+    }
     if (saved_epoch as u64) < restore_epoch {
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         restore(&tx, restore_epoch, full_schema)?;
@@ -108,6 +118,42 @@ pub(super) fn initialize(
     }
     Ok(full_schema)
 }
+
+const V5: &str = "
+CREATE TABLE blob_recency (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    blob_id BLOB NOT NULL UNIQUE REFERENCES blobs(id) ON DELETE CASCADE,
+    mailbox TEXT NOT NULL,
+    uid_validity INTEGER NOT NULL,
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    kind INTEGER NOT NULL CHECK(kind IN(1,2)),
+    part INTEGER NOT NULL,
+    mime_version INTEGER NOT NULL,
+    html_version INTEGER NOT NULL
+) STRICT;
+CREATE INDEX blob_recency_scope ON blob_recency(mailbox,uid_validity,seq);
+INSERT INTO blob_recency(blob_id,mailbox,uid_validity,message_id,kind,part,mime_version,html_version)
+    SELECT a.blob_id,m.mailbox,m.uid_validity,m.id,a.kind,a.part,a.mime_version,a.html_version
+    FROM artifacts a CROSS JOIN messages m ON a.message_id=m.id
+    WHERE a.kind IN(1,2) AND a.state=1 ORDER BY a.rowid;
+CREATE TRIGGER recency_artifact_insert AFTER INSERT ON artifacts
+WHEN new.kind IN(1,2) AND new.state=1 BEGIN
+    INSERT INTO blob_recency(blob_id,mailbox,uid_validity,message_id,kind,part,mime_version,html_version)
+        SELECT new.blob_id,m.mailbox,m.uid_validity,m.id,new.kind,new.part,new.mime_version,new.html_version
+        FROM messages m WHERE m.id=new.message_id;
+END;
+CREATE TRIGGER recency_artifact_update AFTER UPDATE OF state,blob_id ON artifacts
+WHEN new.kind IN(1,2) AND old.blob_id IS NOT new.blob_id BEGIN
+    DELETE FROM blob_recency WHERE blob_id=old.blob_id;
+    INSERT INTO blob_recency(blob_id,mailbox,uid_validity,message_id,kind,part,mime_version,html_version)
+        SELECT new.blob_id,m.mailbox,m.uid_validity,m.id,new.kind,new.part,new.mime_version,new.html_version
+        FROM messages m WHERE m.id=new.message_id AND new.state=1;
+END;
+CREATE TRIGGER recency_artifact_delete AFTER DELETE ON artifacts
+WHEN old.kind IN(1,2) AND old.state=1 BEGIN
+    DELETE FROM blob_recency WHERE blob_id=old.blob_id;
+END;
+";
 
 const V4: &str = "
 CREATE TABLE sync_checkpoints (

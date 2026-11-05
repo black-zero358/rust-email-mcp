@@ -164,7 +164,7 @@ impl CachedReader {
         } else {
             state
         };
-        let mut value = match state {
+        let (mut value, lease) = match state {
             ArtifactState::Materialized(info) => {
                 let mut lease = self
                     .cache
@@ -204,7 +204,7 @@ impl CachedReader {
                     args,
                 )?;
                 lease.revalidate().map_err(cache_error)?;
-                value
+                (value, lease)
             }
             ArtifactState::Derivable { raw } => {
                 let mut lease = self
@@ -220,7 +220,7 @@ impl CachedReader {
                     args,
                 )?;
                 lease.revalidate().map_err(cache_error)?;
-                value
+                (value, lease)
             }
             ArtifactState::Missing => return Err(cache_miss()),
             ArtifactState::Omitted(_) => {
@@ -228,16 +228,24 @@ impl CachedReader {
             }
             ArtifactState::Unsupported(_) => return Err(crate::html::unsupported()),
         };
-        value["read_diagnostics"] =
-            json!({"source":"cache","fallback_reason":null,"limit_kind":null});
-        if !self.persistent.offline_current(
-            reference.account,
-            reference.mailbox,
-            reference.uid_validity,
-            Some(reference.uid),
-        ) {
+        let current = || {
+            self.persistent.offline_current(
+                reference.account,
+                reference.mailbox,
+                reference.uid_validity,
+                Some(reference.uid),
+            )
+        };
+        if !current() {
             return Err(cache_error(CacheError::NeedsVerification));
         }
+        lease.touch();
+        lease.revalidate().map_err(cache_error)?;
+        if !current() {
+            return Err(cache_error(CacheError::NeedsVerification));
+        }
+        value["read_diagnostics"] =
+            json!({"source":"cache","fallback_reason":null,"limit_kind":null});
         if access == Access::Offline {
             value["account_id"] = json!(self.alias);
             value["mailbox"] = json!(reference.mailbox);

@@ -69,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
         .with_cancellation_token(ct.child_token());
     let download_mail = mail.clone();
     let shutdown_mail = mail.clone();
+    let signal_mail = mail.clone();
     let service = StreamableHttpService::new(
         move || Ok(EmailServer(mail.clone())),
         Arc::new(LocalSessionManager::default()),
@@ -98,8 +99,9 @@ async fn main() -> anyhow::Result<()> {
             }),
         );
     let listener = tokio::net::TcpListener::bind(&config.bind).await?;
+    shutdown_mail.start_sync();
     tracing::info!(event = "started", version = env!("CARGO_PKG_VERSION"));
-    axum::serve(listener, router)
+    let served = axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             #[cfg(unix)]
             {
@@ -113,10 +115,12 @@ async fn main() -> anyhow::Result<()> {
                 let _ = tokio::signal::ctrl_c().await;
             }
             ct.cancel();
+            signal_mail.stop_sync();
             tokio::time::sleep(std::time::Duration::from_secs(35)).await;
         })
-        .await?;
+        .await;
     shutdown_mail.finish_cache(cache).await;
+    served?;
     drop(run);
     Ok(())
 }

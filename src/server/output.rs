@@ -52,6 +52,52 @@ fn layer_coverage() -> Value {
     all_required(json!({"raw":layer,"full_body":layer,"attachments":layer}))
 }
 
+fn sync_status() -> Value {
+    let scan = all_required(json!({
+        "scan_id":string(),"high_uid":count(),"revision":count(),"next_low":nullable(uid()),
+        "known_after":nullable(count()),"checked_at_ms":count(),"completed_at_ms":nullable(count()),
+        "complete":boolean()
+    }));
+    let layer = all_required(json!({
+        "materialized":count(),"materialized_bytes":count(),"derivable_from_raw":count(),
+        "missing":count(),"omitted":count(),"unsupported":count(),
+        "available_complete":boolean(),"materialization_complete":boolean()
+    }));
+    let coverage = all_required(json!({
+        "high_uid":count(),"discovery_complete":boolean(),"existence_flags_verified":boolean(),
+        "known_messages":count(),"complete_listing_facts":count(),"complete_headers":count(),
+        "partial_headers":count(),"missing_headers":count(),"indexed_headers":count(),
+        "exact_thread_index":count(),"verified_manifests":count(),"known_flags":count(),
+        "flags_checked_at_ms":nullable(count()),"indexed_bodies":count(),
+        "listing_facts_complete":boolean(),"headers_complete":boolean(),
+        "exact_thread_index_complete":boolean(),"manifests_complete":boolean(),
+        "body_index_complete":boolean(),"raw":layer,"full_body":layer,"attachments":layer,
+        "work":all_required(json!({
+            "pending":count(),"completed":count(),"terminal":count(),"quota_blocked":count(),
+            "retrying":count(),"next_due_ms":nullable(count())
+        })),
+        "gaps":array(all_required(json!({"layer":string(),"status":string(),"reason":string(),"count":count()})))
+    }));
+    let scope = all_required(json!({
+        "uid_validity":nullable(uid()),"observed_high_uid":nullable(count()),
+        "checked_at_ms":nullable(count()),"dirty":boolean(),"history":nullable(scan.clone()),
+        "tail":nullable(scan.clone()),"reconciliation":nullable(scan),
+        "history_coverage":nullable(coverage.clone()),"current_coverage":nullable(coverage)
+    }));
+    let folder = all_required(json!({
+        "mailbox":string(),"progress":nullable(scope),
+        "error":nullable(enumeration(&["quota","storage","verification_pending"])),
+        "runtime":all_required(json!({
+            "last_error":nullable(enumeration(&["network","protocol","storage","quota"])),
+            "quota_paused":boolean()
+        }))
+    }));
+    all_required(json!({
+        "enabled":boolean(),"interval_seconds":count(),"reconcile_interval_seconds":count(),
+        "running":boolean(),"folders":nullable(json!({"type":"array","maxItems":64,"items":folder}))
+    }))
+}
+
 fn cache_context() -> Value {
     let coverage = object(
         json!({
@@ -448,6 +494,7 @@ fn data(name: &str) -> Value {
                 }))
             }));
             schema["properties"]["content_pending"] = count();
+            schema["properties"]["sync"] = sync_status();
             schema
         }
         "list_mailboxes" => all_required(

@@ -410,18 +410,36 @@ async fn fixed_html_budget_marks_only_the_index_as_omitted() {
     }
     replies.push(section("", length, 1, &[]));
     complete(&cache, &account, &stamp, ContentLayer::Raw, replies).await;
-    for layer in [ContentLayer::Manifest, ContentLayer::FullBody] {
-        complete(&cache, &account, &stamp, layer, vec![size(length)]).await;
-    }
-    assert!(matches!(
-        complete(
+    complete(
+        &cache,
+        &account,
+        &stamp,
+        ContentLayer::Manifest,
+        vec![size(length)],
+    )
+    .await;
+    let local = |layer| {
+        let work = next(&cache, &stamp, layer);
+        let outcome = reuse(
             &cache,
-            &account,
-            &stamp,
-            ContentLayer::BodyIndex,
-            vec![size(length)]
+            reference(&account),
+            &CancellationToken::new(),
+            layer,
+            cached_body::LIMIT,
         )
-        .await,
+        .unwrap()
+        .unwrap();
+        cache
+            .commit_sync_content(&work, outcome, &|| false)
+            .unwrap();
+        outcome
+    };
+    assert!(matches!(
+        local(ContentLayer::FullBody),
+        ContentOutcome::PresentBlob(_)
+    ));
+    assert!(matches!(
+        local(ContentLayer::BodyIndex),
         ContentOutcome::Terminal(Omission::DecodedLimit)
     ));
     let ArtifactState::Materialized(body) = cache

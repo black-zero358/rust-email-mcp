@@ -593,7 +593,6 @@ where
     Ok((leaf, part.content_type == "text/html", reserve))
 }
 
-#[cfg(test)]
 pub(in crate::mail) async fn canonical_structured<S>(
     session: &mut async_imap::Session<S>,
     uid: u32,

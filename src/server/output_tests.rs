@@ -32,6 +32,7 @@ mod conversation;
 mod listing;
 mod parts;
 mod structure;
+mod sync_acceptance;
 
 fn validator(name: &str) -> jsonschema::Validator {
     let tool = tools("full").into_iter().find(|t| t.name == name).unwrap();

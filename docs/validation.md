@@ -27,7 +27,9 @@ V4 使用独立事务迁移，保留 V1/V2/V3 既有 DDL。历史发现、独立
 
 实际镜像从 `git archive 331775f18942d17ba35c78331abd87494134c87c` 的独立目录构建，标签 `rust-email-mcp:r12-sync-foundation-local`，镜像 manifest list digest 为 `sha256:6d691a3f79eaac375f8174f98632b878017c4f6eafde1b26c44c19aa76be10ab`。构建使用固定 Rust 1.99.1 和现有生产 Dockerfile；Cargo.toml、Cargo.lock 及部署配置保持原值。
 
-本批同步协议和内容驱动通过内部测试入口验收；生产后台循环、管理员启停配置、只读状态及运行期清理由 R12B 接入。最终 PR CI 与合并结果在完成后追加。真实 ChatGPT 接入与生产部署另行安排。
+本批同步协议和内容驱动通过内部测试入口验收；生产后台循环、管理员启停配置、只读状态及运行期清理由 R12B 接入。真实 ChatGPT 接入与生产部署另行安排。
+
+[PR #78](https://github.com/black-zero358/rust-email-mcp/pull/78) 最终 head `68111294fe694fd27d0b05d273af195b3dd408d5` 仅在源码上追加三份文档，修正发现扫描与独立 keyset 核对的说明并保存验证记录；98 个相对链接/锚点及最终差异独立复核通过。[CI 42025118017](https://github.com/black-zero358/rust-email-mcp/actions/runs/42025118017) 的 check/audit/container 全部成功。GitHub 自动代码/安全审阅遇到账户额度限制，合并前 reviews/review threads 均为空。PR 合并为 `a226545df5d99424ba0bcfb51f78ecd3095abda8`，本地 main、开发分支及对应远端已同步，B 批改动保留在工作区。
 
 ## 2026-11-05 R11 完整离线读取
 

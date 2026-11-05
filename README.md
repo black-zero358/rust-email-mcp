@@ -51,7 +51,9 @@ MIME 在构建结构时限制为 1024 个节点、32 层嵌套，头部每段最
 
 `download_attachment` 保留原有内联 Base64 返回格式及输出预算。附件支持稳定 `attachment_id` 或原有 `attachment_index` 选择；`list_attachments` 返回安全文件名、大小精度、可下载状态及交付方式，`prepare_attachment_download` 返回同主体 Bearer 认证的短期 URL。下载响应提供 SHA-256，客户端可核对文件完整性。仓库提供[标准客户端适配器](scripts/attachment-client-adapter/README.md)，用于认证下载、校验及本地落盘。当前仅用模拟邮箱和合成文件离线测试下载及内容读取，ChatGPT 实际连接测试放到后续阶段。参数与范围限制见 [邮件能力扩展](docs/capabilities.md)。
 
-可选持久缓存通过 `CACHE_CONFIG_PATH` 为指定账户和文件夹启用 `metadata` 或 `full`。metadata 保存在线观察的邮件头、部件证据和索引；full 继续保存完整正文、原始邮件及附件，支持显式选择本地读取。列表、正文、附件和会话使用 `read_source:"cache"`，搜索及 Message-ID 定位使用 `search_source:"cache"`；默认仍在线读取。离线结果给出最后观察时间和覆盖缺口，`get_cache_status` 查看实际保存层、待写入任务及磁盘额度。缓存范围随成功在线读取逐步积累，完整历史同步按 R12 推进。
+可选持久缓存通过 `CACHE_CONFIG_PATH` 为指定账户和文件夹启用 `metadata` 或 `full`。metadata 保存在线观察的邮件头、部件证据和索引；full 继续保存完整正文、原始邮件及附件，支持显式选择本地读取。列表、正文、附件和会话使用 `read_source:"cache"`，搜索及 Message-ID 定位使用 `search_source:"cache"`；默认仍在线读取。离线结果给出最后观察时间和覆盖缺口，`get_cache_status` 查看实际保存层、待写入任务及磁盘额度。
+
+full 配置可显式设置 `sync.enabled:true`，后台按选定账户和目录回填全部历史，持续发现新增邮件并核对标记与删除。省略该配置保持暂停，在线读取仍逐步积累缓存；启停、范围和额度修改通过重启生效。同步进度分别显示冻结历史、新增发现、存在性核对和各内容层，配额不足保留断点及缺口。配置与恢复步骤见[后台同步管理](docs/deployment.md#后台同步管理)。
 
 查询范围全部纳入缓存时，跨文件夹会话游标可在原有效期内跨重启续查；`cursor_storage` 标明 `memory` 或 `persistent`。本地读取继续检查当前账户权限，正常清洁重启保留离线可用性；异常退出、恢复备份和已知邮件修改会使相关范围待核对。配置样例、运行见证文件和备份恢复步骤见[缓存设计](docs/cache-design.md)及[部署规程](docs/deployment.md#持久缓存备份与恢复)。
 

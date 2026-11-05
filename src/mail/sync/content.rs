@@ -6,7 +6,10 @@ use crate::{
     cache::{
         Access, ArtifactKey, ArtifactState, BlobId, BlobLease, BlobStage, Cache, CacheError,
         Omission, Ref as CacheRef,
-        sync_state::{ContentLayer, ContentOutcome, ContentWork},
+        sync_state::{
+            ContentLayer, ContentOutcome, ContentWork, SyncError, SyncReclaimCandidate,
+            SyncReclaimPosition,
+        },
     },
     error::{LimitKind, MailError},
     mail::parts::{
@@ -15,6 +18,7 @@ use crate::{
     },
     mime,
 };
+use sha2::{Digest, Sha256};
 use std::{
     io::{Read, Write},
     sync::Arc,
@@ -214,19 +218,26 @@ impl Job<'_> {
         key: ArtifactKey,
         exact_len: Option<usize>,
     ) -> ContentResult<Option<BlobId>> {
-        self.local(move |cache, reference, _| {
-            let ArtifactState::Materialized(info) = cache.artifact_state(reference, key)? else {
-                return Ok(None);
-            };
-            if exact_len.is_some_and(|size| info.bytes != size as u64) {
-                return Err(ContentError::Read(MailError::backend()));
-            }
-            let lease = cache.open_blob(reference, key, Access::LiveVerified, Some(info.id))?;
-            lease.revalidate()?;
-            Ok(Some(info.id))
-        })
-        .await
+        self.local(move |cache, reference, _| existing_artifact(cache, reference, key, exact_len))
+            .await
     }
+}
+
+fn existing_artifact(
+    cache: &Arc<Cache>,
+    reference: CacheRef<'_>,
+    key: ArtifactKey,
+    exact_len: Option<usize>,
+) -> ContentResult<Option<BlobId>> {
+    let ArtifactState::Materialized(info) = cache.artifact_state(reference, key)? else {
+        return Ok(None);
+    };
+    if exact_len.is_some_and(|size| info.bytes != size as u64) {
+        return Err(ContentError::Read(MailError::backend()));
+    }
+    let lease = cache.open_blob(reference, key, Access::LiveVerified, Some(info.id))?;
+    lease.revalidate()?;
+    Ok(Some(info.id))
 }
 
 pub(super) async fn materialize<S>(
@@ -280,6 +291,53 @@ fn artifact(layer: ContentLayer) -> Option<ArtifactKey> {
             mime_version: 1,
         }),
         _ => None,
+    }
+}
+
+/// Immutable local artifacts can complete a derived work item under its
+/// existing discovery receipt. Remote presence has its own reconciliation pass.
+pub(super) fn reuse(
+    cache: &Arc<Cache>,
+    reference: CacheRef<'_>,
+    cancellation: &CancellationToken,
+    layer: ContentLayer,
+    limit: usize,
+) -> ContentResult<Option<ContentOutcome>> {
+    let result = match layer {
+        ContentLayer::Facts | ContentLayer::Raw => return Ok(None),
+        ContentLayer::BodyIndex => {
+            if !matches!(
+                cache.artifact_state(reference, cached_body::KEY)?,
+                ArtifactState::Materialized(_)
+            ) {
+                return Ok(None);
+            }
+            index_body(cache, reference, cancellation).map(Some)
+        }
+        _ => {
+            if let Some(key) = artifact(layer)
+                && let Some(blob) = existing_artifact(cache, reference, key, None)?
+            {
+                return Ok(Some(ContentOutcome::PresentBlob(blob)));
+            }
+            let ArtifactState::Materialized(raw) =
+                cache.artifact_state(reference, ArtifactKey::Raw)?
+            else {
+                return Ok(None);
+            };
+            derive(
+                cache,
+                reference,
+                cancellation,
+                layer,
+                raw.bytes as usize,
+                limit,
+            )
+        }
+    };
+    match result {
+        Err(ContentError::Terminal(reason)) => Ok(Some(ContentOutcome::Terminal(reason))),
+        result => result,
     }
 }
 
@@ -449,12 +507,12 @@ fn save_body(
     Ok(ContentOutcome::PresentBlob(info.id))
 }
 
-struct BodyWriter<'a> {
-    stage: &'a mut BlobStage,
+struct BodyWriter<'a, W> {
+    stage: &'a mut W,
     cancellation: &'a CancellationToken,
 }
 
-impl Write for BodyWriter<'_> {
+impl<W: Write> Write for BodyWriter<'_, W> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         if self.cancellation.is_cancelled() {
             return Err(std::io::Error::other("Content step was cancelled."));
@@ -515,14 +573,7 @@ fn derive(
             save_manifest(cache, reference, cancellation, &manifest.manifest)?
         }
         ContentLayer::FullBody => {
-            let mut record = cached_body::Record::default();
-            let mut remaining = cached_body::LIMIT;
-            parsed
-                .decoded_display_leaves(&mut remaining, |text, html, reserve| {
-                    record.push(text, html, reserve);
-                    Ok(())
-                })
-                .map_err(ContentError::decoded)?;
+            let record = raw_body(&parsed)?;
             raw.revalidate()?;
             save_body(cache, reference, cancellation, &record)?
         }
@@ -546,6 +597,18 @@ fn derive(
         _ => return Err(ContentError::Stale),
     };
     Ok(Some(outcome))
+}
+
+fn raw_body(parsed: &mime::Part<'_>) -> ContentResult<cached_body::Record> {
+    let mut record = cached_body::Record::default();
+    let mut remaining = cached_body::LIMIT;
+    parsed
+        .decoded_display_leaves(&mut remaining, |text, html, reserve| {
+            record.push(text, html, reserve);
+            Ok(())
+        })
+        .map_err(ContentError::decoded)?;
+    Ok(record)
 }
 
 fn read_raw(
@@ -666,7 +729,7 @@ fn derive_attachment(
     input: &[u8],
     limit: usize,
 ) -> ContentResult<ContentOutcome> {
-    let (mut decoder, expected) = attachment_decoder(part, limit)?;
+    let (decoder, expected) = attachment_decoder(part, limit)?;
     let key = ArtifactKey::Attachment {
         original_index: part.attachment_index as u32,
         mime_version: 1,
@@ -677,6 +740,18 @@ fn derive_attachment(
         expected.map(|size| size as u64),
         limit as u64,
     )?;
+    decode_attachment(cancellation, decoder, input, &mut stage)?;
+    raw.revalidate()?;
+    let info = stage.publish(&|| cancellation.is_cancelled())?;
+    Ok(ContentOutcome::PresentBlob(info.id))
+}
+
+fn decode_attachment(
+    cancellation: &CancellationToken,
+    mut decoder: Decoder,
+    input: &[u8],
+    mut output_writer: impl Write,
+) -> ContentResult<()> {
     let mut output = vec![0; OUTPUT_CHUNK];
     let mut offset = 0;
     loop {
@@ -689,7 +764,7 @@ fn derive_attachment(
             .step(&input[offset..end], &mut output, eof)
             .map_err(decode_error)?;
         offset += step.consumed;
-        stage
+        output_writer
             .write_all(&output[..step.produced])
             .map_err(CacheError::from)?;
         match step.status {
@@ -699,9 +774,115 @@ fn derive_attachment(
             _ => return Err(ContentError::Stale),
         }
     }
+    Ok(())
+}
+
+pub(super) fn reclaim(
+    cache: &Arc<Cache>,
+    account: &AccountKey,
+    mailbox: &str,
+    position: Option<SyncReclaimPosition>,
+    cancellation: &CancellationToken,
+) -> Result<(bool, Option<SyncReclaimPosition>), SyncError> {
+    let page = match cache.sync_reclaim_candidates(account, mailbox, position, 1) {
+        Err(SyncError::Stale) if position.is_some() => {
+            cache.sync_reclaim_candidates(account, mailbox, None, 1)?
+        }
+        result => result?,
+    };
+    let Some(candidate) = page.candidates.first() else {
+        return Ok((false, page.next));
+    };
+    let reference = CacheRef {
+        account,
+        mailbox,
+        uid_validity: candidate.uid_validity,
+        uid: candidate.uid,
+    };
+    match same_derivation(cache, reference, candidate, cancellation) {
+        Ok(true) if !cancellation.is_cancelled() => {
+            if cache.evict_sync_candidate(reference, candidate)? {
+                return Ok((true, None));
+            }
+        }
+        Err(ContentError::Storage(CacheError::Storage)) => return Err(CacheError::Storage.into()),
+        Err(ContentError::Cancelled) => return Err(SyncError::Cancelled),
+        _ => {}
+    }
+    Ok((false, page.next))
+}
+
+#[derive(Default)]
+struct DigestWriter {
+    digest: Sha256,
+    bytes: u64,
+}
+
+impl Write for DigestWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.digest.update(bytes);
+        self.bytes += bytes.len() as u64;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn same_derivation(
+    cache: &Arc<Cache>,
+    reference: CacheRef<'_>,
+    candidate: &SyncReclaimCandidate,
+    cancellation: &CancellationToken,
+) -> ContentResult<bool> {
+    let mut raw = cache.open_blob(
+        reference,
+        ArtifactKey::Raw,
+        Access::LiveVerified,
+        Some(candidate.raw.id),
+    )?;
+    let bytes = read_raw(&mut raw, candidate.raw.bytes as usize, cancellation)?;
+    let parsed = mime::parse(&bytes).map_err(ContentError::decoded)?;
+    let mut output = DigestWriter::default();
+    match candidate.kind {
+        cached_body::KEY => {
+            let materialized = cache.open_blob(
+                reference,
+                candidate.kind,
+                Access::LiveVerified,
+                Some(candidate.materialized.id),
+            )?;
+            let body = raw_body(&parsed)?;
+            let metadata = body
+                .encode(BodyWriter {
+                    stage: &mut output,
+                    cancellation,
+                })
+                .map_err(CacheError::from)?;
+            if materialized.body_metadata() != Some(metadata.as_slice()) {
+                return Ok(false);
+            }
+            materialized.revalidate()?;
+        }
+        ArtifactKey::Attachment {
+            original_index,
+            mime_version: 1,
+        } => {
+            let manifest = parts::from_raw(&parsed).map_err(ContentError::decoded)?;
+            let part = attachment(&manifest.manifest, original_index)?;
+            let entity = manifest
+                .entities
+                .get(original_index as usize)
+                .ok_or(ContentError::Stale)?;
+            let (decoder, _) = attachment_decoder(part, crate::config::DEFAULT_MAX_MESSAGE)?;
+            decode_attachment(cancellation, decoder, entity.encoded_body(), &mut output)?;
+        }
+        _ => return Ok(false),
+    }
     raw.revalidate()?;
-    let info = stage.publish(&|| cancellation.is_cancelled())?;
-    Ok(ContentOutcome::PresentBlob(info.id))
+    Ok(output.bytes == candidate.materialized.bytes
+        && <[u8; 32]>::from(output.digest.finalize()) == candidate.materialized.sha256)
 }
 
 #[cfg(test)]

@@ -2,6 +2,7 @@
 mod content;
 mod reconcile;
 mod scan;
+pub(super) mod worker;
 
 #[cfg(test)]
 mod tests;
