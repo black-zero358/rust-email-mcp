@@ -134,13 +134,13 @@ fn not_found() -> MailError {
     }
 }
 
-/// Consume through the matching OK. ResponseData owners are retained only when needed.
+/// Consume through the matching OK and return the tagged response.
 pub(in crate::mail) async fn command<S>(
     session: &mut async_imap::Session<S>,
     query: String,
     limits: Option<CommandReadLimits>,
     mut consume: impl FnMut(ResponseData) -> std::result::Result<(), FetchFailure>,
-) -> std::result::Result<(), FetchFailure>
+) -> std::result::Result<ResponseData, FetchFailure>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
 {
@@ -162,7 +162,7 @@ where
                 ..
             } if received == &tag => {
                 return match status {
-                    Status::Ok => Ok(()),
+                    Status::Ok => Ok(response),
                     Status::No => Err(FetchFailure::Imap(ImapError::No(
                         "Metadata command rejected".into(),
                     ))),

@@ -506,9 +506,25 @@ impl MailService {
                     .select(mailbox_name(source, InputLimits::LegacyWrite)?)
                     .await
                     .map_err(imap_error)?;
+                self.observe_mailbox(source, &state);
                 check_validity(a, state.uid_validity)?;
-                let uid = uid(a)?.to_string();
-                match name {
+                let id = uid(a)?;
+                let uid = id.to_string();
+                let mut fetched = s.uid_fetch(&uid, "(UID)").await.map_err(imap_error)?;
+                let mut found = false;
+                let mut has_fetch = false;
+                while let Some(row) = fetched.try_next().await.map_err(imap_error)? {
+                    has_fetch = true;
+                    found |= row.uid == Some(id);
+                }
+                drop(fetched);
+                if !found {
+                    if !has_fetch {
+                        self.cache_tombstone(source, state.uid_validity, state.uid_next, id);
+                    }
+                    return Err(fetch_attribute_error(true, false));
+                }
+                let confirmed = match name {
                     "mark_email" => {
                         let flag = match text(a, "flag")? {
                             "seen" => "\\Seen",
@@ -516,20 +532,23 @@ impl MailService {
                             "answered" => "\\Answered",
                             _ => return Err(MailError::input()),
                         };
-                        let op = if a["value"].as_bool().ok_or_else(MailError::input)? {
-                            "+FLAGS.SILENT"
-                        } else {
-                            "-FLAGS.SILENT"
-                        };
+                        let wanted = a["value"].as_bool().ok_or_else(MailError::input)?;
+                        let op = if wanted { "+FLAGS" } else { "-FLAGS" };
                         if dirty.is_none() {
                             *dirty = Some(self.cache_before_write(&[source]).await);
                         }
-                        s.uid_store(uid, format!("{op} ({flag})"))
-                            .await
-                            .map_err(imap_error)?
-                            .try_collect::<Vec<_>>()
+                        let mut stored = s
+                            .uid_store(&uid, format!("{op} ({flag})"))
                             .await
                             .map_err(imap_error)?;
+                        let flag = async_imap::types::Flag::from(flag);
+                        let mut observed = None;
+                        while let Some(row) = stored.try_next().await.map_err(imap_error)? {
+                            if row.uid == Some(id) && row.has_flags() {
+                                observed = Some(row.flags().any(|returned| returned == flag));
+                            }
+                        }
+                        observed == Some(wanted)
                     }
                     "delete_email" if a["permanent"] == true => {
                         if a["confirm"] != true {
@@ -547,18 +566,20 @@ impl MailService {
                         if dirty.is_none() {
                             *dirty = Some(self.cache_before_write(&[source]).await);
                         }
-                        s.uid_store(&uid, "+FLAGS.SILENT (\\Deleted)")
-                            .await
-                            .map_err(imap_error)?
-                            .try_collect::<Vec<_>>()
+                        let mut stored = s
+                            .uid_store(&uid, "+FLAGS.SILENT (\\Deleted)")
                             .await
                             .map_err(imap_error)?;
+                        while stored.try_next().await.map_err(imap_error)?.is_some() {}
+                        drop(stored);
                         s.uid_expunge(&uid)
                             .await
                             .map_err(imap_error)?
-                            .try_collect::<Vec<_>>()
+                            .try_for_each(|_| std::future::ready(Ok(())))
                             .await
                             .map_err(imap_error)?;
+                        // EXPUNGE reports sequence numbers and can include concurrent removals.
+                        false
                     }
                     _ => {
                         let dest = if name == "delete_email" {
@@ -575,14 +596,18 @@ impl MailService {
                                 details: None,
                             });
                         }
-                        let wire = mailbox_name(dest, InputLimits::LegacyWrite)?;
+                        let wire = quoted(&mailbox_name(dest, InputLimits::LegacyWrite)?);
                         if dirty.is_none() {
                             *dirty = Some(self.cache_before_write(&[source, dest]).await);
                         }
-                        s.uid_mv(&uid, wire).await.map_err(imap_error)?;
+                        uid_move_confirmed(s, id, &wire).await?
                     }
+                };
+                if confirmed {
+                    Ok(json!({"status":"updated"}))
+                } else {
+                    Ok(json!({"status":"accepted","retry_allowed":false}))
                 }
-                Ok(json!({"status":"updated"}))
             }
             _ => Err(MailError::input()),
         }
@@ -805,37 +830,21 @@ impl BatchExecutor for SessionBatch<'_> {
         let mut args = self.args.clone();
         args["uid"] = json!(id);
         args.as_object_mut().unwrap().remove("uids");
-        let mailbox = folder(&args, InputLimits::LegacyWrite)?;
-        let state = self
-            .session
-            .select(mailbox_name(mailbox, InputLimits::LegacyWrite)?)
-            .await
-            .map_err(|_| MailError::backend())?;
-        self.service.observe_mailbox(mailbox, &state);
-        check_validity(&args, state.uid_validity)?;
-        let found = self
-            .session
-            .uid_fetch(id.to_string(), "(UID)")
-            .await
-            .map_err(|_| MailError::backend())?
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(|_| MailError::backend())?;
-        if !found.iter().any(|f| f.uid == Some(id)) {
-            if found.is_empty() {
-                self.service
-                    .cache_tombstone(mailbox, state.uid_validity, state.uid_next, id);
-            }
-            return Ok(json!({"uid":id,"status":"not_found"}));
-        }
-        Box::pin(self.service.with_session_guarded(
+        match Box::pin(self.service.with_session_guarded(
             self.session,
             self.name,
             &args,
             &mut self.dirty,
         ))
-        .await?;
-        Ok(json!({"uid":id,"status":"updated"}))
+        .await
+        {
+            Ok(mut result) => {
+                result["uid"] = json!(id);
+                Ok(result)
+            }
+            Err(error) if error.code == "NOT_FOUND" => Ok(json!({"uid":id,"status":"not_found"})),
+            Err(error) => Err(error),
+        }
     }
 }
 async fn run_batch(
@@ -891,10 +900,10 @@ fn quote(value: &str) -> Result<String> {
     if value.len() > 998 || value.contains(['\r', '\n', '\0']) {
         return Err(MailError::input());
     }
-    Ok(format!(
-        "\"{}\"",
-        value.replace('\\', "\\\\").replace('"', "\\\"")
-    ))
+    Ok(quoted(value))
+}
+fn quoted(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 fn imap_date(value: &str) -> Result<String> {
     let bytes = value.as_bytes();
@@ -1220,6 +1229,46 @@ fn addresses(a: &Value, key: &str) -> Result<Vec<Mailbox>> {
         }
     }
 }
+async fn uid_move_confirmed<S>(s: &mut async_imap::Session<S>, uid: u32, wire: &str) -> Result<bool>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
+{
+    use imap_proto::{Response, ResponseCode, Status, rfc4315::UidSetMember};
+    fn singleton(set: &[UidSetMember]) -> Option<u32> {
+        match set {
+            [UidSetMember::Uid(uid)] => Some(*uid),
+            [UidSetMember::UidRange(range)] if range.start() == range.end() => Some(*range.start()),
+            _ => None,
+        }
+        .filter(|uid| *uid > 0)
+    }
+    let matches = |response: &Response<'_>| {
+        let outcome = match response {
+            Response::Data {
+                status: Status::Ok,
+                outcome,
+            }
+            | Response::Done {
+                status: Status::Ok,
+                outcome,
+                ..
+            } => outcome,
+            _ => return false,
+        };
+        matches!(&outcome.code, Some(ResponseCode::CopyUid(validity, source, dest))
+            if *validity > 0 && singleton(source) == Some(uid) && singleton(dest).is_some())
+    };
+    let mut confirmed = false;
+    let completion =
+        parts::reader::command(s, format!("UID MOVE {uid} {wire}"), None, |response| {
+            confirmed |= matches(response.parsed());
+            Ok(())
+        })
+        .await
+        .map_err(|_| MailError::backend())?;
+    Ok(confirmed || matches(completion.parsed()))
+}
+
 async fn email_status<S>(
     s: &mut async_imap::Session<S>,
     uid: u32,
@@ -1544,6 +1593,120 @@ mod tests {
                 truncated: false,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn single_writes_distinguish_missing_targets_and_confirmed_updates() {
+        let (_dir, service) = fetch_fixture();
+        let select = ("SELECT \"INBOX\"", "* OK [UIDVALIDITY 9] valid\r\n", "OK");
+        let target = ("UID FETCH 7 (UID)", "* 1 FETCH (UID 7)\r\n", "OK");
+        let missing = ("UID FETCH 7 (UID)", "", "OK");
+        let move_cap = ("CAPABILITY", "* CAPABILITY IMAP4rev1 MOVE\r\n", "OK");
+        let delete_cap = ("CAPABILITY", "* CAPABILITY IMAP4rev1 UIDPLUS\r\n", "OK");
+        let mark = "UID STORE 7 +FLAGS (\\Seen)";
+        let mv = "UID MOVE 7 \"Archive\"";
+        let del = "UID STORE 7 +FLAGS.SILENT (\\Deleted)";
+        let expunge = "UID EXPUNGE 7";
+        let cases = [
+            ("mark_email", vec![missing], Err("NOT_FOUND")),
+            ("move_email", vec![missing], Err("NOT_FOUND")),
+            (
+                "delete_email",
+                vec![
+                    target,
+                    delete_cap,
+                    (del, "", "OK"),
+                    (expunge, "* 1 EXPUNGE\r\n", "OK"),
+                    select,
+                    missing,
+                ],
+                Ok("accepted"),
+            ),
+            (
+                "mark_email",
+                vec![target, (mark, "* 2 FETCH (UID 8 FLAGS (\\Seen))\r\n", "OK")],
+                Ok("accepted"),
+            ),
+            (
+                "mark_email",
+                vec![target, (mark, "* 1 FETCH (UID 7 FLAGS (\\Seen))\r\n", "OK")],
+                Ok("updated"),
+            ),
+            (
+                "move_email",
+                vec![target, move_cap, (mv, "* 1 EXPUNGE\r\n", "OK")],
+                Ok("accepted"),
+            ),
+            (
+                "move_email",
+                vec![
+                    target,
+                    move_cap,
+                    (mv, "* OK [COPYUID 9 7 42] copied\r\n", "OK"),
+                ],
+                Ok("updated"),
+            ),
+            (
+                "move_email",
+                vec![target, move_cap, (mv, "", "OK [COPYUID 9 7:7 42:42]")],
+                Ok("updated"),
+            ),
+            (
+                "move_email",
+                vec![
+                    target,
+                    move_cap,
+                    (mv, "", "OK [COPYUID 9 1:4294967295 1:4294967295]"),
+                ],
+                Ok("accepted"),
+            ),
+            (
+                "move_email",
+                vec![
+                    target,
+                    move_cap,
+                    (mv, "* OK [COPYUID 9 7 42] copied\r\n", "NO"),
+                ],
+                Err("MAIL_BACKEND"),
+            ),
+            (
+                "mark_email",
+                vec![
+                    target,
+                    (mark, "* 1 FETCH (UID 7 FLAGS (\\Seen))\r\n", "BAD"),
+                ],
+                Err("MAIL_BACKEND"),
+            ),
+            (
+                "mark_email",
+                vec![("UID FETCH 7 (UID)", "* 1 FETCH (UID 7)\r\n", "NO")],
+                Err("MAIL_BACKEND"),
+            ),
+        ];
+        for (name, commands, expected) in cases {
+            let script = [select]
+                .into_iter()
+                .chain(commands)
+                .map(|(command, rows, status)| (command.into(), rows.into(), status))
+                .collect();
+            let (mut session, backend) = fetch_script(script).await;
+            let args = json!({"mailbox":"INBOX","uid":7,"uid_validity":9,"flag":"seen","value":true,
+                "destination":"Archive","permanent":true,"confirm":true});
+            let result = service.with_session(&mut session, name, &args).await;
+            let outcome = result
+                .as_ref()
+                .map(|value| value["status"].as_str().unwrap())
+                .map_err(|error| error.code);
+            assert_eq!(outcome, expected, "{name}");
+            if outcome == Ok("accepted") {
+                assert_eq!(result.unwrap()["retry_allowed"], false);
+            }
+            if name == "delete_email" {
+                let repeated = service.with_session(&mut session, name, &args).await;
+                assert_eq!(repeated.unwrap_err().code, "NOT_FOUND");
+            }
+            backend.await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -1945,9 +2108,11 @@ mod tests {
                     ("CREATE \"&mHl27g-&-\"", ""),
                     ("DELETE \"&mHl27g-&-\"", ""),
                     ("SELECT \"&mHl27g-&-\"", "* 1 EXISTS\r\n* OK [UIDVALIDITY 9] valid\r\n"),
+                    ("UID FETCH 7 (UID)", "* 1 FETCH (UID 7)\r\n"),
                     ("CAPABILITY", "* CAPABILITY IMAP4rev1 MOVE\r\n"),
                     ("UID MOVE 7 \"&ZeVnLIqe-\"", ""),
                     ("SELECT \"&mHl27g-&-\"", "* 1 EXISTS\r\n* OK [UIDVALIDITY 9] valid\r\n"),
+                    ("UID FETCH 7 (UID)", "* 1 FETCH (UID 7)\r\n"),
                     ("CAPABILITY", "* CAPABILITY IMAP4rev1 MOVE\r\n"),
                     ("UID MOVE 7 \"&mHl27g-&-\"", ""),
                     ("EXAMINE \"&mHl27g-&-\"", "* 1 EXISTS\r\n* OK [UIDVALIDITY 9] valid\r\n* OK [UIDNEXT 8] next\r\n"),

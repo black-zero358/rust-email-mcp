@@ -1,4 +1,4 @@
-//! Exact structured-content contracts for the currently implemented read tools.
+//! Exact structured-content contracts for read and message organization tools.
 //! Success, local item errors and the complete-wire fallback share this source.
 use crate::accounts::ACCOUNT_ID_MAX_CHARACTERS;
 use crate::mail::attachments::MAX_ATTACHMENT_INDEX;
@@ -287,7 +287,7 @@ fn error() -> Value {
     details["dependentRequired"] = dependencies;
     object(
         json!({
-            "code":enumeration(&["INVALID_INPUT","MAIL_BACKEND","STORAGE_UNAVAILABLE","ATTACHMENT_STORAGE_UNAVAILABLE","LIMIT_EXCEEDED","TIMEOUT","BUSY","STALE_UID","NOT_FOUND","UNSUPPORTED_BODY","UNSUPPORTED_CHARSET","UNSUPPORTED_TRANSFER_ENCODING","ATTACHMENT_DECODE_FAILED","ATTACHMENT_NOT_FOUND","ACCOUNT_UNAVAILABLE","CURSOR_UNAVAILABLE","CACHE_UNAVAILABLE","CACHE_NEEDS_VERIFICATION","CACHE_MISS","INTERNAL"]),
+            "code":enumeration(&["INVALID_INPUT","MAIL_BACKEND","STORAGE_UNAVAILABLE","ATTACHMENT_STORAGE_UNAVAILABLE","LIMIT_EXCEEDED","TIMEOUT","BUSY","STALE_UID","NOT_FOUND","UNSUPPORTED","UNSUPPORTED_BODY","UNSUPPORTED_CHARSET","UNSUPPORTED_TRANSFER_ENCODING","ATTACHMENT_DECODE_FAILED","ATTACHMENT_NOT_FOUND","ACCOUNT_UNAVAILABLE","CURSOR_UNAVAILABLE","CACHE_UNAVAILABLE","CACHE_NEEDS_VERIFICATION","CACHE_MISS","INTERNAL"]),
             "message":string(),"retryable":boolean(),"details":details
         }),
         &["code", "message", "retryable"],
@@ -556,6 +556,22 @@ fn data(name: &str) -> Value {
             schema
         }
         "get_operation" => all_required(json!({"operation":nullable(reference("operation"))})),
+        "mark_email" | "move_email" | "delete_email" => json!({"oneOf":[
+            all_required(json!({"status":{"const":"updated"}})),
+            all_required(json!({"status":{"const":"accepted"},"retry_allowed":{"const":false}}))
+        ]}),
+        "mark_emails" | "move_emails" | "delete_emails" => object(
+            json!({
+                "items":{"type":"array","minItems":1,"maxItems":50,"items":{"oneOf":[
+                    all_required(json!({"uid":uid(),"status":enumeration(&["updated","not_found"])})),
+                    all_required(json!({"uid":uid(),"status":enumeration(&["accepted","unprocessed"]),"retry_allowed":{"const":false}})),
+                    all_required(json!({"uid":uid(),"status":{"const":"unknown"},"error":reference("error"),"retry_allowed":{"const":false}}))
+                ]}},
+                "requested":{"type":"integer","minimum":1,"maximum":50},"retry_allowed":{"const":false},
+                "error":reference("error")
+            }),
+            &["items", "requested", "retry_allowed"],
+        ),
         "read_conversation" => {
             let mut legacy = all_required(json!({
             "mailbox":string(),"uid_validity":uid(),"messages":{"type":"array","maxItems":20,"items":reference("conversation_message")},"omitted_uids":array(uid()),
@@ -603,7 +619,7 @@ fn data(name: &str) -> Value {
             failed["failure"] = enumeration(&["connection_check_failed", "timeout"]);
             json!({"oneOf":[all_required(success),all_required(failed)]})
         }
-        _ => unreachable!("only read tools have output schemas"),
+        _ => unreachable!("tool has no output schema"),
     };
     if let Some((field, default)) = crate::mail::read_source::source_field(name)
         && schema.get("$ref").is_none()
