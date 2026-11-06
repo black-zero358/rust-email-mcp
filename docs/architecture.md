@@ -123,7 +123,7 @@ HTTP 内容固定为 octet-stream，带 no-store/nosniff、`X-Content-SHA256` �
 
 `mail/listing` 在一个绝对期限内完成列表或搜索。附件筛选使用 PartManifest，必须取得目标 SIZE 和验证的 MIME 头；显式策略回退每页最多一次，关闭旧连接、复查 UIDVALIDITY 与大小，再严格读取 raw。回退后以最后已检查 UID 形成短页，剩余候选由原游标继续。两条串行连接共享同一 `BudgetStream` 剩余额度，新连接的 parser allocation limit 采用该剩余值，保持每页原有传输上限。
 
-摘要先完整消费匹配 tagged OK，再解析或缓存。HEADER 请求长度与单条 literal 的分配前上限均为 1 MiB，严格核对目标 UID、HEADER section、origin 0 和唯一头数据；FLAGS-only 不构造空摘要，实际 FLAGS（含空值）按到达顺序更新。短于取样上限的头可以是无正文、无终止空行的完整头；达到上限且没有结束标记时，分类仅使用已完整观察到的逻辑字段，标记 partial。摘要解析共用 MIME 头行数限制。头部缓存沿用各自的 128 KiB 字节及完整性检查，超出缓存上限的摘要头只用于本次响应。连接累计字节和 JSON-RPC 输出预算同时生效。
+摘要先完整消费匹配 tagged OK，再解析或缓存。HEADER 请求长度与单条 literal 的分配前上限均为 1 MiB，严格核对目标 UID、HEADER section、origin 0 和唯一头数据；FLAGS-only 不构造空摘要，实际 FLAGS（含空值）按到达顺序更新。短于取样上限的头可以是无正文、无终止空行的完整头；达到上限且没有结束标记时，摘要和分类只使用已完整观察到的逻辑字段。在线和离线摘要提供 `header_complete`，值为 false 时主题、发件人和日期的 null 表示未知。摘要解析共用 MIME 头行数限制。超出 128 KiB 的摘要头只用于本次响应。按 Message-ID 定位请求 128 KiB 加一字节，匹配 tagged OK 且响应不超过 128 KiB 时视为完整头部，支持末尾无分隔空行的纯头部邮件。连接累计字节和 JSON-RPC 输出预算同时生效。
 
 `mail/parts/preview` 共用完整正文的候选选择、transfer/charset 解码与 HTML 安全策略。每封 8 KiB、整页 128 KiB 编码申请额度包含非空和 EOF 探针，失败命令不退还；取样最多输出 200 Unicode 码点并跨叶折叠空白。只有完整取得所选叶且验证结束时才 flush transfer/charset 或 HTML EOF。部分 HTML 只处理已完成 token，保留原复杂度与 foreign-content 拒绝。预览期限设为 5 秒与总期限剩余一半中的较小值；网络等待按期限取消，同步 MIME 解析受字节/结构界限约束，取样完成后再核对期限。本地错误可继续、协议错误或超时停止后续预览，已经取得的摘要与游标始终保留。筛选已读回的单个 raw 只为匹配 UID 保留至该项本地取样结束，最多 32 MiB，并共用页预览额度。
 
@@ -253,7 +253,7 @@ JSON 日志使用固定事件名和受控字段，记录服务端生成的 reque
 | 原则 | 当前验证入口 |
 | --- | --- |
 | D1 身份与授权 | `auth::tests::jwt_trust_boundaries`、`failed_refresh_is_shared_and_expired_keys_fail_closed`；`server::output_tests` 的 HTTP 请求鉴权、账户隔离及附件主体检查 |
-| D2 读取与引用 | `mail::tests` 的目标 UID 属性匹配、状态和摘要的 FLAGS 合并、rev1 文件夹往返；`tests/imap_completion.rs` 的完成状态；HTTP 同 UID 双账户与过期 UIDVALIDITY |
+| D2 读取与引用 | `mail::tests` 的目标 UID 属性匹配、状态和摘要的 FLAGS 合并、摘要截断覆盖和纯头部邮件定位、rev1 文件夹往返；`tests/imap_completion.rs` 的完成状态；HTTP 同 UID 双账户与过期 UIDVALIDITY |
 | D3 资源有界 | 六个 `tests/*.rs` 协议集成入口；MIME 头部/解码预算、HTML 分词前属性预算；异步 SMTP 分片响应在累积前的限额；`server::tests` 的完整 wire 预算与正文前缀；暂存取消与调度配额 |
 | D4 发送与幂等 | `journal::tests` 的重启/主体隔离与并发 claim；`mail::tests` 的 SMTP 已知结果持久化、MAIL 前能力拒绝和 DATA 确认丢失后的去重；`smtp::tests` 的 DATA 格式、TLS/AUTH 与响应超限阶段结果 |
 | D5 隐私与内容 | `mail::tests::draft_envelope_and_privacy_filter_share_canonical_fields`；MIME 未知编码与完整 alternative 选择；附件精确字节、授权 GET 及私有暂存 |

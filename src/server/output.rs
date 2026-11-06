@@ -327,6 +327,7 @@ fn listing_summary() -> Value {
     let mut schema = all_required(json!({
         "account_id":account_id(),"mailbox":string(),"uid_validity":nullable(uid()),"uid":uid(),
         "subject":nullable(string()),"from":nullable(string()),"date":nullable(string()),"size":nullable(count()),"flags":nullable(array(string())),
+        "header_complete":{"type":"boolean","description":"Whether the full message header was observed. With partial coverage, a null subject, from or date is unknown."},
         "classification":{"type":"array","items":enumeration(&["newsletter","automated","unclassified"]),"minItems":1,"maxItems":2,"uniqueItems":true},
         "classification_signals":{"type":"array","items":all_required(json!({
             "field":enumeration(&["list-id","list-unsubscribe","list-unsubscribe-post","auto-submitted","precedence"]),

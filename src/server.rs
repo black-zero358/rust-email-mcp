@@ -459,13 +459,13 @@ pub fn tools(mode: &str) -> Vec<Tool> {
         ),
         (
             "list_emails",
-            "List newest metadata and header classifications in a bounded UID window. Set preview to true to request bounded body previews and inspect each preview_status. Follow next_before_uid even if a page is empty.",
+            "List newest metadata and header classifications in a bounded UID window. When header_complete is false, null subject, from and date values are unknown. Set preview to true to request bounded body previews and inspect each preview_status. Follow next_before_uid even if a page is empty.",
             json!({"mailbox":mailbox,"limit":{"type":"integer","minimum":1,"maximum":50,"default":20},"before_uid":uid,"uid_validity":uid,"preview":{"type":"boolean","default":false}}),
             vec![],
         ),
         (
             "search_emails",
-            "Search using server filters and verified MIME metadata for has_attachment. Dates are YYYY-MM-DD with an inclusive since and exclusive before. Sizes use inclusive byte bounds. Set preview to true for bounded body previews. Follow next_before_uid even on empty pages.",
+            "Search using server filters and verified MIME metadata for has_attachment. Dates are YYYY-MM-DD with an inclusive since and exclusive before. Sizes use inclusive byte bounds. When header_complete is false, null subject, from and date values are unknown. Set preview to true for bounded body previews. Follow next_before_uid even on empty pages.",
             json!({"mailbox":mailbox,"query":{"type":"string","maxLength":512},"from":{"type":"string","maxLength":512},"to":{"type":"string","maxLength":512},"subject":{"type":"string","maxLength":512},"since":{"type":"string","minLength":10,"maxLength":10},"before":{"type":"string","minLength":10,"maxLength":10},"seen":{"type":"boolean"},"flagged":{"type":"boolean"},"answered":{"type":"boolean"},"has_attachment":{"type":"boolean"},"min_size":{"type":"integer","minimum":0,"maximum":4294967295_u64},"max_size":{"type":"integer","minimum":0,"maximum":4294967295_u64},"limit":{"type":"integer","minimum":1,"maximum":50},"before_uid":uid,"uid_validity":uid,"preview":{"type":"boolean","default":false}}),
             vec![],
         ),
