@@ -202,6 +202,8 @@ full 配置经 `Cache::open_full_with_run` 绑定运行见证。`cache/blob` 保
 
 `mail/cache_read` 和离线会话先授权，再使用与在线调用相同的 4 槽/20 请求调度；本地 blocking 工作持有共享许可直到实际结束。显式 cache 分支执行本地查询与完整性核对，保持零 IMAP；默认 live 分支继续核对 UIDVALIDITY 和目标存在性。结果报告来源、观察时间和覆盖；FLAGS 缺失保留未知状态。完整正文的文本负载与有界叶元数据分离，维持单文件 32 MiB，渲染与输出裁减在读取时执行；全文索引只接收完整内容。
 
+离线日期搜索按 INTERNALDATE 原时区的日历日处理前台 IMAP 原文和后台已解析的日期。已知系统 FLAGS 在协议读取时按 ASCII 大小写无关规则识别，离线筛选兼容早期已存为自定义拼写的系统标记。显式空 FLAGS 按已知空集合处理，字段缺失仍为未知。对应回归位于 `src/mail/cache_read/query.rs`、`src/mail/sync/tests.rs` 和 `src/mail.rs`。
+
 D2/D3/D4/D5 验证入口为 `src/cache/full_tests.rs`、`src/cache/content_tests.rs`、`src/accounts/cache_run/tests.rs` 和 `src/mail/cache_write_guard/tests.rs`；metadata 和持久游标继续运行 R10 回归。显式离线工具矩阵及故障场景见[实施设计](cache-content-design.md#验收矩阵)。
 
 已完成 FETCH 的删除观察绑定原会话 UIDVALIDITY 与 UIDNEXT 上界；范围内未知 UID 留下持久墓碑以封存迟到证据，未来 UID 保持可分配。`fetch_miss_tombstones_only_uids_below_the_observed_uidnext` 和 `live_missing_future_uid_does_not_disable_cache_or_tombstone_later_arrival` 验证持久层和签名 HTTP 路径；`batch_observes_only_confirmed_existing_generation_misses_and_preserves_item_statuses` 覆盖批量写入前的目标存在性检查。协议失败及缺必要属性沿用原错误和停止规则。
