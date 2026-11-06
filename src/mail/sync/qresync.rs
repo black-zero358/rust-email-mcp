@@ -226,7 +226,12 @@ impl<S> Opened<S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + Debug,
 {
-    pub(super) async fn collect(&mut self, known: &[u32], base: u64) -> Result<Evidence> {
+    pub(super) async fn collect(
+        &mut self,
+        known: &[u32],
+        base: u64,
+        mut fence_live_deletion: impl FnMut() -> bool,
+    ) -> Result<Evidence> {
         if !matches!(self.modseq, ModSeq::Highest(_))
             || self.evidence.modseq_unavailable
             || !(1..=MAX_MODSEQ).contains(&base)
@@ -248,7 +253,17 @@ where
             &mut self.session,
             &command,
             CommandReadLimits::qresync(),
-            |response| collector.observe(response),
+            |response| {
+                collector.observe(response)?;
+                // The mailbox is already selected. Realtime deletions are
+                // independent of this FETCH's completion and cancellation.
+                if matches!(response, Response::Vanished { earlier: false, .. })
+                    && !fence_live_deletion()
+                {
+                    return Err(MailError::backend());
+                }
+                Ok(())
+            },
         )
         .await?;
         if collector.evidence.modseq_unavailable {
