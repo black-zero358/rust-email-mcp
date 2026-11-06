@@ -1,0 +1,157 @@
+name: Release
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/release.yml
+      - scripts/package-release.sh
+      - scripts/check-cache-recovery.py
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    if: github.event_name == 'pull_request' || (github.event.created && !github.event.deleted)
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      source: ${{ steps.source.outputs.sha }}
+      ci_url: ${{ steps.ci.outputs.url }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Resolve source and verify the version tag
+        id: source
+        shell: bash
+        run: |
+          version=$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)
+          if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME must match Cargo.toml version $version."
+            exit 1
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Require full main CI on the tagged commit
+        if: github.event_name == 'push'
+        id: ci
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          run=$(gh api -X GET "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
+            -f branch=main -f head_sha="$SOURCE_SHA" -F per_page=1 \
+            --jq '.workflow_runs[0] | select(.conclusion == "success")')
+          if [[ -z "$run" ]]; then
+            echo "::error::Wait for CI on main at $SOURCE_SHA to pass, then rerun this workflow."
+            exit 1
+          fi
+          run_id=$(jq -r '.id' <<< "$run")
+          if ! gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs" | jq -e '
+            [.jobs[] | select(.conclusion == "success") | .name] as $passed
+            | ["check", "audit", "container"] - $passed == []
+          ' > /dev/null; then
+            echo "::error::CI run $run_id must pass check, audit and container. Run full CI on the tagged commit and retry."
+            exit 1
+          fi
+          echo "url=$(jq -r '.html_url' <<< "$run")" >> "$GITHUB_OUTPUT"
+      - name: Prepare the musl build and recovery sandbox
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          toolchain=$(awk -F '"' '/^channel = "/ { print $2; exit }' rust-toolchain.toml)
+          rustup toolchain install "$toolchain" --profile minimal --target x86_64-unknown-linux-musl
+          # Ubuntu 24.04 may restrict user namespaces on the ephemeral runner.
+          if ! unshare --user --map-root-user --net -- true; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            unshare --user --map-root-user --net -- true
+          fi
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: '0.11.18'
+          enable-cache: false
+      - name: Build and verify the release package
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          bash scripts/package-release.sh --source-sha "$SOURCE_SHA" \
+            --output "$RUNNER_TEMP/release" --schema-version 6
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: github.event_name == 'push'
+        with:
+          name: release-package
+          path: ${{ runner.temp }}/release/
+          if-no-files-found: error
+          overwrite: true
+
+  publish:
+    if: github.event_name == 'push'
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-package
+          path: ${{ runner.temp }}/release
+      - name: Upload and publish the verified assets
+        shell: bash
+        working-directory: ${{ runner.temp }}/release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ needs.package.outputs.source }}
+          CI_URL: ${{ needs.package.outputs.ci_url }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          archive="rust-email-mcp-${tag#v}-x86_64-unknown-linux-musl.tar.gz"
+          sha256sum --check --strict SHA256SUMS
+          tag_sha=$(gh api "repos/$GH_REPO/commits/refs%2Ftags%2F$tag" --jq '.sha')
+          if [[ "$tag_sha" != "$SOURCE_SHA" ]]; then
+            echo "::error::Tag $tag no longer points to $SOURCE_SHA."
+            exit 1
+          fi
+
+          if ! release=$(gh release view "$tag" --json isDraft,assets); then
+            notes=$(cat <<EOF
+          - Source commit: $SOURCE_SHA
+          - Target: Linux amd64 (static musl)
+          - [Source CI]($CI_URL)
+          - [Build and isolated recovery smoke test]($GITHUB_SERVER_URL/$GH_REPO/actions/runs/$GITHUB_RUN_ID)
+          - [Upgrade and rollback]($GITHUB_SERVER_URL/$GH_REPO/blob/$SOURCE_SHA/docs/deployment.md#验收与回滚)
+          EOF
+            )
+            gh release create "$tag" --draft --verify-tag --generate-notes --notes "$notes"
+            release=$(gh release view "$tag" --json isDraft,assets)
+          fi
+
+          missing=()
+          for file in "$archive" SHA256SUMS; do
+            checksum=$(sha256sum -- "$file")
+            digest=$(jq -r --arg file "$file" \
+              '.assets[] | select(.name == $file) | .digest // "unknown"' <<< "$release")
+            if [[ -z "$digest" ]]; then
+              missing+=("$file")
+            elif [[ "$digest" != "sha256:${checksum%% *}" ]]; then
+              echo "::error::Release asset $file already exists with a different digest."
+              exit 1
+            fi
+          done
+          if (( ${#missing[@]} )); then
+            gh release upload "$tag" "${missing[@]}"
+          fi
+          if [[ $(jq -r '.isDraft' <<< "$release") == true ]]; then
+            gh release edit "$tag" --draft=false
+          fi
