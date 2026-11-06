@@ -218,13 +218,17 @@ impl Credentials {
     }
 
     fn token(&self, subject: &str) -> String {
+        self.token_with_expiry(subject, 300)
+    }
+
+    fn token_with_expiry(&self, subject: &str, seconds_from_now: i64) -> String {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
         encode(
             &self.header,
-            &json!({"sub":subject,"iss":self.config.issuer,"aud":self.config.audience,"exp":now+300,"nbf":now-1,"scope":self.config.scope,"typ":"Bearer"}),
+            &json!({"sub":subject,"iss":self.config.issuer,"aud":self.config.audience,"exp":now.saturating_add_signed(seconds_from_now),"nbf":now-1,"scope":self.config.scope,"typ":"Bearer"}),
             &self.signing,
         ).unwrap()
     }
@@ -323,16 +327,26 @@ impl Harness {
         method: &str,
         params: Value,
     ) -> axum::response::Response {
+        let authorization =
+            subject.map(|subject| format!("Bearer {}", self.credentials.token(subject)));
+        self.rpc_with_authorization(authorization.as_deref(), id, method, params)
+            .await
+    }
+
+    async fn rpc_with_authorization(
+        &self,
+        authorization: Option<&str>,
+        id: Value,
+        method: &str,
+        params: Value,
+    ) -> axum::response::Response {
         let mut request = Request::post("/mcp")
             .header(header::HOST, "localhost")
             .header(header::CONTENT_TYPE, "application/json")
             .header(header::ACCEPT, "application/json, text/event-stream")
             .header("MCP-Protocol-Version", "2025-06-18");
-        if let Some(subject) = subject {
-            request = request.header(
-                header::AUTHORIZATION,
-                format!("Bearer {}", self.credentials.token(subject)),
-            );
+        if let Some(authorization) = authorization {
+            request = request.header(header::AUTHORIZATION, authorization);
         }
         let body = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
         self.app
@@ -383,17 +397,14 @@ impl Harness {
         content.clone()
     }
 
-    async fn attachment(&self, subject: &str, url: &str) -> axum::response::Response {
+    async fn attachment(&self, authorization: &str, url: &str) -> axum::response::Response {
         let url = reqwest::Url::parse(url).unwrap();
         self.app
             .clone()
             .oneshot(
                 Request::get(url.path())
                     .header(header::HOST, "localhost")
-                    .header(
-                        header::AUTHORIZATION,
-                        format!("Bearer {}", self.credentials.token(subject)),
-                    )
+                    .header(header::AUTHORIZATION, authorization)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -474,22 +485,64 @@ async fn signed_target_attachment_get_rechecks_subject_and_returns_exact_binary(
         .as_str()
         .unwrap_or_else(|| panic!("{prepared}"));
     let before = h.connections();
+    let other = format!("Bearer {}", h.credentials.token("billing"));
     assert_eq!(
-        h.attachment("billing", url).await.status(),
+        h.attachment(&other, url).await.status(),
         StatusCode::NOT_FOUND
     );
+    let token = h.credentials.token("owner");
+    let expired = h.credentials.token_with_expiry("owner", -120);
+    for (case, authorization) in [
+        ("wrong scheme", format!("Basic {token}")),
+        ("missing token", "Bearer".into()),
+        ("empty token", "Bearer  ".into()),
+        ("tab separator", format!("Bearer\t{token}")),
+        ("tab after space", format!("Bearer \t{token}")),
+        ("space before scheme", format!(" Bearer {token}")),
+        ("space after token", format!("Bearer {token} ")),
+        ("invalid token", "Bearer invalid-token".into()),
+        ("expired token", format!("bEaReR {expired}")),
+    ] {
+        let rpc = h
+            .rpc_with_authorization(Some(&authorization), json!(1), "tools/list", json!({}))
+            .await;
+        let download = h.attachment(&authorization, url).await;
+        for response in [rpc, download] {
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{case}");
+            assert!(
+                response.headers().contains_key(header::WWW_AUTHENTICATE),
+                "{case}"
+            );
+        }
+    }
     assert_eq!(h.connections(), before);
-    let response = h.attachment("owner", url).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response.headers()[header::CONTENT_TYPE],
-        "application/octet-stream"
-    );
-    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
-    assert_eq!(
-        to_bytes(response.into_body(), 4096).await.unwrap().as_ref(),
-        ATTACHMENT
-    );
+
+    for (scheme, spaces) in [
+        ("Bearer", " "),
+        ("bearer", " "),
+        ("BEARER", " "),
+        ("bEaReR", "   "),
+    ] {
+        let authorization = format!("{scheme}{spaces}{token}");
+        let rpc = h
+            .rpc_with_authorization(Some(&authorization), json!(1), "tools/list", json!({}))
+            .await;
+        let response = h.attachment(&authorization, url).await;
+        assert_eq!(
+            (rpc.status(), response.status()),
+            (StatusCode::OK, StatusCode::OK),
+            "{scheme}"
+        );
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/octet-stream"
+        );
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(
+            to_bytes(response.into_body(), 4096).await.unwrap().as_ref(),
+            ATTACHMENT
+        );
+    }
 }
 
 #[tokio::test]

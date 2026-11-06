@@ -170,6 +170,8 @@ SMTPUTF8 需求为信封中非 ASCII 地址或 `mime::requires_smtputf8` 检出�
 
 Rauthy 0.37.2 是选用的身份服务，使用嵌入式 Hiqlite/SQLite，负责 authorization code/PKCE、用户登录、refresh rotation 和会话持久化。邮件服务对每次进入 MCP 的 HTTP 请求校验 RS256 签名、issuer、resource audience、expiry、nbf、scope 与 subject allowlist；不能把已有 MCP 会话当作免验凭据。公开发现信息和健康检查保持各自有限职责。
 
+MCP 和附件 GET 共用 HTTP Bearer 鉴权。认证方案按 ASCII 大小写无关规则匹配，方案与 JWT 由一个或多个 ASCII 空格分隔，JWT 以原始字节进入验证。签名 HTTP 回归覆盖两条路由的合法大小写、非法分隔、无效和过期令牌。
+
 JWKS 的硬缓存期限为 300 秒，不因刷新失败延长。刷新 I/O 使用独立协调器，仍有效的已缓存 key 不等待其他 kid 的网络刷新；成功和失败刷新结果共享 10 秒冷却。JWKS 暂不可用返回 HTTP 503 与 `Retry-After`，无效令牌返回 401。JWT 选择 AWS-LC 后端时的动机是避开当时锁文件中存在已知风险的 RustCrypto 传递依赖；持续安全状态以当前依赖审计为准。
 
 静态 OAuth 客户端明确回调 allowlist，生产与测试分离用户和客户端。Rauthy 允许提前 refresh，保留轮换和五秒宽限。单节点 Hiqlite 使用 immediate durable Raft log sync、一个读连接、一个 HTTP worker 和一次并发 Argon2id 哈希（32 MiB、三次迭代、两通道）。多会话互不干扰、提前刷新、重启恢复及资源观测是认证/部署变更的验收内容。
@@ -257,7 +259,7 @@ JSON 日志使用固定事件名和受控字段，记录服务端生成的 reque
 
 测试精简移除了大量故障排列、细粒度边界组合、独立客户端原型和 R13 持续负载设施。开发者针对新缺陷增加最小回归，并同步替换重叠用例，保持总体量预算。历史长跑和完整矩阵记录位于 [validation](validation.md)，下方设计记录中的旧测试名称随对应历史工作包保留。
 
-Vendored 包的协议回归集中在根包 `tests/`。各上游身份继续由 `scripts/audit-dependencies.sh` 检查，Docker 上下文由 `scripts/test-docker-context.sh` 以合成哨兵和实际构建器核验。
+Vendored 包的协议回归集中在根包 `tests/`。`tests/imap_completion.rs` 通过原始 CAPABILITY 响应核对 MOVE、UIDPLUS 等扩展能力的 ASCII 大小写匹配，覆盖写入能力检查和诊断共用的查询接口。各上游身份继续由 `scripts/audit-dependencies.sh` 检查，Docker 上下文由 `scripts/test-docker-context.sh` 以合成哨兵和实际构建器核验。
 
 ## Decision records
 
