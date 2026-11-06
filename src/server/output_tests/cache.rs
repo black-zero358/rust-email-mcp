@@ -172,7 +172,7 @@ async fn live_listing_and_preview_tombstone_only_confirmed_missing_uids() {
         // payload pool is best-effort, so a third rapid capture can be skipped.
         wait_cached_body(&h, &app, uid, "synthetic content").await;
     }
-    let summary = "UID FETCH 9 (UID FLAGS RFC822.SIZE INTERNALDATE BODY.PEEK[HEADER]<0.8192>)";
+    let summary = "UID FETCH 9 (UID FLAGS RFC822.SIZE INTERNALDATE BODY.PEEK[HEADER]<0.1048576>)";
     h.fault("INBOX", summary, Fault::OnlyUid(9));
     let flags_only = call("list_emails", json!({"limit":1})).await;
     assert_eq!(flags_only["data"]["emails"], json!([]), "{flags_only}");
@@ -811,15 +811,25 @@ async fn metadata_quota_preserves_live_bodies_and_reports_failed_writes() {
 async fn off_has_no_storage_and_metadata_records_only_verified_complete_index_entries() {
     let root = tempfile::tempdir().unwrap();
     let path = configuration(root.path(), &[("default", &["INBOX"])]);
-    let mut partial = synthetic(8, "部分邮件");
-    let mut long_field = b"X-Synthetic: ".to_vec();
-    long_field.extend(std::iter::repeat_n(b'x', 9000));
-    long_field.extend_from_slice(b"\r\n");
-    partial.splice(0..0, long_field);
+    let padded = |uid, subject, length| {
+        let mut raw = synthetic(uid, subject);
+        let mut field = b"X-Synthetic: ".to_vec();
+        field.extend(std::iter::repeat_n(b'x', length));
+        field.extend_from_slice(b"\r\n");
+        raw.splice(0..0, field);
+        raw
+    };
     let h = CacheHarness::new(
         [(
             "INBOX",
-            Folder::new("", 9, [(7, synthetic(7, "完整主题")), (8, partial)]),
+            Folder::new(
+                "",
+                9,
+                [
+                    (7, padded(7, "完整主题", 9000)),
+                    (8, padded(8, "部分邮件", 1024 * 1024)),
+                ],
+            ),
         )],
         512 * 1024,
     )
@@ -859,6 +869,18 @@ async fn off_has_no_storage_and_metadata_records_only_verified_complete_index_en
         list["data"]["emails"][0]["classification_status"],
         "partial"
     );
+    assert_eq!(list["data"]["emails"][1]["subject"], "完整主题");
+    assert_eq!(
+        list["data"]["emails"][1]["classification_status"],
+        "complete"
+    );
+    let listed_status = h
+        .call_tool(Some(&app), "alice", "get_cache_status", json!({}))
+        .await;
+    let listed_inbox = &listed_status["data"]["storage"]["folders"][0];
+    assert_eq!(listed_inbox["messages"], 1);
+    assert_eq!(listed_inbox["complete_headers"], 1);
+    assert_eq!(listed_inbox["indexed_headers"], 1);
     let body = h
         .call_tool(
             Some(&app),
@@ -877,7 +899,7 @@ async fn off_has_no_storage_and_metadata_records_only_verified_complete_index_en
     let inbox = &status["data"]["storage"]["folders"][0];
     assert_eq!(inbox["uid_validity"], 9);
     assert_eq!(inbox["high_uid"], 8);
-    assert_eq!(inbox["messages"], 2);
+    assert_eq!(inbox["messages"], 1);
     assert_eq!(inbox["complete_headers"], 1);
     assert_eq!(inbox["indexed_headers"], 1);
     assert_eq!(inbox["verified_parts"], 1);

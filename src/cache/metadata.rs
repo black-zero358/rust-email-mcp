@@ -4,7 +4,7 @@ use crate::accounts::AccountKey;
 use rusqlite::{OptionalExtension, Transaction, params};
 use serde::Serialize;
 
-const HEADER_BYTES: usize = 128 * 1024;
+pub(crate) const MAX_CACHED_HEADER_BYTES: usize = 128 * 1024;
 const INDEX_BYTES: usize = 8 * 1024;
 const PART_BYTES: usize = 256 * 1024;
 const MAX_SEARCH_CANDIDATES: usize = 200;
@@ -123,7 +123,7 @@ impl Cache {
         index_text: Option<&str>,
     ) -> Result<(), CacheError> {
         let index_text = index_text.filter(|text| !text.is_empty());
-        if header.len() > HEADER_BYTES
+        if header.len() > MAX_CACHED_HEADER_BYTES
             || index_text.is_some_and(|text| text.len() > INDEX_BYTES || text.contains('\0'))
             || (!complete && index_text.is_some())
         {

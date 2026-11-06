@@ -24,7 +24,7 @@
 
 预览字段仅在请求时返回：`preview_status` 为 `ok`、`empty`、`budget_skipped`、`error`、`unprocessed` 或 `wire_budget_skipped`。成功或完整空正文附 `preview` 和 `preview_truncated`；错误附脱敏 `preview_error`。UTF-7 和其他不支持的取样字符集返回逐项 `UNSUPPORTED_BODY`，可通过完整正文读取工具读取 UTF-7 邮件。单项本地错误后继续；协议失败或预览子期限结束后，保留摘要并将后续预览标为 unprocessed。预览读取期限设为 5 秒与剩余操作时间一半中的较小值；网络等待按期限取消，同步 MIME 取样受字节和结构预算约束，完成后再次核对期限。完整 JSON-RPC 超限时从页尾移除可选预览，标 wire_budget_skipped；若逐项状态仍放不下，则省略整页的预览字段，保留 UID、摘要、分类和游标。客户端在请求预览后收到无预览字段的摘要时，应按响应预算省略处理；仅基础元数据超限返回 `LIMIT_EXCEEDED`。
 
-列表摘要始终提供 `classification`、`classification_signals`、`classification_rule_version:headers-v1`、`classification_status` 和 `unsubscribe_available`。合法 List-Id、List-Unsubscribe、List-Unsubscribe-Post 或 `Precedence:list` 产生 newsletter；非 no 的合法 Auto-Submitted，或 `Precedence:bulk|junk|auto_reply` 产生 automated。两类可并存，无信号时为 unclassified。signals 仅含固定字段名与类别，按固定顺序去重。摘要头最多 8 KiB；classification_status 为 partial 时，只使用已经完整观察到的字段。
+列表摘要始终提供 `classification`、`classification_signals`、`classification_rule_version:headers-v1`、`classification_status` 和 `unsubscribe_available`。合法 List-Id、List-Unsubscribe、List-Unsubscribe-Post 或 `Precedence:list` 产生 newsletter；非 no 的合法 Auto-Submitted，或 `Precedence:bulk|junk|auto_reply` 产生 automated。两类可并存，无信号时为 unclassified。signals 仅含固定字段名与类别，按固定顺序去重。摘要头最多 1 MiB；classification_status 为 partial 时，只使用已经完整观察到的字段。
 
 `unsubscribe_available` 表示 List-Unsubscribe 中存在受支持的 http/https/mailto URI；最多 2048 字节，拒绝认证信息及控制字符。服务只检查字段，不访问地址、不退订、不修改邮件。完整正文继续使用 `get_email` 或 `get_emails`。
 
@@ -65,7 +65,7 @@
 
 `get_email`、`get_emails` 和 `read_conversation` 先核对邮件结构及 MIME 头，再分块读取完整的所选正文；大附件邮件中的小正文可独立读取。正文与原整封解析共用 alternative/related 选择规则，所有所选部件共用 32 MiB 解码预留和 HTML 展示预算，字符集状态跨块保留。`max_body_length:0` 和显示截断仍先完成正文校验。
 
-需要完整 MIME 或 UTF-7 解码时，在已确认的整封大小上限内，每 UID 最多回退一次新连接 raw 读取，重新核对 UIDVALIDITY 并沿用原期限。正文结果增加 `read_diagnostics`，字段与附件诊断一致，额外回退原因 `charset_utf7` 表示 UTF-7。批量中已完成命令后的局部正文错误只影响当前项；协议、目标数据或连接失败停止后续读取，后续项标记 `unprocessed`。重复 UID 按输入顺序保留逐项结果。
+需要完整 MIME、UTF-7 解码，或已成功完成的正文末尾探测返回额外 1 字节时，在已确认的整封大小上限内，每 UID 最多回退一次新连接 raw 读取，重新核对 UIDVALIDITY 并沿用原期限。正文结果增加 `read_diagnostics`，字段与附件诊断一致，额外回退原因 `charset_utf7` 表示 UTF-7，`body_eof_mismatch` 表示正文部件的长度与末尾探测结果不一致。批量中已完成命令后的局部正文错误只影响当前项；协议、目标数据或连接失败停止后续读取，后续项标记 `unprocessed`。重复 UID 按输入顺序保留逐项结果。
 
 `read_conversation` 未传 `mailboxes`、`scope` 或 `cursor` 时沿用单文件夹调用：从指定 `uid` 和 `uid_validity` 出发，按 Message-ID、References 和 In-Reply-To 的精确标识符关联同一文件夹的邮件，不使用相同主题作为关联依据。默认检查 100 个候选头，最多 200 个；默认返回 10 封，最多 20 封，累计正文最多 256 KiB。扫描范围、候选上限、遗漏邮件和后续 UID 游标均随结果返回。`next_before_uid` 仅推进候选扫描；`omitted_uids` 列出本次已关联但因数量、响应预算、正文错误或连接终止未返回的 UID，具体失败保存在 `message_errors`。可根据逐项错误处理后用 `get_emails` 分批读取。跨窗口关联由客户端继续查询并结合已有结果。
 

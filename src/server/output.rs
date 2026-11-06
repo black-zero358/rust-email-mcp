@@ -421,7 +421,7 @@ fn attachment_descriptor() -> Value {
 fn read_diagnostics() -> Value {
     all_required(json!({
         "source":enumeration(&["bodystructure","raw","cache"]),
-        "fallback_reason":nullable(enumeration(&["structure_limit","structure_rejected","mapping_unverified","metadata_conflict","whole_multipart_attachment","header_budget","charset_utf7"])),
+        "fallback_reason":nullable(enumeration(&["structure_limit","structure_rejected","mapping_unverified","metadata_conflict","whole_multipart_attachment","header_budget","charset_utf7","body_eof_mismatch"])),
         "limit_kind":nullable(enumeration(&["mime_structure"]))
     }))
 }

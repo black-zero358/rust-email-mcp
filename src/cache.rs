@@ -37,6 +37,7 @@ pub use dirty::{DirtyStamp, DirtyTicket};
 pub use evidence::{
     CachedListingPage, CachedMailbox, CachedMessage, ListingEvidence, MailboxEvidence,
 };
+pub(crate) use metadata::MAX_CACHED_HEADER_BYTES;
 pub use metadata::{AccountStatus, FolderStatus, SearchHit, SearchPage};
 pub use thread_index::{ScopeSnapshot, THREAD_INDEX_VERSION, ThreadId, ThreadRole};
 

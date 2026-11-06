@@ -2014,7 +2014,7 @@ mod tests {
                     ),
                     ("UID SEARCH UID 1:7".into(), "* SEARCH 7\r\n".into(), "OK"),
                     (
-                        "UID FETCH 7 (UID FLAGS RFC822.SIZE BODY.PEEK[HEADER]<0.8192>)".into(),
+                        "UID FETCH 7 (UID FLAGS RFC822.SIZE BODY.PEEK[HEADER]<0.1048576>)".into(),
                         rows,
                         status,
                     ),
@@ -2055,7 +2055,7 @@ mod tests {
                 "OK",
             ),
             (
-                "UID FETCH 7,6 (UID FLAGS RFC822.SIZE BODY.PEEK[HEADER]<0.8192>)".into(),
+                "UID FETCH 7,6 (UID FLAGS RFC822.SIZE BODY.PEEK[HEADER]<0.1048576>)".into(),
                 rows,
                 "OK",
             ),
@@ -2097,7 +2097,7 @@ mod tests {
                     ),
                     ("UID SEARCH UID 1:7".into(), "* SEARCH 7\r\n".into(), "OK"),
                     (
-                        "UID FETCH 7 (UID FLAGS RFC822.SIZE BODY.PEEK[HEADER]<0.8192>)".into(),
+                        "UID FETCH 7 (UID FLAGS RFC822.SIZE BODY.PEEK[HEADER]<0.1048576>)".into(),
                         rows,
                         "OK",
                     ),

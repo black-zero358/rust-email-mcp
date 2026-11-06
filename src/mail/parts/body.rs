@@ -100,8 +100,9 @@ pub(in crate::mail) struct BodyReadSession<'a> {
 impl<'a> BodyReadSession<'a> {
     pub(in crate::mail) async fn open(service: &'a MailService, args: &Value) -> Result<Self> {
         let mailbox = folder(args, InputLimits::Read)?.to_owned();
-        let session = service.connect_read().await?;
-        let mut reader = Self::from_connection(service, session, None);
+        let transport = Arc::new(AtomicUsize::new(service.config.max_message * 4));
+        let session = service.connect_for(true, Some(transport.clone())).await?;
+        let mut reader = Self::from_connection(service, session, Some(transport));
         reader.examine(&mailbox, args).await?;
         Ok(reader)
     }
@@ -337,16 +338,9 @@ impl<'a> BodyReadSession<'a> {
             .await
             {
                 Ok(leaf) => leaf,
-                Err(StructuredFault::RawFallback) => {
+                Err(StructuredFault::RawFallback(reason)) => {
                     return self
-                        .raw_fallback(
-                            uid,
-                            size,
-                            hard_limit,
-                            args,
-                            reader::Fallback::CharsetUtf7,
-                            true,
-                        )
+                        .raw_fallback(uid, size, hard_limit, args, reason, true)
                         .await;
                 }
                 Err(fault) => return Err(fault.read_fault(command_fault)),
@@ -480,7 +474,7 @@ impl<'a> BodyReadSession<'a> {
 pub(in crate::mail) enum StructuredFault {
     Command(MailError),
     Local(MailError),
-    RawFallback,
+    RawFallback(reader::Fallback),
 }
 
 impl StructuredFault {
@@ -488,7 +482,7 @@ impl StructuredFault {
         match self {
             Self::Command(error) => command(error),
             Self::Local(error) => ReadFault::local(error),
-            Self::RawFallback => ReadFault::local(crate::html::unsupported()),
+            Self::RawFallback(_) => ReadFault::local(crate::html::unsupported()),
         }
     }
 }
@@ -557,7 +551,7 @@ where
         .checked_sub(reserve)
         .ok_or_else(|| StructuredFault::Local(body_limit()))?;
     let Some(mut charset) = charset else {
-        return Err(StructuredFault::RawFallback);
+        return Err(StructuredFault::RawFallback(reader::Fallback::CharsetUtf7));
     };
     let encoding = transfer_decode::Encoding::for_label(&part.transfer_encoding)
         .ok_or_else(|| StructuredFault::Local(crate::html::unsupported()))?;
@@ -584,9 +578,16 @@ where
             .map_err(StructuredFault::Local)?;
         offset += expected;
     }
-    fetch::section_chunk(session, uid, &part.section, encoded, 1, Some(0))
+    // A few servers return one byte at the declared EOF. The slice reader
+    // validates the target and waits for tagged OK before returning the probe.
+    let eof = fetch::section_chunk(session, uid, &part.section, encoded, 1, None)
         .await
         .map_err(StructuredFault::Command)?;
+    if !eof.is_empty() {
+        return Err(StructuredFault::RawFallback(
+            reader::Fallback::BodyEofMismatch,
+        ));
+    }
     decode_transfer(&mut transfer, &mut charset, &[], true, &mut leaf)
         .map_err(StructuredFault::Local)?;
     decode_charset(&mut charset, &[], true, &mut leaf).map_err(StructuredFault::Local)?;

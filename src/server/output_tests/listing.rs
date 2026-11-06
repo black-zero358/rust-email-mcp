@@ -5,12 +5,16 @@ use super::{
 };
 use std::sync::atomic::Ordering;
 
+const SUMMARY_HEADER_LIMIT: usize = 1_048_576;
+
 #[derive(Clone, Copy)]
 pub(super) enum SummaryFault {
     WrongOrigin,
+    WrongSection,
     Duplicate,
     Nil,
     Missing,
+    Oversized,
     NonTarget,
     NonTargetOversized,
 }
@@ -36,11 +40,16 @@ pub(super) fn summary_response(
         Some(SummaryFault::NonTarget) => {
             response.extend_from_slice(b"* 2 FETCH (UID 99999 BODY[HEADER]<1> {5}\r\nnoise)\r\n");
         }
-        Some(SummaryFault::NonTargetOversized) => {
+        Some(SummaryFault::Oversized | SummaryFault::NonTargetOversized) => {
             // The declaration alone must fail before the parser waits for bytes.
+            let uid = if matches!(fault, Some(SummaryFault::Oversized)) {
+                uid
+            } else {
+                99999
+            };
             response.extend_from_slice(
                 format!(
-                    "* 2 FETCH (UID 99999 BODY[HEADER]<0> {{{}}}\r\n",
+                    "* 2 FETCH (UID {uid} BODY[HEADER]<0> {{{}}}\r\n",
                     requested + 1
                 )
                 .as_bytes(),
@@ -50,6 +59,11 @@ pub(super) fn summary_response(
         _ => {}
     }
     let origin = usize::from(matches!(fault, Some(SummaryFault::WrongOrigin)));
+    let section = if matches!(fault, Some(SummaryFault::WrongSection)) {
+        "TEXT"
+    } else {
+        "HEADER"
+    };
     let copies = if matches!(fault, Some(SummaryFault::Duplicate)) {
         2
     } else {
@@ -58,7 +72,7 @@ pub(super) fn summary_response(
     for _ in 0..copies {
         response.extend_from_slice(
             format!(
-                "* 1 FETCH (UID {uid} RFC822.SIZE {size} BODY[HEADER]<{origin}> {{{}}}\r\n",
+                "* 1 FETCH (UID {uid} RFC822.SIZE {size} BODY[{section}]<{origin}> {{{}}}\r\n",
                 bytes.len()
             )
             .as_bytes(),
@@ -114,7 +128,7 @@ async fn preview_defaults_off_and_classification_uses_bounded_complete_header_fi
     let full = b"Subject: weekly fixture\r\nList-Id: Synthetic list <weekly.example.test>\r\nList-Unsubscribe: <https://example.test/private-unsubscribe-token>\r\nList-Unsubscribe-Post: List-Unsubscribe=One-Click\r\nAuto-Submitted: auto-generated\r\nContent-Type: text/plain\r\n\r\nprivate body".to_vec();
     let partial = format!(
         "Subject: partial fixture\r\nPrecedence: list\r\nList-Unsubscribe: <https://example.test/private-partial-token>\r\n {}\r\nAuto-Submitted: auto-generated\r\n\r\nprivate body",
-        "x".repeat(9000),
+        "x".repeat(SUMMARY_HEADER_LIMIT),
     );
     let h = Harness::new(
         BTreeMap::from([
@@ -186,14 +200,64 @@ async fn preview_defaults_off_and_classification_uses_bounded_complete_header_fi
 }
 
 #[tokio::test]
+async fn list_and_search_accept_exactly_one_mib_of_qq_style_headers() {
+    let mut header = b"X-QQ-Trace: synthetic\r\n".to_vec();
+    let tail = b"Subject: after the large header\r\nList-Id: <qq.example.test>\r\n\r\n";
+    let mut padding = SUMMARY_HEADER_LIMIT - header.len() - tail.len();
+    while padding > 0 {
+        // Each line is at most 998 bytes and leaves room for the next fold.
+        let width = if padding <= 998 {
+            padding
+        } else {
+            (padding - 4).min(998)
+        };
+        header.push(b' ');
+        header.resize(header.len() + width - 3, b'x');
+        header.extend_from_slice(b"\r\n");
+        padding -= width;
+    }
+    header.extend_from_slice(tail);
+    assert_eq!(header.len(), SUMMARY_HEADER_LIMIT);
+    header.extend_from_slice(b"body excluded from summary");
+    let h = Harness::new(BTreeMap::from([(7, header)]), None, 16 * 1024).await;
+    let (app, token) = signed(&h);
+    for name in ["list_emails", "search_emails"] {
+        let result = call(&h, &app, &token, name, json!({})).await;
+        let rows = items(&result);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["uid"], 7);
+        assert_eq!(rows[0]["subject"], "after the large header");
+        assert_eq!(rows[0]["classification"], json!(["newsletter"]));
+        assert_eq!(rows[0]["classification_status"], "complete");
+    }
+    assert_eq!(
+        commands(&h)
+            .iter()
+            .filter(|(_, command)| command
+                == "UID FETCH 7 (UID FLAGS RFC822.SIZE BODY.PEEK[HEADER]<0.1048576>)")
+            .count(),
+        2
+    );
+    assert!(body_fetches(&h).is_empty());
+    assert_eq!(h.writes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn listing_checks_target_header_origin_uniqueness_and_literal_budget() {
     use SummaryFault::*;
     for (fault, code, limit_kind, summaries) in [
         (WrongOrigin, Some("MAIL_BACKEND"), None, 0),
+        (WrongSection, None, None, 0),
         (Duplicate, Some("MAIL_BACKEND"), None, 0),
         (Nil, Some("MAIL_BACKEND"), None, 0),
         (Missing, None, None, 0),
         (NonTarget, None, None, 1),
+        (
+            Oversized,
+            Some("LIMIT_EXCEEDED"),
+            Some("part_fetch_bytes"),
+            0,
+        ),
         (
             NonTargetOversized,
             Some("LIMIT_EXCEEDED"),
@@ -216,6 +280,13 @@ async fn listing_checks_target_header_origin_uniqueness_and_literal_budget() {
                 result["error"]["details"]["limit_kind"].as_str(),
                 limit_kind
             );
+            if limit_kind.is_some() {
+                assert_eq!(result["error"]["details"]["limit"], SUMMARY_HEADER_LIMIT);
+                assert_eq!(
+                    result["error"]["details"]["actual"],
+                    SUMMARY_HEADER_LIMIT + 1
+                );
+            }
         } else {
             assert_eq!(items(&result).len(), summaries);
             if summaries != 0 {
@@ -575,6 +646,20 @@ fn wire_budget_keeps_summaries_even_when_preview_statuses_do_not_fit() {
             "wire_response_bytes"
         );
     }
+
+    let mut oversized = summary;
+    oversized["emails"][0]["subject"] = json!("中".repeat(1024 * 1024 / 3));
+    oversized["emails"][0]["preview"] = json!("optional preview");
+    oversized["emails"][0]["preview_status"] = json!("ok");
+    let (content, _) = check(
+        bounded_listing_result(Ok(oversized), request_id, &id, threshold).unwrap(),
+        threshold,
+    );
+    assert_eq!(
+        content["error"]["details"]["limit_kind"],
+        "wire_response_bytes"
+    );
+    assert_eq!(content["retry_allowed"], false);
 }
 
 #[tokio::test]

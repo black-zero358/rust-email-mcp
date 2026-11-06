@@ -467,7 +467,7 @@ async fn oversized_live_range_blocks_offline_until_a_new_full_rev1_audit() {
             .insert(202, message(None, &[], None, "late positive", "old"));
     });
     const SUMMARY: &str =
-        "UID FETCH 202 (UID FLAGS RFC822.SIZE INTERNALDATE BODY.PEEK[HEADER]<0.8192>)";
+        "UID FETCH 202 (UID FLAGS RFC822.SIZE INTERNALDATE BODY.PEEK[HEADER]<0.1048576>)";
     let late = h.hold("INBOX", SUMMARY);
     let mut foreground =
         Box::pin(h.call_tool(Some(&app), "alice", "list_emails", json!({"limit":1})));

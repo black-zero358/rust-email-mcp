@@ -37,6 +37,7 @@ pub(crate) struct Part<'a> {
 fn headers_with_budget<'a>(
     raw: &'a [u8],
     budget: &mut Budget,
+    max_block: usize,
 ) -> Result<(Vec<MailHeader<'a>>, usize)> {
     // Scan without allocating, including folded lines. Never hand an unbounded
     // header section to parse_headers or its encoded-word/parameter decoders.
@@ -45,7 +46,7 @@ fn headers_with_budget<'a>(
         end += line.len();
         budget.header_bytes += line.len();
         budget.header_lines += 1;
-        if end > MAX_HEADER_BLOCK
+        if end > max_block
             || budget.header_bytes > MAX_HEADER_BYTES
             || budget.header_lines > MAX_HEADER_LINES
         {
@@ -59,7 +60,13 @@ fn headers_with_budget<'a>(
 }
 
 pub(crate) fn headers(raw: &[u8]) -> Result<Vec<MailHeader<'_>>> {
-    Ok(headers_with_budget(raw, &mut Budget::default())?.0)
+    Ok(headers_with_budget(raw, &mut Budget::default(), MAX_HEADER_BLOCK)?.0)
+}
+
+/// List/search accepts a larger top-level HEADER sample; other MIME readers
+/// keep their normal per-block limit. The byte and line preflight is shared.
+pub(crate) fn summary_headers(raw: &[u8], max_block: usize) -> Result<Vec<MailHeader<'_>>> {
+    Ok(headers_with_budget(raw, &mut Budget::default(), max_block)?.0)
 }
 
 pub(crate) fn parse(raw: &[u8]) -> Result<Part<'_>> {
@@ -119,7 +126,7 @@ fn parse_part<'a>(
         return Err(MailError::limit_kind(LimitKind::MimeStructure));
     }
     budget.parts += 1;
-    let (headers, body_start) = headers_with_budget(raw, budget)?;
+    let (headers, body_start) = headers_with_budget(raw, budget, MAX_HEADER_BLOCK)?;
     let ctype = mailparse::parse_content_type(
         &headers.get_first_value("Content-Type").unwrap_or_else(|| {
             if digest {
@@ -750,7 +757,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            headers_with_budget(b"Subject: a\n\n", &mut budget)
+            headers_with_budget(b"Subject: a\n\n", &mut budget, MAX_HEADER_BLOCK)
                 .unwrap_err()
                 .code,
             "LIMIT_EXCEEDED"
@@ -759,7 +766,7 @@ mod tests {
             header_lines: MAX_HEADER_LINES,
             ..Default::default()
         };
-        assert!(headers_with_budget(b"X: y\n\n", &mut budget).is_err());
+        assert!(headers_with_budget(b"X: y\n\n", &mut budget, MAX_HEADER_BLOCK).is_err());
         assert_eq!(parse(NORMAL).unwrap().plain_body().unwrap(), "hello €");
     }
 
