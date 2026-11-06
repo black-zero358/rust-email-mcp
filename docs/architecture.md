@@ -161,7 +161,7 @@ SMTP 使用 lettre 的低层 connection/command/message API，保留 TLS、AUTH�
 
 SMTPUTF8 需求为信封中非 ASCII 地址或 `mime::requires_smtputf8` 检出的原始国际化头。按 [RFC 6531 §3.2、§3.6](https://www.rfc-editor.org/rfc/rfc6531#section-3.6) 检查所有 MIME 子头，附件子树也不排除；只检查原始字节，RFC 2047 编码词和叶子正文不展开。identity 编码的 message/rfc822、message/global 递归共用结构/头部预算；编码封装的 message/global 保持不透明，符合 [RFC 6532 §3.5](https://www.rfc-editor.org/rfc/rfc6532#section-3.5) 对 7bit 封装的支持。此检查不调用正文选择、HTML 渲染或 transfer/charset 解码；非 ASCII 输入无法在结构/头部预算内确定需求时，连接前返回确定 `rejected`。
 
-缺少 SMTPUTF8 能力通过私有拒绝类型在 MAIL 前返回并持久化为 `rejected`，清理继续有界 QUIT；网络/事务的不确定结果保持 `unknown`，已知接受仍为 `accepted`。8BITMIME 对原始非 ASCII 数据的既有要求、TLS/AUTH 和状态恢复规则不变。
+服务端缺少邮件所需的 SMTPUTF8 或 8BITMIME 时，在 MAIL 前返回类型化拒绝，持久化为 `rejected` 后执行有界 QUIT。SMTP DATA 已提交但最终确认丢失时保持 `unknown`，已知接受仍为 `accepted`。
 
 
 ## Authentication
@@ -249,7 +249,7 @@ JSON 日志使用固定事件名和受控字段，记录服务端生成的 reque
 | D1 身份与授权 | `auth::tests::jwt_trust_boundaries`、`failed_refresh_is_shared_and_expired_keys_fail_closed`；`server::output_tests` 的 HTTP 请求鉴权、账户隔离及附件主体检查 |
 | D2 读取与引用 | `mail::tests` 的目标 UID 属性匹配、状态和摘要的 FLAGS 合并、rev1 文件夹往返；`tests/imap_completion.rs` 的完成状态；HTTP 同 UID 双账户与过期 UIDVALIDITY |
 | D3 资源有界 | 六个 `tests/*.rs` 协议集成入口；MIME 头部/解码预算、HTML 分词前属性预算；`server::tests` 的完整 wire 预算与正文前缀；暂存取消与调度配额 |
-| D4 发送与幂等 | `journal::tests` 的重启/主体隔离与并发 claim；`mail::tests` 的 SMTP 未知结果及 accepted 持久化；`smtp::tests` 的 DATA 格式和最终结果 |
+| D4 发送与幂等 | `journal::tests` 的重启/主体隔离与并发 claim；`mail::tests` 的 SMTP 已知结果持久化、MAIL 前能力拒绝和 DATA 确认丢失后的去重；`smtp::tests` 的 DATA 格式和最终结果 |
 | D5 隐私与内容 | `mail::tests::draft_envelope_and_privacy_filter_share_canonical_fields`；MIME 未知编码与完整 alternative 选择；附件精确字节、授权 GET 及私有暂存 |
 | D6 维护与恢复 | `src/accounts`、`src/cache` 的注册库/世代/迁移/回放回归；CI fmt/test/clippy、依赖审计和容器 release 构建；`scripts/check-cache-recovery.py` 的实际候选二进制恢复检查 |
 
