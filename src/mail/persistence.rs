@@ -2195,7 +2195,14 @@ mod tests {
         assert!(flags(cache).is_empty());
         release.send(()).unwrap();
         persistent.sync_write_barrier().await.unwrap();
-        mail.finish_cache(persistent).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        mail.begin_shutdown();
+        assert!(
+            tokio::time::timeout_at(deadline, mail.drain_shutdown(deadline))
+                .await
+                .unwrap()
+        );
+        assert!(mail.finish_cache(persistent, deadline).await);
         drop(mail);
 
         let next = open(CacheRunIdentity {
