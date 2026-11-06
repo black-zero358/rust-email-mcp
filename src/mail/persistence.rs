@@ -1377,7 +1377,7 @@ impl MailService {
                     uid_validity,
                     uid,
                 };
-                write_body(cache, reference, &payload.0)
+                write_body(cache, reference, &payload.0, None, &|| false)
             },
         );
     }
@@ -1500,7 +1500,7 @@ impl MailService {
                         ArtifactState::Derivable { raw: published.id },
                     ));
                     cache.record_artifact_states(reference, &states)?;
-                    write_body(cache, reference, &record)?;
+                    write_body(cache, reference, &record, None, &|| false)?;
                 } else {
                     cache.record_artifact_states(reference, &states)?;
                 }
@@ -1757,10 +1757,12 @@ impl MailService {
     }
 }
 
-fn write_body(
+pub(super) fn write_body(
     cache: &Arc<Cache>,
     reference: CacheRef<'_>,
     record: &parts::cached_body::Record,
+    expected_old: Option<crate::cache::BlobId>,
+    cancelled: &dyn Fn() -> bool,
 ) -> std::result::Result<(), CacheError> {
     let mut stage = cache.begin_blob(
         reference,
@@ -1769,14 +1771,14 @@ fn write_body(
         parts::cached_body::LIMIT as u64,
     )?;
     let metadata = record.encode(&mut stage)?;
-    let blob = stage.publish_body(&metadata, &|| false)?;
+    let blob = stage.publish_body_replacing(&metadata, expected_old, cancelled)?;
     if let Ok(rendered) = record.display(crate::html::HtmlDisplay::Legacy) {
         cache.remember_full_body_index(
             reference,
             parts::cached_body::KEY,
             blob.id,
             &rendered.text,
-            &|| false,
+            cancelled,
         )?;
     }
     Ok(())

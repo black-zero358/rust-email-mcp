@@ -111,7 +111,8 @@ fn cache_context() -> Value {
         json!({
             "remote_complete":{"const":false},"known_messages":count(),"complete_headers":count(),
             "indexed_threads":count(),"list_observed":boolean(),"filter_unknown":count(),"headers_missing":count(),
-            "search_index":all_required(json!({"indexed_metadata":count(),"indexed_body":count(),"version":{"const":1}})),
+            "search_index":all_required(json!({"indexed_metadata":count(),"indexed_body":count(),
+                "version":{"const":crate::cache::BODY_INDEX_VERSION},"rebuild_pending":boolean()})),
             "layers":layer_coverage(),
         }),
         &["remote_complete"],

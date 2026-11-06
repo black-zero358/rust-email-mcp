@@ -233,10 +233,10 @@ fn coverage_at(
          LEFT JOIN artifacts a ON a.message_id=m.id AND a.kind=1 AND a.part=0
              AND a.mime_version=1 AND a.html_version=1 AND a.state=1
          LEFT JOIN body_leaf_metadata d ON d.blob_id=a.blob_id
-         LEFT JOIN body_indexes b ON b.message_id=m.id AND b.mime_version=1 AND b.html_version=1
+         LEFT JOIN body_indexes b ON b.message_id=m.id AND b.mime_version=1 AND b.html_version=?4
              AND b.blob_id=d.blob_id AND b.complete
          WHERE m.mailbox=?1 AND m.uid_validity=?2 AND m.uid<=?3 AND NOT m.tombstone",
-        params![mailbox,uid_validity,high_uid],
+        params![mailbox,uid_validity,high_uid,super::super::body_index::index_html_version(1)],
         |row| { let count = |index| row.get::<_,i64>(index).map(|v| v as u64);
             Ok((count(0)?,count(1)?,count(2)?,count(3)?,count(4)?,count(5)?,count(6)?,row.get(7)?,count(8)?,count(9)?)) },
     )?;

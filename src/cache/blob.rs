@@ -635,7 +635,8 @@ impl Cache {
                     SELECT s.id FROM body_segments s JOIN body_indexes b ON b.id=s.index_id
                     WHERE NOT EXISTS(
                         SELECT 1 FROM artifacts a WHERE a.message_id=b.message_id AND a.kind=1
-                          AND a.mime_version=b.mime_version AND a.html_version=b.html_version
+                          AND a.mime_version=b.mime_version
+                          AND a.html_version IN (b.html_version,b.html_version >> 16)
                           AND a.state=1 AND a.blob_id=b.blob_id)
                     LIMIT 16
                  )",
@@ -647,7 +648,8 @@ impl Cache {
                     WHERE NOT EXISTS(SELECT 1 FROM body_segments s WHERE s.index_id=b.id)
                     AND NOT EXISTS(
                         SELECT 1 FROM artifacts a WHERE a.message_id=b.message_id AND a.kind=1
-                          AND a.mime_version=b.mime_version AND a.html_version=b.html_version
+                          AND a.mime_version=b.mime_version
+                          AND a.html_version IN (b.html_version,b.html_version >> 16)
                           AND a.state=1 AND a.blob_id=b.blob_id)
                     LIMIT ?1
                  )",
@@ -755,12 +757,23 @@ fn apply_artifact_states(
 impl BlobStage {
     /// Call only with verified, complete evidence after protocol completion.
     pub fn publish(self, cancelled: &dyn Fn() -> bool) -> Result<BlobInfo, CacheError> {
-        self.publish_inner(None, cancelled)
+        self.publish_inner(None, None, cancelled)
     }
 
     pub fn publish_body(
         self,
         leaf_metadata: &[u8],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<BlobInfo, CacheError> {
+        self.publish_body_replacing(leaf_metadata, None, cancelled)
+    }
+
+    /// Replace the precise old body whose projection failed, after the
+    /// caller obtained a complete replacement from verified raw evidence.
+    pub(crate) fn publish_body_replacing(
+        self,
+        leaf_metadata: &[u8],
+        expected_old: Option<BlobId>,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<BlobInfo, CacheError> {
         if !matches!(self.kind, ArtifactKey::FullBody { .. })
@@ -769,12 +782,13 @@ impl BlobStage {
         {
             return Err(CacheError::OutOfScope);
         }
-        self.publish_inner(Some(leaf_metadata), cancelled)
+        self.publish_inner(Some(leaf_metadata), expected_old, cancelled)
     }
 
     fn publish_inner(
         mut self,
         body_metadata: Option<&[u8]>,
+        expected_old: Option<BlobId>,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<BlobInfo, CacheError> {
         if self.failed || self.expected_len.is_some_and(|len| len != self.bytes) {
@@ -809,8 +823,14 @@ impl BlobStage {
             let database = databases
                 .get_mut(&namespace)
                 .ok_or(CacheError::OutOfScope)?;
-            if let ArtifactState::Materialized(existing) =
-                artifact(&database.connection, reference, self.kind)?
+            let existing = artifact(&database.connection, reference, self.kind)?;
+            if let Some(old) = expected_old
+                && !matches!(existing, ArtifactState::Materialized(info) if info.id == old)
+            {
+                return Err(CacheError::OutOfScope);
+            }
+            if let ArtifactState::Materialized(existing) = existing
+                && expected_old.is_none()
                 && replace_legacy != Some(existing.id)
             {
                 if existing.bytes != info.bytes || existing.sha256 != info.sha256 {
