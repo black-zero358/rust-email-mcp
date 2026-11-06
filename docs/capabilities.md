@@ -153,7 +153,7 @@ cache 请求使用当前账户授权和本地证据，零 IMAP；在线退避期
 
 正文支持原有 body_mode、html_display 和完整响应预算。附件保留原 MIME index、字节长度和 SHA-256；离线 download_url 继续要求同主体 Bearer，GET 复核当前账户权限、过期、目录状态和文件完整性。缺少完整副本返回 CACHE_MISS；未配置 full 或请求超出范围返回 CACHE_UNAVAILABLE；恢复、异常退出或写操作影响的范围返回 CACHE_NEEDS_VERIFICATION。网络错误后可另行选择 cache。
 
-全文搜索使用完整头和完整正文索引，支持中文长词与短词，并返回匹配层及索引覆盖。存在 next_cache_cursor 时，使用 cache_cursor 和相同查询、范围、筛选条件继续；数据修订变化后重新搜索。离线会话游标绑定来源和本地范围修订，正常清洁重启保留原到期时间。各工具的完整矩阵见[内容缓存设计](cache-content-design.md#显式离线契约)。
+全文搜索使用完整头和完整正文索引，支持中文长词与短词，并返回匹配层及索引覆盖。`search_index.version` 为 2，`indexed_body` 只计入新版完整正文索引，`rebuild_pending` 表示还有旧索引或尚未完成的替换。每次初始搜索可从本地正文重建至多四封，后台同步暂停时仍可推进。存在 next_cache_cursor 时，使用 cache_cursor 和相同查询、范围、筛选条件继续；索引版本或数据修订变化后，游标返回 `CURSOR_UNAVAILABLE`，需重新搜索。离线会话游标绑定来源和本地范围修订，正常清洁重启保留原到期时间。各工具的完整矩阵见[内容缓存设计](cache-content-design.md#显式离线契约)。
 
 ## 协议依据
 

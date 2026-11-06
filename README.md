@@ -72,6 +72,8 @@
 
 四个纯文本写入工具的正文支持 LF 和 CRLF，最多 65,536 UTF-8 字节。重用发送的 `operation_key` 时需原样提交参数，包括正文换行。
 
+离线全文搜索返回正文索引覆盖；`search_index.rebuild_pending` 为 true 时，初始搜索会继续从本地正文重建旧索引。升级后请重新开始先前的搜索分页。[离线查询契约](docs/capabilities.md#诊断统计和缓存)
+
 ## 权限与使用限制
 
 | `MAIL_MODE` | 默认邮箱可用操作 |

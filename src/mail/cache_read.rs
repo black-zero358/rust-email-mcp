@@ -7,6 +7,11 @@ use crate::cache::{
 use std::io::Read;
 use tokio::sync::OwnedSemaphorePermit;
 
+enum BodyRepair {
+    Unsupported,
+    Replace(crate::cache::BlobId),
+}
+
 pub(super) fn cache_error(error: CacheError) -> MailError {
     let (code, message, retryable) = match error {
         CacheError::NeedsVerification => (
@@ -154,79 +159,96 @@ impl CachedReader {
             .cache
             .artifact_state(reference, cached_body::KEY)
             .map_err(cache_error)?;
-        let state = if state == ArtifactState::Missing
-            && let ArtifactState::Materialized(raw) = self
-                .cache
-                .artifact_state(reference, ArtifactKey::Raw)
-                .map_err(cache_error)?
+        let repair =
+            matches!(state, ArtifactState::Unsupported(_)).then_some(BodyRepair::Unsupported);
+        let state = if matches!(
+            state,
+            ArtifactState::Missing | ArtifactState::Unsupported(_)
+        ) && let ArtifactState::Materialized(raw) = self
+            .cache
+            .artifact_state(reference, ArtifactKey::Raw)
+            .map_err(cache_error)?
         {
             ArtifactState::Derivable { raw: raw.id }
         } else {
             state
         };
-        let (mut value, lease) = match state {
-            ArtifactState::Materialized(info) => {
-                let mut lease = self
-                    .cache
-                    .open_blob(reference, cached_body::KEY, access, Some(info.id))
-                    .map_err(cache_error)?;
-                let body = cached_body::Record::decode(&mut lease).map_err(cache_error)?;
-                let parts = if access == Access::Offline {
-                    self.cache
-                        .cached_parts(reference)
-                        .map_err(cache_error)?
-                        .map(|(parts, _)| parts)
-                } else {
-                    self.cache.parts(reference).map_err(cache_error)?
-                }
-                .ok_or_else(cache_miss)?;
-                let manifest = manifest(&parts)?;
-                let headers = mime::headers(header)?;
-                let attachments = manifest["parts"]
-                    .as_array()
-                    .ok_or_else(cache_miss)?
-                    .iter()
-                    .filter(|part| part["is_attachment"] == true)
-                    .map(|part| {
-                        json!({
-                            "attachment_index":part["attachment_index"],
-                            "content_type":part["content_type"], "filename":part["filename"]
+        let (mut value, lease) = 'body: {
+            match state {
+                ArtifactState::Materialized(info) => {
+                    let mut lease = self
+                        .cache
+                        .open_blob(reference, cached_body::KEY, access, Some(info.id))
+                        .map_err(cache_error)?;
+                    let body = cached_body::Record::decode(&mut lease).map_err(cache_error)?;
+                    let displayed = match body.display(insights::display_format(args)?) {
+                        Err(error) if error.code == "UNSUPPORTED_BODY" => {
+                            // Older records can contain the rejected representation
+                            // alone. A saved raw message still has all alternatives.
+                            let ArtifactState::Materialized(raw) = self
+                                .cache
+                                .artifact_state(reference, ArtifactKey::Raw)
+                                .map_err(cache_error)?
+                            else {
+                                return Err(error);
+                            };
+                            drop(body);
+                            drop(lease);
+                            break 'body self.raw_body(
+                                reference,
+                                access,
+                                raw.id,
+                                args,
+                                limit,
+                                Some(BodyRepair::Replace(info.id)),
+                            )?;
+                        }
+                        result => result?,
+                    };
+                    let parts = if access == Access::Offline {
+                        self.cache
+                            .cached_parts(reference)
+                            .map_err(cache_error)?
+                            .map(|(parts, _)| parts)
+                    } else {
+                        self.cache.parts(reference).map_err(cache_error)?
+                    }
+                    .ok_or_else(cache_miss)?;
+                    let manifest = manifest(&parts)?;
+                    let headers = mime::headers(header)?;
+                    let attachments = manifest["parts"]
+                        .as_array()
+                        .ok_or_else(cache_miss)?
+                        .iter()
+                        .filter(|part| part["is_attachment"] == true)
+                        .map(|part| {
+                            json!({
+                                "attachment_index":part["attachment_index"],
+                                "content_type":part["content_type"], "filename":part["filename"]
+                            })
                         })
-                    })
-                    .collect::<Vec<_>>();
-                let value = insights::with_displayed(
-                    json!({"uid":reference.uid,"uid_validity":reference.uid_validity,
+                        .collect::<Vec<_>>();
+                    let value = insights::with_displayed(
+                        json!({"uid":reference.uid,"uid_validity":reference.uid_validity,
                         "subject":headers.get_first_value("Subject"),"from":headers.get_first_value("From"),
                         "to":headers.get_first_value("To"),"attachments":attachments,"content_trust":"untrusted"}),
-                    &headers,
-                    body.display(insights::display_format(args)?)?,
-                    limit,
-                    args,
-                )?;
-                lease.revalidate().map_err(cache_error)?;
-                (value, lease)
+                        &headers,
+                        displayed,
+                        limit,
+                        args,
+                    )?;
+                    lease.revalidate().map_err(cache_error)?;
+                    (value, lease)
+                }
+                ArtifactState::Derivable { raw } => {
+                    self.raw_body(reference, access, raw, args, limit, repair)?
+                }
+                ArtifactState::Missing => return Err(cache_miss()),
+                ArtifactState::Omitted(_) => {
+                    return Err(MailError::limit_kind(LimitKind::DecodedBodyBytes));
+                }
+                ArtifactState::Unsupported(_) => return Err(crate::html::unsupported()),
             }
-            ArtifactState::Derivable { raw } => {
-                let mut lease = self
-                    .cache
-                    .open_blob(reference, ArtifactKey::Raw, access, Some(raw))
-                    .map_err(cache_error)?;
-                let bytes = blob_bytes(&mut lease, self.config.max_message)?;
-                let value = insights::parsed_with_options(
-                    &bytes,
-                    reference.uid,
-                    Some(reference.uid_validity),
-                    limit,
-                    args,
-                )?;
-                lease.revalidate().map_err(cache_error)?;
-                (value, lease)
-            }
-            ArtifactState::Missing => return Err(cache_miss()),
-            ArtifactState::Omitted(_) => {
-                return Err(MailError::limit_kind(LimitKind::DecodedBodyBytes));
-            }
-            ArtifactState::Unsupported(_) => return Err(crate::html::unsupported()),
         };
         let current = || {
             self.persistent.offline_current(
@@ -251,6 +273,74 @@ impl CachedReader {
             value["mailbox"] = json!(reference.mailbox);
         }
         Ok(value)
+    }
+
+    fn raw_body(
+        &self,
+        reference: CacheRef<'_>,
+        access: Access,
+        raw: crate::cache::BlobId,
+        args: &Value,
+        limit: usize,
+        repair: Option<BodyRepair>,
+    ) -> Result<(Value, crate::cache::BlobLease)> {
+        let mut lease = self
+            .cache
+            .open_blob(reference, ArtifactKey::Raw, access, Some(raw))
+            .map_err(cache_error)?;
+        let bytes = blob_bytes(&mut lease, self.config.max_message)?;
+        let format = insights::display_format(args)?;
+        let value = if let Some(repair) = repair
+            && format == crate::html::HtmlDisplay::Legacy
+        {
+            let part = mime::parse(&bytes)?;
+            let mut record = cached_body::Record::default();
+            let mut remaining = cached_body::LIMIT;
+            let displayed =
+                part.display_body_with_leaves(format, &mut remaining, |text, html, reserve| {
+                    record.push(text, html, reserve);
+                    Ok(())
+                })?;
+            let value = insights::with_displayed(
+                parsed_metadata(&part, reference.uid, Some(reference.uid_validity))?,
+                &part.headers,
+                displayed,
+                limit,
+                args,
+            )?;
+            lease.revalidate().map_err(cache_error)?;
+            let expected_old = match repair {
+                BodyRepair::Unsupported => None,
+                BodyRepair::Replace(blob) => Some(blob),
+            };
+            // A subsequent cached body read needs both the manifest and body.
+            if self
+                .cache
+                .parts(reference)
+                .is_ok_and(|parts| parts.is_some())
+            {
+                let _ =
+                    persistence::write_body(&self.cache, reference, &record, expected_old, &|| {
+                        !self.persistent.offline_current(
+                            reference.account,
+                            reference.mailbox,
+                            reference.uid_validity,
+                            Some(reference.uid),
+                        )
+                    });
+            }
+            value
+        } else {
+            insights::parsed_with_options(
+                &bytes,
+                reference.uid,
+                Some(reference.uid_validity),
+                limit,
+                args,
+            )?
+        };
+        lease.revalidate().map_err(cache_error)?;
+        Ok((value, lease))
     }
 
     fn read_bodies(&self, name: &str, args: &Value) -> Result<Value> {
