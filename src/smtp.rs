@@ -254,6 +254,258 @@ mod tests {
         assert!(validate_data(b"ordinary\n").is_err());
     }
 
+    #[derive(Debug)]
+    struct FragmentedReplies {
+        replies: Vec<u8>,
+        offset: usize,
+        reads_after_limit: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        commands: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl tokio::io::AsyncRead for FragmentedReplies {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.offset == self.replies.len() {
+                self.reads_after_limit
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // The peer remains open at the budget boundary.
+                return std::task::Poll::Pending;
+            }
+            let end = (self.offset + buffer.remaining().min(137)).min(self.replies.len());
+            buffer.put_slice(&self.replies[self.offset..end]);
+            self.offset = end;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl tokio::io::AsyncWrite for FragmentedReplies {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.commands.lock().unwrap().extend_from_slice(bytes);
+            std::task::Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl lettre::transport::smtp::client::AsyncTokioStream for FragmentedReplies {
+        fn peer_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+            Ok(([127, 0, 0, 1], 25).into())
+        }
+    }
+
+    #[tokio::test]
+    async fn smtp_reader_enforces_line_and_reply_limits_with_fragmented_input() {
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        const GREETING: &str = "220 synthetic ESMTP\r\n";
+        const EHLO: &str = "250-test\r\n250-8BITMIME\r\n250 SMTPUTF8\r\n";
+        let continuation = format!("250-{}\r\n", "x".repeat(994));
+        let full = format!("{}250 {}\r\n", continuation.repeat(99), "x".repeat(994));
+        assert_eq!(full.len(), 100_000);
+        let unterminated = "x".repeat(1_000);
+        let mut connection = AsyncSmtpConnection::connect_with_transport(
+            Box::new(FragmentedReplies {
+                replies: format!("{GREETING}{EHLO}{full}250 next\r\n{unterminated}250 stale\r\n")
+                    .into_bytes(),
+                offset: 0,
+                reads_after_limit: Arc::default(),
+                commands: Arc::default(),
+            }),
+            &ClientId::default(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            connection
+                .server_info()
+                .supports_feature(Extension::EightBitMime)
+        );
+        assert!(
+            connection
+                .server_info()
+                .supports_feature(Extension::SmtpUtfEight)
+        );
+        assert_eq!(
+            connection.read_response().await.unwrap().message().count(),
+            100
+        );
+        assert_eq!(
+            connection.read_response().await.unwrap().first_word(),
+            Some("next")
+        );
+
+        assert!(connection.read_response().await.is_err());
+        assert!(connection.has_broken());
+        assert!(connection.read_response().await.is_err());
+        assert!(
+            connection
+                .command(lettre::transport::smtp::commands::Noop)
+                .await
+                .is_err()
+        );
+        let over_reply = format!(
+            "{}250-{}\r\n{}",
+            continuation.repeat(99),
+            "x".repeat(944),
+            "x".repeat(50)
+        );
+        assert_eq!(over_reply.len(), 100_000);
+        for (replies, reason, ehlo) in [
+            ("x".repeat(1_000), "SMTP response line too long", false),
+            (
+                format!("{GREETING}{}", "x".repeat(1_000)),
+                "SMTP response line too long",
+                true,
+            ),
+            (
+                format!("{GREETING}{over_reply}"),
+                "SMTP response too large",
+                true,
+            ),
+            (
+                format!("{GREETING}{}", continuation.repeat(100)),
+                "SMTP response too large",
+                true,
+            ),
+        ] {
+            let reads_after_limit = Arc::new(AtomicUsize::new(0));
+            let commands = Arc::new(Mutex::new(Vec::new()));
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                AsyncSmtpConnection::connect_with_transport(
+                    Box::new(FragmentedReplies {
+                        replies: replies.into_bytes(),
+                        offset: 0,
+                        reads_after_limit: reads_after_limit.clone(),
+                        commands: commands.clone(),
+                    }),
+                    &ClientId::default(),
+                ),
+            )
+            .await
+            .expect("budget should reject while the peer is still open");
+            let error = result.err().expect("oversized reply must fail");
+            assert!(error.to_string().contains(reason), "{error}");
+            assert_eq!(reads_after_limit.load(Ordering::Relaxed), 0);
+            let commands = commands.lock().unwrap();
+            if ehlo {
+                assert!(commands.starts_with(b"EHLO "));
+                assert_eq!(commands.iter().filter(|&&byte| byte == b'\n').count(), 1);
+            } else {
+                assert!(commands.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_tls_and_starttls_happy_paths() {
+        use lettre::transport::smtp::client::Certificate;
+        use tokio_rustls::{
+            TlsAcceptor,
+            rustls::{ServerConfig, pki_types::PrivatePkcs8KeyDer},
+        };
+        for starttls in [false, true] {
+            let rcgen::CertifiedKey { cert, signing_key } =
+                rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+            let server_config = ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![cert.der().clone()],
+                    PrivatePkcs8KeyDer::from(signing_key.serialize_der()).into(),
+                )
+                .unwrap();
+            let acceptor = TlsAcceptor::from(std::sync::Arc::new(server_config));
+            let tls = TlsParameters::builder("localhost".into())
+                .add_root_certificate(Certificate::from_der(cert.der().to_vec()).unwrap())
+                .build()
+                .unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let backend = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let socket = if starttls {
+                    let mut plain = BufReader::new(socket);
+                    plain.write_all(b"220 synthetic ESMTP\r\n").await.unwrap();
+                    let mut line = String::new();
+                    plain.read_line(&mut line).await.unwrap();
+                    assert!(line.starts_with("EHLO"));
+                    plain
+                        .write_all(b"250-test\r\n250-STARTTLS\r\n250 AUTH PLAIN\r\n")
+                        .await
+                        .unwrap();
+                    line.clear();
+                    plain.read_line(&mut line).await.unwrap();
+                    assert_eq!(line, "STARTTLS\r\n");
+                    plain.write_all(b"220 upgrade\r\n").await.unwrap();
+                    plain.into_inner()
+                } else {
+                    socket
+                };
+                let mut secured = BufReader::new(acceptor.accept(socket).await.unwrap());
+                if !starttls {
+                    secured.write_all(b"220 synthetic ESMTP\r\n").await.unwrap();
+                }
+                for (prefix, reply) in [
+                    ("EHLO", "250-test\r\n250 AUTH PLAIN\r\n"),
+                    ("AUTH PLAIN", "235 authenticated\r\n"),
+                    ("MAIL", "250 ok\r\n"),
+                    ("RCPT", "250 ok\r\n"),
+                    ("DATA", "354 data\r\n"),
+                ] {
+                    let mut line = String::new();
+                    secured.read_line(&mut line).await.unwrap();
+                    assert!(line.starts_with(prefix), "expected {prefix}, got {line:?}");
+                    secured.write_all(reply.as_bytes()).await.unwrap();
+                }
+                loop {
+                    let mut line = String::new();
+                    assert!(secured.read_line(&mut line).await.unwrap() > 0);
+                    if line == ".\r\n" {
+                        break;
+                    }
+                }
+                secured.write_all(b"250 accepted\r\n").await.unwrap();
+                let mut line = String::new();
+                secured.read_line(&mut line).await.unwrap();
+                assert_eq!(line, "QUIT\r\n");
+                secured.write_all(b"221 bye\r\n").await.unwrap();
+            });
+            let mut sender = SmtpSender::fixture(port, Duration::from_secs(2));
+            sender.tls = Some(tls);
+            sender.starttls = starttls;
+            sender.credentials = Some(Credentials::new("synthetic".into(), "test-only".into()));
+            let envelope = Envelope::new(None, vec!["one@example.com".parse().unwrap()]).unwrap();
+            let result = sender
+                .submit(&envelope, b"Subject: synthetic\r\n\r\nbody")
+                .await;
+            assert_eq!(result.status, "accepted");
+            result.cleanup().await;
+            backend.await.unwrap();
+        }
+    }
+
     async fn scripted_send(
         steps: Vec<(&'static str, &'static str)>,
         unicode: bool,
@@ -294,6 +546,11 @@ mod tests {
                     "disconnect" => break,
                     "stall" => {
                         tokio::time::sleep(Duration::from_millis(800)).await;
+                    }
+                    "oversized" => {
+                        socket.write_all(&[b'x'; 400]).await.unwrap();
+                        socket.write_all(&[b'x'; 600]).await.unwrap();
+                        assert_eq!(socket.read_line(&mut String::new()).await.unwrap(), 0);
                     }
                     _ => socket.write_all(reply.as_bytes()).await.unwrap(),
                 }
@@ -337,9 +594,11 @@ mod tests {
         for (final_reply, cleanup, expected) in [
             ("250 accepted\r\n", "disconnect", "accepted"),
             ("250 accepted\r\n", "stall", "accepted"),
+            ("250 accepted\r\n", "oversized", "accepted"),
             ("550 rejected\r\n", "stall", "rejected"),
             ("450 deferred\r\n", "221 bye\r\n", "rejected"),
             ("disconnect", "", "unknown"),
+            ("oversized", "", "unknown"),
             ("stall", "", "unknown"),
             ("354 unexpected continuation\r\n", "", "unknown"),
         ] {
