@@ -165,7 +165,18 @@ impl Batch<'_> {
                 .await;
         }
         if !exact && !page.uids.is_empty() {
-            let fetched = match Box::pin(opened.collect(&page.uids, round.base_modseq)).await {
+            let mut live_fenced = None;
+            let fetched = Box::pin(opened.collect(&page.uids, round.base_modseq, || {
+                let fenced = self.set_qresync_deletion_fence(&selected);
+                live_fenced = Some(fenced);
+                fenced
+            }))
+            .await;
+            if live_fenced == Some(false) {
+                return Err(Error::Deferred);
+            }
+            deletion |= live_fenced == Some(true);
+            let fetched = match fetched {
                 Ok(fetched) => fetched,
                 Err(_) => {
                     drop(opened);
@@ -179,7 +190,9 @@ impl Batch<'_> {
                         .await;
                 }
             };
-            deletion |= self.fence_qresync_evidence(&selected, &fetched)?;
+            if !fetched.earlier.is_empty() {
+                deletion |= self.fence_qresync_evidence(&selected, &fetched)?;
+            }
             evidence = combine(evidence, fetched);
         }
         drop(opened);
@@ -232,14 +245,18 @@ impl Batch<'_> {
         if evidence.live.is_empty() && evidence.earlier.is_empty() {
             return Ok(false);
         }
-        if !self.service.persistent.fence_qresync_deletion(
-            &self.lease.key,
-            &self.mailbox,
-            selected.uid_validity,
-        ) {
+        if !self.set_qresync_deletion_fence(selected) {
             return Err(Error::Deferred);
         }
         Ok(true)
+    }
+
+    fn set_qresync_deletion_fence(&self, selected: &scan::Selected) -> bool {
+        self.service.persistent.fence_qresync_deletion(
+            &self.lease.key,
+            &self.mailbox,
+            selected.uid_validity,
+        )
     }
 
     async fn finish_qresync_turn(&self, result: Result<Turn>, deletion: bool) -> Result<Turn> {

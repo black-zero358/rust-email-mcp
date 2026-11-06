@@ -238,7 +238,7 @@ V6 独立持久化扩展水位与修订。基线只能来自同一完整 rev1 �
 
 R12D 的 `mail/sync/qresync` 在 auto 策略中优先协商 QRESYNC，严格要求同连接 CAPABILITY、ENABLED QRESYNC 和匹配 tagged OK。完整非空已知集合至多 200 UID 时使用只读 EXAMINE QRESYNC，较大范围先 EXAMINE CONDSTORE 再按精确 UID 页 FETCH CHANGEDSINCE VANISHED；空集合跳过 FETCH。预览与实际页面通过范围修订和 UID 序列 CAS 复核，生成命令完整长度最多 8192 字节。parser 采用独立有界入口，完整命令预算 128 KiB，VANISHED 区间在分配前限数并保持压缩；EARLIER 必须属于请求集合，实时删除核对 UIDNEXT 与事件顺序。各协议回退共享每步骤至多两条实际连接、原期限和累计传输预算。
 
-已确认删除先建立进程内范围围栏。小量删除与 FLAGS/分页原子提交；超出有界提交额度时推进持久 dirty 修订并开启新的完整 rev1 核对，完成前暂停离线交付和 clean receipt。前台读写入口在网络之前捕获证据修订，正向缓存写入在入队和执行时核对；核对结束保留范围修订，拒绝旧网络结果的迟到写回。已开始的 FIFO 写入通过队列屏障结清后才冻结新的审计，使先前未知 UID 也纳入存在性核对。失败保留围栏，正常关闭仍等待队列与许可释放。该机制沿用 V6，D1/D2/D3 的验证位置为 `src/cache/sync_state/delta/tests.rs`、`src/mail/sync/qresync/tests.rs`、`src/server/output_tests/qresync_acceptance.rs` 和 `tests/sync_qresync_budget.rs`。
+已确认删除先建立进程内范围围栏。已选择目录的 UID FETCH 逐帧处理实时 VANISHED，失败或取消保留围栏，EARLIER、FLAGS 与水位继续等待匹配 tagged OK。小量删除与 FLAGS/分页原子提交；超出有界提交额度时推进持久 dirty 修订并开启新的完整 rev1 核对，完成前暂停离线交付和 clean receipt。前台读写入口在网络之前捕获证据修订，正向缓存写入在入队和执行时核对；核对结束保留范围修订，拒绝旧网络结果的迟到写回。已开始的 FIFO 写入通过队列屏障结清后才冻结新的审计，使先前未知 UID 也纳入存在性核对。失败保留围栏，正常关闭仍等待队列与许可释放。该机制沿用 V6，D1/D2/D3 的验证位置为 `src/cache/sync_state/delta/tests.rs`、`src/mail/sync/qresync/tests.rs`、`src/server/output_tests/qresync_acceptance.rs` 和 `tests/sync_qresync_budget.rs`。
 
 ## Local operation store
 

@@ -61,13 +61,6 @@ pub(super) struct Changed {
     pub(super) modseq_unavailable: bool,
 }
 
-pub(super) async fn supports_condstore<S>(session: &mut Session<S>) -> Result<bool>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + Debug,
-{
-    Ok(capabilities(session).await?.condstore)
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct Capabilities {
     pub(super) condstore: bool,
@@ -166,6 +159,7 @@ pub(super) async fn collect<S>(
     selected: &Selected,
     expected: &[u32],
     base: u64,
+    capabilities: Capabilities,
 ) -> Result<Changed>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + Debug,
@@ -209,7 +203,13 @@ where
                     _ => {}
                 },
                 Response::Fetch(sequence, attributes) => {
-                    let change = FetchFlags::read(*sequence, attributes)?;
+                    // An independent notification may omit UID only on a server
+                    // that does not support QRESYNC (RFC 7162 section 3.1.4.2).
+                    let Some(change) =
+                        FetchFlags::read_condstore(*sequence, attributes, capabilities)?
+                    else {
+                        return Ok(());
+                    };
                     // Untagged updates outside the requested UID set carry no evidence for it.
                     let Ok(index) = expected.binary_search(&change.uid) else {
                         return Ok(());
@@ -237,9 +237,14 @@ pub(super) struct FetchFlags<'a, 'wire> {
 }
 
 impl<'a, 'wire> FetchFlags<'a, 'wire> {
-    pub(super) fn read(sequence: u32, attributes: &'a [AttributeValue<'wire>]) -> Result<Self> {
-        let change = Self::read_optional(sequence, attributes)?;
-        if change.flags.is_none() {
+    fn read_condstore(
+        sequence: u32,
+        attributes: &'a [AttributeValue<'wire>],
+        capabilities: Capabilities,
+    ) -> Result<Option<Self>> {
+        let allow_uidless = capabilities.condstore && !capabilities.qresync;
+        let change = Self::parse(sequence, attributes, allow_uidless)?;
+        if change.as_ref().is_some_and(|change| change.flags.is_none()) {
             return Err(MailError::backend());
         }
         Ok(change)
@@ -249,6 +254,14 @@ impl<'a, 'wire> FetchFlags<'a, 'wire> {
         sequence: u32,
         attributes: &'a [AttributeValue<'wire>],
     ) -> Result<Self> {
+        Self::parse(sequence, attributes, false)?.ok_or_else(MailError::backend)
+    }
+
+    fn parse(
+        sequence: u32,
+        attributes: &'a [AttributeValue<'wire>],
+        allow_uidless: bool,
+    ) -> Result<Option<Self>> {
         if sequence == 0 {
             return Err(MailError::backend());
         }
@@ -263,11 +276,16 @@ impl<'a, 'wire> FetchFlags<'a, 'wire> {
                 _ => return Err(MailError::backend()),
             }
         }
-        Ok(Self {
-            uid: uid.ok_or_else(MailError::backend)?,
-            modseq: modseq.ok_or_else(MailError::backend)?,
-            flags: flags.map(Vec::as_slice),
-        })
+        let modseq = modseq.ok_or_else(MailError::backend)?;
+        match uid {
+            Some(uid) => Ok(Some(Self {
+                uid,
+                modseq,
+                flags: flags.map(Vec::as_slice),
+            })),
+            None if allow_uidless && flags.is_some() => Ok(None),
+            None => Err(MailError::backend()),
+        }
     }
 
     pub(super) fn merge(

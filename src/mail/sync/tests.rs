@@ -18,6 +18,40 @@ async fn command(server: &mut BufReader<DuplexStream>, expected: &str) -> String
     tag.into()
 }
 
+pub(super) async fn scripted_session<R: AsRef<str> + Send + 'static>(
+    commands: Vec<(&'static str, R)>,
+    close: bool,
+) -> (Session<DuplexStream>, JoinHandle<()>) {
+    let (client, server) = tokio::io::duplex(4096);
+    let peer = tokio::spawn(async move {
+        let mut server = BufReader::new(server);
+        let tag = command(&mut server, "LOGIN \"synthetic\" \"local\"").await;
+        server
+            .write_all(format!("{tag} OK login\r\n").as_bytes())
+            .await
+            .unwrap();
+        for (expected, reply) in commands {
+            let tag = command(&mut server, expected).await;
+            if server
+                .write_all(reply.as_ref().replace("{tag}", &tag).as_bytes())
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        if !close {
+            let mut extra = String::new();
+            assert_eq!(server.read_line(&mut extra).await.unwrap(), 0, "{extra}");
+        }
+    });
+    let session = async_imap::Client::new(client)
+        .login("synthetic", "local")
+        .await
+        .unwrap();
+    (session, peer)
+}
+
 async fn selected(
     account: &AccountKey,
     validity: u32,
