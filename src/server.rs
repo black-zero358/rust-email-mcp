@@ -612,7 +612,11 @@ pub fn tools(mode: &str) -> Vec<Tool> {
     specs.extend(crate::mail::insights::tool_specs());
     specs.retain(|(name, _, _, _)| allowed(name, mode));
     specs.into_iter().map(|(name,description,properties,required)|{
+        let message_write = matches!(name,"mark_email"|"move_email"|"delete_email"|"mark_emails"|"move_emails"|"delete_emails");
         let description = if is_read(name) { description.to_owned() } else { format!("{description} Targets only the legacy default account.") };
+        let description = if message_write {
+            format!("{description} Updated confirms the requested flag state or a UID move. Accepted reports server OK with no per-UID confirmation. Do not retry accepted results automatically.")
+        } else { description };
         let properties = if is_read(name) { input::read_properties(name,properties) } else { properties };
         let mut tool = json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"annotations":{"readOnlyHint":is_read(name),"destructiveHint":(["delete_email","delete_emails","delete_mailbox"].contains(&name)),"idempotentHint":is_read(name)||is_send(name)||name=="mark_email","openWorldHint":true}});
         if matches!(name,"download_attachment"|"prepare_attachment_download") {
@@ -626,7 +630,7 @@ pub fn tools(mode: &str) -> Vec<Tool> {
                 {"required":["cursor"],"not":{"anyOf":[{"required":["mailbox"]},{"required":["uid"]},{"required":["uid_validity"]},{"required":["before_uid"]},{"required":["candidate_limit"]},{"required":["limit"]},{"required":["body_mode"]},{"required":["html_display"]},{"required":["max_body_length"]},{"required":["mailboxes"]},{"required":["scope"]}]}}
             ]);
         }
-        if is_read(name) { tool["outputSchema"] = output::schema(name); }
+        if is_read(name) || message_write { tool["outputSchema"] = output::schema(name); }
         serde_json::from_value(tool).expect("static tool schema")
     }).collect()
 }

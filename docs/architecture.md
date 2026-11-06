@@ -49,7 +49,7 @@
 
 输入错误可附 `details`：首项包含字段 JSON Pointer、稳定原因、预期类型/范围、长度单位和修正动作，`additional_violations` 最多七项，合计最多八项。未知字段指向所属对象，错误不回显字段值或任意未知键。读取资源错误通过 `limit_kind` 区分预算类型；完整响应容纳不下详情时先移除详情，保留基础错误与 request_id，再执行原有有界降级。
 
-`server/output` 定义 16 个读取工具的 `outputSchema`，按真实成功、错误、逐项失败和完整响应降级分支描述封装；对象字段、可空值和状态分支均显式声明。`server/output_tests` 通过真实 HTTP MCP handler、隔离 TLS IMAP 与 jsonschema 验证器核验结果，覆盖旧调用、空页、错误和降级；写工具沿用原 Schema。
+`server/output` 定义 16 个读取工具的 `outputSchema`，按真实成功、错误、逐项失败和完整响应降级分支描述封装；对象字段、可空值和状态分支均显式声明。`server/output_tests` 通过真实 HTTP MCP handler、隔离 TLS IMAP 与 jsonschema 验证器核验结果，覆盖旧调用、空页、错误和降级。单封及批量整理工具也公布结果 Schema，其余写工具沿用原 Schema。
 
 default 的 `AccountKey` 包含持久 UUID 与配置世代（v1 为 1），存放于独立 `accounts.sqlite`。注册库绑定 IMAP 登录身份/端点及规范化操作库路径，摘要域区分文件操作库与内存操作库；修改绑定拒绝启动。初始化在文件锁下清理固定暂存文件、构建完整 SQLite、同步并原子无覆盖发布，再加载正式路径核验。未知版本、损坏或权限不符返回脱敏错误；初始化成功后才打开 Journal。附件句柄携带 AccountKey，GET 再核对，重启继续使原内存句柄失效。
 
@@ -218,7 +218,7 @@ full 配置经 `Cache::open_full_with_run` 绑定运行见证。`cache/blob` 保
 
 D2/D3/D4/D5 验证入口为 `src/cache/full_tests.rs`、`src/cache/content_tests.rs`、`src/accounts/cache_run/tests.rs` 和 `src/mail/cache_write_guard/tests.rs`；metadata 和持久游标继续运行 R10 回归。显式离线工具矩阵及故障场景见[实施设计](cache-content-design.md#验收矩阵)。
 
-已完成 FETCH 的删除观察绑定原会话 UIDVALIDITY 与 UIDNEXT 上界；范围内未知 UID 留下持久墓碑以封存迟到证据，未来 UID 保持可分配。`fetch_miss_tombstones_only_uids_below_the_observed_uidnext` 和 `live_missing_future_uid_does_not_disable_cache_or_tombstone_later_arrival` 验证持久层和签名 HTTP 路径；`batch_observes_only_confirmed_existing_generation_misses_and_preserves_item_statuses` 覆盖批量写入前的目标存在性检查。协议失败及缺必要属性沿用原错误和停止规则。
+已完成 FETCH 的删除观察绑定原会话 UIDVALIDITY 与 UIDNEXT 上界；范围内未知 UID 留下持久墓碑以封存迟到证据，未来 UID 保持可分配。`fetch_miss_tombstones_only_uids_below_the_observed_uidnext` 和 `live_missing_future_uid_does_not_disable_cache_or_tombstone_later_arrival` 验证持久层和签名 HTTP 路径；单封与批量整理共用同一 SELECT 会话的 UIDVALIDITY 校验和完整 UID FETCH，在首个远端写命令前登记 dirty。标记只用匹配目标 UID 的 FLAGS 确认，移动只用成功命令内映射该 UID 的 COPYUID 确认。永久删除的 EXPUNGE 序号可包含并发移除，成功完成归入 `accepted`。合成协议回归 `single_writes_distinguish_missing_targets_and_confirmed_updates` 与签名 HTTP 回归 `message_write_outcomes_validate_through_signed_mcp` 覆盖证据、完成标签、缺失和逐项结果。协议失败及缺必要属性沿用原错误和停止规则。
 
 ### Synchronization foundation
 
