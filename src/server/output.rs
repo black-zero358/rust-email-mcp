@@ -559,14 +559,18 @@ fn data(name: &str) -> Value {
             all_required(json!({"status":{"const":"updated"}})),
             all_required(json!({"status":{"const":"accepted"},"retry_allowed":{"const":false}}))
         ]}),
-        "mark_emails" | "move_emails" | "delete_emails" => all_required(json!({
-            "items":{"type":"array","minItems":1,"maxItems":50,"items":{"oneOf":[
-                all_required(json!({"uid":uid(),"status":enumeration(&["updated","not_found"])})),
-                all_required(json!({"uid":uid(),"status":enumeration(&["accepted","unprocessed"]),"retry_allowed":{"const":false}})),
-                all_required(json!({"uid":uid(),"status":{"const":"unknown"},"error":reference("error"),"retry_allowed":{"const":false}}))
-            ]}},
-            "requested":{"type":"integer","minimum":1,"maximum":50},"retry_allowed":{"const":false}
-        })),
+        "mark_emails" | "move_emails" | "delete_emails" => object(
+            json!({
+                "items":{"type":"array","minItems":1,"maxItems":50,"items":{"oneOf":[
+                    all_required(json!({"uid":uid(),"status":enumeration(&["updated","not_found"])})),
+                    all_required(json!({"uid":uid(),"status":enumeration(&["accepted","unprocessed"]),"retry_allowed":{"const":false}})),
+                    all_required(json!({"uid":uid(),"status":{"const":"unknown"},"error":reference("error"),"retry_allowed":{"const":false}}))
+                ]}},
+                "requested":{"type":"integer","minimum":1,"maximum":50},"retry_allowed":{"const":false},
+                "error":reference("error")
+            }),
+            &["items", "requested", "retry_allowed"],
+        ),
         "read_conversation" => {
             let mut legacy = all_required(json!({
             "mailbox":string(),"uid_validity":uid(),"messages":{"type":"array","maxItems":20,"items":reference("conversation_message")},"omitted_uids":array(uid()),

@@ -456,7 +456,7 @@ impl Harness {
 
 #[tokio::test]
 async fn message_write_outcomes_validate_through_signed_mcp() {
-    let harness = Harness::new(false).await;
+    let mut harness = Harness::new(false).await;
     let single = json!({"uid":8,"uid_validity":9,"destination":"Archive"});
     assert_eq!(
         harness.call("owner", "move_email", single).await["error"]["code"],
@@ -473,6 +473,26 @@ async fn message_write_outcomes_validate_through_signed_mcp() {
         harness.call("owner", "mark_email", single).await["data"],
         json!({"status":"accepted","retry_allowed":false})
     );
+
+    let backend = &mut harness.backends[0].task;
+    backend.abort();
+    assert!((&mut *backend).await.unwrap_err().is_cancelled());
+    for (name, extra) in [
+        ("mark_emails", json!({"flag":"seen","value":true})),
+        ("move_emails", json!({"destination":"Archive"})),
+        ("delete_emails", json!({"confirm":true})),
+    ] {
+        let mut args = json!({"uids":[7],"uid_validity":9});
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let data = harness.call("owner", name, args).await["data"].clone();
+        assert_eq!(data["error"]["code"], "MAIL_BACKEND");
+        assert_eq!(
+            data["items"],
+            json!([{"uid":7,"status":"unprocessed","retry_allowed":false}])
+        );
+    }
 }
 
 #[tokio::test]
