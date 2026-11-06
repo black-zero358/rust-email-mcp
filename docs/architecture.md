@@ -69,7 +69,7 @@ default 的 `AccountKey` 包含持久 UUID 与配置世代（v1 为 1），存�
 
 每账户实际 TCP/TLS、欢迎响应或登录失败，以及后端操作超时，触发 1 秒读取退避。期间该账户的新读取返回可重试 `BUSY`，附件 GET 返回 429；服务不自动重试，其他账户可继续。队列等待、本地输入/MIME 错误及连接建立后的命令错误沿用各自结果。账户发现、历史发送状态和旧写工具独立于读取退避。下载的后端计时从取得执行槽开始，客户端取消读取时释放对应队列、连接及许可；旧写任务继续持有其执行状态直到原生命周期结束。
 
-读取必须使用 `EXAMINE` 和 `BODY.PEEK`。状态 FETCH 只接受所请求 UID 的结果，忽略其他 UID 或无 UID 的非请求更新；目标不存在返回 `NOT_FOUND`，目标存在但 `FLAGS ()` 为空应成功，后出现的同 UID flags 覆盖先前值。整封读取按目标 UID 及所需 SIZE/BODY 属性筛选，异步 FLAGS 不代替所需属性；缺失所需属性仍返回 `MAIL_BACKEND`。列表/搜索按请求 UID 归并 HEADER、SIZE 与最后实际出现的 FLAGS；用 vendored `Fetch::has_flags` 区分未提供 FLAGS 与显式空集合，不让后到的无 FLAGS 响应清空标记。只有明确返回 HEADER（包括真实空头部）才生成摘要，每个 UID 一条、按 UID 降序且数量不超过 limit，忽略其他 UID/无 UID 响应；缺失 HEADER 不从缓存伪造摘要。所有结果均等待匹配 tag 的 OK，不以已收到部分数据代替成功终结。依据 [RFC 3501 §5.2](https://www.rfc-editor.org/rfc/rfc3501#section-5.2) 与 [§7.4.2](https://www.rfc-editor.org/rfc/rfc3501#section-7.4.2)。不得以关闭会话为由引入 `CLOSE/EXPUNGE` 等额外副作用。
+读取必须使用 `EXAMINE` 和 `BODY.PEEK`。状态 FETCH 只接受所请求 UID 的结果，忽略其他 UID 或无 UID 的非请求更新；目标 UID 未返回时报告 `NOT_FOUND`，已返回目标 UID 但缺少 FLAGS 时报告 `MAIL_BACKEND`。使用 vendored `Fetch::has_flags` 保留同一 UID 最后实际出现的 FLAGS，显式 `FLAGS ()` 成功返回空集合。整封读取按目标 UID 及所需 SIZE/BODY 属性筛选，异步 FLAGS 不代替所需属性；缺失所需属性仍返回 `MAIL_BACKEND`。列表/搜索按请求 UID 归并 HEADER、SIZE 与最后实际出现的 FLAGS。只有明确返回 HEADER（包括真实空头部）才生成摘要，每个 UID 一条、按 UID 降序且数量不超过 limit，忽略其他 UID/无 UID 响应；缺失 HEADER 不从缓存伪造摘要。所有结果均等待匹配 tag 的 OK，不以已收到部分数据代替成功终结。依据 [RFC 3501 §5.2](https://www.rfc-editor.org/rfc/rfc3501#section-5.2) 与 [§7.4.2](https://www.rfc-editor.org/rfc/rfc3501#section-7.4.2)。不得以关闭会话为由引入 `CLOSE/EXPUNGE` 等额外副作用。
 
 连接、原始响应和单封邮件都必须有预算；`BudgetStream` 对连接累计读取字节计量；`Client::with_buffer_limit` 在真实 parser 的 `decode_needs`、扩容及剩余数据重置前执行同一个应用字节上限（`max_message * 4`，默认 128 MiB，另保留上游 512 MiB 硬上限）。已用字节与 parser 所需追加字节采用 checked arithmetic；初始化、分块取整和替换缓冲区同样不超过该上限。移除独立的行尾 literal 猜测扫描，合法响应文本中的花括号不会被当作 literal。预算约束每个 parser 缓冲块，非进程 RSS；增长时新旧块、已交付响应及协议对象可能同时存活。列表和搜索最多扫描 500 个 UID、返回 50 条摘要，批量读取最多 10 封并保留逐项结果。具体字节、结构及输出限额见 README；调整数值仍须满足 D3 并评估客户端兼容性。
 
@@ -245,7 +245,7 @@ JSON 日志使用固定事件名和受控字段，记录服务端生成的 reque
 | 原则 | 当前验证入口 |
 | --- | --- |
 | D1 身份与授权 | `auth::tests::jwt_trust_boundaries`、`failed_refresh_is_shared_and_expired_keys_fail_closed`；`server::output_tests` 的 HTTP 请求鉴权、账户隔离及附件主体检查 |
-| D2 读取与引用 | `mail::tests` 的目标 UID 属性匹配、FLAGS 合并、rev1 文件夹往返；`tests/imap_completion.rs` 的完成状态；HTTP 同 UID 双账户与过期 UIDVALIDITY |
+| D2 读取与引用 | `mail::tests` 的目标 UID 属性匹配、状态和摘要的 FLAGS 合并、rev1 文件夹往返；`tests/imap_completion.rs` 的完成状态；HTTP 同 UID 双账户与过期 UIDVALIDITY |
 | D3 资源有界 | 六个 `tests/*.rs` 协议集成入口；MIME 头部/解码预算、HTML 分词前属性预算；`server::tests` 的完整 wire 预算与正文前缀；暂存取消与调度配额 |
 | D4 发送与幂等 | `journal::tests` 的重启/主体隔离与并发 claim；`mail::tests` 的 SMTP 已知结果持久化、MAIL 前能力拒绝和 DATA 确认丢失后的去重；`smtp::tests` 的 DATA 格式和最终结果 |
 | D5 隐私与内容 | `mail::tests::draft_envelope_and_privacy_filter_share_canonical_fields`；MIME 未知编码与完整 alternative 选择；附件精确字节、授权 GET 及私有暂存 |

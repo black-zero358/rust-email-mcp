@@ -1228,25 +1228,33 @@ async fn email_status<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
 {
-    let fetched = s
+    let mut fetched = s
         .uid_fetch(uid.to_string(), "(UID FLAGS)")
         .await
-        .map_err(map_read_imap_error)?
-        .try_collect::<Vec<_>>()
-        .await
         .map_err(map_read_imap_error)?;
-    // FETCH may also contain unsolicited updates for other messages. A target
-    // update replaces its previous flags, so use the last matching response.
-    let target = fetched
-        .iter()
-        .rev()
-        .find(|f| f.uid == Some(uid))
-        .ok_or(MailError {
-            code: "NOT_FOUND",
-            message: "The requested email UID was not returned by the mailbox.",
-            retryable: false,
-            details: None,
-        })?;
+    let mut target_seen = false;
+    let mut last_flags = None;
+    // Keep the last response with explicit FLAGS while awaiting tagged completion.
+    while let Some(fetch) = fetched.try_next().await.map_err(map_read_imap_error)? {
+        if fetch.uid == Some(uid) {
+            target_seen = true;
+            if fetch.has_flags() {
+                last_flags = Some(fetch);
+            }
+        }
+    }
+    let target = last_flags.ok_or_else(|| {
+        if target_seen {
+            MailError::backend()
+        } else {
+            MailError {
+                code: "NOT_FOUND",
+                message: "The requested email UID was not returned by the mailbox.",
+                retryable: false,
+                details: None,
+            }
+        }
+    })?;
     Ok(
         json!({"uid":uid,"uid_validity":validity,"flags":target.flags().map(|f|format!("{f:?}")).collect::<Vec<_>>()}),
     )
@@ -1491,6 +1499,52 @@ mod tests {
         )
         .unwrap();
         (dir, service)
+    }
+
+    #[tokio::test]
+    async fn email_status_uses_last_target_flags_after_matching_completion() {
+        let (_dir, service) = fetch_fixture();
+        let updates = "* 1 FETCH (UID 7 FLAGS (\\Seen))\r\n* 1 FETCH (UID 7 FLAGS (\\Flagged))\r\n";
+        let size = "* 1 FETCH (UID 7 RFC822.SIZE 100)\r\n";
+        let unrelated = "* 2 FETCH (UID 8 FLAGS (\\Deleted))\r\n* 3 FETCH (FLAGS (\\Answered))\r\n";
+        for (rows, completion, expected) in [
+            (format!("{updates}{size}"), "OK", Ok(json!(["Flagged"]))),
+            (
+                format!("{updates}* 1 FETCH (UID 7 FLAGS ())\r\n{size}"),
+                "OK",
+                Ok(json!([])),
+            ),
+            (size.to_owned(), "OK", Err("MAIL_BACKEND")),
+            (String::new(), "OK", Err("NOT_FOUND")),
+            (updates.to_owned(), "NO", Err("MAIL_BACKEND")),
+            (updates.to_owned(), "BAD", Err("MAIL_BACKEND")),
+            (updates.to_owned(), "EOF", Err("MAIL_BACKEND")),
+        ] {
+            let (mut session, backend) = fetch_script(vec![
+                (
+                    "EXAMINE \"INBOX\"".into(),
+                    "* 3 EXISTS\r\n* OK [UIDVALIDITY 9] valid\r\n".into(),
+                    "OK",
+                ),
+                (
+                    "UID FETCH 7 (UID FLAGS)".into(),
+                    format!("{rows}{unrelated}"),
+                    completion,
+                ),
+            ])
+            .await;
+            let result = service
+                .with_session(
+                    &mut session,
+                    "get_email_status",
+                    &json!({"uid":7,"uid_validity":9}),
+                )
+                .await
+                .map_err(|error| error.code);
+            backend.await.unwrap();
+            let expected = expected.map(|flags| json!({"uid":7,"uid_validity":9,"flags":flags}));
+            assert_eq!(result, expected, "{completion} with {rows:?}");
+        }
     }
 
     #[tokio::test]
