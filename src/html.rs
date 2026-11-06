@@ -1,7 +1,7 @@
 //! Bounded HTML-to-text extraction. Tokenize only: no DOM, CSS, layout, script
 //! execution, resource loading or link expansion. The small input cap also
 //! bounds the tokenizer's temporary tag/attribute allocation before callbacks.
-use crate::error::{MailError, Result};
+use crate::error::{LimitKind, MailError, Result};
 use html5ever::tokenizer::{
     BufferQueue, Token, TokenSink, TokenSinkResult, Tokenizer, states::RawKind,
 };
@@ -9,6 +9,48 @@ use std::cell::RefCell;
 
 mod readable;
 pub(crate) use readable::{DisplayBody, DisplayContext, HtmlDisplay};
+
+/// Join rendered inline leaves without fusing their contents across MIME boundaries.
+fn append_body_leaf(out: &mut String, leaf: &str, remaining: &mut usize) -> Result<()> {
+    if !out.is_empty()
+        && !leaf.is_empty()
+        && !out.ends_with(['\r', '\n'])
+        && !leaf.starts_with(['\r', '\n'])
+    {
+        *remaining = remaining
+            .checked_sub(1)
+            .ok_or_else(|| MailError::limit_kind(LimitKind::DecodedBodyBytes))?;
+        out.push('\n');
+    }
+    out.push_str(leaf);
+    Ok(())
+}
+
+#[derive(Default)]
+pub(crate) struct RenderWork {
+    tokens: usize,
+}
+
+pub(crate) fn project_body_leaf(
+    out: &mut String,
+    leaf: &str,
+    html: bool,
+    reserve: usize,
+    remaining: &mut usize,
+    context: &mut DisplayContext,
+    work: &mut RenderWork,
+) -> Result<()> {
+    let rendered = if html {
+        std::borrow::Cow::Owned(render_selected(leaf, context, work)?)
+    } else {
+        std::borrow::Cow::Borrowed(leaf)
+    };
+    // Readable HTML accounts for generated indentation and link text separately.
+    if rendered.len() > reserve && !(html && context.format() == HtmlDisplay::Readable) {
+        return Err(MailError::limit_kind(LimitKind::DecodedBodyBytes));
+    }
+    append_body_leaf(out, &rendered, remaining)
+}
 
 pub(crate) const MAX_INPUT: usize = 1024 * 1024;
 const MAX_TOKENS: usize = 32768;
@@ -165,6 +207,7 @@ impl TokenSink for Sink {
                 if !text.in_head && text.templates == 0 {
                     if let Some(readable) = &mut text.readable {
                         readable.tag(&tag);
+                        text.limited |= readable.limited();
                     } else if matches!(
                         name,
                         "br" | "p"
@@ -235,25 +278,34 @@ fn check_input(html: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn to_text(html: &str) -> Result<String> {
-    tokenize(html, None, true).map(|(text, _)| text)
-}
-
-pub(crate) fn render_selected(html: &str, context: &mut DisplayContext) -> Result<String> {
+pub(crate) fn render_selected(
+    html: &str,
+    context: &mut DisplayContext,
+    work: &mut RenderWork,
+) -> Result<String> {
     context.html_part();
     if context.format() == HtmlDisplay::Legacy {
-        return to_text(html);
+        return tokenize(html, None, true, work).map(|(text, _)| text);
     }
-    render_readable(html, context, true)
+    render_readable(html, context, true, work)
 }
 
-pub(crate) fn render_selected_prefix(html: &str, context: &mut DisplayContext) -> Result<String> {
+pub(crate) fn render_selected_prefix(
+    html: &str,
+    context: &mut DisplayContext,
+    work: &mut RenderWork,
+) -> Result<String> {
     context.html_part();
-    render_readable(html, context, false)
+    render_readable(html, context, false, work)
 }
 
-fn render_readable(html: &str, context: &mut DisplayContext, complete: bool) -> Result<String> {
-    let (text, next) = tokenize(html, Some(std::mem::take(context)), complete)?;
+fn render_readable(
+    html: &str,
+    context: &mut DisplayContext,
+    complete: bool,
+    work: &mut RenderWork,
+) -> Result<String> {
+    let (text, next) = tokenize(html, Some(std::mem::take(context)), complete, work)?;
     *context = next.ok_or_else(MailError::backend)?;
     Ok(text)
 }
@@ -262,19 +314,26 @@ fn tokenize(
     html: &str,
     context: Option<DisplayContext>,
     complete: bool,
+    work: &mut RenderWork,
 ) -> Result<(String, Option<DisplayContext>)> {
     check_input(html)?;
     let input = BufferQueue::default();
     input.push_back(html.into());
     let mut sink = Sink::default();
+    sink.0.get_mut().tokens = work.tokens;
     if let Some(context) = context {
-        sink.0.get_mut().tokens = context.tokens();
         sink.0.get_mut().readable = Some(readable::Readable::new(context));
     }
     let tokenizer = Tokenizer::new(sink, Default::default());
     let _ = tokenizer.feed(&input);
     if !input.is_empty() {
-        return Err(unsupported());
+        let text = tokenizer.sink.0.borrow();
+        work.tokens = text.tokens;
+        return Err(if text.limited {
+            MailError::limit()
+        } else {
+            unsupported()
+        });
     }
     // At a sampling boundary the tokenizer may be holding a partial token.
     // Keep only output emitted from the available prefix.
@@ -282,14 +341,15 @@ fn tokenize(
         tokenizer.end();
     }
     let mut text = tokenizer.sink.0.into_inner();
-    if text.unsupported {
-        return Err(unsupported());
-    }
+    work.tokens = text.tokens;
     if text.limited {
         return Err(MailError::limit());
     }
+    if text.unsupported {
+        return Err(unsupported());
+    }
     if let Some(readable) = text.readable {
-        return readable.finish(text.tokens, text.parse_error, html, complete);
+        return readable.finish(text.parse_error, html, complete);
     }
     while text.out.ends_with('\n') {
         text.out.pop();
@@ -312,6 +372,14 @@ pub(crate) fn unsupported() -> MailError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn to_text(html: &str) -> Result<String> {
+        render_selected(
+            html,
+            &mut DisplayContext::default(),
+            &mut RenderWork::default(),
+        )
+    }
 
     #[test]
     fn attributes_are_bounded_before_tokenization_without_whitespace() {

@@ -353,63 +353,96 @@ impl Part<'_> {
         remaining: &mut usize,
         context: &mut crate::html::DisplayContext,
     ) -> Result<()> {
-        self.decoded_display_leaves(remaining, |text, html, reserve| {
-            let text = if html {
-                crate::html::render_selected(&text, context)?
-            } else {
-                text
-            };
-            // Charset decoding is charged above. Readable HTML can add safe
-            // indentation/address bytes beyond encoded*4; its shared formatter
-            // independently enforces the 1 MiB output cap across selected leaves.
-            if text.len() > reserve
-                && !(html && context.format() == crate::html::HtmlDisplay::Readable)
-            {
-                return Err(MailError::limit_kind(LimitKind::DecodedBodyBytes));
-            }
-            out.push_str(&text);
-            Ok(())
-        })
+        self.project(out, remaining, context, false).map(|_| ())
     }
 
     pub(crate) fn decoded_display_leaves(
         &self,
         remaining: &mut usize,
-        mut consume: impl FnMut(String, bool, usize) -> Result<()>,
+        consume: impl FnMut(String, bool, usize) -> Result<()>,
     ) -> Result<()> {
-        let mut selected = Vec::new();
-        // Raw entities always have known encoded emptiness.
-        if selection::select(self, &mut selected, true).unwrap_or(true) {
-            return Err(crate::html::unsupported());
+        self.display_body_with_leaves(crate::html::HtmlDisplay::Legacy, remaining, consume)
+            .map(|_| ())
+    }
+
+    pub(crate) fn display_body_with_leaves(
+        &self,
+        format: crate::html::HtmlDisplay,
+        remaining: &mut usize,
+        mut consume: impl FnMut(String, bool, usize) -> Result<()>,
+    ) -> Result<crate::html::DisplayBody> {
+        let mut text = String::new();
+        let mut context = crate::html::DisplayContext::new(format);
+        let leaves = self.project(&mut text, remaining, &mut context, true)?;
+        for (text, html, reserve) in leaves {
+            consume(text, html, reserve)?;
         }
-        for part in selected {
-            let html = part.ctype.mimetype == "text/html";
-            if !html && part.ctype.mimetype != "text/plain" {
-                continue;
-            }
-            if !part.body.is_empty()
-                && charset::Charset::for_label_no_replacement(part.ctype.charset.as_bytes())
-                    .is_none()
+        Ok(crate::html::DisplayBody {
+            text,
+            metadata: context.into_metadata(),
+        })
+    }
+
+    fn project(
+        &self,
+        out: &mut String,
+        remaining: &mut usize,
+        context: &mut crate::html::DisplayContext,
+        retain: bool,
+    ) -> Result<Vec<(String, bool, usize)>> {
+        let mut rejected = std::collections::HashSet::new();
+        let mut work = crate::html::RenderWork::default();
+        let format = context.format();
+        let start = out.len();
+        'candidate: loop {
+            let mut selected = Vec::new();
+            // Raw entities always have known encoded emptiness.
+            if selection::select(self, &mut selected, true, &|part| {
+                rejected.contains(&std::ptr::from_ref(part))
+            })
+            .unwrap_or(true)
             {
                 return Err(crate::html::unsupported());
             }
-            // Transfer output never exceeds input. UTF-8 can require up to
-            // four bytes per input byte, charged across all selected leaves.
-            let limit = || MailError::limit_kind(LimitKind::DecodedBodyBytes);
-            let reserve = part.body.len().checked_mul(4).ok_or_else(limit)?;
-            *remaining = remaining.checked_sub(reserve).ok_or_else(limit)?;
-            let text = match part.encoded()? {
-                Body::Base64(b) | Body::QuotedPrintable(b) => b.get_decoded_as_string(),
-                Body::SevenBit(b) | Body::EightBit(b) => b.get_as_string(),
-                Body::Binary(b) => b.get_as_string(),
+            let mut leaves = Vec::new();
+            for part in selected {
+                let html = part.ctype.mimetype == "text/html";
+                let (text, reserve) = part.decode_text(remaining)?;
+                if let Err(error) = crate::html::project_body_leaf(
+                    out, &text, html, reserve, remaining, context, &mut work,
+                ) {
+                    if error.code != "UNSUPPORTED_BODY" {
+                        return Err(error);
+                    }
+                    rejected.insert(std::ptr::from_ref(part));
+                    out.truncate(start);
+                    *context = crate::html::DisplayContext::new(format);
+                    continue 'candidate;
+                }
+                if retain {
+                    leaves.push((text, html, reserve));
+                }
             }
-            .map_err(|_| MailError::backend())?;
-            if text.len() > reserve {
-                return Err(limit());
-            }
-            consume(text, html, reserve)?;
+            return Ok(leaves);
         }
-        Ok(())
+    }
+
+    fn decode_text(&self, remaining: &mut usize) -> Result<(String, usize)> {
+        // Transfer output never exceeds input. UTF-8 can require up to
+        // four bytes per input byte, charged across all attempted leaves.
+        let limit = || MailError::limit_kind(LimitKind::DecodedBodyBytes);
+        let reserve = self.body.len().checked_mul(4).ok_or_else(limit)?;
+        *remaining = remaining.checked_sub(reserve).ok_or_else(limit)?;
+        let text = match self.encoded()? {
+            Body::Base64(b) | Body::QuotedPrintable(b) => b.get_decoded_as_string(),
+            Body::SevenBit(b) | Body::EightBit(b) => b.get_as_string(),
+            Body::Binary(b) => b.get_as_string(),
+        }
+        .map_err(|_| MailError::backend())?;
+        if text.len() > reserve {
+            return Err(limit());
+        }
+        Ok((text, reserve))
     }
 }
 
@@ -467,6 +500,55 @@ mod tests {
         // empty complete plain representation.
         let raw = b"Content-Type: multipart/alternative; boundary=a\n\n--a\nContent-Type: text/plain\n\n\n--a\nContent-Type: multipart/mixed; boundary=m\n\n--m\n\nSignature\n--m\nContent-Type: text/html\n\n<p>Invoice 123</p>\n--m--\n--a--\n";
         assert_eq!(parse(raw).unwrap().plain_body().unwrap(), "");
+    }
+
+    #[test]
+    fn alternatives_require_supported_charset_and_complete_html() {
+        let plain = "Content-Type: text/plain; charset=utf-8\n\nComplete fallback";
+        let html = "Content-Type: text/html\n\n<p>Complete fallback</p>";
+        let unknown = "Content-Type: text/plain; charset=x-unknown\n\nUnreadable";
+        let foreign = "Content-Type: text/html\n\nVisible<svg><![CDATA[not HTML]]></svg>";
+        let mixed = format!(
+            "Content-Type: multipart/mixed; boundary=m\n\n--m\n\nSignature\n--m\n{foreign}\n--m--"
+        );
+        for (fallback, preferred) in [(plain, unknown), (html, &mixed)] {
+            let raw = format!(
+                "Content-Type: multipart/alternative; boundary=a\n\n--a\n{fallback}\n--a\n{preferred}\n--a--\n"
+            );
+            assert_eq!(
+                parse(raw.as_bytes()).unwrap().plain_body().unwrap(),
+                "Complete fallback"
+            );
+        }
+        let raw = format!(
+            "Content-Type: multipart/alternative; boundary=a\n\n--a\n{unknown}\n--a\n{foreign}\n--a--\n"
+        );
+        assert_eq!(
+            parse(raw.as_bytes())
+                .unwrap()
+                .plain_body()
+                .unwrap_err()
+                .code,
+            "UNSUPPORTED_BODY"
+        );
+        let raw = format!(
+            "Content-Type: multipart/alternative; boundary=a\n\n--a\n{html}\n--a\n{foreign}\n--a--\n"
+        );
+        let mut out = String::new();
+        let mut remaining = foreign.split_once("\n\n").unwrap().1.len() * 4;
+        assert_eq!(
+            parse(raw.as_bytes())
+                .unwrap()
+                .append_plain(
+                    &mut out,
+                    &mut remaining,
+                    &mut crate::html::DisplayContext::default(),
+                )
+                .unwrap_err()
+                .code,
+            "LIMIT_EXCEEDED"
+        );
+        assert!(out.is_empty());
     }
 
     #[test]

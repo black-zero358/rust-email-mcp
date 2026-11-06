@@ -1451,7 +1451,7 @@ fn parsed_metadata(p: &mime::Part<'_>, uid: u32, validity: Option<u32>) -> Resul
 mod tests {
     use super::*;
 
-    async fn fetch_script(
+    pub(super) async fn fetch_script(
         script: Vec<(String, String, &'static str)>,
     ) -> (
         async_imap::Session<tokio::io::DuplexStream>,
@@ -1499,6 +1499,51 @@ mod tests {
         )
         .unwrap();
         (dir, service)
+    }
+
+    #[test]
+    fn mixed_inline_body_preserves_leaf_boundaries_in_forward_cache_and_preview() {
+        let raw = concat!(
+            "Content-Type: multipart/mixed; boundary=m\r\n\r\n",
+            "--m\r\n\r\nAmount: 1\r\n",
+            "--m\r\n\r\n\r\n",
+            "--m\r\nContent-Type: multipart/alternative; boundary=a\r\n\r\n",
+            "--a\r\nContent-Type: text/html\r\n\r\n<b>000</b>\r\n",
+            "--a\r\nContent-Type: text/html\r\n\r\nDiscard<svg></svg>\r\n",
+            "--a--\r\n",
+            "--m\r\n\r\n\r\nsignature\r\n",
+            "--m--\r\n",
+        )
+        .as_bytes();
+        let expected = "Amount: 1\n000\r\nsignature";
+        assert_eq!(
+            forward_body(raw, "Note").unwrap(),
+            format!("Note\n\n---------- Forwarded message ----------\n{expected}")
+        );
+        let part = mime::parse(raw).unwrap();
+        let mut record = parts::cached_body::Record::default();
+        let mut remaining = parts::cached_body::LIMIT;
+        part.decoded_display_leaves(&mut remaining, |text, html, reserve| {
+            record.push(text, html, reserve);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            record
+                .display(crate::html::HtmlDisplay::Legacy)
+                .unwrap()
+                .text,
+            expected
+        );
+        assert_eq!(
+            parts::preview::from_raw(raw, &mut (8 * 1024))
+                .map_err(|fault| fault.error)
+                .unwrap(),
+            parts::preview::Preview::Text {
+                text: "Amount: 1 000 signature".into(),
+                truncated: false,
+            }
+        );
     }
 
     #[tokio::test]

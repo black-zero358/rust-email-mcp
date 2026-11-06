@@ -3,7 +3,8 @@ use super::{
     body_tree::{BodyKind, Node},
     charset_decode, fetch, reader, transfer_decode, *,
 };
-use crate::html::{DisplayBody, DisplayContext, HtmlDisplay};
+use crate::html::{DisplayBody, DisplayContext, HtmlDisplay, RenderWork};
+use std::collections::HashSet;
 
 impl MailService {
     pub(in crate::mail) async fn body_operation(&self, name: &str, args: &Value) -> Result<Value> {
@@ -318,64 +319,29 @@ impl<'a> BodyReadSession<'a> {
             uid,
             &manifest,
         );
-        let selected = selected_leaves(session, uid, &mut manifest)
-            .await
-            .map_err(|fault| fault.read_fault(command_fault))?;
-        let mut remaining = cached_body::LIMIT;
-        let mut context = DisplayContext::new(format);
-        let mut text = String::new();
         let capture = self.service.content_capture(&self.mailbox);
-        let mut complete = cached_body::Record::default();
-        // Match the raw reader's validation order across the chosen leaves.
-        // A failure discards the result without changing the selection.
-        for index in selected {
-            let (leaf, html, reserve) = match decoded_leaf(
-                session,
-                uid,
-                &manifest.parts[index],
-                &mut remaining,
-                capture.is_some(),
-            )
-            .await
-            {
-                Ok(leaf) => leaf,
-                Err(StructuredFault::RawFallback(reason)) => {
-                    return self
-                        .raw_fallback(uid, size, hard_limit, args, reason, true)
-                        .await;
-                }
-                Err(fault) => return Err(fault.read_fault(command_fault)),
-            };
-            let displayed = if html {
-                std::borrow::Cow::Owned(
-                    crate::html::render_selected(&leaf, &mut context).map_err(ReadFault::local)?,
-                )
-            } else {
-                std::borrow::Cow::Borrowed(leaf.as_str())
-            };
-            if displayed.len() > reserve && !(html && format == HtmlDisplay::Readable) {
-                return Err(ReadFault::local(body_limit()));
+        let (displayed, complete) = match project_structured(
+            session,
+            uid,
+            &mut manifest,
+            format,
+            capture.is_some(),
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(StructuredFault::RawFallback(reason)) => {
+                return self
+                    .raw_fallback(uid, size, hard_limit, args, reason, true)
+                    .await;
             }
-            text.push_str(&displayed);
-            drop(displayed);
-            if capture.is_some() {
-                complete.push(leaf, html, reserve);
-            }
-        }
+            Err(fault) => return Err(fault.read_fault(command_fault)),
+        };
         let headers = mime::headers(&manifest.body.root_headers).map_err(ReadFault::local)?;
         let metadata =
             insights::manifest_metadata(&headers, &manifest, uid, self.state.uid_validity);
-        let mut value = insights::with_displayed(
-            metadata,
-            &headers,
-            DisplayBody {
-                text,
-                metadata: context.into_metadata(),
-            },
-            hard_limit,
-            args,
-        )
-        .map_err(ReadFault::local)?;
+        let mut value = insights::with_displayed(metadata, &headers, displayed, hard_limit, args)
+            .map_err(ReadFault::local)?;
         value["read_diagnostics"] = serde_json::to_value(reader::ManifestDiagnostics::structured())
             .map_err(|_| ReadFault::local(MailError::backend()))?;
         if let Some(permit) = capture {
@@ -492,6 +458,7 @@ async fn selected_leaves<S>(
     session: &mut async_imap::Session<S>,
     uid: u32,
     manifest: &mut PartManifest,
+    rejected: &HashSet<usize>,
 ) -> std::result::Result<Vec<usize>, StructuredFault>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
@@ -500,7 +467,12 @@ where
         // Restart selection from the root after a probe. Fragments from an
         // incomplete alternative never enter the next attempt.
         let mut selected = Vec::new();
-        match mime::selection::select(Node { manifest, index: 0 }, &mut selected, true) {
+        match mime::selection::select(
+            Node { manifest, index: 0 },
+            &mut selected,
+            true,
+            &|node| matches!(manifest.body.nodes[node.index].kind, BodyKind::Leaf(index) if rejected.contains(&index)),
+        ) {
             Ok(true) => return Err(StructuredFault::Local(crate::html::unsupported())),
             Ok(false) => {
                 return selected
@@ -603,14 +575,58 @@ pub(in crate::mail) async fn canonical_structured<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
 {
-    let mut record = cached_body::Record::default();
+    project_structured(session, uid, manifest, HtmlDisplay::Legacy, true)
+        .await
+        .map(|(_, record)| record)
+}
+
+async fn project_structured<S>(
+    session: &mut async_imap::Session<S>,
+    uid: u32,
+    manifest: &mut PartManifest,
+    format: HtmlDisplay,
+    retain: bool,
+) -> std::result::Result<(DisplayBody, cached_body::Record), StructuredFault>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
+{
     let mut remaining = cached_body::LIMIT;
-    for index in selected_leaves(session, uid, manifest).await? {
-        let (text, html, reserve) =
-            decoded_leaf(session, uid, &manifest.parts[index], &mut remaining, true).await?;
-        record.push(text, html, reserve);
+    let mut work = RenderWork::default();
+    let mut rejected = HashSet::new();
+    'candidate: loop {
+        let mut record = cached_body::Record::default();
+        let mut text = String::new();
+        let mut context = DisplayContext::new(format);
+        for index in selected_leaves(session, uid, manifest, &rejected).await? {
+            let (leaf, html, reserve) =
+                decoded_leaf(session, uid, &manifest.parts[index], &mut remaining, retain).await?;
+            if let Err(error) = crate::html::project_body_leaf(
+                &mut text,
+                &leaf,
+                html,
+                reserve,
+                &mut remaining,
+                &mut context,
+                &mut work,
+            ) {
+                if error.code != "UNSUPPORTED_BODY" {
+                    return Err(StructuredFault::Local(error));
+                }
+                rejected.insert(index);
+                continue 'candidate;
+            }
+            if retain {
+                record.push(leaf, html, reserve);
+            }
+        }
+        return Ok((
+            DisplayBody {
+                text,
+                metadata: context.into_metadata(),
+            },
+            record,
+        ));
     }
-    Ok(record)
 }
 
 fn body_limit() -> MailError {
