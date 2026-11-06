@@ -48,7 +48,8 @@ for name, data in sources.items():
         visit(rust.parse(data).root_node)
         dedicated = ("/tests/" in name or "/output_tests/" in name or name.startswith("tests/")
                      or name.endswith(("/tests.rs", "/output_tests.rs", "_tests.rs"))
-                     or name == "examples/benchmark_journal.rs")
+                     or name in ("examples/benchmark_journal.rs", "src/mail/attachments/regression.rs",
+                                 "vendor/async-imap/src/mock_stream.rs"))
         if dedicated:
             spans = [(0, len(data))]
     elif name.endswith((".py", ".mjs", ".sh")) and (
