@@ -155,6 +155,8 @@ HTML 回退只用有界 tokenizer sink，不引入 DOM/layout 引擎、不执行
 
 SMTP 使用 lettre 的低层 connection/command/message API，保留 TLS、AUTH、SMTPUTF8 和 8BITMIME 策略。连接及事务共用发送期限；最终 DATA 250 确认后先记录 `accepted`，明确拒绝先记录 `rejected`，再执行独立的最多一秒 QUIT 清理。`unknown` 或取消的事务直接关闭，不 QUIT、不进连接池。执行槽位持有到清理结束，避免积累清理任务。HTTP/MCP 调用者断开不能把发送生命周期变成不受记录的重试。
 
+进程收到停机信号即封闭写入登记并停止接受新 HTTP 连接。已登记的写任务保留共享队列和执行许可，HTTP、同步和写入排空共用从信号开始计时的绝对截止。只有任务和缓存队列完成排空且仍在期限内，缓存才发布 clean receipt。若排空未完成，进程保留运行见证锁至退出。SMTP 已确认结果先持久化再清理，未完成的 sending 在下次启动恢复为 unknown。
+
 已知 SMTP 接受结果不得因后续日志/数据库更新或清理失败而改为失败。操作记录更新失败时，本次响应保留 `accepted` 并附 `journal_update_failed`；这不等于数据库已经成功保存该结果，后续必须检查操作状态及服务商记录。
 
 草稿发送使用同一个有界规范化头部缓冲区做收件人解释和隐私过滤，在 claim/SMTP 前验证字段名、续行及头/体分隔符，并明确拒绝不支持的 `Resent-*` 语义。To/Cc/Bcc 的每个原始结构化头通过 `mailparse::addrparse_header` 解析，编码显示名称中的标点保持显示数据；重复字段和组地址共同构成信封。BCC 参与信封投递但不进入发送头部；可用于 DATA 的正文原始字节（包括 Base64/quoted-printable 编码附件）保持不变，源草稿保留并返回 `draft_retained`。在 `prepare_draft` 和共同 `claim_send` 边界验证 CRLF、无 NUL、每行最多 998 原始字节（dot-stuffing 新增点不计）；不合规返回固定 `UNSUPPORTED_DATA_FORMAT`，不 claim、不连接，不盲目规范化二进制/MIME 正文。末行无 CRLF 仍允许，由现有 lettre DATA codec 补终结。`SmtpSender::submit` 同样在连接前做防御检查，不将确定未提交的非法格式标为 unknown。8bit 数据仍需 SMTPUTF8/8BITMIME 能力检查，当前未协商 BINARYMIME/BDAT。发送前格式验证见 `smtp::tests`，结构化收件人及隐私过滤见 `mail::tests::draft_envelope_and_privacy_filter_share_canonical_fields`。
@@ -249,7 +251,7 @@ JSON 日志使用固定事件名和受控字段，记录服务端生成的 reque
 | D1 身份与授权 | `auth::tests::jwt_trust_boundaries`、`failed_refresh_is_shared_and_expired_keys_fail_closed`；`server::output_tests` 的 HTTP 请求鉴权、账户隔离及附件主体检查 |
 | D2 读取与引用 | `mail::tests` 的目标 UID 属性匹配、状态和摘要的 FLAGS 合并、rev1 文件夹往返；`tests/imap_completion.rs` 的完成状态；HTTP 同 UID 双账户与过期 UIDVALIDITY |
 | D3 资源有界 | 六个 `tests/*.rs` 协议集成入口；MIME 头部/解码预算、HTML 分词前属性预算；`server::tests` 的完整 wire 预算与正文前缀；暂存取消与调度配额 |
-| D4 发送与幂等 | `journal::tests` 的重启/主体隔离与并发 claim；`mail::tests` 的 SMTP 已知结果持久化、MAIL 前能力拒绝和 DATA 确认丢失后的去重；`smtp::tests` 的 DATA 格式和最终结果 |
+| D4 发送与幂等 | `journal::tests` 的重启/主体隔离与并发 claim；`mail::tests` 的 SMTP 已知结果持久化、MAIL 前能力拒绝和 DATA 确认丢失后的去重；Unix 子进程的 SIGTERM 和已接纳写入排空；`smtp::tests` 的 DATA 格式和最终结果 |
 | D5 隐私与内容 | `mail::tests::draft_envelope_and_privacy_filter_share_canonical_fields`；MIME 未知编码与完整 alternative 选择；附件精确字节、授权 GET 及私有暂存 |
 | D6 维护与恢复 | `src/accounts`、`src/cache` 的注册库/世代/迁移/回放回归；CI fmt/test/clippy、依赖审计和容器 release 构建；`scripts/check-cache-recovery.py` 的实际候选二进制恢复检查 |
 

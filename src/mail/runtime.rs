@@ -96,25 +96,39 @@ impl MailRuntime {
         &self.config
     }
 
-    pub async fn finish_cache(&self, cache: PreparedCache) {
-        let sync_finished = self.sync.finish().await;
-        let writes_finished = self
-            .write_guards
-            .seal_and_drain(std::time::Duration::from_secs(10))
-            .await;
+    pub(crate) fn shutdown_budget(&self) -> std::time::Duration {
+        // A queued draft/reply/forward can still use separate full IMAP and
+        // SMTP budgets, two cache fences and QUIT after admission.
+        scheduler::QUEUE_WAIT
+            + self.config.timeout * 2
+            + persistence::WRITE_FENCE_WAIT * 2
+            + crate::smtp::QUIT_TIMEOUT
+            + std::time::Duration::from_secs(20) // journal, local work and cache finalization
+    }
+
+    pub(crate) fn begin_shutdown(&self) {
+        self.write_guards.seal();
+        self.sync.stop();
+    }
+
+    pub(crate) async fn drain_shutdown(&self, deadline: tokio::time::Instant) -> bool {
+        let (writes_finished, sync_finished) =
+            tokio::join!(self.write_guards.drain_until(deadline), self.sync.finish());
+        writes_finished && sync_finished
+    }
+
+    pub(crate) async fn finish_cache(
+        &self,
+        cache: PreparedCache,
+        deadline: tokio::time::Instant,
+    ) -> bool {
         let reads_finished = self.scheduler.stop_admission();
         let transfers_finished = self.attachments.stop_transfers();
-        if sync_finished && writes_finished && reads_finished && transfers_finished {
-            cache.finish().await;
-        }
+        reads_finished && transfers_finished && cache.finish_before(deadline).await
     }
 
     pub fn start_sync(self: &Arc<Self>) {
         self.sync.start(self);
-    }
-
-    pub fn stop_sync(&self) {
-        self.sync.stop();
     }
 
     pub fn has_read_access(&self, principal: &str) -> bool {
@@ -347,6 +361,15 @@ impl MailRuntime {
             .await
     }
 
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_test_smtp(mut self, port: u16) -> Self {
+        self.services
+            .values_mut()
+            .find(|service| service.smtp.is_some())
+            .expect("legacy SMTP service")
+            .smtp = Some(SmtpSender::fixture(port, self.config.timeout));
+        self
+    }
     #[cfg(test)]
     pub(crate) fn with_test_imap_roots(mut self, roots: RootCertStore) -> Self {
         for service in self.services.values_mut() {
