@@ -158,16 +158,17 @@ pub enum Flag<'a> {
 
 impl Flag<'static> {
     fn system(s: &str) -> Option<Self> {
-        match s {
-            "\\Seen" => Some(Flag::Seen),
-            "\\Answered" => Some(Flag::Answered),
-            "\\Flagged" => Some(Flag::Flagged),
-            "\\Deleted" => Some(Flag::Deleted),
-            "\\Draft" => Some(Flag::Draft),
-            "\\Recent" => Some(Flag::Recent),
-            "\\*" => Some(Flag::MayCreate),
-            _ => None,
-        }
+        [
+            ("\\Seen", Flag::Seen),
+            ("\\Answered", Flag::Answered),
+            ("\\Flagged", Flag::Flagged),
+            ("\\Deleted", Flag::Deleted),
+            ("\\Draft", Flag::Draft),
+            ("\\Recent", Flag::Recent),
+            ("\\*", Flag::MayCreate),
+        ]
+        .into_iter()
+        .find_map(|(name, flag)| name.eq_ignore_ascii_case(s).then_some(flag))
     }
 }
 

@@ -50,6 +50,15 @@ unexpected source/checksum or changed pinned version. Upgrade the provenance,
 script and tests together when changing this dependency; verify audit coverage
 against RustSec again. There is no fallback that suppresses an audit failure.
 
+## Case-insensitive capability lookup (issue #59)
+
+`Capabilities::has_str` compares extension atoms such as MOVE and UIDPLUS
+without regard to ASCII case, following [RFC 3501 section 9](https://www.rfc-editor.org/rfc/rfc3501#section-9).
+It preserves parsed spelling, the typed `has` lookup, and the existing IMAP4rev1
+and AUTH= handling. AUTH= prefix detection checks UTF-8 character boundaries.
+The root `tests/imap_completion.rs` regression exercises raw CAPABILITY replies
+with mixed case and checks extension, standard, and unknown names.
+
 ## SELECT/EXAMINE and STATUS completion (issue #28)
 
 `src/parse.rs` also routes `parse_mailbox` and `parse_status` through one
@@ -240,3 +249,11 @@ the exact UID set or taking its bounded fallback. Run
 ## Test suite reduction (2026-11-06)
 
 The vendored crate-local test modules were removed as part of the repository-wide test maintenance reduction. Runtime source and upstream identity remain the same. Current parser/client verification runs through the root package integration tests in `tests/`; historical test commands above describe the earlier patch acceptance.
+
+## Case-insensitive system flags (issue #84)
+
+Both borrowed and owned flag conversions recognize the system flag names in
+ASCII case-insensitive form. Other flags retain their original text and the
+existing Custom representation. This follows [RFC 3501 section 9](https://www.rfc-editor.org/rfc/rfc3501#section-9).
+The root package's summary FETCH and sync facts regressions cover mixed-case
+wire flags. The upstream identity and dependency versions remain unchanged.
