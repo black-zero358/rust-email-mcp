@@ -1,6 +1,77 @@
 use super::*;
 use base64::Engine;
 
+#[tokio::test]
+async fn structured_alternative_retries_render_failure_but_keeps_command_failure() {
+    use crate::mail::{
+        parts::{body_tree::BodyNode, mapping::Section},
+        tests::fetch_script,
+    };
+
+    let good = "<b>Complete fallback</b>";
+    let bad = "Discard this<svg>unsupported</svg>";
+    let raw = format!(
+        "Content-Type: multipart/alternative; boundary=a\r\n\r\n--a\r\nContent-Type: text/html\r\n\r\n{good}\r\n--a\r\nContent-Type: text/html\r\n\r\n{bad}\r\n--a--\r\n"
+    );
+    let parsed = mime::parse(raw.as_bytes()).unwrap();
+    for completion in ["OK", "NO"] {
+        let mut manifest = super::super::from_raw(&parsed).unwrap().manifest;
+        manifest.body.nodes.push(BodyNode {
+            parent: None,
+            children: vec![1, 2],
+            kind: BodyKind::Container {
+                section: Section(vec![]),
+                media_type: "multipart/alternative".into(),
+                encoding: "7bit".into(),
+                content_id: None,
+                related_start: None,
+            },
+            nonempty: None,
+        });
+        manifest.body.nodes.extend((0..2).map(|index| BodyNode {
+            parent: Some(0),
+            children: Vec::new(),
+            kind: BodyKind::Leaf(index),
+            nonempty: None,
+        }));
+        let data = |section, text: &str, status| {
+            (
+                format!("UID FETCH 7 (UID BODY.PEEK[{section}]<0.65536>)"),
+                format!(
+                    "* 1 FETCH (UID 7 BODY[{section}]<0> {{{}}}\r\n{text})\r\n",
+                    text.len()
+                ),
+                status,
+            )
+        };
+        let eof = |section, len| {
+            (
+                format!("UID FETCH 7 (UID BODY.PEEK[{section}]<{len}.1>)"),
+                format!("* 1 FETCH (UID 7 BODY[{section}]<{len}> {{0}}\r\n)\r\n"),
+                "OK",
+            )
+        };
+        let mut script = vec![data(2, bad, completion)];
+        if completion == "OK" {
+            script.extend([eof(2, bad.len()), data(1, good, "OK"), eof(1, good.len())]);
+        }
+        let (mut session, backend) = fetch_script(script).await;
+        let result = canonical_structured(&mut session, 7, &mut manifest).await;
+        backend.await.unwrap();
+        if completion == "OK" {
+            let Ok(record) = result else {
+                panic!("expected a renderable alternative")
+            };
+            assert_eq!(
+                record.display(HtmlDisplay::Legacy).unwrap().text,
+                "Complete fallback"
+            );
+        } else {
+            assert!(matches!(result, Err(StructuredFault::Command(_))));
+        }
+    }
+}
+
 #[test]
 fn transfer_and_charset_cross_chunk_pipeline_matches_the_raw_oracle() {
     let utf8 = "中文与emoji😀\n".repeat(16).into_bytes();

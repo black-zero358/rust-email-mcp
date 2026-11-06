@@ -22,7 +22,8 @@ pub struct SyncGcPage {
 }
 
 const LIVE_BODY: &str = "EXISTS(SELECT 1 FROM artifacts a WHERE a.message_id=b.message_id
-    AND a.kind=1 AND a.mime_version=b.mime_version AND a.html_version=b.html_version
+    AND a.kind=1 AND a.mime_version=b.mime_version
+    AND a.html_version IN (b.html_version,b.html_version >> 16)
     AND a.state=1 AND a.blob_id=b.blob_id)";
 
 impl Cache {

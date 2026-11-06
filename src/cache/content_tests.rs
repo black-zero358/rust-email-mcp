@@ -121,3 +121,76 @@ fn body_metadata_is_verified_with_the_blob_before_a_lease_is_returned() {
     assert_eq!(page.indexed_body, 0);
     assert!(page.items.is_empty());
 }
+
+#[test]
+fn legacy_body_index_is_hidden_and_rebuilt_from_the_same_blob() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountKey::synthetic();
+    let cache = open(&dir.path().join("cache"), &account);
+    observe(&cache, &account);
+    let reference = message(&account, 7);
+    let blob = publish_body(&cache, reference);
+    cache
+        .remember_full_body_index(reference, BODY, blob.id, "Amount: 1000", &|| false)
+        .unwrap();
+    {
+        let databases = cache.lock().unwrap();
+        let db = &databases[&account.reference_namespace()].connection;
+        db.execute_batch(
+            "UPDATE body_indexes SET complete=0;
+             UPDATE body_indexes SET html_version=1;
+             UPDATE body_indexes SET complete=1;",
+        )
+        .unwrap();
+    }
+    let search = |query| {
+        cache
+            .search_cached(&account, INBOX, query, None, 10, Some((1, 1)))
+            .unwrap()
+    };
+    let scope = cache.freeze_scope(&account, INBOX).unwrap();
+    let old = search("1000");
+    assert!(old.items.is_empty());
+    assert_eq!(old.indexed_body, 0);
+    assert_eq!(
+        cache
+            .pending_body_index_rebuild(&account, &scope, (1, 1))
+            .unwrap(),
+        Some((7, blob.id, blob.bytes))
+    );
+    cache
+        .remember_full_body_index(reference, BODY, blob.id, "Amount: 1\n000", &|| false)
+        .unwrap();
+    let current = search("000");
+    assert_eq!(current.items.len(), 1);
+    assert_eq!(current.items[0].message.uid, 7);
+    assert_eq!(current.indexed_body, 1);
+    assert!(current.search_revision > old.search_revision);
+    assert!(search("1000").items.is_empty());
+    assert!(
+        cache
+            .pending_body_index_rebuild(&account, &scope, (1, 1))
+            .unwrap()
+            .is_none()
+    );
+    cache.collect_blobs(&account).unwrap();
+    assert_eq!(search("000").items.len(), 1);
+
+    let mut stage = cache.begin_blob(reference, BODY, Some(4), 4).unwrap();
+    stage.write_all(b"new!").unwrap();
+    let replacement = stage
+        .publish_body_replacing(b"replacement metadata", Some(blob.id), &|| false)
+        .unwrap();
+    assert_ne!(replacement.id, blob.id);
+    assert_eq!(
+        cache.artifact_state(reference, BODY).unwrap(),
+        ArtifactState::Materialized(replacement)
+    );
+    assert!(search("000").items.is_empty());
+    let mut stale = cache.begin_blob(reference, BODY, Some(4), 4).unwrap();
+    stale.write_all(b"old!").unwrap();
+    assert!(matches!(
+        stale.publish_body_replacing(b"stale metadata", Some(blob.id), &|| false),
+        Err(CacheError::OutOfScope)
+    ));
+}
