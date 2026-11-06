@@ -278,5 +278,12 @@ async fn realtime_deletion_fences_offline_access_before_fetch_completion() {
             assert_eq!(committed(), "4", "{case}");
         }
     }
-    mail.finish_cache(persistent).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    mail.begin_shutdown();
+    assert!(
+        tokio::time::timeout_at(deadline, mail.drain_shutdown(deadline))
+            .await
+            .unwrap()
+    );
+    assert!(mail.finish_cache(persistent, deadline).await);
 }
