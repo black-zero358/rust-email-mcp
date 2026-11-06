@@ -13,6 +13,8 @@ use lettre::{
 };
 use std::time::Duration;
 
+pub(crate) const QUIT_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Validate DATA representability without rewriting MIME bytes. The codec adds
 /// the final CRLF, so a nonempty last line need not already end in CRLF.
 pub(crate) fn validate_data(raw: &[u8]) -> crate::error::Result<()> {
@@ -66,7 +68,7 @@ impl Submission {
         // The caller has already persisted status. Keep its execution slot until
         // cleanup completes, so slow QUIT cannot accumulate unbounded tasks.
         if let Some(connection) = self.connection.as_mut() {
-            let _ = tokio::time::timeout(Duration::from_secs(1), connection.abort()).await;
+            let _ = tokio::time::timeout(QUIT_TIMEOUT, connection.abort()).await;
         }
     }
 }

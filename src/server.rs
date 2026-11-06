@@ -14,6 +14,8 @@ use std::{sync::Arc, time::Instant};
 
 mod input;
 mod output;
+mod shutdown;
+pub use shutdown::serve_until_shutdown;
 #[cfg(test)]
 mod output_tests;
 

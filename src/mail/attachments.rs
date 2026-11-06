@@ -77,9 +77,14 @@ impl AttachmentStore {
             transfers: Arc::new(Semaphore::new(MAX_TRANSFERS)),
         }
     }
-    pub(super) fn stop_transfers(&self) -> bool {
+    pub(super) async fn drain_transfers(&self, deadline: tokio::time::Instant) -> bool {
+        // HTTP has already stopped. Acquiring all permits waits for detached
+        // I/O owners as well as ordinary response streams.
+        let drained =
+            tokio::time::timeout_at(deadline, self.transfers.acquire_many(MAX_TRANSFERS as u32))
+                .await;
         self.transfers.close();
-        self.transfers.available_permits() == MAX_TRANSFERS
+        matches!(drained, Ok(Ok(_)))
     }
 
     async fn insert(&self, transfer: Transfer) -> Result<String> {
@@ -750,6 +755,42 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_waits_for_detached_read_and_transfer_permits() {
+        let settings = crate::config::ValidatedAccountSet::legacy(crate::config::fixture());
+        let catalog = crate::accounts::AccountCatalog::from_test_accounts(settings).unwrap();
+        let journal = Journal::open(std::path::Path::new(":memory:")).unwrap();
+        let runtime = MailRuntime::new(catalog, Arc::new(journal)).unwrap();
+        let read = runtime
+            .scheduler
+            .acquire(
+                [1; 32],
+                scheduler::WorkClass::Foreground,
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let transfer = runtime
+            .attachments
+            .transfers
+            .clone()
+            .try_acquire_owned()
+            .unwrap();
+        let start = tokio::time::Instant::now();
+        let detached = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(11)).await;
+            drop(read);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            drop(transfer);
+        });
+        assert!(
+            runtime
+                .finish_cache(PreparedCache::default(), start + Duration::from_secs(15))
+                .await
+        );
+        assert_eq!(start.elapsed(), Duration::from_secs(12));
+        detached.await.unwrap();
     }
     #[tokio::test]
     async fn handles_are_principal_bound_expiring_and_capacity_bounded() {
