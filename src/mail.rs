@@ -1377,8 +1377,8 @@ pub fn prepare_draft(raw: &[u8], from: &str, id: &str) -> Result<(Vec<u8>, Envel
     let headers = mime::headers(&canonical)?;
     let mut recipients = Vec::new();
     for key in ["To", "Cc", "Bcc"] {
-        for val in headers.get_all_values(key) {
-            let list = mailparse::addrparse(&val).map_err(|_| MailError::input())?;
+        for header in headers.get_all_headers(key) {
+            let list = mailparse::addrparse_header(header).map_err(|_| MailError::input())?;
             for a in list.iter() {
                 match a {
                     mailparse::MailAddr::Single(s) => {
@@ -1830,11 +1830,41 @@ mod tests {
     }
     #[test]
     fn draft_envelope_and_privacy_filter_share_canonical_fields() {
-        let mut raw = b"From: old@example.com\nSender: old@example.com\nMessage-ID: <old@example.com>\nReturn-Path: <old@example.com>\nTo: visible@example.com\nCc: copy@example.com\nBcc: hidden@example.com,\n second@example.com\nbCc: third@example.com\nSubject: preserved\nContent-Type: application/octet-stream\nContent-Transfer-Encoding: quoted-printable\n\n".to_vec();
+        let mut raw = concat!(
+            "From: old@example.com\n",
+            "Sender: old@example.com\n",
+            "Message-ID: <old@example.com>\n",
+            "Return-Path: <old@example.com>\n",
+            "To: =?UTF-8?Q?review=40example.net=2C_release=3A_=3CLead=3E?= <visible@example.com>\n",
+            "To: 张三 <unicode@example.com>\n",
+            "Cc: Copy group: =?UTF-8?B?6YOo572yIDx0ZWFtPiwgKGNvcHkp?= <copy@example.com>, reviewer@example.com;\n",
+            "Bcc: hidden@example.com,\n second@example.com\n",
+            "bCc: third@example.com\n",
+            "Subject: preserved\n",
+            "Content-Type: application/octet-stream\n",
+            "Content-Transfer-Encoding: quoted-printable\n\n",
+        )
+        .as_bytes()
+        .to_vec();
         let body = b"binary=00=FF\r\n\r\n--unchanged";
         raw.extend_from_slice(body);
         let (clean, envelope) = prepare_draft(&raw, "me@example.com", "<new@example.com>").unwrap();
-        assert_eq!(envelope.to().len(), 5);
+        assert_eq!(
+            envelope
+                .to()
+                .iter()
+                .map(AsRef::<str>::as_ref)
+                .collect::<Vec<_>>(),
+            [
+                "visible@example.com",
+                "unicode@example.com",
+                "copy@example.com",
+                "reviewer@example.com",
+                "hidden@example.com",
+                "second@example.com",
+                "third@example.com",
+            ]
+        );
         let (headers, body_start) = mailparse::parse_headers(&clean).unwrap();
         assert!(headers.get_all_values("Bcc").is_empty());
         assert!(headers.get_all_values("Sender").is_empty());
@@ -1845,6 +1875,9 @@ mod tests {
         assert!(!String::from_utf8_lossy(&clean).contains("hidden@example.com"));
         assert!(!String::from_utf8_lossy(&clean).contains("second@example.com"));
         assert!(!String::from_utf8_lossy(&clean).contains("third@example.com"));
+
+        let ambiguous = b"To: =?UTF-8?Q?address=40example.com?=\r\n\r\nbody";
+        assert!(prepare_draft(ambiguous, "me@example.com", "<new@example.com>").is_err());
     }
 
     async fn smtp_fixture(disconnect_after_data: bool) {
