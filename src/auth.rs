@@ -219,7 +219,12 @@ pub async fn require_auth(State(auth): State<Arc<Auth>>, mut req: Request, next:
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "));
+        .and_then(|authorization| {
+            let (scheme, credentials) = authorization.split_once(' ')?;
+            // The separator is one or more ASCII spaces. Pass the token bytes through.
+            let token = credentials.trim_start_matches(' ');
+            (scheme.eq_ignore_ascii_case("Bearer") && !token.is_empty()).then_some(token)
+        });
     let principal = match token {
         Some(token) => auth.verify(token).await,
         None => Err(AuthError::InvalidToken),

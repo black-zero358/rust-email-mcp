@@ -287,7 +287,15 @@ impl CachedReader {
                 let Some(flags) = &row.flags else {
                     return Ok(None);
                 };
-                if flags.iter().any(|value| value == flag) != wanted {
+                if flags.iter().any(|value| {
+                    // Older versions serialized a mixed-case system flag as Custom("\\...").
+                    value == flag
+                        || value
+                            .strip_prefix(r#"Custom("\\"#)
+                            .and_then(|value| value.strip_suffix(r#"")"#))
+                            .is_some_and(|name| name.eq_ignore_ascii_case(flag))
+                }) != wanted
+                {
                     return Ok(Some(false));
                 }
             }
@@ -509,20 +517,29 @@ fn summary(row: &CachedMessage) -> Result<Value> {
 fn server_day(date: &str) -> Option<String> {
     let day = date.split_ascii_whitespace().next()?;
     let mut parts = day.split('-');
-    let day: u8 = parts.next()?.parse().ok()?;
-    let month = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ]
-    .iter()
-    .position(|month| {
-        parts
-            .clone()
-            .next()
-            .is_some_and(|value| month.eq_ignore_ascii_case(value))
-    })? + 1;
-    parts.next()?;
-    let year: u16 = parts.next()?.parse().ok()?;
-    (parts.next().is_none() && (1..=31).contains(&day) && (1..=9999).contains(&year))
+    let (first, second, third) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() {
+        return None;
+    }
+
+    // Background observations store a parsed datetime's display string. Both
+    // forms start with the calendar date in the message's original offset.
+    let (year, month, day) = if first.len() == 4 && second.len() == 2 && third.len() == 2 {
+        (
+            first.parse::<u16>().ok()?,
+            second.parse::<usize>().ok()?,
+            third.parse::<u8>().ok()?,
+        )
+    } else {
+        let month = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ]
+        .iter()
+        .position(|month| month.eq_ignore_ascii_case(second))?
+            + 1;
+        (third.parse().ok()?, month, first.parse().ok()?)
+    };
+    ((1..=9999).contains(&year) && (1..=12).contains(&month) && (1..=31).contains(&day))
         .then(|| format!("{year:04}-{month:02}-{day:02}"))
 }
 
@@ -587,4 +604,137 @@ fn decode_cursor(token: &str, key: [u8; 32]) -> Result<SearchPosition> {
         uid,
         segment: (segment != u16::MAX).then_some(segment),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        accounts::{AccountCatalog, CacheRunIdentity},
+        cache::ListingEvidence,
+        config::{self, ValidatedAccountSet},
+        mail::MailRuntime,
+    };
+
+    #[tokio::test]
+    async fn offline_search_matches_both_internal_date_formats_and_legacy_flags() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cache.json");
+        std::fs::write(
+            &path,
+            br#"{"version":1,"mode":"full","directory":"cache","max_bytes":33554432,"accounts":[{"account_id":"default","mailboxes":["INBOX"],"max_bytes":8388608}]}"#,
+        )
+        .unwrap();
+        let config = config::fixture();
+        let settings = ValidatedAccountSet::legacy(config.clone());
+        let cache_settings = config::load_cache_file(&path, &settings).unwrap();
+        let catalog = AccountCatalog::from_test_accounts(settings).unwrap();
+        let account = catalog.registered_accounts().pop().unwrap().key;
+        let persistent = MailRuntime::prepare_cache_for_run(
+            &catalog,
+            cache_settings,
+            Some(CacheRunIdentity {
+                instance: uuid::Uuid::new_v4(),
+                previous: None,
+                current: uuid::Uuid::new_v4(),
+            }),
+        )
+        .unwrap();
+        let cache = persistent.full_storage(&account).unwrap().clone();
+        cache
+            .observe_folder(&account, "INBOX", 9, Some(5), 1)
+            .unwrap();
+        let reader = CachedReader {
+            cache,
+            account,
+            alias: "default".into(),
+            config,
+            persistent,
+        };
+        let canonical = ["Seen", "Answered", "Flagged"];
+        let legacy = [
+            r#"Custom("\\sEeN")"#,
+            r#"Custom("\\ANSWERED")"#,
+            r#"Custom("\\fLaGgEd")"#,
+        ];
+        let custom = [r#"Custom("Seen")"#, r#"Custom("\\SeenOther")"#];
+        let rows = [
+            (
+                1,
+                Some(" 7-Feb-2025 23:30:00 -0800"),
+                Some(canonical.as_slice()),
+            ),
+            (
+                2,
+                Some("2025-02-07 23:30:00 -08:00"),
+                Some(legacy.as_slice()),
+            ),
+            (3, Some("2025-02-08 00:00:00 -08:00"), Some(&[][..])),
+            (4, None, Some(custom.as_slice())),
+            (5, None, None),
+        ];
+        for (uid, internal_date, flags) in rows {
+            let reference = reader.reference("INBOX", 9, uid);
+            reader
+                .cache
+                .remember_headers(reference, true, b"Subject: synthetic\r\n\r\n", None)
+                .unwrap();
+            let flags = flags.map(|flags| {
+                flags
+                    .iter()
+                    .map(|flag| (*flag).to_owned())
+                    .collect::<Vec<_>>()
+            });
+            reader
+                .cache
+                .remember_listing(
+                    reference,
+                    ListingEvidence {
+                        flags: flags.as_deref(),
+                        internal_date,
+                        size: None,
+                        observed_at_ms: 1,
+                    },
+                )
+                .unwrap();
+        }
+
+        for (mut args, expected, unknown) in [
+            (
+                json!({"since":"2025-02-07","before":"2025-02-08"}),
+                json!([2, 1]),
+                2,
+            ),
+            (
+                json!({"since":"2025-02-08","before":"2025-02-09"}),
+                json!([3]),
+                2,
+            ),
+            (
+                json!({"seen":true,"answered":true,"flagged":true}),
+                json!([2, 1]),
+                1,
+            ),
+            (
+                json!({"seen":false,"answered":false,"flagged":false}),
+                json!([4, 3]),
+                1,
+            ),
+        ] {
+            args["uid_validity"] = json!(9);
+            let page = reader.cached_query("search_emails", &args).unwrap();
+            let uids = page["emails"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| &row["uid"])
+                .collect::<Vec<_>>();
+            assert_eq!(json!(uids), expected, "{args}: {page}");
+            assert_eq!(
+                page["cache"]["scopes"][0]["coverage"]["filter_unknown"], unknown,
+                "{page}"
+            );
+        }
+        reader.persistent.finish().await;
+    }
 }

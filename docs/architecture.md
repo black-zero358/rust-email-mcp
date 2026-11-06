@@ -157,18 +157,22 @@ HTML 回退只用有界 tokenizer sink，不引入 DOM/layout 引擎、不执行
 
 SMTP 使用 lettre 的低层 connection/command/message API，保留 TLS、AUTH、SMTPUTF8 和 8BITMIME 策略。连接及事务共用发送期限；最终 DATA 250 确认后先记录 `accepted`，明确拒绝先记录 `rejected`，再执行独立的最多一秒 QUIT 清理。`unknown` 或取消的事务直接关闭，不 QUIT、不进连接池。执行槽位持有到清理结束，避免积累清理任务。HTTP/MCP 调用者断开不能把发送生命周期变成不受记录的重试。
 
+异步 SMTP 响应在解密后按每行 1,000 字节、每个完整回复 100,000 字节限制累积，计入行结束符。每次追加前核对剩余预算。回复用尽预算仍未完成时丢弃连接和预读数据，跳过 QUIT。该路径覆盖 greeting、EHLO、STARTTLS、AUTH、DATA 和 QUIT。DATA 最终确认超限按未知结果处理，已持久化的接受结果在 QUIT 超限时保留。来源与替换条件见 [lettre 补丁记录](../vendor/lettre/PATCHES.md)。
+
 已知 SMTP 接受结果不得因后续日志/数据库更新或清理失败而改为失败。操作记录更新失败时，本次响应保留 `accepted` 并附 `journal_update_failed`；这不等于数据库已经成功保存该结果，后续必须检查操作状态及服务商记录。
 
 草稿发送使用同一个有界规范化头部缓冲区做收件人解释和隐私过滤，在 claim/SMTP 前验证字段名、续行及头/体分隔符，并明确拒绝不支持的 `Resent-*` 语义。To/Cc/Bcc 的每个原始结构化头通过 `mailparse::addrparse_header` 解析，编码显示名称中的标点保持显示数据；重复字段和组地址共同构成信封。BCC 参与信封投递但不进入发送头部；可用于 DATA 的正文原始字节（包括 Base64/quoted-printable 编码附件）保持不变，源草稿保留并返回 `draft_retained`。在 `prepare_draft` 和共同 `claim_send` 边界验证 CRLF、无 NUL、每行最多 998 原始字节（dot-stuffing 新增点不计）；不合规返回固定 `UNSUPPORTED_DATA_FORMAT`，不 claim、不连接，不盲目规范化二进制/MIME 正文。末行无 CRLF 仍允许，由现有 lettre DATA codec 补终结。`SmtpSender::submit` 同样在连接前做防御检查，不将确定未提交的非法格式标为 unknown。8bit 数据仍需 SMTPUTF8/8BITMIME 能力检查，当前未协商 BINARYMIME/BDAT。发送前格式验证见 `smtp::tests`，结构化收件人及隐私过滤见 `mail::tests::draft_envelope_and_privacy_filter_share_canonical_fields`。
 
 SMTPUTF8 需求为信封中非 ASCII 地址或 `mime::requires_smtputf8` 检出的原始国际化头。按 [RFC 6531 §3.2、§3.6](https://www.rfc-editor.org/rfc/rfc6531#section-3.6) 检查所有 MIME 子头，附件子树也不排除；只检查原始字节，RFC 2047 编码词和叶子正文不展开。identity 编码的 message/rfc822、message/global 递归共用结构/头部预算；编码封装的 message/global 保持不透明，符合 [RFC 6532 §3.5](https://www.rfc-editor.org/rfc/rfc6532#section-3.5) 对 7bit 封装的支持。此检查不调用正文选择、HTML 渲染或 transfer/charset 解码；非 ASCII 输入无法在结构/头部预算内确定需求时，连接前返回确定 `rejected`。
 
-缺少 SMTPUTF8 能力通过私有拒绝类型在 MAIL 前返回并持久化为 `rejected`，清理继续有界 QUIT；网络/事务的不确定结果保持 `unknown`，已知接受仍为 `accepted`。8BITMIME 对原始非 ASCII 数据的既有要求、TLS/AUTH 和状态恢复规则不变。
+服务端缺少邮件所需的 SMTPUTF8 或 8BITMIME 时，在 MAIL 前返回类型化拒绝，持久化为 `rejected` 后执行有界 QUIT。SMTP DATA 已提交但最终确认丢失时保持 `unknown`，已知接受仍为 `accepted`。
 
 
 ## Authentication
 
 Rauthy 0.37.2 是选用的身份服务，使用嵌入式 Hiqlite/SQLite，负责 authorization code/PKCE、用户登录、refresh rotation 和会话持久化。邮件服务对每次进入 MCP 的 HTTP 请求校验 RS256 签名、issuer、resource audience、expiry、nbf、scope 与 subject allowlist；不能把已有 MCP 会话当作免验凭据。公开发现信息和健康检查保持各自有限职责。
+
+MCP 和附件 GET 共用 HTTP Bearer 鉴权。认证方案按 ASCII 大小写无关规则匹配，方案与 JWT 由一个或多个 ASCII 空格分隔，JWT 以原始字节进入验证。签名 HTTP 回归覆盖两条路由的合法大小写、非法分隔、无效和过期令牌。
 
 JWKS 的硬缓存期限为 300 秒，不因刷新失败延长。刷新 I/O 使用独立协调器，仍有效的已缓存 key 不等待其他 kid 的网络刷新；成功和失败刷新结果共享 10 秒冷却。JWKS 暂不可用返回 HTTP 503 与 `Retry-After`，无效令牌返回 401。JWT 选择 AWS-LC 后端时的动机是避开当时锁文件中存在已知风险的 RustCrypto 传递依赖；持续安全状态以当前依赖审计为准。
 
@@ -205,6 +209,8 @@ full 配置经 `Cache::open_full_with_run` 绑定运行见证。`cache/blob` 保
 `mail/cache_read` 和离线会话先授权，再使用与在线调用相同的 4 槽/20 请求调度；本地 blocking 工作持有共享许可直到实际结束。显式 cache 分支执行本地查询与完整性核对，保持零 IMAP；默认 live 分支继续核对 UIDVALIDITY 和目标存在性。结果报告来源、观察时间和覆盖；FLAGS 缺失保留未知状态。完整正文的文本负载与有界叶元数据分离，维持单文件 32 MiB，渲染与输出裁减在读取时执行；全文索引只接收完整内容。
 
 正文全文索引 v2 使用新的投影身份，已保存的 R11B 正文叶和 SQLite V6 继续可读。离线搜索只计入 v2 完整索引，`rebuild_pending` 表示本地还有旧索引或未完成的替换；初始搜索从已有正文 blob 最多重建四封、合计最多 32 MiB 负载，分页延续同一索引视图。旧游标需重新搜索。旧正文的候选无法渲染但缓存有完整原件时，从原件重新选叶，默认展示可物化恢复后的正文。实际回归覆盖旧粘连词隐藏、同 blob 重建、版本覆盖和回收。
+
+离线日期搜索按 INTERNALDATE 原时区的日历日处理前台 IMAP 原文和后台已解析的日期。已知系统 FLAGS 在协议读取时按 ASCII 大小写无关规则识别，离线筛选兼容早期已存为自定义拼写的系统标记。显式空 FLAGS 按已知空集合处理，字段缺失仍为未知。对应回归位于 `src/mail/cache_read/query.rs`、`src/mail/sync/tests.rs` 和 `src/mail.rs`。
 
 D2/D3/D4/D5 验证入口为 `src/cache/full_tests.rs`、`src/cache/content_tests.rs`、`src/accounts/cache_run/tests.rs` 和 `src/mail/cache_write_guard/tests.rs`；metadata 和持久游标继续运行 R10 回归。显式离线工具矩阵及故障场景见[实施设计](cache-content-design.md#验收矩阵)。
 
@@ -250,14 +256,14 @@ JSON 日志使用固定事件名和受控字段，记录服务端生成的 reque
 | --- | --- |
 | D1 身份与授权 | `auth::tests::jwt_trust_boundaries`、`failed_refresh_is_shared_and_expired_keys_fail_closed`；`server::output_tests` 的 HTTP 请求鉴权、账户隔离及附件主体检查 |
 | D2 读取与引用 | `mail::tests` 的目标 UID 属性匹配、状态和摘要的 FLAGS 合并、rev1 文件夹往返；`tests/imap_completion.rs` 的完成状态；HTTP 同 UID 双账户与过期 UIDVALIDITY |
-| D3 资源有界 | 六个 `tests/*.rs` 协议集成入口；MIME 头部/解码预算、HTML 分词前属性预算；`server::tests` 的完整 wire 预算与正文前缀；暂存取消与调度配额 |
-| D4 发送与幂等 | `journal::tests` 的重启/主体隔离与并发 claim；`mail::tests` 的 SMTP 未知结果及 accepted 持久化；`smtp::tests` 的 DATA 格式和最终结果 |
+| D3 资源有界 | 六个 `tests/*.rs` 协议集成入口；MIME 头部/解码预算、HTML 分词前属性预算；异步 SMTP 分片响应在累积前的限额；`server::tests` 的完整 wire 预算与正文前缀；暂存取消与调度配额 |
+| D4 发送与幂等 | `journal::tests` 的重启/主体隔离与并发 claim；`mail::tests` 的 SMTP 已知结果持久化、MAIL 前能力拒绝和 DATA 确认丢失后的去重；`smtp::tests` 的 DATA 格式、TLS/AUTH 与响应超限阶段结果 |
 | D5 隐私与内容 | `mail::tests::draft_envelope_and_privacy_filter_share_canonical_fields`；MIME 未知编码与完整 alternative 选择；附件精确字节、授权 GET 及私有暂存 |
 | D6 维护与恢复 | `src/accounts`、`src/cache` 的注册库/世代/迁移/回放回归；CI fmt/test/clippy、依赖审计和容器 release 构建；`scripts/check-cache-recovery.py` 的实际候选二进制恢复检查 |
 
 测试精简移除了大量故障排列、细粒度边界组合、独立客户端原型和 R13 持续负载设施。开发者针对新缺陷增加最小回归，并同步替换重叠用例，保持总体量预算。历史长跑和完整矩阵记录位于 [validation](validation.md)，下方设计记录中的旧测试名称随对应历史工作包保留。
 
-Vendored 包的协议回归集中在根包 `tests/`。两个上游身份继续由 `scripts/audit-dependencies.sh` 检查，Docker 上下文由 `scripts/test-docker-context.sh` 以合成哨兵和实际构建器核验。
+Vendored 包的协议回归集中在根包 `tests/`。`tests/imap_completion.rs` 通过原始 CAPABILITY 响应核对 MOVE、UIDPLUS 等扩展能力的 ASCII 大小写匹配，覆盖写入能力检查和诊断共用的查询接口。各上游身份继续由 `scripts/audit-dependencies.sh` 检查，Docker 上下文由 `scripts/test-docker-context.sh` 以合成哨兵和实际构建器核验。
 
 ## Decision records
 
