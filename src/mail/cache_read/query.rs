@@ -2,10 +2,7 @@
 use super::*;
 use crate::{
     cache::{BODY_INDEX_REBUILD_BATCH, BODY_INDEX_VERSION, SearchPosition, ThreadRole},
-    mail::{
-        classification::{self, Coverage},
-        parts::preview,
-    },
+    mail::{classification, listing::header_summary, parts::preview},
 };
 use base64::Engine;
 
@@ -486,11 +483,6 @@ impl CachedReader {
 }
 
 fn summary(row: &CachedMessage) -> Result<Value> {
-    let coverage = if row.header_complete {
-        Coverage::Complete
-    } else {
-        Coverage::Partial
-    };
     let raw = row.header.as_deref().unwrap_or_default();
     let known = if row.header_complete {
         raw
@@ -498,12 +490,8 @@ fn summary(row: &CachedMessage) -> Result<Value> {
         classification::complete_header_prefix(raw)
     };
     let headers = mime::headers(known)?;
-    let mut value = serde_json::to_value(classification::classify(&headers, coverage))
-        .map_err(|_| MailError::backend())?;
+    let mut value = header_summary(&headers, row.header_complete)?;
     value["uid"] = json!(row.uid);
-    value["subject"] = json!(headers.get_first_value("Subject"));
-    value["from"] = json!(headers.get_first_value("From"));
-    value["date"] = json!(headers.get_first_value("Date"));
     value["size"] = json!(row.size);
     value["flags"] = json!(row.flags);
     value["cache_evidence"] = json!({
@@ -616,7 +604,10 @@ mod tests {
         mail::MailRuntime,
     };
 
-    fn reader_fixture(directory: &std::path::Path, uid_next: u32) -> CachedReader {
+    fn reader_fixture(
+        directory: &std::path::Path,
+        uid_next: u32,
+    ) -> (CachedReader, Arc<AccountCatalog>) {
         let path = directory.join("cache.json");
         std::fs::write(
             &path,
@@ -642,19 +633,22 @@ mod tests {
         cache
             .observe_folder(&account, "INBOX", 9, Some(uid_next), 1)
             .unwrap();
-        CachedReader {
-            cache,
-            account,
-            alias: "default".into(),
-            config,
-            persistent,
-        }
+        (
+            CachedReader {
+                cache,
+                account,
+                alias: "default".into(),
+                config,
+                persistent,
+            },
+            catalog,
+        )
     }
 
     #[tokio::test]
     async fn offline_search_matches_both_internal_date_formats_and_legacy_flags() {
         let directory = tempfile::tempdir().unwrap();
-        let reader = reader_fixture(directory.path(), 5);
+        let (reader, catalog) = reader_fixture(directory.path(), 5);
         let stamp = reader
             .cache
             .listing_stamp(&reader.account, "INBOX", 9)
@@ -683,9 +677,17 @@ mod tests {
         ];
         for (uid, internal_date, flags) in rows {
             let reference = reader.reference("INBOX", 9, uid);
+            let (header, complete) = if uid == 5 {
+                (
+                    b"From: sender@example.invalid\r\nSubject: clipped".as_slice(),
+                    false,
+                )
+            } else {
+                (b"Subject: synthetic\r\n\r\n".as_slice(), true)
+            };
             reader
                 .cache
-                .remember_headers(reference, true, b"Subject: synthetic\r\n\r\n", None)
+                .remember_headers(reference, complete, header, None)
                 .unwrap();
             let flags = flags.map(|flags| {
                 flags
@@ -707,6 +709,38 @@ mod tests {
                 )
                 .unwrap();
         }
+
+        let journal = crate::journal::Journal::open(std::path::Path::new(":memory:")).unwrap();
+        let runtime =
+            MailRuntime::with_cache(catalog, Arc::new(journal), reader.persistent.clone()).unwrap();
+        let page = runtime
+            .execute(
+                "list_emails",
+                &json!({"read_source":"cache","uid_validity":9,"limit":2}),
+                "owner",
+            )
+            .await
+            .unwrap();
+        let schema = crate::server::tools("full")
+            .into_iter()
+            .find(|tool| tool.name == "list_emails")
+            .unwrap()
+            .output_schema
+            .unwrap();
+        let validator = jsonschema::draft202012::options()
+            .build(&json!(schema))
+            .unwrap();
+        let envelope = json!({"data":page,"request_id":"synthetic"});
+        assert!(validator.is_valid(&envelope), "{envelope}");
+        let page = &envelope["data"];
+        let partial = &page["emails"][0];
+        assert_eq!(partial["uid"], 5);
+        assert_eq!(partial["from"], "sender@example.invalid");
+        assert!(partial["subject"].is_null());
+        assert_eq!(partial["header_complete"], false);
+        assert_eq!(partial["cache_evidence"]["header_complete"], false);
+        assert_eq!(page["emails"][1]["header_complete"], true);
+        assert!(page["emails"][1]["from"].is_null());
 
         for (mut args, expected, unknown) in [
             (
@@ -750,7 +784,7 @@ mod tests {
     #[tokio::test]
     async fn offline_index_rebuild_rotates_past_storage_failures_and_retries() {
         let directory = tempfile::tempdir().unwrap();
-        let reader = reader_fixture(directory.path(), 6);
+        let (reader, _) = reader_fixture(directory.path(), 6);
         for uid in 1..=5 {
             let reference = reader.reference("INBOX", 9, uid);
             reader
