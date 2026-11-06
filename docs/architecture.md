@@ -161,6 +161,8 @@ SMTP 使用 lettre 的低层 connection/command/message API，保留 TLS、AUTH�
 
 异步 SMTP 响应在解密后按每行 1,000 字节、每个完整回复 100,000 字节限制累积，计入行结束符。每次追加前核对剩余预算。回复用尽预算仍未完成时丢弃连接和预读数据，跳过 QUIT。该路径覆盖 greeting、EHLO、STARTTLS、AUTH、DATA 和 QUIT。DATA 最终确认超限按未知结果处理，已持久化的接受结果在 QUIT 超限时保留。来源与替换条件见 [lettre 补丁记录](../vendor/lettre/PATCHES.md)。
 
+`save_draft`、`send_email`、`reply_email` 和 `forward_email` 的 `body` 支持 LF 和 CRLF，拒绝裸 CR 和 NUL，按输入 UTF-8 字节计算 65,536 字节上限。lettre 构建邮件时统一使用 CRLF。发送幂等摘要保留调用参数的原始换行。签名 MCP 回归核对写入前拒绝、APPEND 正文解码和操作键重查。
+
 已知 SMTP 接受结果不得因后续日志/数据库更新或清理失败而改为失败。操作记录更新失败时，本次响应保留 `accepted` 并附 `journal_update_failed`；这不等于数据库已经成功保存该结果，后续必须检查操作状态及服务商记录。
 
 草稿发送使用同一个有界规范化头部缓冲区做收件人解释和隐私过滤，在 claim/SMTP 前验证字段名、续行及头/体分隔符，并明确拒绝不支持的 `Resent-*` 语义。To/Cc/Bcc 的每个原始结构化头通过 `mailparse::addrparse_header` 解析，编码显示名称中的标点保持显示数据；重复字段和组地址共同构成信封。BCC 参与信封投递但不进入发送头部；可用于 DATA 的正文原始字节（包括 Base64/quoted-printable 编码附件）保持不变，源草稿保留并返回 `draft_retained`。在 `prepare_draft` 和共同 `claim_send` 边界验证 CRLF、无 NUL、每行最多 998 原始字节（dot-stuffing 新增点不计）；不合规返回固定 `UNSUPPORTED_DATA_FORMAT`，不 claim、不连接，不盲目规范化二进制/MIME 正文。末行无 CRLF 仍允许，由现有 lettre DATA codec 补终结。`SmtpSender::submit` 同样在连接前做防御检查，不将确定未提交的非法格式标为 unknown。8bit 数据仍需 SMTPUTF8/8BITMIME 能力检查，当前未协商 BINARYMIME/BDAT。发送前格式验证见 `smtp::tests`，结构化收件人及隐私过滤见 `mail::tests::draft_envelope_and_privacy_filter_share_canonical_fields`。

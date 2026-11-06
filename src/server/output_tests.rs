@@ -23,11 +23,14 @@ use base64::{
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use std::{
     path::Path,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
     task::JoinHandle,
 };
@@ -128,6 +131,7 @@ type DraftGate = tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<()>>;
 struct Backend {
     port: u16,
     connections: Arc<AtomicUsize>,
+    draft: Arc<Mutex<Option<Vec<u8>>>>,
     task: JoinHandle<()>,
 }
 
@@ -154,12 +158,15 @@ impl Backend {
                 .splice(..0, b"To: recipient@example.test\r\n".iter().copied());
         }
         let message = Arc::new(message);
+        let draft = Arc::new(Mutex::new(None));
+        let captured = draft.clone();
         let task = tokio::spawn(async move {
             while let Ok((socket, _)) = listener.accept().await {
                 count.fetch_add(1, Ordering::SeqCst);
                 let tls = tls.clone();
                 let message = message.clone();
                 let gate = gate.clone();
+                let captured = captured.clone();
                 tokio::spawn(async move {
                     let Ok(stream) = tls.accept(socket).await else {
                         return;
@@ -177,6 +184,18 @@ impl Backend {
                             "EXAMINE INBOX" | "EXAMINE \"INBOX\"" | "EXAMINE \"Drafts\"" => b"* 1 EXISTS\r\n* OK [UIDVALIDITY 9] valid\r\n* OK [UIDNEXT 8] next\r\n".to_vec(),
                             command if command.starts_with("LOGIN ") => Vec::new(),
                             command if command.starts_with("LIST ") => b"* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n".to_vec(),
+                            command if command.starts_with("APPEND \"Drafts\" (\\Draft) {") => {
+                                let size: usize = command.rsplit_once('{').unwrap().1.strip_suffix('}').unwrap().parse().unwrap();
+                                stream.write_all(b"+ continue\r\n").await.unwrap();
+                                stream.flush().await.unwrap();
+                                let mut bytes = vec![0; size];
+                                stream.read_exact(&mut bytes).await.unwrap();
+                                let mut ending = [0; 2];
+                                stream.read_exact(&mut ending).await.unwrap();
+                                assert_eq!(&ending, b"\r\n");
+                                *captured.lock().unwrap() = Some(bytes);
+                                Vec::new()
+                            }
                             command if command.starts_with("UID SEARCH ") => b"* SEARCH 7\r\n".to_vec(),
                             command if command.starts_with("UID FETCH ") => {
                                 let (uids, attrs) = command.strip_prefix("UID FETCH ").unwrap().split_once(' ').unwrap();
@@ -205,6 +224,7 @@ impl Backend {
         Self {
             port,
             connections,
+            draft,
             task,
         }
     }
@@ -258,6 +278,7 @@ struct Harness {
     app: Router,
     credentials: Credentials,
     backends: [Backend; 2],
+    journal: Arc<Journal>,
     cache: crate::mail::PreparedCache,
     _staging: tempfile::TempDir,
 }
@@ -332,7 +353,7 @@ impl Harness {
         };
         let journal = Arc::new(Journal::open(Path::new(":memory:")).unwrap());
         let mail = Arc::new(
-            MailRuntime::with_cache(catalog, journal, cache.clone())
+            MailRuntime::with_cache(catalog, journal.clone(), cache.clone())
                 .unwrap()
                 .with_test_imap_roots(roots),
         );
@@ -348,6 +369,7 @@ impl Harness {
             app,
             credentials,
             backends,
+            journal,
             cache,
             _staging: staging,
         }
@@ -484,6 +506,92 @@ async fn signed_http_reads_keep_same_uid_in_each_authorized_account() {
         .call("owner", "get_email", json!({"uid":7,"uid_validity":8}))
         .await;
     assert_eq!(stale["error"]["code"], "STALE_UID", "{stale}");
+}
+
+#[tokio::test]
+async fn signed_legacy_writes_accept_crlf_in_body_only() {
+    use sha2::{Digest, Sha256};
+
+    async fn write(h: &Harness, name: &str, arguments: &Value) -> Value {
+        let response = h
+            .rpc(
+                Some("owner"),
+                json!(1),
+                "tools/call",
+                json!({"name":name,"arguments":arguments}),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        serde_json::from_slice::<Value>(&bytes).unwrap()["result"]["structuredContent"].clone()
+    }
+
+    let h = Harness::new(false).await;
+    let crlf = "first\r\n中文\nlast\r\n";
+    let lf = "first\n中文\nlast\n";
+    for name in ["save_draft", "send_email", "reply_email", "forward_email"] {
+        let mut args = json!({"to":["recipient@example.test"],"body":crlf});
+        if matches!(name, "save_draft" | "send_email") {
+            args["subject"] = json!("synthetic");
+        } else {
+            args["uid"] = json!(7);
+            args["uid_validity"] = json!(9);
+        }
+        if name != "save_draft" {
+            args["operation_key"] = json!(name);
+            let fingerprint = format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&json!([name, args])).unwrap())
+            );
+            h.journal
+                .claim("owner", name, &fingerprint, "<fixture@example.test>")
+                .unwrap();
+            h.journal.finish("owner", name, "accepted", &[]).unwrap();
+        }
+
+        let before = h.connections();
+        for (field, value) in [
+            ("body", json!("first\rlast")),
+            ("body", json!("first\r")),
+            ("body", json!("first\0last")),
+            ("to", json!(["recipient@example.test\r\n"])),
+        ] {
+            let mut bad = args.clone();
+            bad[field] = value;
+            assert_eq!(
+                write(&h, name, &bad).await["error"]["code"],
+                "INVALID_INPUT",
+                "{name} {field}"
+            );
+        }
+        assert_eq!(h.connections(), before);
+        let result = write(&h, name, &args).await;
+        args["body"] = json!(lf);
+        if name == "save_draft" {
+            assert_eq!(result["data"]["status"], "saved", "{result}");
+            let draft = h.backends[0].draft.lock().unwrap().take().unwrap();
+            assert_eq!(
+                mailparse::parse_mail(&draft).unwrap().get_body().unwrap(),
+                "first\r\n中文\r\nlast\r\n"
+            );
+            assert_eq!(write(&h, name, &args).await["data"]["status"], "saved");
+            let draft = h.backends[0].draft.lock().unwrap().take().unwrap();
+            assert_eq!(
+                mailparse::parse_mail(&draft).unwrap().get_body().unwrap(),
+                "first\r\n中文\r\nlast\r\n"
+            );
+        } else {
+            assert_eq!(
+                result["data"]["operation"]["status"], "accepted",
+                "{name}: {result}"
+            );
+            assert_eq!(
+                write(&h, name, &args).await["error"]["code"],
+                "IDEMPOTENCY_CONFLICT"
+            );
+            assert_eq!(h.connections(), before);
+        }
+    }
 }
 
 #[tokio::test]
