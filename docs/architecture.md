@@ -123,7 +123,7 @@ HTTP 内容固定为 octet-stream，带 no-store/nosniff、`X-Content-SHA256` �
 
 `mail/listing` 在一个绝对期限内完成列表或搜索。附件筛选使用 PartManifest，必须取得目标 SIZE 和验证的 MIME 头；显式策略回退每页最多一次，关闭旧连接、复查 UIDVALIDITY 与大小，再严格读取 raw。回退后以最后已检查 UID 形成短页，剩余候选由原游标继续。两条串行连接共享同一 `BudgetStream` 剩余额度，新连接的 parser allocation limit 采用该剩余值，保持每页原有传输上限。
 
-摘要先完整消费匹配 tagged OK，再解析或缓存。HEADER 请求长度与单条 literal 的分配前上限均为 1 MiB，严格核对目标 UID、HEADER section、origin 0 和唯一头数据；FLAGS-only 不构造空摘要，实际 FLAGS（含空值）按到达顺序更新。短于取样上限的头可以是无正文、无终止空行的完整头；达到上限且没有结束标记时，分类仅使用已完整观察到的逻辑字段，标记 partial。摘要解析共用 MIME 头行数限制。头部缓存沿用各自的 128 KiB 字节及完整性检查，超出缓存上限的摘要头只用于本次响应。连接累计字节和 JSON-RPC 输出预算同时生效。
+摘要先完整消费匹配 tagged OK，再解析或缓存。HEADER 请求长度与单条 literal 的分配前上限均为 1 MiB，严格核对目标 UID、HEADER section、origin 0 和唯一头数据；FLAGS-only 不构造空摘要，实际 FLAGS（含空值）按到达顺序更新。短于取样上限的头可以是无正文、无终止空行的完整头；达到上限且没有结束标记时，摘要和分类只使用已完整观察到的逻辑字段。在线和离线摘要提供 `header_complete`，值为 false 时主题、发件人和日期的 null 表示未知。摘要解析共用 MIME 头行数限制。超出 128 KiB 的摘要头只用于本次响应。按 Message-ID 定位请求 128 KiB 加一字节，匹配 tagged OK 且响应不超过 128 KiB 时视为完整头部，支持末尾无分隔空行的纯头部邮件。连接累计字节和 JSON-RPC 输出预算同时生效。
 
 `mail/parts/preview` 共用完整正文的候选选择、transfer/charset 解码与 HTML 安全策略。每封 8 KiB、整页 128 KiB 编码申请额度包含非空和 EOF 探针，失败命令不退还；取样最多输出 200 Unicode 码点并跨叶折叠空白。只有完整取得所选叶且验证结束时才 flush transfer/charset 或 HTML EOF。部分 HTML 只处理已完成 token，保留原复杂度与 foreign-content 拒绝。预览期限设为 5 秒与总期限剩余一半中的较小值；网络等待按期限取消，同步 MIME 解析受字节/结构界限约束，取样完成后再核对期限。本地错误可继续、协议错误或超时停止后续预览，已经取得的摘要与游标始终保留。筛选已读回的单个 raw 只为匹配 UID 保留至该项本地取样结束，最多 32 MiB，并共用页预览额度。
 
@@ -160,6 +160,8 @@ SMTP 使用 lettre 的低层 connection/command/message API，保留 TLS、AUTH�
 进程收到停机信号即封闭写入登记并停止接受新 HTTP 连接。已登记的写任务保留共享队列和执行许可，HTTP、同步、写入和取消后仍持有许可的读取或附件传输共用从信号开始计时的绝对截止。只有任务和缓存队列完成排空且仍在期限内，缓存才发布 clean receipt。若排空未完成，进程保留运行见证锁至退出。SMTP 已确认结果先持久化再清理，未完成的 sending 在下次启动恢复为 unknown。
 
 异步 SMTP 响应在解密后按每行 1,000 字节、每个完整回复 100,000 字节限制累积，计入行结束符。每次追加前核对剩余预算。回复用尽预算仍未完成时丢弃连接和预读数据，跳过 QUIT。该路径覆盖 greeting、EHLO、STARTTLS、AUTH、DATA 和 QUIT。DATA 最终确认超限按未知结果处理，已持久化的接受结果在 QUIT 超限时保留。来源与替换条件见 [lettre 补丁记录](../vendor/lettre/PATCHES.md)。
+
+`save_draft`、`send_email`、`reply_email` 和 `forward_email` 的 `body` 支持 LF 和 CRLF，拒绝裸 CR 和 NUL，按输入 UTF-8 字节计算 65,536 字节上限。lettre 构建邮件时统一使用 CRLF。发送幂等摘要保留调用参数的原始换行。签名 MCP 回归核对写入前拒绝、APPEND 正文解码和操作键重查。
 
 已知 SMTP 接受结果不得因后续日志/数据库更新或清理失败而改为失败。操作记录更新失败时，本次响应保留 `accepted` 并附 `journal_update_failed`；这不等于数据库已经成功保存该结果，后续必须检查操作状态及服务商记录。
 
@@ -236,7 +238,7 @@ V6 独立持久化扩展水位与修订。基线只能来自同一完整 rev1 �
 
 R12D 的 `mail/sync/qresync` 在 auto 策略中优先协商 QRESYNC，严格要求同连接 CAPABILITY、ENABLED QRESYNC 和匹配 tagged OK。完整非空已知集合至多 200 UID 时使用只读 EXAMINE QRESYNC，较大范围先 EXAMINE CONDSTORE 再按精确 UID 页 FETCH CHANGEDSINCE VANISHED；空集合跳过 FETCH。预览与实际页面通过范围修订和 UID 序列 CAS 复核，生成命令完整长度最多 8192 字节。parser 采用独立有界入口，完整命令预算 128 KiB，VANISHED 区间在分配前限数并保持压缩；EARLIER 必须属于请求集合，实时删除核对 UIDNEXT 与事件顺序。各协议回退共享每步骤至多两条实际连接、原期限和累计传输预算。
 
-已确认删除先建立进程内范围围栏。小量删除与 FLAGS/分页原子提交；超出有界提交额度时推进持久 dirty 修订并开启新的完整 rev1 核对，完成前暂停离线交付和 clean receipt。前台读写入口在网络之前捕获证据修订，正向缓存写入在入队和执行时核对；核对结束保留范围修订，拒绝旧网络结果的迟到写回。已开始的 FIFO 写入通过队列屏障结清后才冻结新的审计，使先前未知 UID 也纳入存在性核对。失败保留围栏，正常关闭仍等待队列与许可释放。该机制沿用 V6，D1/D2/D3 的验证位置为 `src/cache/sync_state/delta/tests.rs`、`src/mail/sync/qresync/tests.rs`、`src/server/output_tests/qresync_acceptance.rs` 和 `tests/sync_qresync_budget.rs`。
+已确认删除先建立进程内范围围栏。已选择目录的 UID FETCH 逐帧处理实时 VANISHED，失败或取消保留围栏，EARLIER、FLAGS 与水位继续等待匹配 tagged OK。小量删除与 FLAGS/分页原子提交；超出有界提交额度时推进持久 dirty 修订并开启新的完整 rev1 核对，完成前暂停离线交付和 clean receipt。前台读写入口在网络之前捕获证据修订，正向缓存写入在入队和执行时核对；核对结束保留范围修订，拒绝旧网络结果的迟到写回。已开始的 FIFO 写入通过队列屏障结清后才冻结新的审计，使先前未知 UID 也纳入存在性核对。失败保留围栏，正常关闭仍等待队列与许可释放。该机制沿用 V6，D1/D2/D3 的验证位置为 `src/cache/sync_state/delta/tests.rs`、`src/mail/sync/qresync/tests.rs`、`src/server/output_tests/qresync_acceptance.rs` 和 `tests/sync_qresync_budget.rs`。
 
 ## Local operation store
 
@@ -259,7 +261,7 @@ JSON 日志使用固定事件名和受控字段，记录服务端生成的 reque
 | 原则 | 当前验证入口 |
 | --- | --- |
 | D1 身份与授权 | `auth::tests::jwt_trust_boundaries`、`failed_refresh_is_shared_and_expired_keys_fail_closed`；`server::output_tests` 的 HTTP 请求鉴权、账户隔离及附件主体检查 |
-| D2 读取与引用 | `mail::tests` 的目标 UID 属性匹配、状态和摘要的 FLAGS 合并、rev1 文件夹往返；`tests/imap_completion.rs` 的完成状态；HTTP 同 UID 双账户与过期 UIDVALIDITY |
+| D2 读取与引用 | `mail::tests` 的目标 UID 属性匹配、状态和摘要的 FLAGS 合并、摘要截断覆盖和纯头部邮件定位、rev1 文件夹往返；`tests/imap_completion.rs` 的完成状态；HTTP 同 UID 双账户与过期 UIDVALIDITY |
 | D3 资源有界 | 六个 `tests/*.rs` 协议集成入口；MIME 头部/解码预算、HTML 分词前属性预算；异步 SMTP 分片响应在累积前的限额；`server::tests` 的完整 wire 预算与正文前缀；暂存取消与调度配额 |
 | D4 发送与幂等 | `journal::tests` 的重启/主体隔离与并发 claim；`mail::tests` 的 SMTP 已知结果持久化、MAIL 前能力拒绝和 DATA 确认丢失后的去重；Unix 子进程的 SIGTERM 和已接纳写入排空；`smtp::tests` 的 DATA 格式、TLS/AUTH 与响应超限阶段结果 |
 | D5 隐私与内容 | `mail::tests::draft_envelope_and_privacy_filter_share_canonical_fields`；MIME 未知编码与完整 alternative 选择；附件精确字节、授权 GET 及私有暂存 |

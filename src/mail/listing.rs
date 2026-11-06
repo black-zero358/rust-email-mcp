@@ -275,30 +275,17 @@ impl MailService {
             let complete = header.len() < SUMMARY_HEADER_BYTES
                 || header.ends_with(b"\r\n\r\n")
                 || header.ends_with(b"\n\n");
-            let (classification, headers) = if complete {
-                let headers = mime::summary_headers(header, SUMMARY_HEADER_BYTES)?;
-                self.remember_headers(mailbox, validity, id, header);
-                (
-                    classification::classify(&headers, Coverage::Complete),
-                    headers,
-                )
+            let known = if complete {
+                header
             } else {
-                let prefix = classification::complete_header_prefix(header);
-                let known = mime::summary_headers(prefix, SUMMARY_HEADER_BYTES)?;
-                // Preserve existing summary fields where the partial literal can
-                // be parsed. Classification uses only fully observed fields.
-                let classification = classification::classify(&known, Coverage::Partial);
-                (
-                    classification,
-                    mime::summary_headers(header, SUMMARY_HEADER_BYTES).unwrap_or(known),
-                )
+                classification::complete_header_prefix(header)
             };
-            let mut email =
-                serde_json::to_value(classification).map_err(|_| MailError::backend())?;
+            let headers = mime::summary_headers(known, SUMMARY_HEADER_BYTES)?;
+            if complete {
+                self.remember_complete_headers(mailbox, validity, id, header);
+            }
+            let mut email = header_summary(&headers, complete)?;
             email["uid"] = json!(id);
-            email["subject"] = json!(headers.get_first_value("Subject"));
-            email["from"] = json!(headers.get_first_value("From"));
-            email["date"] = json!(headers.get_first_value("Date"));
             email["size"] = json!(summary.size);
             email["flags"] = json!(summary.flags.as_deref().unwrap_or_default());
             if listing_stamp.is_some() {
@@ -322,6 +309,24 @@ impl MailService {
         }
         Ok(emails)
     }
+}
+
+pub(super) fn header_summary(
+    headers: &[mailparse::MailHeader<'_>],
+    complete: bool,
+) -> Result<Value> {
+    let coverage = if complete {
+        Coverage::Complete
+    } else {
+        Coverage::Partial
+    };
+    let mut value = serde_json::to_value(classification::classify(headers, coverage))
+        .map_err(|_| MailError::backend())?;
+    value["header_complete"] = json!(complete);
+    value["subject"] = json!(headers.get_first_value("Subject"));
+    value["from"] = json!(headers.get_first_value("From"));
+    value["date"] = json!(headers.get_first_value("Date"));
+    Ok(value)
 }
 
 pub(super) async fn select_list_mailbox<S>(

@@ -24,7 +24,7 @@
 
 预览字段仅在请求时返回：`preview_status` 为 `ok`、`empty`、`budget_skipped`、`error`、`unprocessed` 或 `wire_budget_skipped`。成功或完整空正文附 `preview` 和 `preview_truncated`；错误附脱敏 `preview_error`。UTF-7 和其他不支持的取样字符集返回逐项 `UNSUPPORTED_BODY`，可通过完整正文读取工具读取 UTF-7 邮件。单项本地错误后继续；协议失败或预览子期限结束后，保留摘要并将后续预览标为 unprocessed。预览读取期限设为 5 秒与剩余操作时间一半中的较小值；网络等待按期限取消，同步 MIME 取样受字节和结构预算约束，完成后再次核对期限。完整 JSON-RPC 超限时从页尾移除可选预览，标 wire_budget_skipped；若逐项状态仍放不下，则省略整页的预览字段，保留 UID、摘要、分类和游标。客户端在请求预览后收到无预览字段的摘要时，应按响应预算省略处理；仅基础元数据超限返回 `LIMIT_EXCEEDED`。
 
-列表摘要始终提供 `classification`、`classification_signals`、`classification_rule_version:headers-v1`、`classification_status` 和 `unsubscribe_available`。合法 List-Id、List-Unsubscribe、List-Unsubscribe-Post 或 `Precedence:list` 产生 newsletter；非 no 的合法 Auto-Submitted，或 `Precedence:bulk|junk|auto_reply` 产生 automated。两类可并存，无信号时为 unclassified。signals 仅含固定字段名与类别，按固定顺序去重。摘要头最多 1 MiB；classification_status 为 partial 时，只使用已经完整观察到的字段。
+列表摘要始终提供 `classification`、`classification_signals`、`classification_rule_version:headers-v1`、`classification_status` 和 `unsubscribe_available`。合法 List-Id、List-Unsubscribe、List-Unsubscribe-Post 或 `Precedence:list` 产生 newsletter；非 no 的合法 Auto-Submitted，或 `Precedence:bulk|junk|auto_reply` 产生 automated。两类可并存，无信号时为 unclassified。signals 仅含固定字段名与类别，按固定顺序去重。摘要头最多 1 MiB。在线和离线摘要均返回 `header_complete`。值为 false 时，分类和主题、发件人、日期只使用已完整观察到的字段，null 表示未知。值为 true 时，null 表示完整头部中缺少该字段。
 
 `unsubscribe_available` 表示 List-Unsubscribe 中存在受支持的 http/https/mailto URI；最多 2048 字节，拒绝认证信息及控制字符。服务只检查字段，不访问地址、不退订、不修改邮件。完整正文继续使用 `get_email` 或 `get_emails`。
 

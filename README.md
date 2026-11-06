@@ -59,7 +59,7 @@
 
 | 任务 | 常用工具与行为 |
 | --- | --- |
-| 找邮件和读正文 | `list_emails`、`search_emails` 支持组合筛选、分页和可选预览。用 `get_email` 或 `get_emails` 读取单封或批量正文。 |
+| 找邮件和读正文 | `list_emails`、`search_emails` 支持组合筛选、分页和可选预览。摘要的 `header_complete` 为 false 时，主题、发件人和日期中的 `null` 表示未知。用 `get_email` 或 `get_emails` 读取单封或批量正文。 |
 | 追踪往来 | `read_conversation` 按邮件关联头串起收件箱、已发送和配置的归档目录，可分页追查并保留副本来源。用 `locate_message` 按精确 Message-ID 定位。 |
 | 下载附件 | `list_attachments` 查附件，`download_attachment` 返回小文件的 Base64，`prepare_attachment_download` 生成短期认证下载地址。 |
 | 访问多个邮箱 | `list_accounts` 和 `list_mailboxes` 列出当前主体可用的账户和文件夹。实例最多配置 16 个邮箱，追加账户固定只读。 |
@@ -69,6 +69,8 @@
 附件的 HTTP GET 需要**同一 OAuth 主体**的有效 Bearer 令牌，文件提供 SHA-256 校验。客户端取得文件后交给文件解析工具。[标准适配器](scripts/attachment-client-adapter/README.md)支持下载、校验和落盘。当前附件下载与内容读取使用合成文件离线验收，ChatGPT 文件接收待实测。
 
 持久缓存默认关闭，启用后仍默认在线读取。支持离线的工具可传 `read_source:"cache"`，搜索和 Message-ID 定位使用 `search_source:"cache"`。后台同步需在 full 缓存中单独启用。[缓存配置与同步](docs/deployment.md#持久缓存配置)
+
+四个纯文本写入工具的正文支持 LF 和 CRLF，最多 65,536 UTF-8 字节。重用发送的 `operation_key` 时需原样提交参数，包括正文换行。
 
 离线全文搜索返回正文索引覆盖；`search_index.rebuild_pending` 为 true 时，初始搜索会继续从本地正文重建旧索引。升级后请重新开始先前的搜索分页。[离线查询契约](docs/capabilities.md#诊断统计和缓存)
 
