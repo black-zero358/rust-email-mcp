@@ -30,6 +30,7 @@ pub(super) enum Fault {
 #[derive(Default)]
 pub(super) struct Protocol {
     bodies: Mutex<BTreeMap<(u32, String), Vec<u8>>>,
+    eof_bytes: Mutex<BTreeMap<(u32, String), u8>>,
     faults: Mutex<BTreeMap<usize, Fault>>,
     requests: Mutex<Vec<(usize, usize)>>,
 }
@@ -43,6 +44,12 @@ impl Protocol {
             .lock()
             .unwrap()
             .insert((uid, section.into()), bytes.to_vec());
+    }
+    pub(super) fn install_eof_byte(&self, uid: u32, section: &str, byte: u8) {
+        self.eof_bytes
+            .lock()
+            .unwrap()
+            .insert((uid, section.into()), byte);
     }
     pub(super) fn completion(&self, fetch: &str, tag: &str) -> Option<Vec<u8>> {
         let offset = fetch
@@ -81,8 +88,9 @@ impl Protocol {
         let (offset, count) = range.strip_suffix(">)")?.split_once('.')?;
         let offset = offset.parse::<usize>().ok()?;
         let count = count.parse::<usize>().ok()?;
+        let key = (uid, section.into());
         let bodies = self.bodies.lock().unwrap();
-        let body = bodies.get(&(uid, section.into()))?;
+        let body = bodies.get(&key)?;
         self.requests.lock().unwrap().push((offset, count));
         let fault = self.faults.lock().unwrap().get(&offset).copied();
         match fault {
@@ -99,6 +107,12 @@ impl Protocol {
             .take(count)
             .copied()
             .collect::<Vec<_>>();
+        if offset == body.len()
+            && count == 1
+            && let Some(byte) = self.eof_bytes.lock().unwrap().get(&key)
+        {
+            bytes.push(*byte);
+        }
         match fault {
             Some(Fault::Short) => {
                 bytes.pop();

@@ -39,6 +39,7 @@ pub(in crate::mail) enum Fallback {
     WholeMultipart,
     HeaderBudget,
     CharsetUtf7,
+    BodyEofMismatch,
 }
 impl Fallback {
     pub(super) fn diagnostics(self) -> ManifestDiagnostics {
@@ -52,6 +53,7 @@ impl Fallback {
                 Self::WholeMultipart => "whole_multipart_attachment",
                 Self::HeaderBudget => "header_budget",
                 Self::CharsetUtf7 => "charset_utf7",
+                Self::BodyEofMismatch => "body_eof_mismatch",
             }),
             limit_kind: matches!(self, Self::StructureLimit).then_some("mime_structure"),
         }

@@ -603,6 +603,105 @@ async fn utf7_fallback_checks_validity_and_healthy_replacement_sessions_serve_la
     assert_eq!(h.connections.load(Ordering::SeqCst), 2);
 }
 
+async fn body_eof_mismatch_fixture() -> (Harness, usize) {
+    let first = Entity::text("Canonical body");
+    let later = Entity::text("Healthy later UID");
+    let h = Harness::new(
+        BTreeMap::from([(7, first.raw(7)), (8, later.raw(8))]),
+        None,
+        128 * 1024,
+    )
+    .await;
+    first.install(&h, 7);
+    later.install(&h, 8);
+    // The regular partial FETCH matches BODYSTRUCTURE. Only the exact EOF
+    // probe receives this byte, which is absent from the raw message.
+    h.parts.install_eof_byte(7, "1", b'x');
+    (h, first.encoded.len())
+}
+
+#[tokio::test]
+async fn completed_body_eof_mismatch_reads_raw_once_and_reuses_the_fresh_session() {
+    let (h, eof) = body_eof_mismatch_fixture().await;
+    let (app, token) = signed(&h);
+    let result = call(&h, &app, &token, "get_emails", json!({"uids":[7,7,8]})).await;
+    let items = result["data"]["items"].as_array().unwrap();
+    assert_eq!(result["data"]["completed"], 3);
+    assert_eq!(items[0]["email"]["body"], "Canonical body");
+    assert_eq!(
+        items[0]["email"]["read_diagnostics"],
+        json!({"source":"raw","fallback_reason":"body_eof_mismatch","limit_kind":null})
+    );
+    assert_eq!(items[0], items[1]);
+    assert_eq!(items[2]["email"]["body"], "Healthy later UID");
+    assert_eq!(
+        items[2]["email"]["read_diagnostics"]["source"],
+        "bodystructure"
+    );
+    assert_eq!(h.connections.load(Ordering::SeqCst), 2);
+    let raw = raw_fetches(&h);
+    assert_eq!(raw.len(), 1);
+    assert_eq!(raw[0].0, 2);
+    assert!(raw[0].1.starts_with("UID FETCH 7 (UID BODY.PEEK[]<0."));
+    let log = commands(&h);
+    assert!(log.contains(&(1, format!("UID FETCH 7 (UID BODY.PEEK[1]<{eof}.1>)"))));
+    assert!(log.contains(&(2, "EXAMINE \"INBOX\"".into())));
+    assert!(log.contains(&(2, "UID FETCH 7 (UID RFC822.SIZE)".into())));
+    assert!(log.contains(&(2, "UID FETCH 8 (UID RFC822.SIZE)".into())));
+}
+
+#[tokio::test]
+async fn body_eof_mismatch_fallback_requires_exact_data_and_matching_completion() {
+    for fault in [
+        parts::Fault::WrongOrigin,
+        parts::Fault::WrongSection,
+        parts::Fault::Duplicate,
+        parts::Fault::Missing,
+        parts::Fault::Oversized,
+        parts::Fault::NoAfterData,
+        parts::Fault::BadAfterData,
+        parts::Fault::ByeAfterData,
+        parts::Fault::EofAfterData,
+        parts::Fault::WrongTagAfterData,
+    ] {
+        let (h, eof) = body_eof_mismatch_fixture().await;
+        h.parts.fail_at(eof, fault);
+        let (app, token) = signed(&h);
+        let result = call(&h, &app, &token, "get_emails", json!({"uids":[7,8]})).await;
+        let items = result["data"]["items"].as_array().unwrap();
+        let code = if matches!(fault, parts::Fault::Oversized) {
+            "LIMIT_EXCEEDED"
+        } else {
+            "MAIL_BACKEND"
+        };
+        assert_eq!(items[0]["error"]["code"], code, "{fault:?}: {result}");
+        assert_eq!(items[1]["status"], "unprocessed", "{fault:?}: {result}");
+        assert_eq!(h.connections.load(Ordering::SeqCst), 1);
+        assert!(raw_fetches(&h).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn body_eof_mismatch_respects_the_raw_size_limit_and_keeps_the_completed_session() {
+    let (h, _) = body_eof_mismatch_fixture().await;
+    let size = config::DEFAULT_MAX_MESSAGE + 1;
+    h.structure.sizes.lock().unwrap().insert(
+        7,
+        structure::Reply::Data(format!("* 1 FETCH (UID 7 RFC822.SIZE {size})\r\n").into_bytes()),
+    );
+    let (app, token) = signed(&h);
+    let result = call(&h, &app, &token, "get_emails", json!({"uids":[7,8]})).await;
+    let items = result["data"]["items"].as_array().unwrap();
+    assert_eq!(items[0]["error"]["code"], "LIMIT_EXCEEDED");
+    assert_eq!(
+        items[0]["error"]["details"]["limit_kind"],
+        "raw_message_bytes"
+    );
+    assert_eq!(items[1]["email"]["body"], "Healthy later UID");
+    assert_eq!(h.connections.load(Ordering::SeqCst), 1);
+    assert!(raw_fetches(&h).is_empty());
+}
+
 #[tokio::test]
 async fn completed_local_codec_failures_leave_batch_sessions_usable_even_with_zero_display() {
     for entity in [

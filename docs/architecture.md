@@ -123,13 +123,13 @@ HTTP 内容固定为 octet-stream，带 no-store/nosniff、`X-Content-SHA256` �
 
 `mail/listing` 在一个绝对期限内完成列表或搜索。附件筛选使用 PartManifest，必须取得目标 SIZE 和验证的 MIME 头；显式策略回退每页最多一次，关闭旧连接、复查 UIDVALIDITY 与大小，再严格读取 raw。回退后以最后已检查 UID 形成短页，剩余候选由原游标继续。两条串行连接共享同一 `BudgetStream` 剩余额度，新连接的 parser allocation limit 采用该剩余值，保持每页原有传输上限。
 
-摘要先完整消费匹配 tagged OK，再解析或缓存。单个 HEADER literal 最多 8192 字节，严格核对目标 UID、HEADER section、origin 0 和唯一头数据；FLAGS-only 不构造空摘要，实际 FLAGS（含空值）按到达顺序更新。短于取样上限的头可以是无正文、无终止空行的完整头；达到上限且没有结束标记时，分类仅使用已完整观察到的逻辑字段，标记 partial。头部缓存仍遵守其原完整性检查。
+摘要先完整消费匹配 tagged OK，再解析或缓存。HEADER 请求长度与单条 literal 的分配前上限均为 1 MiB，严格核对目标 UID、HEADER section、origin 0 和唯一头数据；FLAGS-only 不构造空摘要，实际 FLAGS（含空值）按到达顺序更新。短于取样上限的头可以是无正文、无终止空行的完整头；达到上限且没有结束标记时，分类仅使用已完整观察到的逻辑字段，标记 partial。摘要解析共用 MIME 头行数限制。头部缓存沿用各自的 128 KiB 字节及完整性检查，超出缓存上限的摘要头只用于本次响应。连接累计字节和 JSON-RPC 输出预算同时生效。
 
 `mail/parts/preview` 共用完整正文的候选选择、transfer/charset 解码与 HTML 安全策略。每封 8 KiB、整页 128 KiB 编码申请额度包含非空和 EOF 探针，失败命令不退还；取样最多输出 200 Unicode 码点并跨叶折叠空白。只有完整取得所选叶且验证结束时才 flush transfer/charset 或 HTML EOF。部分 HTML 只处理已完成 token，保留原复杂度与 foreign-content 拒绝。预览期限设为 5 秒与总期限剩余一半中的较小值；网络等待按期限取消，同步 MIME 解析受字节/结构界限约束，取样完成后再核对期限。本地错误可继续、协议错误或超时停止后续预览，已经取得的摘要与游标始终保留。筛选已读回的单个 raw 只为匹配 UID 保留至该项本地取样结束，最多 32 MiB，并共用页预览额度。
 
 列表分类采用固定 `headers-v1`：信号只包含允许字段名和类别。退订 URI 的语法、2048 字节及协议检查均在本地完成，不访问外部地址。完整响应预算通过 `bounded_listing_result` 计入真实 JSON-RPC id、request_id 及转义副本；必要时从尾部撤掉预览并标记 wire_budget_skipped。状态字段仍超限时，整页省略全部可选预览字段，保留摘要、分类及分页信息；仅基础元数据超限返回 LIMIT_EXCEEDED。
 
-`get_email`、`get_emails` 和 `read_conversation` 共用 `mail/parts/body` 的正文读取会话。先完成独立 SIZE、BODYSTRUCTURE 和必要 MIME 头核对，再由 `mime/selection` 在 raw 树与已核对部件树上使用同一候选规则。所有选中叶按原 DFS 顺序共享编码长度四倍的 32 MiB 解码预留和 HTML 预算；transfer 与 charset 状态跨 64 KiB 块保留。完整正文验证后应用显示截断，包括 `max_body_length:0`。成功输出增加有界 `read_diagnostics`，UTF-7 的固定 raw 回退原因为 `charset_utf7`。
+`get_email`、`get_emails` 和 `read_conversation` 共用 `mail/parts/body` 的正文读取会话。先完成独立 SIZE、BODYSTRUCTURE 和必要 MIME 头核对，再由 `mime/selection` 在 raw 树与已核对部件树上使用同一候选规则。所有选中叶按原 DFS 顺序共享编码长度四倍的 32 MiB 解码预留和 HTML 预算；transfer 与 charset 状态跨 64 KiB 块保留。完整正文验证后应用显示截断，包括 `max_body_length:0`。成功输出增加有界 `read_diagnostics`，UTF-7 的固定 raw 回退原因为 `charset_utf7`。正文末尾探测按目标 UID、section 和声明长度偏移请求 1 字节。匹配 tagged OK 后，空结果表示正文结束，1 字节触发 `body_eof_mismatch`，在同一累计传输预算和期限内按整封大小上限回退一次。新连接重新 EXAMINE，核对 UIDVALIDITY 和 RFC822.SIZE 后读取整封。
 
 `get_emails` 按明确的命令完成状态区分失败：匹配 tagged OK 后的本地 MIME、字符集或展示错误只记录单项失败并继续；映射失败且整封大小超限时，同样检查元数据命令是否完成。目标数据不匹配、必要属性缺失、header/body 协议失败或连接预算错误停止后续读取，后续 UID 明确 `unprocessed`。`completed` 保持已尝试输入项数的含义，重复 UID 保留输入顺序及逐项结果。错误码与连接可继续性分别记录。依据 [RFC 3501 §2.2.2](https://www.rfc-editor.org/rfc/rfc3501#section-2.2.2) 的命令终结语义。
 

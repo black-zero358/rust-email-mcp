@@ -8,7 +8,7 @@ use async_imap::types::{CommandReadLimits, Flag};
 use imap_proto::{AttributeValue, MessageSection, Response, SectionPath};
 use tokio::time::{Duration, Instant};
 
-const SUMMARY_HEADER_BYTES: usize = 8192;
+const SUMMARY_HEADER_BYTES: usize = 1024 * 1024;
 const PREVIEW_TIME: Duration = Duration::from_secs(5);
 
 pub(super) struct ListScan {
@@ -275,7 +275,7 @@ impl MailService {
                 || header.ends_with(b"\r\n\r\n")
                 || header.ends_with(b"\n\n");
             let (classification, headers) = if complete {
-                let headers = mime::headers(header)?;
+                let headers = mime::summary_headers(header, SUMMARY_HEADER_BYTES)?;
                 self.remember_headers(mailbox, validity, id, header);
                 (
                     classification::classify(&headers, Coverage::Complete),
@@ -283,11 +283,14 @@ impl MailService {
                 )
             } else {
                 let prefix = classification::complete_header_prefix(header);
-                let known = mime::headers(prefix)?;
+                let known = mime::summary_headers(prefix, SUMMARY_HEADER_BYTES)?;
                 // Preserve existing summary fields where the partial literal can
                 // be parsed. Classification uses only fully observed fields.
                 let classification = classification::classify(&known, Coverage::Partial);
-                (classification, mime::headers(header).unwrap_or(known))
+                (
+                    classification,
+                    mime::summary_headers(header, SUMMARY_HEADER_BYTES).unwrap_or(known),
+                )
             };
             let mut email =
                 serde_json::to_value(classification).map_err(|_| MailError::backend())?;
@@ -305,7 +308,7 @@ impl MailService {
                     size: summary.size,
                 });
             }
-            if persistent {
+            if persistent && header.len() <= crate::cache::MAX_CACHED_HEADER_BYTES {
                 observations.push(persistence::HeaderObservation::new(
                     id, header, complete, &headers,
                 ));

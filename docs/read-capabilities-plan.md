@@ -401,6 +401,7 @@ UIDVALIDITY 改变立即停用旧世代数据、句柄和游标，后台清理�
 | R11 | 基础 [PR #76](https://github.com/black-zero358/rust-email-mcp/pull/76) 已通过最终 CI 并合并为 `f403187`。应用源码 `4a14cfe` 已接入 full、V3 存储、完整离线工具矩阵、运行见证与既有写入口失效；482 单元 + 44 集成、fmt/clippy/release、8 文件联调及隔离恢复烟测通过，独立审阅问题已修复 | [实施设计](cache-content-design.md)、[应用验证](validation.md#2026-11-05-r11-完整离线读取)；应用 [PR #77](https://github.com/black-zero358/rust-email-mcp/pull/77) 最终 head `485232e` 的 check/audit/container 全部通过，独立审阅闭环，合并为 `5e45e59`；R11 全部完成 |
 | R12 | A/B/C/D 全部完成。D 批源码 `4963b8b` 接入 QRESYNC 同连接协商、独立删除水位、有界 VANISHED 与迟到写回围栏；560 单元 + 57 集成、fmt/clippy/release、八文件联调、V6 恢复、审计、实际镜像与独立审阅通过 | A 批 [PR #78](https://github.com/black-zero358/rust-email-mcp/pull/78) 合并为 `a226545`；B 批 [PR #79](https://github.com/black-zero358/rust-email-mcp/pull/79) 合并为 `68b3235`；C 批 [PR #80](https://github.com/black-zero358/rust-email-mcp/pull/80) 合并为 `62f353b`；D 批 [PR #81](https://github.com/black-zero358/rust-email-mcp/pull/81) 最终 head `4eaa844` 三项 CI 成功，合并为 `c4bdfc2`；[同步设计](cache-sync-design.md)、[QRESYNC 验证](validation.md#2026-11-05-r12-qresync-标记与删除同步) |
 | R13 | 实现与离线验收完成；源码 `706cbdc` 的 560 单元 + 57 集成、fmt/Clippy 与客户端联调通过；1812 秒持续验收核对双账户四范围 10,064 封及 1,006 附件全部物化，四路慢下载、资源和增量进度通过独立复核；提交绑定的 musl 静态候选与 V6 恢复通过 | [PR #82](https://github.com/black-zero358/rust-email-mcp/pull/82) 汇总最终 CI、独立审阅与合并记录；[整体验收及产物摘要](validation.md#2026-11-05-r13-整体验收与-022-候选)、[运行与发布流程](maintenance.md#离线持续验收)；真实 ChatGPT 与真实邮箱验收按独立授权安排 |
+| R07/R08 QQ IMAP 兼容修复 | 摘要 HEADER 请求与分配前上限为 1 MiB；已成功完成的正文末尾探测返回额外 1 字节时触发一次有界整封回退 | 合成回归和审阅随修复 PR；隔离 QQ 复验与生产切换按部署流程单独验收 |
 
 ## 对照实现
 

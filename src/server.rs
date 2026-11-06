@@ -167,6 +167,15 @@ fn bounded_tool_result(
             return Ok(compact);
         }
     }
+    wire_limit_result(request_id, id, limit, status.as_deref())
+}
+
+fn wire_limit_result(
+    request_id: &str,
+    id: &RequestId,
+    limit: usize,
+    status: Option<&str>,
+) -> std::result::Result<CallToolResult, ErrorData> {
     let mut fallback = json!({"error":MailError::limit_kind(crate::error::LimitKind::WireResponseBytes),"request_id":request_id,
         "recovery":"Inspect get_operation with the original operation_key before retrying a write.",
         "retry_allowed":false});
@@ -294,18 +303,32 @@ fn bounded_listing_result(
     limit: usize,
 ) -> std::result::Result<CallToolResult, ErrorData> {
     let result = result.map(|mut value| {
+        // Header fields appear in both the structured data and its text copy.
+        // Reject oversized base summaries before cloning for preview trimming.
+        let header_bytes: usize = value["emails"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|email| ["subject", "from", "date"].map(|key| &email[key]))
+            .filter_map(Value::as_str)
+            .map(str::len)
+            .sum();
+        if header_bytes > limit / 2 {
+            return None;
+        }
         let fits = |value: &Value| {
-            response_fits(
-                &CallToolResult::structured(json!({"data":value,"request_id":request_id})),
-                id,
-                limit,
-            )
+            serialized_fits(value, limit / 2)
+                && response_fits(
+                    &CallToolResult::structured(json!({"data":value,"request_id":request_id})),
+                    id,
+                    limit,
+                )
         };
         if fits(&value) {
-            return value;
+            return Some(value);
         }
         let Some(emails) = value.get("emails").and_then(Value::as_array) else {
-            return value;
+            return Some(value);
         };
         let previews = emails
             .iter()
@@ -340,7 +363,7 @@ fn bounded_listing_result(
             }
             render(low, &mut value);
             if fits(&value) {
-                return value;
+                return Some(value);
             }
         }
         // A tight response budget may accommodate the summaries alone.
@@ -356,9 +379,12 @@ fn bounded_listing_result(
                 }
             }
         }
-        value
+        serialized_fits(&value, limit / 2).then_some(value)
     });
-    bounded_tool_result(result, request_id, id, limit)
+    match result.transpose() {
+        Some(result) => bounded_tool_result(result, request_id, id, limit),
+        None => wire_limit_result(request_id, id, limit, None),
+    }
 }
 pub fn is_send(name: &str) -> bool {
     ["send_email", "send_draft", "reply_email", "forward_email"].contains(&name)

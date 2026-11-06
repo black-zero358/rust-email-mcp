@@ -402,7 +402,10 @@ where
                 .map_err(|fault| match fault {
                     body::StructuredFault::Command(error) => ContentError::command(error),
                     body::StructuredFault::Local(error) => ContentError::decoded(error),
-                    body::StructuredFault::RawFallback => {
+                    body::StructuredFault::RawFallback(reader::Fallback::BodyEofMismatch) => {
+                        ContentError::command(MailError::backend())
+                    }
+                    body::StructuredFault::RawFallback(_) => {
                         ContentError::Terminal(Omission::UnsupportedContent)
                     }
                 })?;
