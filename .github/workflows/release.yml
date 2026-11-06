@@ -2,6 +2,12 @@ name: Release
 on:
   push:
     tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/release.yml
+      - scripts/package-release.sh
+      - scripts/check-cache-recovery.py
 
 concurrency:
   group: release-${{ github.ref }}
@@ -12,7 +18,7 @@ permissions:
 
 jobs:
   package:
-    if: github.event.created && !github.event.deleted
+    if: github.event_name == 'pull_request' || (github.event.created && !github.event.deleted)
     runs-on: ubuntu-24.04
     permissions:
       actions: read
@@ -24,17 +30,18 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-      - name: Verify tag and source version
+      - name: Resolve source and verify the version tag
         id: source
         shell: bash
         run: |
           version=$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ || "$GITHUB_REF_NAME" != "v$version" ]]; then
+          if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF_NAME" != "v$version" ]]; then
             echo "::error::Tag $GITHUB_REF_NAME must match Cargo.toml version $version."
             exit 1
           fi
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - name: Require full main CI on the tagged commit
+        if: github.event_name == 'push'
         id: ci
         shell: bash
         env:
@@ -57,11 +64,18 @@ jobs:
             exit 1
           fi
           echo "url=$(jq -r '.html_url' <<< "$run")" >> "$GITHUB_OUTPUT"
-      - name: Install musl build tools
+      - name: Prepare the musl build and recovery sandbox
+        shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends musl-tools
-          rustup target add x86_64-unknown-linux-musl
+          toolchain=$(awk -F '"' '/^channel = "/ { print $2; exit }' rust-toolchain.toml)
+          rustup toolchain install "$toolchain" --profile minimal --target x86_64-unknown-linux-musl
+          # Ubuntu 24.04 may restrict user namespaces on the ephemeral runner.
+          if ! unshare --user --map-root-user --net -- true; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            unshare --user --map-root-user --net -- true
+          fi
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           version: '0.11.18'
@@ -74,6 +88,7 @@ jobs:
           bash scripts/package-release.sh --source-sha "$SOURCE_SHA" \
             --output "$RUNNER_TEMP/release" --schema-version 6
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: github.event_name == 'push'
         with:
           name: release-package
           path: ${{ runner.temp }}/release/
@@ -81,6 +96,7 @@ jobs:
           overwrite: true
 
   publish:
+    if: github.event_name == 'push'
     needs: package
     runs-on: ubuntu-24.04
     permissions:

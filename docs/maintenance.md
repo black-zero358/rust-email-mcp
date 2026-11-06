@@ -61,6 +61,8 @@ R11B 每次启动在账户注册库旁推进独立运行见证，off 模式也�
 
 若 CI 或附件上传暂时失败，排查后重新运行失败的 Release 工作流。同名附件与本次产物的 SHA-256 一致时直接复用，有冲突时停止发布。修正已发布产物时按新版本发布。
 
+修改发布工作流、打包脚本或恢复烟测的 PR 会在 GitHub runner 上执行打包与恢复验收。发布权限仅授予版本 tag 的发布 job。
+
 ## 离线持续验收
 
 在 Linux 上使用固定工具链执行 `cargo test --release --locked --lib --no-run --message-format=json`，从 Cargo 的 `compiler-artifact` 消息选择本包 `test:true` 的 executable，并将其复制到独立私有目录。使用 `uv run --no-project python scripts/run-r13-acceptance.py --harness <该可执行文件的绝对路径> --output <新建报告的绝对路径> --fixture-log <新建日志的绝对路径>` 启动完整验收。系统需提供 `unshare`、`ip`，并允许无特权用户/网络命名空间；脚本自动建立仅 loopback 的隔离环境，默认持续至少 1800 秒，初始范围完整物化最迟等待至 4800 秒。`--smoke --duration-seconds 130` 用于快速联调。
