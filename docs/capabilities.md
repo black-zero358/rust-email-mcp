@@ -59,6 +59,8 @@
 
 `mark_emails`、`move_emails`、`delete_emails` 接受同一文件夹下明确的 UID 列表，最多 50 个，不接受范围字符串或重复 UID。必须提供 UIDVALIDITY。批量删除无论移入废纸篓还是永久删除，都要求用户明确确认并传入 `confirm:true`。
 
+单封和批量整理在写入前核对源文件夹 UIDVALIDITY 和 UID 存在性。预检缺失时单封返回 `NOT_FOUND`，批量项返回 `not_found`，重复删除沿用这一结果。`updated` 表示服务器确认请求的标记状态或通过 COPYUID 确认目标邮件移动。`accepted` 表示服务器返回 OK，逐 UID 结果尚待核对，例如没有 COPYUID 的移动或永久删除。客户端应处理新增的 `accepted` 状态，并在 `retry_allowed` 为 `false` 时先核对邮箱状态。
+
 操作逐项返回结果。中断后已完成结果保留，当前项可能为 `unknown`，其余为 `unprocessed`。不要自动重试整个批次；先检查邮箱的当前状态。移动要求 MOVE，永久删除要求 UIDPLUS，并仅对指定 UID 执行 UID EXPUNGE。
 
 ## 会话、定位和正文

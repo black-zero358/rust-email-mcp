@@ -181,7 +181,9 @@ impl Backend {
                         let (tag, command) = line.trim_end().split_once(' ').unwrap();
                         let mut reply = match command {
                             "CAPABILITY" => b"* CAPABILITY IMAP4rev1\r\n".to_vec(),
-                            command if command == "EXAMINE \"Drafts\"" || command.strip_prefix("EXAMINE ").is_some_and(|name| name.trim_matches('"').eq_ignore_ascii_case("INBOX")) => b"* 1 EXISTS\r\n* OK [UIDVALIDITY 9] valid\r\n* OK [UIDNEXT 8] next\r\n".to_vec(),
+                            command if command == "SELECT \"INBOX\"" || command == "EXAMINE \"Drafts\"" || command.strip_prefix("EXAMINE ").is_some_and(|name| name.trim_matches('"').eq_ignore_ascii_case("INBOX")) => b"* 1 EXISTS\r\n* OK [UIDVALIDITY 9] valid\r\n* OK [UIDNEXT 8] next\r\n".to_vec(),
+                            "UID STORE 7 +FLAGS (\\Seen)" => b"* 1 FETCH (UID 7 FLAGS (\\Seen))\r\n".to_vec(),
+                            "UID STORE 7 -FLAGS (\\Seen)" => Vec::new(),
                             command if command.starts_with("LOGIN ") => Vec::new(),
                             command if command.starts_with("LIST ") => b"* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n".to_vec(),
                             command if command.starts_with("APPEND \"Drafts\" (\\Draft) {") => {
@@ -471,6 +473,47 @@ impl Harness {
             )
             .await
             .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn message_write_outcomes_validate_through_signed_mcp() {
+    let mut harness = Harness::new(false).await;
+    let single = json!({"uid":8,"uid_validity":9,"destination":"Archive"});
+    assert_eq!(
+        harness.call("owner", "move_email", single).await["error"]["code"],
+        "NOT_FOUND"
+    );
+    let args = json!({"uids":[8,7],"uid_validity":9,"flag":"seen","value":true});
+    let batch = harness.call("owner", "mark_emails", args).await;
+    assert_eq!(
+        batch["data"]["items"],
+        json!([{"uid":8,"status":"not_found"},{"uid":7,"status":"updated"}])
+    );
+    let single = json!({"uid":7,"uid_validity":9,"flag":"seen","value":false});
+    assert_eq!(
+        harness.call("owner", "mark_email", single).await["data"],
+        json!({"status":"accepted","retry_allowed":false})
+    );
+
+    let backend = &mut harness.backends[0].task;
+    backend.abort();
+    assert!((&mut *backend).await.unwrap_err().is_cancelled());
+    for (name, extra) in [
+        ("mark_emails", json!({"flag":"seen","value":true})),
+        ("move_emails", json!({"destination":"Archive"})),
+        ("delete_emails", json!({"confirm":true})),
+    ] {
+        let mut args = json!({"uids":[7],"uid_validity":9});
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let data = harness.call("owner", name, args).await["data"].clone();
+        assert_eq!(data["error"]["code"], "MAIL_BACKEND");
+        assert_eq!(
+            data["items"],
+            json!([{"uid":7,"status":"unprocessed","retry_allowed":false}])
+        );
     }
 }
 
