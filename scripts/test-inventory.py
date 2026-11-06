@@ -25,6 +25,18 @@ else:
     names = subprocess.check_output(["git", "ls-files", "--cached", "--others", "--exclude-standard"], text=True).splitlines()
     sources = {name: Path(name).read_bytes() for name in names if Path(name).is_file()}
 rust = tree_sitter.Parser(tree_sitter.Language(tree_sitter_rust.language()))
+# Named Node cases, probe fixture/negative cases, shell checks, and standalone
+# acceptance/benchmark commands. These counts use the documented entry points.
+other_cases = {
+    "scripts/attachment-client-adapter/adapter.test.mjs": 7,
+    "scripts/attachment-delivery-probe/probe.py": 20,
+    "scripts/test-audit-dependencies.sh": 20,
+    "scripts/test-docker-context.sh": 1,
+    "scripts/check-cache-recovery.py": 1,
+    "scripts/run-r13-acceptance.py": 1,
+    "examples/benchmark_journal.rs": 1,
+    "scripts/test-inventory.py": 1,
+}
 rows = []
 for name, data in sources.items():
     data = data.replace(b"\r\n", b"\n")
@@ -63,7 +75,8 @@ for name, data in sources.items():
     lines = sum(len(data[a:b].splitlines()) for a, b in outer)
     size = sum(b - a for a, b in outer)
     if lines or cases:
-        rows.append({"path": name, "lines": lines, "bytes": size, "rust_cases": cases})
+        rows.append({"path": name, "lines": lines, "bytes": size, "rust_cases": cases, "other_cases": other_cases.get(name, 0)})
 print(json.dumps({"revision": args.revision or "working-tree", "lines": sum(r["lines"] for r in rows),
                   "bytes": sum(r["bytes"] for r in rows), "rust_cases": sum(r["rust_cases"] for r in rows),
-                  "files": rows}, indent=2))
+                  "other_cases": sum(r["other_cases"] for r in rows),
+                  "cases": sum(r["rust_cases"] + r["other_cases"] for r in rows), "files": rows}, indent=2))
