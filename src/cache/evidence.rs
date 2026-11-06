@@ -1,5 +1,7 @@
 //! Attribute and LIST snapshots obtained from completed IMAP observations.
-use super::{Cache, CacheError, DirtyStamp, Ref, ScopeSnapshot, thread_index::current_scope};
+use super::{
+    Cache, CacheError, DirtyStamp, ListingStamp, Ref, ScopeSnapshot, thread_index::current_scope,
+};
 use crate::accounts::AccountKey;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use serde::{Deserialize, Serialize};
@@ -59,10 +61,13 @@ pub struct CachedMailbox {
 }
 
 impl Cache {
+    /// Mutable FLAGS need a stamp from before their FETCH. The body reader
+    /// can also submit a UID-bound size observation on its own.
     pub fn remember_listing(
         &self,
         reference: Ref<'_>,
         evidence: ListingEvidence<'_>,
+        stamp: Option<&ListingStamp>,
     ) -> Result<(), CacheError> {
         if !self.full
             || evidence.observed_at_ms < 0
@@ -72,8 +77,14 @@ impl Cache {
         {
             return Err(CacheError::OutOfScope);
         }
+        if evidence.flags.is_some() && stamp.is_none() {
+            return Err(CacheError::NeedsVerification);
+        }
         let flags = evidence.flags.map(encode_flags).transpose()?;
         self.update_message(reference, |tx, id| {
+            if let Some(stamp) = stamp {
+                stamp.verify(self, tx, reference)?;
+            }
             write_listing(tx, id, evidence, flags.as_deref())
         })
     }

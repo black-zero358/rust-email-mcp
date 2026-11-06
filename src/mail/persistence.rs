@@ -2,7 +2,7 @@
 use super::*;
 use crate::{
     cache::{
-        AccountScope, ArtifactKey, ArtifactState, Cache, CacheError, ListingEvidence,
+        AccountScope, ArtifactKey, ArtifactState, Cache, CacheError, ListingEvidence, ListingStamp,
         MailboxEvidence, Omission, Ref as CacheRef, ThreadId,
     },
     config::{CacheMode, CacheSettings, SyncPolicy, SyncProtocol},
@@ -1124,7 +1124,7 @@ impl MailService {
         let cache = self.persistent.full_storage(&self.account)?;
         let (storage, account) = (cache.clone(), self.account.clone());
         let Some(folders) = self
-            .lookup_sent(move || storage.confirmed_sent(&account))
+            .read_cache_evidence(move || storage.confirmed_sent(&account))
             .await
         else {
             cache.disable_offline();
@@ -1134,10 +1134,10 @@ impl MailService {
         self.cache_before_write(&folders).await
     }
 
-    async fn lookup_sent(
+    async fn read_cache_evidence<T: Send + 'static>(
         &self,
-        lookup: impl FnOnce() -> std::result::Result<Vec<String>, CacheError> + Send + 'static,
-    ) -> Option<Vec<String>> {
+        lookup: impl FnOnce() -> std::result::Result<T, CacheError> + Send + 'static,
+    ) -> Option<T> {
         let permit = self.persistent.cache_read_permit()?;
         let admission = runtime::read_admission();
         let task = tokio::task::spawn_blocking(move || {
@@ -1181,11 +1181,25 @@ impl MailService {
         }
     }
 
+    pub(super) async fn capture_listing_stamp(
+        &self,
+        mailbox: &str,
+        validity: Option<u32>,
+    ) -> Option<ListingStamp> {
+        let uid_validity = validity.filter(|value| *value > 0)?;
+        let mailbox = canonical_mailbox(mailbox);
+        let cache = self.persistent.full_folder(&self.account, mailbox)?.clone();
+        let (account, mailbox) = (self.account.clone(), mailbox.to_owned());
+        self.read_cache_evidence(move || cache.listing_stamp(&account, &mailbox, uid_validity))
+            .await
+    }
+
     pub(super) fn persist_listing(
         &self,
         mailbox: &str,
         validity: Option<u32>,
         items: Vec<ListingObservation>,
+        stamp: Option<ListingStamp>,
     ) {
         let Some(uid_validity) = validity.filter(|value| *value > 0) else {
             return;
@@ -1232,6 +1246,7 @@ impl MailService {
                             size: item.size,
                             observed_at_ms: time,
                         },
+                        stamp.as_ref(),
                     )?;
                 }
                 Ok(())
@@ -1936,6 +1951,267 @@ pub(super) fn encode_manifest(manifest: &parts::PartManifest) -> Option<Vec<u8>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn summary_flags(
+        service: &MailService,
+        flags: &str,
+        pause: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+    ) -> Value {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let (client, server) = tokio::io::duplex(2048);
+        let flags = flags.to_owned();
+        let peer = tokio::spawn(async move {
+            let mut stream = BufReader::new(server);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            let (tag, command) = line.trim_end().split_once(' ').unwrap();
+            assert!(command.starts_with("LOGIN "));
+            stream
+                .write_all(format!("{tag} OK login\r\n").as_bytes())
+                .await
+                .unwrap();
+            line.clear();
+            stream.read_line(&mut line).await.unwrap();
+            let (tag, command) = line.trim_end().split_once(' ').unwrap();
+            assert_eq!(
+                command,
+                "UID FETCH 7 (UID FLAGS RFC822.SIZE INTERNALDATE BODY.PEEK[HEADER]<0.1048576>)"
+            );
+            if let Some((entered, release)) = pause {
+                entered.send(()).unwrap();
+                release.await.unwrap();
+            }
+            let header = "Subject: synthetic\r\n\r\n";
+            stream.write_all(format!(
+                "* 1 FETCH (UID 7 FLAGS ({flags}) RFC822.SIZE 100 INTERNALDATE \" 7-Feb-2025 09:00:00 +0000\" BODY[HEADER]<0> {{{}}}\r\n{header})\r\n{tag} OK done\r\n",
+                header.len(),
+            ).as_bytes()).await.unwrap();
+        });
+        let mut session = async_imap::Client::new(client)
+            .login("synthetic", "test-only")
+            .await
+            .unwrap();
+        let rows = service
+            .fetch_summaries(&mut session, "INBOX", Some(9), Some(8), &[7])
+            .await
+            .unwrap();
+        peer.await.unwrap();
+        rows[0]["flags"].clone()
+    }
+
+    fn verify_unseen(cache: &Cache, reference: CacheRef<'_>) {
+        use crate::cache::sync_state::{MailboxObservation, ReconciledFlags};
+
+        // Reuse the previous observation timestamp so the regression also
+        // exercises queued evidence that ties or outranks the verified write.
+        let checked_at_ms = cache
+            .cached_message(reference)
+            .unwrap()
+            .unwrap()
+            .flags_checked_at_ms
+            .unwrap();
+        let account = reference.account;
+        let mailbox = reference.mailbox;
+        let ticket = cache.begin_dirty(account, &[mailbox]).unwrap();
+        assert!(matches!(
+            cache.listing_stamp(account, mailbox, reference.uid_validity),
+            Err(CacheError::NeedsVerification)
+        ));
+        cache.finish_dirty(ticket).unwrap();
+        let fence = cache.sync_reconcile_fence(account, mailbox).unwrap();
+        let observed = MailboxObservation {
+            uid_validity: reference.uid_validity,
+            uid_next: reference.uid + 1,
+            checked_at_ms,
+        };
+        let scan = cache
+            .start_sync_reconcile(account, mailbox, observed, &fence)
+            .unwrap();
+        let page = cache.sync_known_page(&scan.stamp, 200).unwrap();
+        let flags = [ReconciledFlags {
+            uid: reference.uid,
+            flags: &[],
+        }];
+        assert!(
+            cache
+                .commit_sync_reconcile(&scan.stamp, &page, &flags, checked_at_ms, &|| false)
+                .unwrap()
+                .complete
+        );
+    }
+
+    #[tokio::test]
+    async fn old_summary_flags_cannot_reappear_after_verified_mutation() {
+        use crate::{
+            accounts::{AccountCatalog, CacheRunIdentity},
+            cache::sync_state::{MailboxObservation, ScanKind},
+            config::{self, ValidatedAccountSet},
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cache.json");
+        std::fs::write(
+            &path,
+            br#"{"version":1,"mode":"full","directory":"cache","max_bytes":33554432,"accounts":[{"account_id":"default","mailboxes":["INBOX"],"max_bytes":8388608}]}"#,
+        ).unwrap();
+        let config = config::fixture();
+        let settings = ValidatedAccountSet::legacy(config);
+        let catalog = AccountCatalog::from_test_accounts(settings.clone()).unwrap();
+        let account = catalog.registered_accounts().pop().unwrap().key;
+        let open = |run| {
+            let cache_settings = config::load_cache_file(&path, &settings).unwrap();
+            MailRuntime::prepare_cache_for_run(&catalog, cache_settings, Some(run)).unwrap()
+        };
+        let run = CacheRunIdentity {
+            instance: uuid::Uuid::new_v4(),
+            previous: None,
+            current: uuid::Uuid::new_v4(),
+        };
+        let persistent = open(run);
+        let mail = MailRuntime::with_cache(
+            catalog.clone(),
+            Arc::new(Journal::open(std::path::Path::new(":memory:")).unwrap()),
+            persistent.clone(),
+        )
+        .unwrap();
+        let service = mail.service_for(&account).unwrap();
+        let cache = persistent.full_storage(&account).unwrap();
+        let reference = CacheRef {
+            account: &account,
+            mailbox: "INBOX",
+            uid_validity: 9,
+            uid: 7,
+        };
+        let flags = |cache: &Cache| {
+            cache
+                .cached_message(reference)
+                .unwrap()
+                .unwrap()
+                .flags
+                .unwrap()
+        };
+        let initial_stamp = cache.listing_stamp(&account, "INBOX", 9).unwrap();
+        let observed = MailboxObservation {
+            uid_validity: 9,
+            uid_next: 8,
+            checked_at_ms: 1,
+        };
+        let history = cache
+            .start_sync(&account, "INBOX", ScanKind::History, observed)
+            .unwrap();
+        cache
+            .record_sync_search(&history.stamp, 1, 7, &[7], &|| false)
+            .unwrap();
+        cache
+            .remember_listing(
+                reference,
+                ListingEvidence {
+                    flags: Some(&[]),
+                    internal_date: None,
+                    size: None,
+                    observed_at_ms: 1,
+                },
+                Some(&initial_stamp),
+            )
+            .unwrap();
+        assert_eq!(
+            summary_flags(service, "\\Seen", None).await,
+            json!(["Seen"])
+        );
+        persistent.sync_write_barrier().await.unwrap();
+        assert_eq!(flags(cache), ["Seen"]);
+        let previous = cache.cached_message(reference).unwrap().unwrap();
+        let size_only = ListingEvidence {
+            flags: None,
+            internal_date: None,
+            size: Some(101),
+            observed_at_ms: previous.observed_at_ms.unwrap(),
+        };
+        assert!(matches!(
+            cache.remember_listing(
+                reference,
+                ListingEvidence {
+                    flags: Some(&[]),
+                    ..size_only
+                },
+                None,
+            ),
+            Err(CacheError::NeedsVerification)
+        ));
+        let current = cache.cached_message(reference).unwrap().unwrap();
+        assert_eq!(
+            (current.size, current.flags),
+            (previous.size, previous.flags)
+        );
+        cache.remember_listing(reference, size_only, None).unwrap();
+        let current = cache.cached_message(reference).unwrap().unwrap();
+        assert_eq!(current.size, Some(101));
+        assert_eq!(
+            current.flags.as_deref(),
+            Some(["Seen".to_owned()].as_slice())
+        );
+
+        let (entered, wait_entered) = oneshot::channel();
+        let (release, wait_release) = oneshot::channel();
+        let mut old = Box::pin(summary_flags(
+            service,
+            "\\Seen",
+            Some((entered, wait_release)),
+        ));
+        tokio::select! {
+            entered = wait_entered => entered.unwrap(),
+            _ = &mut old => panic!("the old FETCH did not wait"),
+        }
+        verify_unseen(cache, reference);
+        assert!(flags(cache).is_empty());
+        release.send(()).unwrap();
+        assert_eq!(old.await, json!(["Seen"]));
+        persistent.sync_write_barrier().await.unwrap();
+        let after_delayed = flags(cache);
+
+        assert_eq!(
+            summary_flags(service, "\\Flagged", None).await,
+            json!(["Flagged"])
+        );
+        persistent.sync_write_barrier().await.unwrap();
+        assert_eq!(flags(cache), ["Flagged"]);
+
+        let (entered, wait_entered) = oneshot::channel();
+        let (release, wait_release) = std::sync::mpsc::channel();
+        assert!(persistent.submit(&account, 1, false, move |_, _| {
+            entered.send(()).unwrap();
+            wait_release
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            Ok(())
+        }));
+        wait_entered.await.unwrap();
+        assert_eq!(
+            summary_flags(service, "\\Seen", None).await,
+            json!(["Seen"])
+        );
+        verify_unseen(cache, reference);
+        assert!(flags(cache).is_empty());
+        release.send(()).unwrap();
+        persistent.sync_write_barrier().await.unwrap();
+        mail.finish_cache(persistent).await;
+        drop(mail);
+
+        let next = open(CacheRunIdentity {
+            previous: Some(run.current),
+            current: uuid::Uuid::new_v4(),
+            ..run
+        });
+        let cache = next.full_storage(&account).unwrap();
+        assert!(!cache.status(&account).unwrap().startup_unclean);
+        let after_reopen = flags(cache);
+        next.finish().await;
+        assert_eq!(
+            (after_delayed, after_reopen),
+            (Vec::<String>::new(), Vec::<String>::new())
+        );
+    }
 
     #[test]
     fn first_observations_arriving_out_of_order_keep_the_newest_generation() {

@@ -190,6 +190,7 @@ impl MailService {
             .persistent
             .full_folder(&self.account, mailbox)
             .is_some();
+        let listing_stamp = self.capture_listing_stamp(mailbox, validity).await;
         let internal_date = if full { " INTERNALDATE" } else { "" };
         #[derive(Default)]
         struct Summary {
@@ -300,7 +301,7 @@ impl MailService {
             email["date"] = json!(headers.get_first_value("Date"));
             email["size"] = json!(summary.size);
             email["flags"] = json!(summary.flags.as_deref().unwrap_or_default());
-            if full {
+            if listing_stamp.is_some() {
                 listing.push(persistence::ListingObservation {
                     uid: id,
                     flags: summary.flags,
@@ -316,7 +317,9 @@ impl MailService {
             emails.push(email);
         }
         self.persist_headers(mailbox, validity, observations);
-        self.persist_listing(mailbox, validity, listing);
+        if let Some(stamp) = listing_stamp {
+            self.persist_listing(mailbox, validity, listing, Some(stamp));
+        }
         Ok(emails)
     }
 }
