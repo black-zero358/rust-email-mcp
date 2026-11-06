@@ -122,9 +122,14 @@ impl MailRuntime {
         cache: PreparedCache,
         deadline: tokio::time::Instant,
     ) -> bool {
-        let reads_finished = self.scheduler.stop_admission();
-        let transfers_finished = self.attachments.stop_transfers();
-        reads_finished && transfers_finished && cache.finish_before(deadline).await
+        let (reads_finished, transfers_finished) = tokio::join!(
+            self.scheduler.stop_and_drain(deadline),
+            self.attachments.drain_transfers(deadline),
+        );
+        reads_finished
+            && transfers_finished
+            && tokio::time::Instant::now() < deadline
+            && cache.finish_before(deadline).await
     }
 
     pub fn start_sync(self: &Arc<Self>) {

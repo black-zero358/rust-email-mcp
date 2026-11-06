@@ -4,7 +4,10 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
-use tokio::sync::oneshot;
+use tokio::{
+    sync::{Notify, oneshot},
+    time::Instant,
+};
 use tokio_util::sync::CancellationToken;
 
 pub(crate) const EXECUTION_SLOTS: usize = 4;
@@ -118,6 +121,7 @@ impl State {
 
 pub(crate) struct Scheduler {
     state: Mutex<State>,
+    drained: Notify,
     queue_wait: Duration,
 }
 
@@ -125,6 +129,7 @@ impl Scheduler {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(State::default()),
+            drained: Notify::new(),
             queue_wait: QUEUE_WAIT,
         })
     }
@@ -135,12 +140,28 @@ impl Scheduler {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Stops new work. A clean shutdown can only be published if no queued
-    /// ticket or permit remains, including detached blocking work.
-    pub(super) fn stop_admission(&self) -> bool {
-        let mut state = self.state();
-        state.closed = true;
-        state.admitted == 0
+    /// Called after admitted writes have drained. Close shared admission and
+    /// wait for existing read permits, including detached blocking work.
+    pub(super) async fn stop_and_drain(&self, deadline: Instant) -> bool {
+        self.state().closed = true;
+        loop {
+            if self.state().admitted == 0 {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, self.drained.notified())
+                .await
+                .is_err()
+            {
+                return false;
+            }
+        }
+    }
+
+    fn dispatch(&self, state: &mut State) {
+        state.dispatch();
+        if state.closed && state.admitted == 0 {
+            self.drained.notify_one();
+        }
     }
 
     pub(crate) async fn acquire(
@@ -176,7 +197,7 @@ impl Scheduler {
             id,
             active: true,
         };
-        self.state().dispatch();
+        self.dispatch(&mut self.state());
         tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err(AdmissionError::AccountCancelled),
@@ -225,7 +246,7 @@ impl Drop for QueuedTicket {
             if waiter.granted {
                 state.release_slots(waiter.account, waiter.class);
             }
-            state.dispatch();
+            self.scheduler.dispatch(&mut state);
         }
     }
 }
@@ -240,7 +261,7 @@ impl Drop for BackendPermit {
         let mut state = self.scheduler.state();
         state.admitted = state.admitted.saturating_sub(1);
         state.release_slots(self.account, self.class);
-        state.dispatch();
+        self.scheduler.dispatch(&mut state);
     }
 }
 

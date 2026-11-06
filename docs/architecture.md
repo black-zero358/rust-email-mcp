@@ -155,7 +155,7 @@ HTML 回退只用有界 tokenizer sink，不引入 DOM/layout 引擎、不执行
 
 SMTP 使用 lettre 的低层 connection/command/message API，保留 TLS、AUTH、SMTPUTF8 和 8BITMIME 策略。连接及事务共用发送期限；最终 DATA 250 确认后先记录 `accepted`，明确拒绝先记录 `rejected`，再执行独立的最多一秒 QUIT 清理。`unknown` 或取消的事务直接关闭，不 QUIT、不进连接池。执行槽位持有到清理结束，避免积累清理任务。HTTP/MCP 调用者断开不能把发送生命周期变成不受记录的重试。
 
-进程收到停机信号即封闭写入登记并停止接受新 HTTP 连接。已登记的写任务保留共享队列和执行许可，HTTP、同步和写入排空共用从信号开始计时的绝对截止。只有任务和缓存队列完成排空且仍在期限内，缓存才发布 clean receipt。若排空未完成，进程保留运行见证锁至退出。SMTP 已确认结果先持久化再清理，未完成的 sending 在下次启动恢复为 unknown。
+进程收到停机信号即封闭写入登记并停止接受新 HTTP 连接。已登记的写任务保留共享队列和执行许可，HTTP、同步、写入和取消后仍持有许可的读取或附件传输共用从信号开始计时的绝对截止。只有任务和缓存队列完成排空且仍在期限内，缓存才发布 clean receipt。若排空未完成，进程保留运行见证锁至退出。SMTP 已确认结果先持久化再清理，未完成的 sending 在下次启动恢复为 unknown。
 
 异步 SMTP 响应在解密后按每行 1,000 字节、每个完整回复 100,000 字节限制累积，计入行结束符。每次追加前核对剩余预算。回复用尽预算仍未完成时丢弃连接和预读数据，跳过 QUIT。该路径覆盖 greeting、EHLO、STARTTLS、AUTH、DATA 和 QUIT。DATA 最终确认超限按未知结果处理，已持久化的接受结果在 QUIT 超限时保留。来源与替换条件见 [lettre 补丁记录](../vendor/lettre/PATCHES.md)。
 
