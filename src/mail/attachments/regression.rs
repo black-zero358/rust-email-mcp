@@ -1,6 +1,48 @@
 use super::*;
 use base64::Engine;
 
+#[test]
+fn legacy_inbox_attachment_ids_still_bind_all_reference_dimensions() {
+    let account = AccountKey::synthetic();
+    let other_account = AccountKey::synthetic();
+    let raw =
+        b"Content-Type: application/octet-stream\r\nContent-Disposition: attachment\r\n\r\nfixture";
+    let mut old = Sha256::new();
+    old.update(b"email-mcp-attachment-reference-v1\0");
+    old.update(account.reference_namespace());
+    old.update(5u64.to_be_bytes());
+    old.update(b"iNbOx");
+    for value in [9u32, 7, 0, 1] {
+        old.update(value.to_be_bytes());
+    }
+    let old_id = format!("att_v1_{:x}", old.finalize());
+    let args = json!({"attachment_id":old_id});
+    let read = |args: &Value, account: &AccountKey, mailbox: &str, uid, validity| {
+        inline_download(raw, args, account, mailbox, uid, validity, 1024)
+    };
+    let current = read(&args, &account, "INBOX", 7, 9).unwrap();
+    assert_ne!(current["attachment_id"], old_id);
+    let both = json!({"attachment_id":old_id,"attachment_index":0});
+    assert_eq!(
+        read(&both, &account, "Inbox", 7, 9).unwrap()["attachment_id"],
+        current["attachment_id"]
+    );
+    for (account, mailbox, uid, validity) in [
+        (&other_account, "INBOX", 7, 9),
+        (&account, "INBOX", 8, 9),
+        (&account, "INBOX", 7, 10),
+        (&account, "INBOX/Archive", 7, 9),
+    ] {
+        assert!(read(&args, account, mailbox, uid, validity).is_err());
+    }
+    let wrong_index = json!({"attachment_id":old_id,"attachment_index":1});
+    assert!(read(&wrong_index, &account, "inbox", 7, 9).is_err());
+    let archive = read(&json!({"attachment_index":0}), &account, "Archive", 7, 9).unwrap();
+    let args = json!({"attachment_id":archive["attachment_id"]});
+    assert!(read(&args, &account, "Archive", 7, 9).is_ok());
+    assert!(read(&args, &account, "archive", 7, 9).is_err());
+}
+
 #[tokio::test]
 async fn r00_csv_xlsx_pdf_bytes_survive_mime_decode_and_staged_download() {
     let directory = tempfile::tempdir().unwrap();

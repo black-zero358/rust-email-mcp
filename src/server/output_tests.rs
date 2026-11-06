@@ -159,7 +159,7 @@ impl Backend {
                         let (tag, command) = line.trim_end().split_once(' ').unwrap();
                         let mut reply = match command {
                             "CAPABILITY" => b"* CAPABILITY IMAP4rev1\r\n".to_vec(),
-                            "EXAMINE INBOX" | "EXAMINE \"INBOX\"" => b"* 1 EXISTS\r\n* OK [UIDVALIDITY 9] valid\r\n* OK [UIDNEXT 8] next\r\n".to_vec(),
+                            command if command.strip_prefix("EXAMINE ").is_some_and(|name| name.trim_matches('"').eq_ignore_ascii_case("INBOX")) => b"* 1 EXISTS\r\n* OK [UIDVALIDITY 9] valid\r\n* OK [UIDNEXT 8] next\r\n".to_vec(),
                             command if command.starts_with("LOGIN ") => Vec::new(),
                             command if command.starts_with("LIST ") => b"* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n".to_vec(),
                             command if command.starts_with("UID SEARCH ") => b"* SEARCH 7\r\n".to_vec(),
@@ -244,6 +244,10 @@ struct Harness {
 
 impl Harness {
     async fn new(metadata_cache: bool) -> Self {
+        Self::with_cache(metadata_cache.then_some("metadata")).await
+    }
+
+    async fn with_cache(cache_mode: Option<&str>) -> Self {
         let signed = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let cert = signed.cert.der().clone();
         let tls = tokio_rustls::rustls::ServerConfig::builder()
@@ -285,12 +289,27 @@ impl Harness {
             is_legacy: false,
         });
         let catalog = AccountCatalog::from_test_accounts(settings.clone()).unwrap();
-        let cache_settings = metadata_cache.then(|| {
+        let cache_settings = cache_mode.map(|mode| {
             let path = staging.path().join("cache.json");
-            std::fs::write(&path, br#"{"version":1,"mode":"metadata","directory":"metadata","max_bytes":33554432,"accounts":[{"account_id":"default","mailboxes":["INBOX"],"max_bytes":8388608}]}"#).unwrap();
+            std::fs::write(
+                &path,
+                json!({"version":1,"mode":mode,"directory":"cache","max_bytes":33554432,
+                "accounts":[{"account_id":"default","mailboxes":["INBOX"],"max_bytes":8388608}]})
+                .to_string(),
+            )
+            .unwrap();
             config::load_cache_file(&path, &settings).unwrap().unwrap()
         });
-        let cache = MailRuntime::prepare_cache(&catalog, cache_settings).unwrap();
+        let cache = if cache_mode == Some("full") {
+            let run = crate::accounts::CacheRunIdentity {
+                instance: uuid::Uuid::new_v4(),
+                previous: None,
+                current: uuid::Uuid::new_v4(),
+            };
+            MailRuntime::prepare_cache_for_run(&catalog, cache_settings, Some(run)).unwrap()
+        } else {
+            MailRuntime::prepare_cache(&catalog, cache_settings).unwrap()
+        };
         let journal = Arc::new(Journal::open(Path::new(":memory:")).unwrap());
         let mail = Arc::new(
             MailRuntime::with_cache(catalog, journal, cache.clone())
@@ -460,7 +479,7 @@ async fn http_auth_and_rpc_id_gate_each_request_before_mail() {
 
 #[tokio::test]
 async fn signed_target_attachment_get_rechecks_subject_and_returns_exact_binary() {
-    let h = Harness::new(false).await;
+    let h = Harness::with_cache(Some("full")).await;
     let listed = h
         .call(
             "owner",
@@ -474,11 +493,25 @@ async fn signed_target_attachment_get_rechecks_subject_and_returns_exact_binary(
     );
     let descriptor = &listed["data"]["attachments"][0];
     assert_eq!(descriptor["filename"], "part.bin", "{listed}");
+    let attachment_id = &descriptor["attachment_id"];
+    for mailbox in ["INBOX", "Inbox", "inbox"] {
+        let listed = h
+            .call(
+                "owner",
+                "list_attachments",
+                json!({"mailbox":mailbox,"uid":7,"uid_validity":9}),
+            )
+            .await;
+        assert_eq!(
+            listed["data"]["attachments"][0]["attachment_id"], *attachment_id,
+            "{listed}"
+        );
+    }
     let prepared = h
         .call(
             "owner",
             "prepare_attachment_download",
-            json!({"uid":7,"uid_validity":9,"attachment_id":descriptor["attachment_id"]}),
+            json!({"mailbox":"Inbox","uid":7,"uid_validity":9,"attachment_id":attachment_id}),
         )
         .await;
     let url = prepared["data"]["download_url"]
@@ -543,6 +576,29 @@ async fn signed_target_attachment_get_rechecks_subject_and_returns_exact_binary(
             ATTACHMENT
         );
     }
+
+    let inline = h.call("owner", "download_attachment", json!({"mailbox":"inbox","uid":7,"uid_validity":9,"attachment_id":attachment_id,"attachment_index":descriptor["attachment_index"]})).await;
+    assert_eq!(
+        inline["data"]["base64"],
+        STANDARD.encode(ATTACHMENT),
+        "{inline}"
+    );
+    let before = h.connections();
+    let cached = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let result = h.call("owner", "download_attachment", json!({"read_source":"cache","mailbox":"Inbox","uid":7,"uid_validity":9,"attachment_id":attachment_id})).await;
+            if result["error"]["code"] != "CACHE_MISS" {
+                break result;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.unwrap();
+    assert_eq!(cached["data"]["read_source"], "cache", "{cached}");
+    assert_eq!(cached["data"]["attachment_id"], *attachment_id, "{cached}");
+    assert_eq!(cached["data"]["base64"], STANDARD.encode(ATTACHMENT));
+    assert_eq!(h.connections(), before);
+    drop(h.app);
+    h.cache.finish().await;
 }
 
 #[tokio::test]
