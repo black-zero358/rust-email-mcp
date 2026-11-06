@@ -59,7 +59,7 @@
 
 | 任务 | 常用工具与行为 |
 | --- | --- |
-| 找邮件和读正文 | `list_emails`、`search_emails` 支持组合筛选、分页和可选预览。用 `get_email` 或 `get_emails` 读取单封或批量正文。 |
+| 找邮件和读正文 | `list_emails`、`search_emails` 支持组合筛选、分页和可选预览。摘要的 `header_complete` 为 false 时，主题、发件人和日期中的 `null` 表示未知。用 `get_email` 或 `get_emails` 读取单封或批量正文。 |
 | 追踪往来 | `read_conversation` 按邮件关联头串起收件箱、已发送和配置的归档目录，可分页追查并保留副本来源。用 `locate_message` 按精确 Message-ID 定位。 |
 | 下载附件 | `list_attachments` 查附件，`download_attachment` 返回小文件的 Base64，`prepare_attachment_download` 生成短期认证下载地址。 |
 | 访问多个邮箱 | `list_accounts` 和 `list_mailboxes` 列出当前主体可用的账户和文件夹。实例最多配置 16 个邮箱，追加账户固定只读。 |

@@ -1877,6 +1877,7 @@ mod tests {
                 assert_eq!(emails.len(), 1);
                 assert_eq!(emails[0]["uid"], 7);
                 assert_eq!(emails[0]["subject"], "synthetic");
+                assert_eq!(emails[0]["header_complete"], true);
                 assert_eq!(emails[0]["size"], 101);
                 assert_eq!(
                     emails[0]["flags"],
@@ -1887,6 +1888,133 @@ mod tests {
                     }
                 );
             }
+        }
+    }
+
+    fn padded_header(prefix: &str, tail: &str, bytes: usize) -> String {
+        const LINE_BYTES: usize = 998;
+        let mut header = format!("{prefix}X-Pad:\r\n");
+        let remaining = bytes - header.len() - tail.len();
+        let folds = (remaining - 3) / LINE_BYTES;
+        let fold = format!(" {}\r\n", "x".repeat(LINE_BYTES - 3));
+        header.push_str(&fold.repeat(folds));
+        header.push(' ');
+        header.push_str(&"x".repeat(remaining - folds * LINE_BYTES - 3));
+        header.push_str("\r\n");
+        header.push_str(tail);
+        header
+    }
+
+    #[tokio::test]
+    async fn listing_reports_header_coverage_without_exposing_a_clipped_field() {
+        const SAMPLE: usize = 1024 * 1024;
+        const FROM: &str = "From: sender@example.invalid\r\n";
+        let (_dir, service) = fetch_fixture();
+        for (tail, expected_complete) in [
+            ("Subject: clipped", false),
+            ("Subject: may continue\r\n", false),
+            ("Subject: =?UTF-8?Q?known?=\r\n =?UTF-8?Q?clip", false),
+            ("\r\n", true),
+        ] {
+            let header = padded_header(FROM, tail, SAMPLE);
+            let rows = format!(
+                "* 1 FETCH (UID 7 FLAGS () BODY[HEADER]<0> {{{}}}\r\n{header})\r\n",
+                header.len(),
+            );
+            let (mut session, backend) = fetch_script(vec![
+                (
+                    "EXAMINE \"INBOX\"".into(),
+                    "* 1 EXISTS\r\n* OK [UIDVALIDITY 9] valid\r\n* OK [UIDNEXT 8] next\r\n".into(),
+                    "OK",
+                ),
+                ("UID SEARCH UID 1:7".into(), "* SEARCH 7\r\n".into(), "OK"),
+                (
+                    format!("UID FETCH 7 (UID FLAGS RFC822.SIZE BODY.PEEK[HEADER]<0.{SAMPLE}>)"),
+                    rows,
+                    "OK",
+                ),
+            ])
+            .await;
+            let emails = list_summaries(&service, &mut session, 1, false)
+                .await
+                .unwrap();
+            backend.await.unwrap();
+            assert_eq!(emails[0]["subject"], Value::Null, "{tail:?}");
+            assert_eq!(emails[0]["from"], "sender@example.invalid", "{tail:?}");
+            assert_eq!(emails[0]["header_complete"], expected_complete, "{tail:?}");
+            let classification = if expected_complete {
+                "complete"
+            } else {
+                "partial"
+            };
+            assert_eq!(
+                emails[0]["classification_status"], classification,
+                "{tail:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_locate_accepts_complete_header_only_literals_within_budget() {
+        const LIMIT: usize = 128 * 1024;
+        const ID: &str = "<bare@example.test>";
+        const HEADER: &str = "Subject: Header-only\r\nFrom: sender@example.invalid\r\nMessage-ID: <bare@example.test>\r\n";
+        let boundary = padded_header(HEADER, "", LIMIT);
+        let oversized = padded_header(HEADER, "", LIMIT + 1);
+        let blank_line = format!("{HEADER}\r\n");
+        for (header, case, expected) in [
+            (HEADER, "OK", Ok(7)),
+            (blank_line.as_str(), "OK", Ok(7)),
+            (boundary.as_str(), "OK", Ok(7)),
+            (oversized.as_str(), "OK", Err("LIMIT_EXCEEDED")),
+            (HEADER, "NO", Err("MAIL_BACKEND")),
+            (HEADER, "BAD", Err("MAIL_BACKEND")),
+            (HEADER, "EOF", Err("MAIL_BACKEND")),
+            (HEADER, "WRONG_TAG", Err("MAIL_BACKEND")),
+            (HEADER, "OTHER_UID", Err("MAIL_BACKEND")),
+            (HEADER, "OTHER_SECTION", Err("MAIL_BACKEND")),
+            (HEADER, "OTHER_ORIGIN", Err("MAIL_BACKEND")),
+        ] {
+            let (_dir, service) = fetch_fixture();
+            let (attributes, status) = match case {
+                "OTHER_UID" => ("UID 8 BODY[HEADER]<0>", "OK"),
+                "OTHER_SECTION" => ("UID 7 BODY[TEXT]<0>", "OK"),
+                "OTHER_ORIGIN" => ("UID 7 BODY[HEADER]<1>", "OK"),
+                status => ("UID 7 BODY[HEADER]<0>", status),
+            };
+            let rows = format!(
+                "* 1 FETCH ({attributes} {{{}}}\r\n{header})\r\n",
+                header.len()
+            );
+            let (mut session, backend) = fetch_script(vec![
+                (
+                    "EXAMINE \"INBOX\"".into(),
+                    "* 1 EXISTS\r\n* OK [UIDVALIDITY 9] valid\r\n* OK [UIDNEXT 8] next\r\n".into(),
+                    "OK",
+                ),
+                (
+                    format!("UID SEARCH UID 1:7 HEADER Message-ID \"{ID}\""),
+                    "* SEARCH 7\r\n".into(),
+                    "OK",
+                ),
+                (
+                    format!("UID FETCH 7 (UID BODY.PEEK[HEADER]<0.{}>)", LIMIT + 1),
+                    rows,
+                    status,
+                ),
+            ])
+            .await;
+            let result = service
+                .insight_operation(
+                    &mut session,
+                    "locate_message",
+                    &json!({"message_id":ID,"mailboxes":["INBOX"]}),
+                )
+                .await
+                .map(|value| value["matches"][0]["uid"].as_u64().unwrap())
+                .map_err(|error| error.code);
+            backend.await.unwrap();
+            assert_eq!(result, expected, "{case} with {} bytes", header.len());
         }
     }
 

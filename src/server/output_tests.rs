@@ -543,6 +543,8 @@ async fn signed_http_reads_keep_same_uid_in_each_authorized_account() {
         assert_eq!(body["data"]["account_id"], account, "{body}");
         assert_eq!(body["data"]["body"], expected, "{body}");
     }
+    let listing = h.call("owner", "list_emails", json!({"limit":1})).await;
+    assert_eq!(listing["data"]["emails"][0]["header_complete"], true);
     let stale = h
         .call("owner", "get_email", json!({"uid":7,"uid_validity":8}))
         .await;
