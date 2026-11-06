@@ -544,6 +544,10 @@ mod tests {
             config,
             persistent,
         };
+        let stamp = reader
+            .cache
+            .listing_stamp(&reader.account, "INBOX", 9)
+            .unwrap();
         let canonical = ["Seen", "Answered", "Flagged"];
         let legacy = [
             r#"Custom("\\sEeN")"#,
@@ -588,6 +592,7 @@ mod tests {
                         size: None,
                         observed_at_ms: 1,
                     },
+                    Some(&stamp),
                 )
                 .unwrap();
         }
