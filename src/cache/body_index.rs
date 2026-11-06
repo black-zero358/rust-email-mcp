@@ -3,7 +3,7 @@ use super::{
     ArtifactKey, ArtifactState, BlobId, Cache, CacheError, CachedMessage, Ref, ScopeSnapshot,
     blob::{artifact, present_message},
     evidence::cached_message,
-    thread_index::current_scope,
+    thread_index::{current_scope, verify_scope},
 };
 use crate::accounts::AccountKey;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -64,15 +64,44 @@ struct StoredIndex {
     version: i64,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct RebuildPosition {
+    validity: u32,
+    restore_epoch: u64,
+    format: (u16, u16),
+    before_uid: u32,
+}
+
 impl Cache {
+    #[cfg(test)]
+    pub(crate) fn fixture_legacy_indexes_with_storage_fault(
+        &self,
+        account: &AccountKey,
+        enabled: bool,
+    ) {
+        let databases = self.lock().unwrap();
+        let db = &databases[&account.reference_namespace()].connection;
+        db.execute_batch(if enabled {
+            "UPDATE body_indexes SET complete=0;
+             UPDATE body_indexes SET html_version=1;
+             UPDATE body_indexes SET complete=1;
+             CREATE TRIGGER fail_reindex BEFORE INSERT ON body_indexes
+             WHEN EXISTS(SELECT 1 FROM messages WHERE id=new.message_id AND uid>1)
+             BEGIN SELECT RAISE(ABORT, 'synthetic index write failure'); END;"
+        } else {
+            "DROP TRIGGER fail_reindex"
+        })
+        .unwrap();
+    }
+
     /// Pick old or interrupted body indexes to rebuild from their existing
     /// local body blob. Search results only expose the current projection.
     pub(crate) fn pending_body_index_rebuild(
         &self,
         account: &AccountKey,
         scope: &ScopeSnapshot,
-        (mime, html): (u16, u16),
-    ) -> Result<Vec<(u32, BlobId, u64)>, CacheError> {
+        body: (u16, u16),
+    ) -> Result<Option<(u32, BlobId, u64)>, CacheError> {
         let namespace = self.scope(account, &scope.mailbox)?;
         if !self.full || namespace != scope.account_namespace {
             return Err(CacheError::OutOfScope);
@@ -82,40 +111,100 @@ impl Cache {
             .get(&namespace)
             .ok_or(CacheError::OutOfScope)?
             .connection;
-        let mut statement = db.prepare_cached(
+        rebuild_candidate(db, scope, body, None)
+    }
+
+    /// Reserve the next candidate before doing I/O. Keep the position after
+    /// errors so later UIDs can progress, and wrap only on a fresh search.
+    pub(crate) fn next_body_index_rebuild(
+        &self,
+        account: &AccountKey,
+        scope: &ScopeSnapshot,
+        body: (u16, u16),
+        remaining: u64,
+        wrap: bool,
+    ) -> Result<Option<(u32, BlobId, u64)>, CacheError> {
+        let namespace = self.scope(account, &scope.mailbox)?;
+        if !self.full || namespace != scope.account_namespace {
+            return Err(CacheError::OutOfScope);
+        }
+        let mut databases = self.lock()?;
+        let database = databases
+            .get_mut(&namespace)
+            .ok_or(CacheError::OutOfScope)?;
+        verify_scope(self, &database.connection, namespace, scope)?;
+        let before = database
+            .body_index_rebuild
+            .get(&scope.mailbox)
+            .filter(|position| {
+                position.validity == scope.uid_validity
+                    && position.restore_epoch == scope.restore_epoch
+                    && position.format == body
+            })
+            .map(|position| position.before_uid);
+        let mut next = rebuild_candidate(&database.connection, scope, body, before)?;
+        if next.is_none() && wrap && before.is_some() {
+            next = rebuild_candidate(&database.connection, scope, body, None)?;
+        }
+        if let Some((uid, blob, bytes)) = next
+            && bytes.max(1) <= remaining
+        {
+            database.body_index_rebuild.insert(
+                scope.mailbox.clone(),
+                RebuildPosition {
+                    validity: scope.uid_validity,
+                    restore_epoch: scope.restore_epoch,
+                    format: body,
+                    before_uid: uid,
+                },
+            );
+            return Ok(Some((uid, blob, bytes)));
+        }
+        Ok(None)
+    }
+}
+
+fn rebuild_candidate(
+    db: &Connection,
+    scope: &ScopeSnapshot,
+    (mime, html): (u16, u16),
+    before: Option<u32>,
+) -> Result<Option<(u32, BlobId, u64)>, CacheError> {
+    let mut statement = db.prepare_cached(
             "SELECT m.uid,a.blob_id,d.bytes FROM messages m
              JOIN artifacts a ON a.message_id=m.id AND a.kind=1 AND a.part=0
                 AND a.mime_version=?4 AND a.html_version=?5 AND a.state=1
              JOIN blobs d ON d.id=a.blob_id
-             WHERE m.mailbox=?1 AND m.uid_validity=?2 AND m.uid<=?3 AND NOT m.tombstone
+             WHERE m.mailbox=?1 AND m.uid_validity=?2 AND m.uid<=?3 AND m.uid<?7 AND NOT m.tombstone
                 AND EXISTS(SELECT 1 FROM body_indexes b WHERE b.message_id=m.id AND b.mime_version=?4
                     AND b.blob_id=a.blob_id AND (b.html_version=?5 OR (b.html_version=?6 AND NOT b.complete)))
                 AND NOT EXISTS(SELECT 1 FROM body_indexes b WHERE b.message_id=m.id AND b.mime_version=?4
                     AND b.html_version=?6 AND b.blob_id=a.blob_id AND b.complete)
-             ORDER BY m.uid DESC LIMIT ?7",
+             ORDER BY m.uid DESC LIMIT 1",
         )?;
-        Ok(statement
-            .query_map(
-                params![
-                    scope.mailbox,
-                    scope.uid_validity,
-                    scope.high_uid,
-                    mime,
-                    html,
-                    index_html_version(html),
-                    BODY_INDEX_REBUILD_BATCH
-                ],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        BlobId::from_bytes(row.get(1)?),
-                        u64::from(row.get::<_, u32>(2)?),
-                    ))
-                },
-            )?
-            .collect::<Result<_, _>>()?)
-    }
+    Ok(statement
+        .query_row(
+            params![
+                scope.mailbox,
+                scope.uid_validity,
+                scope.high_uid,
+                mime,
+                html,
+                index_html_version(html),
+                before.map_or(i64::from(u32::MAX) + 1, i64::from),
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    BlobId::from_bytes(row.get(1)?),
+                    u64::from(row.get::<_, u32>(2)?),
+                ))
+            },
+        )
+        .optional()?)
+}
 
+impl Cache {
     pub(crate) fn discard_old_body_index(
         &self,
         reference: Ref<'_>,

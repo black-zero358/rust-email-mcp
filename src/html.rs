@@ -207,6 +207,7 @@ impl TokenSink for Sink {
                 if !text.in_head && text.templates == 0 {
                     if let Some(readable) = &mut text.readable {
                         readable.tag(&tag);
+                        text.limited |= readable.limited();
                     } else if matches!(
                         name,
                         "br" | "p"
@@ -326,8 +327,13 @@ fn tokenize(
     let tokenizer = Tokenizer::new(sink, Default::default());
     let _ = tokenizer.feed(&input);
     if !input.is_empty() {
-        work.tokens = tokenizer.sink.0.borrow().tokens;
-        return Err(unsupported());
+        let text = tokenizer.sink.0.borrow();
+        work.tokens = text.tokens;
+        return Err(if text.limited {
+            MailError::limit()
+        } else {
+            unsupported()
+        });
     }
     // At a sampling boundary the tokenizer may be holding a partial token.
     // Keep only output emitted from the available prefix.
@@ -336,11 +342,11 @@ fn tokenize(
     }
     let mut text = tokenizer.sink.0.into_inner();
     work.tokens = text.tokens;
-    if text.unsupported {
-        return Err(unsupported());
-    }
     if text.limited {
         return Err(MailError::limit());
+    }
+    if text.unsupported {
+        return Err(unsupported());
     }
     if let Some(readable) = text.readable {
         return readable.finish(text.parse_error, html, complete);

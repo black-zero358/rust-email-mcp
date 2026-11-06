@@ -156,7 +156,7 @@ fn legacy_body_index_is_hidden_and_rebuilt_from_the_same_blob() {
         cache
             .pending_body_index_rebuild(&account, &scope, (1, 1))
             .unwrap(),
-        vec![(7, blob.id, blob.bytes)]
+        Some((7, blob.id, blob.bytes))
     );
     cache
         .remember_full_body_index(reference, BODY, blob.id, "Amount: 1\n000", &|| false)
@@ -171,7 +171,7 @@ fn legacy_body_index_is_hidden_and_rebuilt_from_the_same_blob() {
         cache
             .pending_body_index_rebuild(&account, &scope, (1, 1))
             .unwrap()
-            .is_empty()
+            .is_none()
     );
     cache.collect_blobs(&account).unwrap();
     assert_eq!(search("000").items.len(), 1);

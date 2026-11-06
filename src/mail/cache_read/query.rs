@@ -1,7 +1,7 @@
 //! Bounded local metadata, full-text and exact-ID queries.
 use super::*;
 use crate::{
-    cache::{BODY_INDEX_VERSION, SearchPosition, ThreadRole},
+    cache::{BODY_INDEX_REBUILD_BATCH, BODY_INDEX_VERSION, SearchPosition, ThreadRole},
     mail::{
         classification::{self, Coverage},
         parts::preview,
@@ -87,11 +87,11 @@ impl CachedReader {
                 .filter(|cursor| cursor.segment.is_none())
                 .map(|cursor| cursor.uid);
             let next_cursor = page.next.map(|next| encode_cursor(next, key));
-            let rebuild_pending = !self
+            let rebuild_pending = self
                 .cache
                 .pending_body_index_rebuild(&self.account, &scope, SEARCH_BODY)
                 .map_err(cache_error)?
-                .is_empty();
+                .is_some();
             (
                 rows,
                 next_uid,
@@ -178,15 +178,15 @@ impl CachedReader {
 
     fn rebuild_body_indexes(&self, scope: &ScopeSnapshot) -> Result<()> {
         let mut remaining = cached_body::LIMIT as u64;
-        for (uid, blob, bytes) in self
-            .cache
-            .pending_body_index_rebuild(&self.account, scope, SEARCH_BODY)
-            .map_err(cache_error)?
-        {
-            let Some(left) = remaining.checked_sub(bytes.max(1)) else {
-                continue;
+        for attempt in 0..BODY_INDEX_REBUILD_BATCH {
+            let Some((uid, blob, bytes)) = self
+                .cache
+                .next_body_index_rebuild(&self.account, scope, SEARCH_BODY, remaining, attempt == 0)
+                .map_err(cache_error)?
+            else {
+                break;
             };
-            remaining = left;
+            remaining -= bytes.max(1);
             self.rebuild_body_index(scope, uid, blob)?;
         }
         self.verify(scope, None)
@@ -616,10 +616,8 @@ mod tests {
         mail::MailRuntime,
     };
 
-    #[tokio::test]
-    async fn offline_search_matches_both_internal_date_formats_and_legacy_flags() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("cache.json");
+    fn reader_fixture(directory: &std::path::Path, uid_next: u32) -> CachedReader {
+        let path = directory.join("cache.json");
         std::fs::write(
             &path,
             br#"{"version":1,"mode":"full","directory":"cache","max_bytes":33554432,"accounts":[{"account_id":"default","mailboxes":["INBOX"],"max_bytes":8388608}]}"#,
@@ -642,15 +640,21 @@ mod tests {
         .unwrap();
         let cache = persistent.full_storage(&account).unwrap().clone();
         cache
-            .observe_folder(&account, "INBOX", 9, Some(5), 1)
+            .observe_folder(&account, "INBOX", 9, Some(uid_next), 1)
             .unwrap();
-        let reader = CachedReader {
+        CachedReader {
             cache,
             account,
             alias: "default".into(),
             config,
             persistent,
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_search_matches_both_internal_date_formats_and_legacy_flags() {
+        let directory = tempfile::tempdir().unwrap();
+        let reader = reader_fixture(directory.path(), 5);
         let canonical = ["Seen", "Answered", "Flagged"];
         let legacy = [
             r#"Custom("\\sEeN")"#,
@@ -735,6 +739,55 @@ mod tests {
                 "{page}"
             );
         }
+        reader.persistent.finish().await;
+    }
+
+    #[tokio::test]
+    async fn offline_index_rebuild_rotates_past_storage_failures_and_retries() {
+        let directory = tempfile::tempdir().unwrap();
+        let reader = reader_fixture(directory.path(), 6);
+        for uid in 1..=5 {
+            let reference = reader.reference("INBOX", 9, uid);
+            reader
+                .cache
+                .remember_headers(reference, true, b"Subject: synthetic\r\n\r\n", None)
+                .unwrap();
+            let mut record = cached_body::Record::default();
+            record.push("searchable body".into(), false, 64);
+            persistence::write_body(&reader.cache, reference, &record, None, &|| false).unwrap();
+        }
+        reader
+            .cache
+            .fixture_legacy_indexes_with_storage_fault(&reader.account, true);
+        let search = || {
+            reader
+                .cached_query(
+                    "search_emails",
+                    &json!({"query":"searchable","uid_validity":9}),
+                )
+                .unwrap()
+        };
+        let pending = |page: &Value| {
+            page["cache"]["scopes"][0]["coverage"]["search_index"]["rebuild_pending"] == true
+        };
+        let first = search();
+        assert!(
+            first["emails"].as_array().unwrap().is_empty() && pending(&first),
+            "{first}"
+        );
+        let second = search();
+        assert_eq!(second["emails"][0]["uid"], 1, "{second}");
+        assert!(pending(&second), "{second}");
+        reader
+            .cache
+            .fixture_legacy_indexes_with_storage_fault(&reader.account, false);
+        let recovered = search();
+        assert_eq!(
+            recovered["emails"].as_array().unwrap().len(),
+            5,
+            "{recovered}"
+        );
+        assert!(!pending(&recovered), "{recovered}");
         reader.persistent.finish().await;
     }
 }

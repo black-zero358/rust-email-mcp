@@ -51,6 +51,19 @@ pub(crate) struct DisplayBody {
 mod tests {
     use super::*;
 
+    #[test]
+    fn generated_output_limit_precedes_later_foreign_markup() {
+        let mut context = DisplayContext::new(HtmlDisplay::Readable);
+        context.output_bytes = MAX_OUTPUT - 1;
+        let html = "<a href='https://example.test/'>x</a><svg></svg>";
+        assert_eq!(
+            super::super::render_selected(html, &mut context, &mut Default::default())
+                .unwrap_err()
+                .code,
+            "LIMIT_EXCEEDED",
+        );
+    }
+
     fn render(html: &str) -> DisplayBody {
         let mut context = DisplayContext::new(HtmlDisplay::Readable);
         let text =

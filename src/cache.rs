@@ -32,7 +32,7 @@ pub use blob::{
     Access, ArtifactKey, ArtifactLayer, ArtifactState, BlobId, BlobInfo, BlobLease, BlobStage,
     LayerCoverage, Omission,
 };
-pub(crate) use body_index::BODY_INDEX_VERSION;
+pub(crate) use body_index::{BODY_INDEX_REBUILD_BATCH, BODY_INDEX_VERSION};
 pub use body_index::{CachedSearchHit, CachedSearchPage, SearchPosition};
 pub use dirty::{DirtyStamp, DirtyTicket};
 pub use evidence::{
@@ -103,6 +103,7 @@ struct Database {
     connection: Connection,
     name: String,
     full_schema: bool,
+    body_index_rebuild: BTreeMap<String, body_index::RebuildPosition>,
 }
 
 pub struct Cache {
@@ -245,6 +246,7 @@ impl Cache {
                     connection,
                     name,
                     full_schema,
+                    body_index_rebuild: BTreeMap::new(),
                 };
                 if full {
                     cache.recover_blobs(*namespace, &mut database)?;

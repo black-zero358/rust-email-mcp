@@ -272,7 +272,14 @@ where
                 (String::new(), true)
             } else {
                 let mut decoder =
-                    SampleDecoder::new(&part.charset, &part.transfer_encoding, sample)?;
+                    match SampleDecoder::new(&part.charset, &part.transfer_encoding, sample) {
+                        Ok(decoder) => decoder,
+                        Err(fault) if fault.error.code == "UNSUPPORTED_BODY" => {
+                            rejected.insert(node.index);
+                            continue 'candidate;
+                        }
+                        Err(fault) => return Err(fault),
+                    };
                 budget.claim(sample);
                 let bytes =
                     fetch::section_chunk(session, uid, &part.section, 0, sample, Some(sample))
@@ -347,7 +354,14 @@ pub(in crate::mail) fn from_raw(
                 .headers
                 .get_first_value("Content-Transfer-Encoding")
                 .map_or_else(|| "7bit".into(), |value| value.trim().to_ascii_lowercase());
-            let mut decoder = SampleDecoder::new(&part.ctype.charset, &encoding, sample)?;
+            let mut decoder = match SampleDecoder::new(&part.ctype.charset, &encoding, sample) {
+                Ok(decoder) => decoder,
+                Err(fault) if fault.error.code == "UNSUPPORTED_BODY" => {
+                    rejected.insert(std::ptr::from_ref(part));
+                    continue 'candidate;
+                }
+                Err(fault) => return Err(fault),
+            };
             budget.claim(sample);
             decoder.feed(&encoded[..sample])?;
             let complete = sample == encoded.len();
