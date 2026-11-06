@@ -33,7 +33,7 @@ pub use blob::{
     LayerCoverage, Omission,
 };
 pub use body_index::{CachedSearchHit, CachedSearchPage, SearchPosition};
-pub use dirty::{DirtyStamp, DirtyTicket};
+pub use dirty::{DirtyStamp, DirtyTicket, ListingStamp};
 pub use evidence::{
     CachedListingPage, CachedMailbox, CachedMessage, ListingEvidence, MailboxEvidence,
 };
