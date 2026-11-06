@@ -101,6 +101,14 @@ fn metadata_and_parts_respect_account_generation_tombstones_and_clean_reopen() {
         cache.remember_headers(message(&a, 9, 7), true, b"old", None),
         Err(CacheError::OutOfScope)
     ));
+    assert!(matches!(
+        cache.mark_clean_if(&|| false),
+        Err(CacheError::Storage)
+    ));
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["clean"], false);
+    assert!(!path.join(".manifest-next").exists());
     cache.mark_clean().unwrap();
     drop(cache);
 
