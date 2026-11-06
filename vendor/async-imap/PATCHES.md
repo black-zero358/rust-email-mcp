@@ -50,6 +50,15 @@ unexpected source/checksum or changed pinned version. Upgrade the provenance,
 script and tests together when changing this dependency; verify audit coverage
 against RustSec again. There is no fallback that suppresses an audit failure.
 
+## Case-insensitive capability lookup (issue #59)
+
+`Capabilities::has_str` compares extension atoms such as MOVE and UIDPLUS
+without regard to ASCII case, following [RFC 3501 section 9](https://www.rfc-editor.org/rfc/rfc3501#section-9).
+It preserves parsed spelling, the typed `has` lookup, and the existing IMAP4rev1
+and AUTH= handling. AUTH= prefix detection checks UTF-8 character boundaries.
+The root `tests/imap_completion.rs` regression exercises raw CAPABILITY replies
+with mixed case and checks extension, standard, and unknown names.
+
 ## SELECT/EXAMINE and STATUS completion (issue #28)
 
 `src/parse.rs` also routes `parse_mailbox` and `parse_status` through one

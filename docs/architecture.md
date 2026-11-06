@@ -255,7 +255,7 @@ JSON 日志使用固定事件名和受控字段，记录服务端生成的 reque
 
 测试精简移除了大量故障排列、细粒度边界组合、独立客户端原型和 R13 持续负载设施。开发者针对新缺陷增加最小回归，并同步替换重叠用例，保持总体量预算。历史长跑和完整矩阵记录位于 [validation](validation.md)，下方设计记录中的旧测试名称随对应历史工作包保留。
 
-Vendored 包的协议回归集中在根包 `tests/`。两个上游身份继续由 `scripts/audit-dependencies.sh` 检查，Docker 上下文由 `scripts/test-docker-context.sh` 以合成哨兵和实际构建器核验。
+Vendored 包的协议回归集中在根包 `tests/`。`tests/imap_completion.rs` 通过原始 CAPABILITY 响应核对 MOVE、UIDPLUS 等扩展能力的 ASCII 大小写匹配，覆盖写入能力检查和诊断共用的查询接口。两个上游身份继续由 `scripts/audit-dependencies.sh` 检查，Docker 上下文由 `scripts/test-docker-context.sh` 以合成哨兵和实际构建器核验。
 
 ## Decision records
 
