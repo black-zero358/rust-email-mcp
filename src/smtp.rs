@@ -46,8 +46,8 @@ pub(crate) fn validate_data(raw: &[u8]) -> crate::error::Result<()> {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("SMTPUTF8 unavailable before MAIL")]
-struct SmtpUtf8Unavailable;
+#[error("Required SMTP extension unavailable before MAIL")]
+struct RequiredExtensionUnavailable;
 
 pub(crate) struct SmtpSender {
     host: String,
@@ -152,7 +152,7 @@ impl SmtpSender {
         .await;
         let status = match &result {
             Ok(Ok(())) => "accepted",
-            Ok(Err(error)) if error.is::<SmtpUtf8Unavailable>() => "rejected",
+            Ok(Err(error)) if error.is::<RequiredExtensionUnavailable>() => "rejected",
             Ok(Err(error))
                 if error
                     .downcast_ref::<Error>()
@@ -192,17 +192,17 @@ async fn transaction(
             .server_info()
             .supports_feature(Extension::SmtpUtfEight)
         {
-            return Err(SmtpUtf8Unavailable.into());
+            return Err(RequiredExtensionUnavailable.into());
         }
         options.push(MailParameter::SmtpUtfEight);
     }
     if !raw.is_ascii() {
-        anyhow::ensure!(
-            connection
-                .server_info()
-                .supports_feature(Extension::EightBitMime),
-            "8BITMIME unavailable"
-        );
+        if !connection
+            .server_info()
+            .supports_feature(Extension::EightBitMime)
+        {
+            return Err(RequiredExtensionUnavailable.into());
+        }
         options.push(MailParameter::Body(MailBodyParameter::EightBitMime));
     }
     let response = connection

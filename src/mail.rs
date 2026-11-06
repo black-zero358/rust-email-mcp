@@ -1228,25 +1228,33 @@ async fn email_status<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
 {
-    let fetched = s
+    let mut fetched = s
         .uid_fetch(uid.to_string(), "(UID FLAGS)")
         .await
-        .map_err(map_read_imap_error)?
-        .try_collect::<Vec<_>>()
-        .await
         .map_err(map_read_imap_error)?;
-    // FETCH may also contain unsolicited updates for other messages. A target
-    // update replaces its previous flags, so use the last matching response.
-    let target = fetched
-        .iter()
-        .rev()
-        .find(|f| f.uid == Some(uid))
-        .ok_or(MailError {
-            code: "NOT_FOUND",
-            message: "The requested email UID was not returned by the mailbox.",
-            retryable: false,
-            details: None,
-        })?;
+    let mut target_seen = false;
+    let mut last_flags = None;
+    // Keep the last response with explicit FLAGS while awaiting tagged completion.
+    while let Some(fetch) = fetched.try_next().await.map_err(map_read_imap_error)? {
+        if fetch.uid == Some(uid) {
+            target_seen = true;
+            if fetch.has_flags() {
+                last_flags = Some(fetch);
+            }
+        }
+    }
+    let target = last_flags.ok_or_else(|| {
+        if target_seen {
+            MailError::backend()
+        } else {
+            MailError {
+                code: "NOT_FOUND",
+                message: "The requested email UID was not returned by the mailbox.",
+                retryable: false,
+                details: None,
+            }
+        }
+    })?;
     Ok(
         json!({"uid":uid,"uid_validity":validity,"flags":target.flags().map(|f|format!("{f:?}")).collect::<Vec<_>>()}),
     )
@@ -1494,6 +1502,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn email_status_uses_last_target_flags_after_matching_completion() {
+        let (_dir, service) = fetch_fixture();
+        let updates = "* 1 FETCH (UID 7 FLAGS (\\Seen))\r\n* 1 FETCH (UID 7 FLAGS (\\Flagged))\r\n";
+        let size = "* 1 FETCH (UID 7 RFC822.SIZE 100)\r\n";
+        let unrelated = "* 2 FETCH (UID 8 FLAGS (\\Deleted))\r\n* 3 FETCH (FLAGS (\\Answered))\r\n";
+        for (rows, completion, expected) in [
+            (format!("{updates}{size}"), "OK", Ok(json!(["Flagged"]))),
+            (
+                format!("{updates}* 1 FETCH (UID 7 FLAGS ())\r\n{size}"),
+                "OK",
+                Ok(json!([])),
+            ),
+            (size.to_owned(), "OK", Err("MAIL_BACKEND")),
+            (String::new(), "OK", Err("NOT_FOUND")),
+            (updates.to_owned(), "NO", Err("MAIL_BACKEND")),
+            (updates.to_owned(), "BAD", Err("MAIL_BACKEND")),
+            (updates.to_owned(), "EOF", Err("MAIL_BACKEND")),
+        ] {
+            let (mut session, backend) = fetch_script(vec![
+                (
+                    "EXAMINE \"INBOX\"".into(),
+                    "* 3 EXISTS\r\n* OK [UIDVALIDITY 9] valid\r\n".into(),
+                    "OK",
+                ),
+                (
+                    "UID FETCH 7 (UID FLAGS)".into(),
+                    format!("{rows}{unrelated}"),
+                    completion,
+                ),
+            ])
+            .await;
+            let result = service
+                .with_session(
+                    &mut session,
+                    "get_email_status",
+                    &json!({"uid":7,"uid_validity":9}),
+                )
+                .await
+                .map_err(|error| error.code);
+            backend.await.unwrap();
+            let expected = expected.map(|flags| json!({"uid":7,"uid_validity":9,"flags":flags}));
+            assert_eq!(result, expected, "{completion} with {rows:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn raw_fetch_ignores_interleaved_flags_and_requires_target_attributes() {
         let (_dir, service) = fetch_fixture();
         let raw = "Subject: synthetic\r\n\r\nbody";
@@ -1589,7 +1643,7 @@ mod tests {
             header.len()
         );
         for tool in ["list_emails", "search_emails"] {
-            for update in ["\\Flagged", ""] {
+            for update in ["\\fLaGgEd", ""] {
                 let rows = format!(
                     "* 2 FETCH (UID 99 FLAGS (\\Deleted))\r\n* 3 FETCH (FLAGS (\\Answered))\r\n* 1 FETCH (UID 7 FLAGS (\\Answered))\r\n{full}* 1 FETCH (UID 7 FLAGS ({update}))\r\n* 1 FETCH (UID 7 RFC822.SIZE 101)\r\n* 1 FETCH (UID 7)\r\n"
                 );
@@ -1932,6 +1986,124 @@ mod tests {
     #[tokio::test]
     async fn smtp_accepted_is_persisted_before_unresponsive_quit() {
         smtp_fixture(false).await;
+    }
+
+    #[tokio::test]
+    async fn draft_without_required_8bitmime_is_durably_rejected_before_mail() {
+        use tokio::{
+            io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+            net::TcpListener,
+        };
+        use tokio_rustls::{TlsAcceptor, rustls::pki_types::PrivateKeyDer};
+
+        let imap = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let smtp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = (*crate::config::fixture()).clone();
+        config.imap_host = "localhost".into();
+        config.imap_port = imap.local_addr().unwrap().port();
+        let smtp_port = smtp.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(&dir.path().join("db")).unwrap());
+        let body_fetch = format!(
+            "UID FETCH 7 (UID BODY.PEEK[]<0.{}>)",
+            config.max_message + 1
+        );
+        let mut service = MailService::new(Arc::new(config), journal.clone()).unwrap();
+        service.smtp = Some(SmtpSender::fixture(smtp_port, service.config.timeout));
+
+        let signed = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert = signed.cert.der().clone();
+        let tls = tokio_rustls::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.clone()],
+                PrivateKeyDer::Pkcs8(signed.signing_key.serialize_der().into()),
+            )
+            .unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(cert).unwrap();
+        service.test_imap_roots = Some(roots);
+
+        let imap_task = tokio::spawn(async move {
+            let (socket, _) = imap.accept().await.unwrap();
+            let stream = TlsAcceptor::from(Arc::new(tls))
+                .accept(socket)
+                .await
+                .unwrap();
+            let mut stream = BufReader::new(stream);
+            stream.write_all(b"* OK fixture\r\n").await.unwrap();
+            let raw = concat!(
+                "To: receiver@example.com\r\n",
+                "Content-Type: text/plain; charset=utf-8\r\n",
+                "Content-Transfer-Encoding: 8bit\r\n\r\n",
+                "合成正文\r\n",
+            );
+            for (expected, reply) in [
+                ("LOGIN ", String::new()),
+                (
+                    "EXAMINE \"Drafts\"",
+                    "* 1 EXISTS\r\n* OK [UIDVALIDITY 9] valid\r\n".into(),
+                ),
+                (
+                    "UID FETCH 7 (UID RFC822.SIZE)",
+                    format!("* 1 FETCH (UID 7 RFC822.SIZE {})\r\n", raw.len()),
+                ),
+                (
+                    &body_fetch,
+                    format!("* 1 FETCH (UID 7 BODY[]<0> {{{}}}\r\n{raw})\r\n", raw.len()),
+                ),
+            ] {
+                let mut line = String::new();
+                stream.read_line(&mut line).await.unwrap();
+                let (tag, command) = line.trim_end().split_once(' ').unwrap();
+                assert!(command.starts_with(expected), "{command}");
+                stream
+                    .write_all(format!("{reply}{tag} OK complete\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                stream.flush().await.unwrap();
+            }
+        });
+        let smtp_task = tokio::spawn(async move {
+            let (socket, _) = smtp.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            socket.write_all(b"220 test ESMTP\r\n").await.unwrap();
+            let mut line = String::new();
+            socket.read_line(&mut line).await.unwrap();
+            assert!(line.starts_with("EHLO "));
+            socket.write_all(b"250 test\r\n").await.unwrap();
+            line.clear();
+            socket.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "QUIT\r\n");
+            assert_eq!(
+                journal.get("owner", "test-8bit").unwrap().unwrap().status,
+                "rejected"
+            );
+            socket.write_all(b"221 bye\r\n").await.unwrap();
+            smtp
+        });
+
+        let args = json!({"uid":7,"uid_validity":9,"operation_key":"test-8bit"});
+        let sent = service.execute("send_draft", &args, "owner").await.unwrap();
+        assert_eq!(sent["operation"]["status"], "rejected");
+        assert_eq!(sent["retry_allowed"], false);
+        imap_task.await.unwrap();
+        let smtp = smtp_task.await.unwrap().into_std().unwrap();
+        let lookup = service
+            .execute(
+                "get_operation",
+                &json!({"operation_key":"test-8bit"}),
+                "owner",
+            )
+            .await
+            .unwrap();
+        let repeat = service.execute("send_draft", &args, "owner").await.unwrap();
+        assert_eq!(lookup["operation"], sent["operation"]);
+        assert_eq!(repeat["operation"], sent["operation"]);
+        assert_eq!(
+            smtp.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 
     #[tokio::test]
