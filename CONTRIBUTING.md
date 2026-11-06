@@ -74,7 +74,7 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
-Release 编译由 `container` job 的生产 Dockerfile 执行。Rust job 缓存依赖构建，恢复缓存后清理本包与两个 vendored 包，保证当前源码重新编译。审计工具和 Docker 构建层分别缓存。
+Release 编译由 `container` job 的生产 Dockerfile 执行。Rust job 缓存依赖构建，恢复缓存后清理本包与全部 vendored 包，保证当前源码重新编译。审计工具和 Docker 构建层分别缓存。
 
 依赖审计使用专用脚本覆盖 vendored 上游版本；`cargo-audit` 版本与 CI 一致：
 
@@ -83,7 +83,7 @@ cargo install cargo-audit --version 0.22.2 --locked
 bash scripts/audit-dependencies.sh
 ```
 
-审计脚本变更同时执行 `bash scripts/test-audit-dependencies.sh`，核对两个本地补丁包的身份恢复、错误传播、临时文件清理及原锁文件保持；CI 的 audit job 持续运行这些离线回归。
+审计脚本变更同时执行 `bash scripts/test-audit-dependencies.sh`，核对各本地补丁包的身份恢复、错误传播、临时文件清理及原锁文件保持；CI 的 audit job 持续运行这些离线回归。
 
 容器、构建上下文或 path 依赖变化还需执行：
 
