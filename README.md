@@ -89,7 +89,9 @@
 
 ## 构建与版本
 
-本页描述 `main` 上的 0.2.2 源码。已发布的 Linux amd64 二进制和 `SHA256SUMS` 在 [GitHub Releases](https://github.com/black-zero358/rust-email-mcp/releases)，安装时按对应标签的发行说明使用。0.2.2 的 musl 候选、双账户 10,064 封合成邮件和 30 分钟持续验收记录见[验证记录](docs/validation.md#2026-11-05-r13-整体验收与-022-候选)。现有实例升级前，先查看[配置、缓存和回滚要点](docs/maintenance.md#022-升级要点)。
+本页对应 `main` 的 0.3.0 源码。从已发布版本安装时，使用该版本的 Linux amd64 二进制、`SHA256SUMS` 和发行说明。[下载 v0.2.2](https://github.com/black-zero358/rust-email-mcp/releases/tag/v0.2.2)
+
+从 0.2.2 升级到 0.3.0 前，核对整理结果中的 `accepted`、离线正文索引重建及停止宽限。[0.3.0 升级与回退](docs/maintenance.md#030-升级要点)
 
 从源码构建时使用 [rust-toolchain.toml](rust-toolchain.toml) 固定的 Rust 1.99.1 和仓库锁文件：
 

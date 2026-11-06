@@ -2,6 +2,20 @@
 
 本文件保存带版本与环境边界的证据。每次新增记录注明提交/tag、日期与时区、环境、命令、结果、CI 链接及未覆盖项；保留历史结果，不把其测试数量或部署状态当作当前版本的证明。验证要求见 [贡献指南](../CONTRIBUTING.md#验证与完成标准)。
 
+## 0.3.0 兼容性验证入口
+
+下表用于在最终候选提交上复验升级契约。测试使用合成邮件、隔离缓存及测试身份，运行 `cargo test --locked <测试名>` 可单独复验。验收结果按[发布检查](maintenance.md#发布检查)记录到对应提交和 CI 运行。
+
+| 场景 | 回归入口及检查点 |
+| --- | --- |
+| 单封和批量整理 | `single_writes_distinguish_missing_targets_and_confirmed_updates`、`message_write_outcomes_validate_through_signed_mcp`。验证缺失或重复删除、逐 UID 证据、命令已接受但结果待核对、错误完成，以及签名 MCP 的逐项结果和连接失败 Schema。 |
+| 正文与旧索引 | `structured_alternative_retries_render_failure_but_keeps_command_failure`、`offline_index_rebuild_rotates_past_storage_failures_and_retries`、`offline_body_search_publishes_projection_coverage_through_its_schema`。验证 MIME 候选回退、旧索引有界轮转和 v2 搜索覆盖。 |
+| 摘要与定位 | `listing_reports_header_coverage_without_exposing_a_clipped_field`、`offline_search_matches_both_internal_date_formats_and_legacy_flags`、`cold_locate_accepts_complete_header_only_literals_within_budget`。验证在线及离线的 `header_complete`、截断字段、纯头邮件和协议完成。 |
+| 原发送参数与附件引用 | `signed_legacy_writes_accept_crlf_in_body_only`、`legacy_inbox_attachment_ids_still_bind_all_reference_dimensions`、`signed_target_attachment_get_rechecks_subject_and_returns_exact_binary`。验证旧操作键的指纹语义及附件 ID 的在线、离线、大小写和作用域兼容性。 |
+| 正常停止 | Linux 上运行 `sigterm_drains_admitted_drafts`，向测试服务发送 SIGTERM，验证空闲时快速退出、排空已接纳写入，以及 SMTP 确认超时后持久保留 `unknown`。部署时按[停止宽限](deployment.md#验收与回滚)核对实际编排配置。 |
+
+候选提交同时运行 `cargo fmt --check`、`cargo test --locked`、`cargo clippy --locked --all-targets -- -D warnings`，并按[维护规程](maintenance.md#离线持续验收)复核测试规模。发行二进制的静态链接和隔离恢复结果记录在对应发布验收中。
+
 ## 2026-11-06 测试与 CI 精简
 
 基线为 `42873c0`。使用 `uv run scripts/test-inventory.py --revision 42873c0` 与工作树统计，按 UTF-8/LF 归一化后的测试源码测量，包含内嵌测试/辅助模块、专项脚本、恢复烟测和统计脚本。保留历史证据、数据夹具和文档，源码计数覆盖可执行测试代码。

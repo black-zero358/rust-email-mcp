@@ -23,6 +23,26 @@
 
 删除或改义应先说明替代方式和迁移窗口。发布前用相关旧参数、旧配置或合成旧数据库验证受影响的兼容路径，并记录结果；无关路径不要求重复全量验收。
 
+### 0.3.0 升级要点
+
+0.3.0 调整单封和批量标记、移动、删除的成功结果契约。旧客户端如果只识别 `updated`，升级前应加入以下分支。六个工具均发布对应的输出 Schema。
+
+| 结果 | 含义与客户端处理 |
+| --- | --- |
+| `updated` | 收到了目标 UID 的结果证据，例如返回的 FLAGS 符合请求，或 COPYUID 确认了移动。 |
+| `accepted` | IMAP 命令返回匹配的 tagged OK，逐 UID 结果仍待核对。没有 COPYUID 的移动和永久删除可以返回此状态。遵循 `retry_allowed:false`，先检查邮箱状态。 |
+| 单封 `NOT_FOUND`、批量项 `not_found` | 写入前的 UID 核对确认目标缺失。重复删除沿用此结果。 |
+
+- 列表和搜索摘要新增 `header_complete`。值为 false 时，`subject`、`from` 和 `date` 的 null 表示未知。按 Message-ID 定位支持在限额内读取末尾没有空行的完整纯头邮件。
+- `save_draft`、`send_email`、`reply_email` 和 `forward_email` 的顶层 `body` 接受 CRLF 和原有 LF。发送操作仍按原始参数计算指纹。复用既有 `operation_key` 时请沿用原请求的换行写法。
+- 在线及离线附件清单为 `INBOX` 的 ASCII 大小写拼写生成同一 `att_v1` ID。升级前按其他 `INBOX` 拼写生成的引用仍可使用，其他文件夹按原拼写匹配。
+
+完整缓存沿用 SQLite schema V6，正文搜索改用投影索引 v2。升级前保存账户注册库、相邻运行见证、最新发送操作库和缓存备份。用 `search_emails` 发起离线正文搜索时，提供 `query` 和 `search_source:"cache"`，省略 `cache_cursor` 和 `before_uid`。服务从已有本地正文记录逐批重建旧索引，每次最多尝试 4 封，按候选正文 blob 大小累计最多 32 MiB。同步暂停时也会推进此步骤。查看 `data.cache.scopes[].coverage.search_index` 的 `indexed_body` 和 `rebuild_pending` 判断本次搜索覆盖及重建进度。升级前取得的 `cache_cursor` 返回 `CURSOR_UNAVAILABLE` 时，省略该游标重新开始查询。
+
+手动运行或自备编排器时，为正常停止预留至少 165 秒。0.3.0 收到停止信号后，在 153 秒上限内排空已经登记的写入及收尾任务，仓库 Compose 设置 165 秒停止宽限。操作步骤见[部署指南](deployment.md#验收与回滚)。
+
+回退前先停止同步并正常关闭。保留升级后的缓存目录，给旧版本配置独立的私有缓存目录，沿用原账户注册库、运行见证及最新发送操作库。恢复缓存备份时，执行[缓存恢复和在线核对](deployment.md#持久缓存备份与恢复)。客户端按实际连接版本解释整理状态。升级验收见[0.3.0 兼容性验证入口](validation.md#030-兼容性验证入口)。
+
 ### 0.2.2 升级要点
 
 `0.2.2` 汇总附件下载与内容读取、HTML 展示、Unicode/输出契约、多账户只读、跨目录会话、正文预览和持久离线缓存。新增配置保持显式启用：未配置缓存时为 off，后台同步默认暂停，启用同步后默认 rev1；`sync.protocol:"auto"` 按服务器能力使用 QRESYNC、CONDSTORE 或基础核对。既有默认账户的写工具和发送操作键保持原作用域。
