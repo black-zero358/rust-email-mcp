@@ -4,6 +4,7 @@ pub(crate) trait Node: Copy {
     fn media_type(&self) -> &str;
     fn attachment(self) -> bool;
     fn encoding_supported(self) -> bool;
+    fn charset_supported(self) -> bool;
     fn nonempty(self) -> Option<bool>;
     fn children(self) -> usize;
     fn child(self, index: usize) -> Self;
@@ -11,8 +12,14 @@ pub(crate) trait Node: Copy {
 }
 
 /// An error asks the caller to establish encoded emptiness for that entity.
-/// Charset and transfer decoding never participate in an alternative probe.
-pub(crate) fn select<N: Node>(node: N, out: &mut Vec<N>, html: bool) -> Result<bool, N> {
+/// Decoding stays outside selection. A caller can exclude leaves which
+/// proved unrenderable, then retry without selecting a partial alternative.
+pub(crate) fn select<N: Node>(
+    node: N,
+    out: &mut Vec<N>,
+    html: bool,
+    rejected: &impl Fn(N) -> bool,
+) -> Result<bool, N> {
     if node.attachment() {
         return Ok(false);
     }
@@ -21,8 +28,18 @@ pub(crate) fn select<N: Node>(node: N, out: &mut Vec<N>, html: bool) -> Result<b
     }
     if node.children() == 0 {
         match node.media_type() {
-            "text/plain" => out.push(node),
-            "text/html" if html => out.push(node),
+            "text/plain" | "text/html" if node.media_type() == "text/plain" || html => {
+                if rejected(node) {
+                    return Ok(true);
+                }
+                if !node.charset_supported() {
+                    // A truly empty text entity is a complete representation.
+                    if node.nonempty().ok_or(node)? {
+                        return Ok(true);
+                    }
+                }
+                out.push(node);
+            }
             _ => return node.nonempty().ok_or(node),
         }
         return Ok(false);
@@ -33,7 +50,7 @@ pub(crate) fn select<N: Node>(node: N, out: &mut Vec<N>, html: bool) -> Result<b
             for mode in [false, true].into_iter().take(if html { 2 } else { 1 }) {
                 for index in (0..node.children()).rev() {
                     let before = out.len();
-                    let failed = select(node.child(index), out, mode)?;
+                    let failed = select(node.child(index), out, mode, rejected)?;
                     if failed {
                         out.truncate(before);
                         unsupported = true;
@@ -45,17 +62,21 @@ pub(crate) fn select<N: Node>(node: N, out: &mut Vec<N>, html: bool) -> Result<b
             Ok(unsupported)
         }
         "multipart/related" => match node.related_root() {
-            Some(root) => select(root, out, html),
+            Some(root) => select(root, out, html, rejected),
             None => node.nonempty().ok_or(node),
         },
         _ => {
             let mut unsupported = false;
             for index in 0..node.children() {
-                unsupported |= select(node.child(index), out, html)?;
+                unsupported |= select(node.child(index), out, html, rejected)?;
             }
             Ok(unsupported)
         }
     }
+}
+
+pub(crate) fn charset_supported(label: &str) -> bool {
+    charset::Charset::for_label_no_replacement(label.as_bytes()).is_some()
 }
 
 impl Node for &super::Part<'_> {
@@ -67,6 +88,9 @@ impl Node for &super::Part<'_> {
     }
     fn encoding_supported(self) -> bool {
         self.transfer_encoding().is_ok()
+    }
+    fn charset_supported(self) -> bool {
+        charset_supported(&self.ctype.charset)
     }
     fn nonempty(self) -> Option<bool> {
         Some(!self.body.is_empty())

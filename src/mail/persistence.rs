@@ -18,7 +18,7 @@ const CACHE_JOBS: usize = EXECUTION_SLOTS * 4;
 const CACHE_JOB_BYTES: usize = 8 * 1024 * 1024;
 const INDEX_BYTES: usize = 8 * 1024;
 const PARTS_BYTES: usize = 256 * 1024;
-const WRITE_FENCE_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+pub(super) const WRITE_FENCE_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 // Two retained payloads plus one 32 MiB conversion buffer on the single FIFO
 // worker. The worker releases raw before constructing the full-text index.
 const CONTENT_PAYLOADS: usize = 2;
@@ -73,7 +73,11 @@ type CacheJob = Box<dyn FnOnce(&Arc<Cache>) + Send>;
 enum CacheMessage {
     Work(CacheJob),
     Barrier(oneshot::Sender<()>),
-    Finish(Arc<Persistent>, oneshot::Sender<()>),
+    Finish(
+        Arc<Persistent>,
+        Option<tokio::time::Instant>,
+        oneshot::Sender<bool>,
+    ),
 }
 type GenerationKey = ([u8; 32], String);
 type Generations = Mutex<HashMap<GenerationKey, Generation>>;
@@ -169,13 +173,19 @@ impl PreparedCache {
                                 CacheMessage::Barrier(done) => {
                                     let _ = done.send(());
                                 }
-                                CacheMessage::Finish(state, done) => {
-                                    if state.can_mark_clean() {
-                                        let _ = worker.mark_clean();
-                                    }
+                                CacheMessage::Finish(state, deadline, done) => {
+                                    let publish = || {
+                                        !done.is_closed()
+                                            && deadline.is_none_or(|deadline| {
+                                                tokio::time::Instant::now() < deadline
+                                            })
+                                    };
+                                    let finished = publish()
+                                        && (!state.can_mark_clean()
+                                            || worker.mark_clean_if(&publish).is_ok());
                                     drop(state);
                                     drop(worker);
-                                    let _ = done.send(());
+                                    let _ = done.send(finished);
                                     return;
                                 }
                             }
@@ -625,19 +635,30 @@ impl PreparedCache {
     }
 
     pub async fn finish(self) {
-        if let Some(state) = &self.0
-            && let Some(queue) = &state.queue
-        {
-            state.cache_read_jobs.close();
-            let (done, wait) = oneshot::channel();
-            if queue
-                .send(CacheMessage::Finish(state.clone(), done))
-                .await
-                .is_ok()
-            {
-                let _ = wait.await;
-            }
-        }
+        self.finish_with_deadline(None).await;
+    }
+
+    pub(super) async fn finish_before(self, deadline: tokio::time::Instant) -> bool {
+        tokio::time::timeout_at(deadline, self.finish_with_deadline(Some(deadline)))
+            .await
+            .unwrap_or(false)
+    }
+
+    async fn finish_with_deadline(self, deadline: Option<tokio::time::Instant>) -> bool {
+        let Some((state, queue)) = self
+            .0
+            .as_ref()
+            .and_then(|state| state.queue.as_ref().map(|queue| (state, queue)))
+        else {
+            return true;
+        };
+        state.cache_read_jobs.close();
+        let (done, wait) = oneshot::channel();
+        queue
+            .send(CacheMessage::Finish(state.clone(), deadline, done))
+            .await
+            .is_ok()
+            && wait.await.unwrap_or(false)
     }
 
     pub fn mark_restored(&self) -> anyhow::Result<()> {
@@ -1356,7 +1377,7 @@ impl MailService {
                     uid_validity,
                     uid,
                 };
-                write_body(cache, reference, &payload.0)
+                write_body(cache, reference, &payload.0, None, &|| false)
             },
         );
     }
@@ -1479,7 +1500,7 @@ impl MailService {
                         ArtifactState::Derivable { raw: published.id },
                     ));
                     cache.record_artifact_states(reference, &states)?;
-                    write_body(cache, reference, &record)?;
+                    write_body(cache, reference, &record, None, &|| false)?;
                 } else {
                     cache.record_artifact_states(reference, &states)?;
                 }
@@ -1736,10 +1757,12 @@ impl MailService {
     }
 }
 
-fn write_body(
+pub(super) fn write_body(
     cache: &Arc<Cache>,
     reference: CacheRef<'_>,
     record: &parts::cached_body::Record,
+    expected_old: Option<crate::cache::BlobId>,
+    cancelled: &dyn Fn() -> bool,
 ) -> std::result::Result<(), CacheError> {
     let mut stage = cache.begin_blob(
         reference,
@@ -1748,14 +1771,14 @@ fn write_body(
         parts::cached_body::LIMIT as u64,
     )?;
     let metadata = record.encode(&mut stage)?;
-    let blob = stage.publish_body(&metadata, &|| false)?;
+    let blob = stage.publish_body_replacing(&metadata, expected_old, cancelled)?;
     if let Ok(rendered) = record.display(crate::html::HtmlDisplay::Legacy) {
         cache.remember_full_body_index(
             reference,
             parts::cached_body::KEY,
             blob.id,
             &rendered.text,
-            &|| false,
+            cancelled,
         )?;
     }
     Ok(())
@@ -2174,7 +2197,14 @@ mod tests {
         assert!(flags(cache).is_empty());
         release.send(()).unwrap();
         persistent.sync_write_barrier().await.unwrap();
-        mail.finish_cache(persistent).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        mail.begin_shutdown();
+        assert!(
+            tokio::time::timeout_at(deadline, mail.drain_shutdown(deadline))
+                .await
+                .unwrap()
+        );
+        assert!(mail.finish_cache(persistent, deadline).await);
         drop(mail);
 
         let next = open(CacheRunIdentity {

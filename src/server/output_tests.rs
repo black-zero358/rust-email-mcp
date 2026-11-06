@@ -38,6 +38,9 @@ use tokio_rustls::{
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
+#[cfg(unix)]
+mod shutdown;
+
 const PART_HEADER: &[u8] = b"Content-Type: application/octet-stream; name=part.bin\r\nContent-Disposition: attachment; filename=part.bin\r\nContent-Transfer-Encoding: base64\r\n\r\n";
 const TEXT_HEADER: &[u8] =
     b"Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n";
@@ -121,6 +124,7 @@ impl Message {
     }
 }
 
+type DraftGate = tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<()>>;
 struct Backend {
     port: u16,
     connections: Arc<AtomicUsize>,
@@ -135,16 +139,27 @@ impl Drop for Backend {
 
 impl Backend {
     async fn start(tls: TlsAcceptor, text: &str) -> Self {
+        Self::start_with_draft_gate(tls, text, None).await
+    }
+
+    async fn start_with_draft_gate(tls: TlsAcceptor, text: &str, gate: Option<DraftGate>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let connections = Arc::new(AtomicUsize::new(0));
         let count = connections.clone();
-        let message = Arc::new(Message::new(text));
+        let mut message = Message::new(text);
+        if gate.is_some() {
+            message
+                .raw
+                .splice(..0, b"To: recipient@example.test\r\n".iter().copied());
+        }
+        let message = Arc::new(message);
         let task = tokio::spawn(async move {
             while let Ok((socket, _)) = listener.accept().await {
                 count.fetch_add(1, Ordering::SeqCst);
                 let tls = tls.clone();
                 let message = message.clone();
+                let gate = gate.clone();
                 tokio::spawn(async move {
                     let Ok(stream) = tls.accept(socket).await else {
                         return;
@@ -159,13 +174,18 @@ impl Backend {
                         let (tag, command) = line.trim_end().split_once(' ').unwrap();
                         let mut reply = match command {
                             "CAPABILITY" => b"* CAPABILITY IMAP4rev1\r\n".to_vec(),
-                            command if command.strip_prefix("EXAMINE ").is_some_and(|name| name.trim_matches('"').eq_ignore_ascii_case("INBOX")) => b"* 1 EXISTS\r\n* OK [UIDVALIDITY 9] valid\r\n* OK [UIDNEXT 8] next\r\n".to_vec(),
+                            command if command == "EXAMINE \"Drafts\"" || command.strip_prefix("EXAMINE ").is_some_and(|name| name.trim_matches('"').eq_ignore_ascii_case("INBOX")) => b"* 1 EXISTS\r\n* OK [UIDVALIDITY 9] valid\r\n* OK [UIDNEXT 8] next\r\n".to_vec(),
                             command if command.starts_with("LOGIN ") => Vec::new(),
                             command if command.starts_with("LIST ") => b"* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n".to_vec(),
                             command if command.starts_with("UID SEARCH ") => b"* SEARCH 7\r\n".to_vec(),
                             command if command.starts_with("UID FETCH ") => {
                                 let (uids, attrs) = command.strip_prefix("UID FETCH ").unwrap().split_once(' ').unwrap();
                                 if uids.split(',').any(|uid| uid == "7") {
+                                    if attrs.contains("BODY.PEEK[]") && let Some(gate) = &gate {
+                                        let (release, wait) = tokio::sync::oneshot::channel();
+                                        gate.send(release).await.unwrap();
+                                        wait.await.unwrap();
+                                    }
                                     message.fetch(attrs)
                                 } else {
                                     Vec::new()
@@ -625,6 +645,40 @@ async fn metadata_cache_status_reports_live_evidence_without_an_imap_read() {
     })
     .await
     .unwrap();
+    assert_eq!(h.connections(), before);
+    drop(h.app);
+    h.cache.finish().await;
+}
+
+#[tokio::test]
+async fn offline_body_search_publishes_projection_coverage_through_its_schema() {
+    let h = Harness::with_cache(Some("full")).await;
+    let live = h
+        .call("owner", "get_email", json!({"uid":7,"uid_validity":9}))
+        .await;
+    assert_eq!(live["data"]["body"], "第一个邮箱");
+    let before = h.connections();
+    let searched = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let page = h
+                .call(
+                    "owner",
+                    "search_emails",
+                    json!({"query":"第一个","search_source":"cache","uid_validity":9}),
+                )
+                .await;
+            if page["data"]["emails"][0]["cache_match"]["body"] == true {
+                break page;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let index = &searched["data"]["cache"]["scopes"][0]["coverage"]["search_index"];
+    assert_eq!(index["indexed_body"], 1);
+    assert_eq!(index["version"], 2);
+    assert_eq!(index["rebuild_pending"], false);
     assert_eq!(h.connections(), before);
     drop(h.app);
     h.cache.finish().await;

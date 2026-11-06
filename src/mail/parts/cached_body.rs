@@ -107,18 +107,23 @@ impl Record {
             } else {
                 0
             };
-        let mut text = String::with_capacity(reserved + readable_extra);
+        let mut remaining = LIMIT
+            .checked_sub(reserved)
+            .ok_or_else(|| MailError::limit_kind(LimitKind::DecodedBodyBytes))?;
+        let capacity = (reserved + self.leaves.len().saturating_sub(1)).min(LIMIT);
+        let mut text = String::with_capacity(capacity + readable_extra);
         let mut context = DisplayContext::new(format);
+        let mut work = crate::html::RenderWork::default();
         for leaf in &self.leaves {
-            if leaf.html {
-                let rendered = crate::html::render_selected(&leaf.text, &mut context)?;
-                if rendered.len() > leaf.reserve && format != HtmlDisplay::Readable {
-                    return Err(MailError::limit_kind(LimitKind::DecodedBodyBytes));
-                }
-                text.push_str(&rendered);
-            } else {
-                text.push_str(&leaf.text);
-            }
+            crate::html::project_body_leaf(
+                &mut text,
+                &leaf.text,
+                leaf.html,
+                leaf.reserve,
+                &mut remaining,
+                &mut context,
+                &mut work,
+            )?;
         }
         Ok(DisplayBody {
             text,

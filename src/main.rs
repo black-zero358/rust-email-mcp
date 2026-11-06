@@ -1,11 +1,27 @@
 use rust_email_mcp::{
-    accounts, auth::Auth, config, journal::Journal, mail::MailRuntime, server::http_router,
+    accounts,
+    auth::Auth,
+    config,
+    journal::Journal,
+    mail::MailRuntime,
+    server::{http_router, serve_until_shutdown},
 };
 use std::{path::Path, sync::Arc};
 use tracing_subscriber::EnvFilter;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let mut witness = None;
+    let result = runtime.block_on(run(&mut witness));
+    // Application writes and cache work have drained on this return path.
+    runtime.shutdown_background();
+    drop(witness);
+    result
+}
+
+async fn run(witness: &mut Option<accounts::CacheRun>) -> anyhow::Result<()> {
     // Library debug logs may contain protocol payloads. Keep a fixed allowlist filter.
     tracing_subscriber::fmt()
         .json()
@@ -33,6 +49,7 @@ async fn main() -> anyhow::Result<()> {
     let catalog = accounts::open_catalog(settings)?;
     let run = accounts::CacheRun::begin(catalog.config())?;
     let cache = MailRuntime::prepare_cache_for_run(&catalog, cache_settings, Some(run.identity()))?;
+    *witness = Some(run);
     if restore {
         cache.mark_restored()?;
         tracing::info!(event = "cache_restore_marked");
@@ -47,32 +64,12 @@ async fn main() -> anyhow::Result<()> {
     let mail = Arc::new(MailRuntime::with_cache(catalog, journal, cache.clone())?);
     let auth = Auth::new(config.clone()).await?;
     let ct = tokio_util::sync::CancellationToken::new();
-    let shutdown_mail = mail.clone();
-    let signal_mail = mail.clone();
-    let router = http_router(&config, mail, auth, ct.clone())?;
+    let router = http_router(&config, mail.clone(), auth, ct.clone())?;
     let listener = tokio::net::TcpListener::bind(&config.bind).await?;
-    shutdown_mail.start_sync();
-    tracing::info!(event = "started", version = env!("CARGO_PKG_VERSION"));
-    let served = axum::serve(listener, router)
-        .with_graceful_shutdown(async move {
-            #[cfg(unix)]
-            {
-                let mut term =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                        .expect("signal handler");
-                tokio::select! {_=tokio::signal::ctrl_c()=>{},_=term.recv()=>{}}
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = tokio::signal::ctrl_c().await;
-            }
-            ct.cancel();
-            signal_mail.stop_sync();
-            tokio::time::sleep(std::time::Duration::from_secs(35)).await;
-        })
-        .await;
-    shutdown_mail.finish_cache(cache).await;
-    served?;
-    drop(run);
+    if !serve_until_shutdown(listener, router, mail, cache, ct).await? {
+        // Blocking jobs may still hold storage state. Keep the run witness
+        // locked until the OS terminates the process and its remaining work.
+        std::process::exit(1);
+    }
     Ok(())
 }

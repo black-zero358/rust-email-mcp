@@ -147,6 +147,8 @@ HTTP 内容固定为 octet-stream，带 no-store/nosniff、`X-Content-SHA256` �
 
 HTML 回退只用有界 tokenizer sink，不引入 DOM/layout 引擎、不执行脚本或加载资源。tokenizer 前检查输入和属性复杂度，处理时继续限制 token 与输出；属性复杂度必须覆盖无空白的相邻 quoted attributes 和 slash recovery。tokenizer-only sink 无法解释 SVG/MathML 外来内容及其 CDATA，出现时即使已有可见文字也拒绝整段正文。其他非空但无法完整解释的内联内容同样显式失败，转发必须在发送 claim 前拒绝不完整原文。所有新构建纯文本邮件显式声明 UTF-8，保持转发中的 Unicode 内容。
 
+正文候选探测在解码前核对非空文本叶的字符集。某个候选的 HTML 无法完整渲染时，舍弃本轮全部展示、HTML 统计和缓存叶，重新选择完整表示；尝试已用的解码、分词、预览取样及 IMAP 字节预算继续计入。协议失败和资源限额沿原错误传播。投影按选中叶顺序展示，相邻非空叶之间没有换行时补一个 LF，计入正文预算；预览把独立叶边界折叠为一个空格。回归覆盖 raw/转发、结构化分块、缓存叶重放和预览。
+
 读取可显式选择 `html_display:readable`；默认和转发继续使用 `legacy`。两种格式复用同一 MIME 候选选择器，读取解析一次 MIME 后分别提取元数据及所选格式正文。`html/readable` 维护有界格式状态：16 层列表/引用/表格、256 个链接、每链接 2048 UTF-8 字节；实体解码后验证 http/https/mailto 协议、控制字符和长度。多个所选 HTML 叶子共用 token、输出和链接预算。输出含 `legacy-v1` / `readable-v1` 及固定原因省略计数，保持外来内容拒绝和原有输入/标记复杂度约束。
 
 ## Send lifecycle
@@ -154,6 +156,8 @@ HTML 回退只用有界 tokenizer sink，不引入 DOM/layout 引擎、不执行
 发送先提交 operation key、参数摘要与 Message-ID，再进入 SMTP。参数摘要包含工具名与参数；并发请求通过同一去重键竞争执行权，重复调用读取已存状态。SMTP 最终响应丢失、超时或取消后不能猜测已失败，更不能自动重试。进程重启将未完成的 `sending` 记录改为 `unknown`。操作键默认持续保留；保留和迁移规则见维护文档。
 
 SMTP 使用 lettre 的低层 connection/command/message API，保留 TLS、AUTH、SMTPUTF8 和 8BITMIME 策略。连接及事务共用发送期限；最终 DATA 250 确认后先记录 `accepted`，明确拒绝先记录 `rejected`，再执行独立的最多一秒 QUIT 清理。`unknown` 或取消的事务直接关闭，不 QUIT、不进连接池。执行槽位持有到清理结束，避免积累清理任务。HTTP/MCP 调用者断开不能把发送生命周期变成不受记录的重试。
+
+进程收到停机信号即封闭写入登记并停止接受新 HTTP 连接。已登记的写任务保留共享队列和执行许可，HTTP、同步、写入和取消后仍持有许可的读取或附件传输共用从信号开始计时的绝对截止。只有任务和缓存队列完成排空且仍在期限内，缓存才发布 clean receipt。若排空未完成，进程保留运行见证锁至退出。SMTP 已确认结果先持久化再清理，未完成的 sending 在下次启动恢复为 unknown。
 
 异步 SMTP 响应在解密后按每行 1,000 字节、每个完整回复 100,000 字节限制累积，计入行结束符。每次追加前核对剩余预算。回复用尽预算仍未完成时丢弃连接和预读数据，跳过 QUIT。该路径覆盖 greeting、EHLO、STARTTLS、AUTH、DATA 和 QUIT。DATA 最终确认超限按未知结果处理，已持久化的接受结果在 QUIT 超限时保留。来源与替换条件见 [lettre 补丁记录](../vendor/lettre/PATCHES.md)。
 
@@ -208,6 +212,8 @@ full 配置经 `Cache::open_full_with_run` 绑定运行见证。`cache/blob` 保
 
 `mail/cache_read` 和离线会话先授权，再使用与在线调用相同的 4 槽/20 请求调度；本地 blocking 工作持有共享许可直到实际结束。显式 cache 分支执行本地查询与完整性核对，保持零 IMAP；默认 live 分支继续核对 UIDVALIDITY 和目标存在性。结果报告来源、观察时间和覆盖；FLAGS 缺失保留未知状态。完整正文的文本负载与有界叶元数据分离，维持单文件 32 MiB，渲染与输出裁减在读取时执行；全文索引只接收完整内容。
 
+正文全文索引 v2 使用新的投影身份，已保存的 R11B 正文叶和 SQLite V6 继续可读。离线搜索只计入 v2 完整索引，`rebuild_pending` 表示本地还有旧索引或未完成的替换；初始搜索从已有正文 blob 最多尝试四封、合计最多 32 MiB 负载。每个邮箱在本次进程内轮转候选，失败计入本次预算并留待下一轮重试；分页延续同一索引视图。旧游标需重新搜索。旧正文的候选无法渲染但缓存有完整原件时，从原件重新选叶，默认展示可物化恢复后的正文。实际回归覆盖旧粘连词隐藏、同 blob 重建、版本覆盖和回收。
+
 离线日期搜索按 INTERNALDATE 原时区的日历日处理前台 IMAP 原文和后台已解析的日期。已知系统 FLAGS 在协议读取时按 ASCII 大小写无关规则识别，离线筛选兼容早期已存为自定义拼写的系统标记。显式空 FLAGS 按已知空集合处理，字段缺失仍为未知。对应回归位于 `src/mail/cache_read/query.rs`、`src/mail/sync/tests.rs` 和 `src/mail.rs`。
 
 D2/D3/D4/D5 验证入口为 `src/cache/full_tests.rs`、`src/cache/content_tests.rs`、`src/accounts/cache_run/tests.rs` 和 `src/mail/cache_write_guard/tests.rs`；metadata 和持久游标继续运行 R10 回归。显式离线工具矩阵及故障场景见[实施设计](cache-content-design.md#验收矩阵)。
@@ -255,7 +261,7 @@ JSON 日志使用固定事件名和受控字段，记录服务端生成的 reque
 | D1 身份与授权 | `auth::tests::jwt_trust_boundaries`、`failed_refresh_is_shared_and_expired_keys_fail_closed`；`server::output_tests` 的 HTTP 请求鉴权、账户隔离及附件主体检查 |
 | D2 读取与引用 | `mail::tests` 的目标 UID 属性匹配、状态和摘要的 FLAGS 合并、rev1 文件夹往返；`tests/imap_completion.rs` 的完成状态；HTTP 同 UID 双账户与过期 UIDVALIDITY |
 | D3 资源有界 | 六个 `tests/*.rs` 协议集成入口；MIME 头部/解码预算、HTML 分词前属性预算；异步 SMTP 分片响应在累积前的限额；`server::tests` 的完整 wire 预算与正文前缀；暂存取消与调度配额 |
-| D4 发送与幂等 | `journal::tests` 的重启/主体隔离与并发 claim；`mail::tests` 的 SMTP 已知结果持久化、MAIL 前能力拒绝和 DATA 确认丢失后的去重；`smtp::tests` 的 DATA 格式、TLS/AUTH 与响应超限阶段结果 |
+| D4 发送与幂等 | `journal::tests` 的重启/主体隔离与并发 claim；`mail::tests` 的 SMTP 已知结果持久化、MAIL 前能力拒绝和 DATA 确认丢失后的去重；Unix 子进程的 SIGTERM 和已接纳写入排空；`smtp::tests` 的 DATA 格式、TLS/AUTH 与响应超限阶段结果 |
 | D5 隐私与内容 | `mail::tests::draft_envelope_and_privacy_filter_share_canonical_fields`；MIME 未知编码与完整 alternative 选择；附件精确字节、授权 GET 及私有暂存 |
 | D6 维护与恢复 | `src/accounts`、`src/cache` 的注册库/世代/迁移/回放回归；CI fmt/test/clippy、依赖审计和容器 release 构建；`scripts/check-cache-recovery.py` 的实际候选二进制恢复检查 |
 

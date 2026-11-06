@@ -419,7 +419,9 @@ fn verify_receipt(
             }
             if layer == ContentLayer::BodyIndex && !tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM body_indexes WHERE message_id=?1 AND mime_version=?2 AND html_version=?3
-                    AND blob_id=?4 AND complete)", params![message,mime,html,blob.bytes()],|row| row.get::<_,bool>(0))?
+                    AND blob_id=?4 AND complete)",
+                params![message,mime,super::super::body_index::index_html_version(html),blob.bytes()],
+                |row| row.get::<_,bool>(0))?
             { return Err(SyncError::Invalid); }
         }
         ContentOutcome::Terminal(reason) => {

@@ -32,6 +32,7 @@ pub use blob::{
     Access, ArtifactKey, ArtifactLayer, ArtifactState, BlobId, BlobInfo, BlobLease, BlobStage,
     LayerCoverage, Omission,
 };
+pub(crate) use body_index::{BODY_INDEX_REBUILD_BATCH, BODY_INDEX_VERSION};
 pub use body_index::{CachedSearchHit, CachedSearchPage, SearchPosition};
 pub use dirty::{DirtyStamp, DirtyTicket, ListingStamp};
 pub use evidence::{
@@ -102,6 +103,7 @@ struct Database {
     connection: Connection,
     name: String,
     full_schema: bool,
+    body_index_rebuild: BTreeMap<String, body_index::RebuildPosition>,
 }
 
 pub struct Cache {
@@ -244,6 +246,7 @@ impl Cache {
                     connection,
                     name,
                     full_schema,
+                    body_index_rebuild: BTreeMap::new(),
                 };
                 if full {
                     cache.recover_blobs(*namespace, &mut database)?;
@@ -277,6 +280,10 @@ impl Cache {
 
     /// Called after all cache workers and writes have stopped.
     pub fn mark_clean(&self) -> Result<(), CacheError> {
+        self.mark_clean_if(&|| true)
+    }
+
+    pub(crate) fn mark_clean_if(&self, publish: &impl Fn() -> bool) -> Result<(), CacheError> {
         let databases = self.lock()?;
         self.write_health()?;
         if self.full
@@ -312,7 +319,7 @@ impl Cache {
                 return Ok(());
             }
         }
-        self.disk.mark_clean(self.max_bytes)
+        self.disk.mark_clean_if(self.max_bytes, publish)
     }
 
     /// Run on an offline restored copy before reopening it for reads.
