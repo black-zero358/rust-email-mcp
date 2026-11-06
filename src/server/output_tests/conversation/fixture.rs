@@ -599,6 +599,21 @@ impl Harness {
             .0
     }
 
+    pub async fn wait_for_cache_listing(&self, app: &Router, args: Value) -> Value {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let result = self
+                .call_tool(Some(app), "alice", "list_emails", args.clone())
+                .await;
+            // Background work can change the scope revision during an offline read.
+            if result["error"]["code"] != "CACHE_NEEDS_VERIFICATION" {
+                return result;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "{result}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     pub async fn attachment(
         &self,
         app: &Router,

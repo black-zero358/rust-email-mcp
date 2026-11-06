@@ -556,13 +556,13 @@ async fn oversized_live_range_blocks_offline_until_a_new_full_rev1_audit() {
         .call_tool(Some(&app), "alice", "list_emails", json!({"limit":1}))
         .await;
     assert_eq!(fresh["data"]["emails"][0]["uid"], 203, "{fresh}");
+    status(&h, &app, "default", |row| {
+        row["progress"]["current_coverage"]["known_messages"] == 1
+            && row["progress"]["current_coverage"]["complete_headers"] == 1
+    })
+    .await;
     let local = h
-        .call_tool(
-            Some(&app),
-            "alice",
-            "list_emails",
-            json!({"read_source":"cache","uid_validity":9}),
-        )
+        .wait_for_cache_listing(&app, json!({"read_source":"cache","uid_validity":9}))
         .await;
     assert_eq!(local["data"]["emails"][0]["uid"], 203, "{local}");
     drop(app);

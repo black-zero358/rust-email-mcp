@@ -50,7 +50,7 @@ R11B 每次启动在账户注册库旁推进独立运行见证，off 模式也�
 发布源码、发布二进制和部署生产是三个独立动作。合入 PR 或创建 Release 不代表批准生产部署或真实邮件写入。
 
 1. **确定源码。** 选择干净提交，记录完整 commit SHA，确认 `Cargo.toml` 版本与 `v<version>` tag 一致。不覆盖已发布的 tag 或悄悄替换同名产物；修正产物应发布新版本并说明原因。源码部署也必须记录 commit，不能只依赖程序中的 package version。
-2. **核对质量证据。** 候选提交的 `check`、`audit`、`container` 必须成功。记录对应 CI run 和必要的手动验收，验证记录必须绑定 commit/tag、环境、命令和结果。历史记录与其他提交的绿色 CI 不能代替候选版本的检查。
+2. **核对质量证据。** 候选提交的 `check`、`audit`、`container` 必须实际执行并成功。候选只触发了纯文档检查时，在该提交手动运行 CI。记录对应 CI run 和必要的手动验收，验证记录绑定 commit/tag、环境、命令和结果。
 3. **构建并核验产物。** 在固定工具链及记录过的 musl 编译环境中安装 `x86_64-unknown-linux-musl` target，执行 `bash scripts/package-release.sh --source-sha <完整提交SHA> --output <新的绝对目录> --schema-version 6`。该[打包脚本](../scripts/package-release.sh)从指定 Git 提交导出源码，在独立 Cargo target 中执行锁定的 musl release 构建，记录编译器/链接器环境、核对 amd64 静态 ELF，并运行[隔离恢复验收](../scripts/check-cache-recovery.py)。预制二进制使用独立的 snapshot 模式，包名带快照标识；正式候选使用提交模式。
 4. **归档与说明。** 发布归档包含目标程序、README 和许可证，为最终归档生成 SHA-256 校验文件。Release 说明关联 tag、完整 SHA、平台、构建/验证证据、行为变更、已知限制及升级/回滚说明。校验文件只证明内容一致性，不能代替源码和构建证据。
 5. **部署验收。** 如另行执行部署，按 [部署指南](deployment.md#验收与回滚) 在隔离环境验收 OAuth、重启恢复、工具发现与相关只读行为，再切换流量。真实邮件发送或修改仍须另行取得明确授权，使用约定的测试邮箱、收件人与操作范围。
@@ -95,7 +95,11 @@ R10 为现有锁定的 `rusqlite 0.41.0` 启用 `blob` 功能，使用 SQLite �
 
 ## 自动化配置核验
 
-维护者负责在 `main` 启用保护规则，将 `check`、`audit`、`container` 设为必需检查，并核对允许绕过的范围。持续审计应有每周定时触发；自动化启用前按上述周期手动运行并留存结果。未来的 musl 发布自动化必须覆盖同样的目标构建和产物验收。
+1. [CI](../.github/workflows/ci.yml) 覆盖面向 `main` 的 PR 和 `main` 推送。同一 PR 的新运行取消旧运行，合并后的 `main` 检查独立运行。
+2. `scope` 只对列入白名单的纯 Markdown 文档跳过 Rust 检查、依赖审计和容器构建。混合改动或无法确认差异时运行完整检查。
+3. 启用 `main` 规则集时，要求经 PR 合并，指定 GitHub Actions 的 `scope`、`check`、`audit`、`container` 为必需检查。复核绕过权限，并分别用纯文档和代码 PR 核验门禁。
+
+依赖审计每周运行，定时触发落地前手动留存结果。musl 发布自动化沿用本规程的构建与产物验收。
 
 这些要求的实际配置状态及后续项统一记录在 [待闭环事项](../CONTRIBUTING.md#待闭环事项)，不在多份文档重复维护状态。只有取得配置、运行或发布证据后，才能标记为已落实。
 

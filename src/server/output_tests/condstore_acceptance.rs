@@ -315,14 +315,11 @@ async fn changed_flags_apply_without_removing_omitted_uids_and_nomodseq_revokes_
     }
     wait_status(&h, &app, |row| watermarked(row, FLOOR + 1)).await;
     let response = h
-        .call_tool(
-            Some(&app),
-            "alice",
-            "list_emails",
-            json!({"read_source":"cache","uid_validity":9}),
-        )
+        .wait_for_cache_listing(&app, json!({"read_source":"cache","uid_validity":9}))
         .await;
-    let rows = response["data"]["emails"].as_array().unwrap();
+    let rows = response["data"]["emails"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected cached emails: {response}"));
     assert_eq!(rows.len(), 2);
     assert_eq!(
         rows.iter().find(|row| row["uid"] == 1).unwrap()["flags"],
