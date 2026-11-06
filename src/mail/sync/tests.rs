@@ -124,7 +124,7 @@ async fn facts_merge_target_fragments_with_exact_header_origin_and_all_attribute
             ""
         };
         let data = format!(
-            "* 1 FETCH (UID 7 BODY[HEADER]<{origin}> {{8}}\r\nX: a\r\n\r\n)\r\n* 1 FETCH (UID 7 RFC822.SIZE 8 FLAGS (\\Seen){date})\r\n"
+            "* 1 FETCH (UID 7 BODY[HEADER]<{origin}> {{8}}\r\nX: a\r\n\r\n)\r\n* 1 FETCH (UID 7 RFC822.SIZE 8 FLAGS (\\seen \\ANSWERED \\fLaGgEd \\Extension){date})\r\n"
         );
         let (mut session, observed, server) =
             selected(&account, 7, 9, Some((command, data.into_bytes(), "OK"))).await;
@@ -138,7 +138,10 @@ async fn facts_merge_target_fragments_with_exact_header_origin_and_all_attribute
                 panic!("missing target facts")
             };
             assert_eq!(item.size, Some(8));
-            assert_eq!(item.flags, ["Seen"]);
+            assert_eq!(
+                item.flags,
+                ["Seen", "Answered", "Flagged", r#"Custom("\\Extension")"#]
+            );
             assert!(
                 item.internal_date
                     .as_deref()

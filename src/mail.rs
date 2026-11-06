@@ -1589,7 +1589,7 @@ mod tests {
             header.len()
         );
         for tool in ["list_emails", "search_emails"] {
-            for update in ["\\Flagged", ""] {
+            for update in ["\\fLaGgEd", ""] {
                 let rows = format!(
                     "* 2 FETCH (UID 99 FLAGS (\\Deleted))\r\n* 3 FETCH (FLAGS (\\Answered))\r\n* 1 FETCH (UID 7 FLAGS (\\Answered))\r\n{full}* 1 FETCH (UID 7 FLAGS ({update}))\r\n* 1 FETCH (UID 7 RFC822.SIZE 101)\r\n* 1 FETCH (UID 7)\r\n"
                 );
