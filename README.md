@@ -70,6 +70,8 @@
 
 持久缓存默认关闭，启用后仍默认在线读取。支持离线的工具可传 `read_source:"cache"`，搜索和 Message-ID 定位使用 `search_source:"cache"`。后台同步需在 full 缓存中单独启用。[缓存配置与同步](docs/deployment.md#持久缓存配置)
 
+四个纯文本写入工具的正文支持 LF 和 CRLF，最多 65,536 UTF-8 字节。重用发送的 `operation_key` 时需原样提交参数，包括正文换行。
+
 ## 权限与使用限制
 
 | `MAIL_MODE` | 默认邮箱可用操作 |
