@@ -87,3 +87,14 @@ async fn a_stale_reconciliation_stamp_cannot_clear_a_later_mutation() {
     cache.clear_dirty_if_verified(&new, 7).unwrap();
     assert!(cache.offline_scope_allowed(&account, "INBOX", 7).is_ok());
 }
+
+#[tokio::test(start_paused = true)]
+async fn sealed_pool_drains_only_when_admitted_tickets_finish() {
+    let pool = WriteGuardPool::default();
+    let admitted = pool.admit().unwrap();
+    pool.seal();
+    assert!(pool.admit().is_none());
+    assert!(!pool.drain_until(Instant::now() + WAIT).await);
+    drop(admitted);
+    assert!(pool.drain_until(Instant::now() + WAIT).await);
+}

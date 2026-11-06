@@ -27,7 +27,6 @@ mod qresync;
 const PAGE: usize = 200;
 const BACKOFF: Duration = Duration::from_secs(5);
 const QUOTA_WAIT: Duration = Duration::from_secs(60);
-const CLEAN_WAIT: Duration = Duration::from_secs(10);
 
 pub(in crate::mail) struct Supervisor {
     cache: PreparedCache,
@@ -118,13 +117,11 @@ impl Supervisor {
 
     pub(in crate::mail) async fn finish(&self) -> bool {
         self.stop();
-        let Ok(mut task) = self.task.lock().map(|mut task| task.take()) else {
+        let Ok(task) = self.task.lock().map(|mut task| task.take()) else {
             return false;
         };
-        match task.as_mut() {
-            Some(task) => tokio::time::timeout(CLEAN_WAIT, task)
-                .await
-                .is_ok_and(|result| result.is_ok()),
+        match task {
+            Some(task) => task.await.is_ok(),
             None => true,
         }
     }
@@ -1182,4 +1179,23 @@ fn work_scan(scope: &Scope) -> Result<Option<ScanState>> {
         .into_iter()
         .filter(|scan| scan.stamp.kind != ScanKind::Reconcile)
         .max_by_key(|scan| scan.stamp.high_uid))
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn supervisor_can_finish_after_the_old_ten_second_cutoff() {
+        let supervisor = Supervisor::new(PreparedCache::default());
+        *supervisor.task.lock().unwrap() = Some(tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(11)).await;
+        }));
+        let deadline = Instant::now() + Duration::from_secs(15);
+        assert!(
+            tokio::time::timeout_at(deadline, supervisor.finish())
+                .await
+                .unwrap()
+        );
+    }
 }
