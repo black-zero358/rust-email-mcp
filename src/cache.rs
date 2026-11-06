@@ -280,6 +280,10 @@ impl Cache {
 
     /// Called after all cache workers and writes have stopped.
     pub fn mark_clean(&self) -> Result<(), CacheError> {
+        self.mark_clean_if(&|| true)
+    }
+
+    pub(crate) fn mark_clean_if(&self, publish: &impl Fn() -> bool) -> Result<(), CacheError> {
         let databases = self.lock()?;
         self.write_health()?;
         if self.full
@@ -315,7 +319,7 @@ impl Cache {
                 return Ok(());
             }
         }
-        self.disk.mark_clean(self.max_bytes)
+        self.disk.mark_clean_if(self.max_bytes, publish)
     }
 
     /// Run on an offline restored copy before reopening it for reads.

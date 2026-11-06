@@ -74,20 +74,20 @@ impl WriteGuardPool {
         Some(WriteAdmission(self.admission.clone()))
     }
 
-    /// Close admission permanently before publishing a clean receipt. The
-    /// same budget covers queued writes, active writes and detached SQLite
-    /// work; a timeout leaves the durable run unclean.
-    pub(super) async fn seal_and_drain(&self, wait: Duration) -> bool {
-        let deadline = Instant::now() + wait;
-        match self.admission.state.lock() {
-            Ok(mut state) => state.sealed = true,
-            Err(_) => return false,
+    /// Close admission synchronously with the listener and keep existing tickets.
+    pub(super) fn seal(&self) {
+        if let Ok(mut state) = self.admission.state.lock() {
+            state.sealed = true;
         }
+    }
+
+    /// Wait for queued writes, active writes and detached cache fence work.
+    pub(super) async fn drain_until(&self, deadline: Instant) -> bool {
         loop {
             match self.admission.state.lock() {
-                Ok(state) if state.active == 0 => break,
-                Ok(_) => {}
-                Err(_) => return false,
+                Ok(state) if state.sealed && state.active == 0 => break,
+                Ok(state) if state.sealed => {}
+                _ => return false,
             }
             if tokio::time::timeout_at(deadline, self.admission.changed.notified())
                 .await
@@ -96,20 +96,24 @@ impl WriteGuardPool {
                 return false;
             }
         }
-        self.drain(deadline.saturating_duration_since(Instant::now()))
-            .await
+        self.drain_fences_until(deadline).await
     }
 
-    /// The caller has already stopped write admission. A timeout leaves the
-    /// process unclean so an unfinished fence cannot produce a clean receipt.
-    pub(super) async fn drain(&self, wait: Duration) -> bool {
+    async fn drain_fences_until(&self, deadline: Instant) -> bool {
         matches!(
-            tokio::time::timeout(wait, self.permits.clone().acquire_many_owned(self.capacity))
-                .await,
+            tokio::time::timeout_at(
+                deadline,
+                self.permits.clone().acquire_many_owned(self.capacity)
+            )
+            .await,
             Ok(Ok(_))
         )
     }
 
+    #[cfg(test)]
+    async fn drain(&self, wait: Duration) -> bool {
+        self.drain_fences_until(Instant::now() + wait).await
+    }
     /// Call after authorization and protocol preconditions, before sending the
     /// first mutating command. A failed fence closes offline reads before the
     /// caller continues the existing online write path.

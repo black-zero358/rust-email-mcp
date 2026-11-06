@@ -184,8 +184,12 @@ impl Root {
         Ok(path)
     }
 
-    pub(super) fn mark_clean(&self, limit: u64) -> Result<(), CacheError> {
-        self.write_manifest(true, self.restore_epoch(), limit)
+    pub(super) fn mark_clean_if(
+        &self,
+        limit: u64,
+        publish: &impl Fn() -> bool,
+    ) -> Result<(), CacheError> {
+        self.write_manifest_if(true, self.restore_epoch(), limit, publish)
     }
 
     pub(super) fn restore_epoch(&self) -> u64 {
@@ -570,6 +574,16 @@ impl Root {
         restore_epoch: u64,
         limit: u64,
     ) -> Result<(), CacheError> {
+        self.write_manifest_if(clean, restore_epoch, limit, &|| true)
+    }
+
+    fn write_manifest_if(
+        &self,
+        clean: bool,
+        restore_epoch: u64,
+        limit: u64,
+        publish: &impl Fn() -> bool,
+    ) -> Result<(), CacheError> {
         let usage = self.usage()?;
         let manifest = Manifest {
             version: 1,
@@ -591,6 +605,9 @@ impl Root {
         let result = (|| -> Result<(), CacheError> {
             file.write_all(&bytes)?;
             file.sync_all()?;
+            if !publish() {
+                return Err(CacheError::Storage);
+            }
             fs::rename(&stage, self.path.join(MANIFEST))?;
             File::open(&self.path)?.sync_all()?;
             Ok(())
