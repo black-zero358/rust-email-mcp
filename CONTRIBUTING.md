@@ -6,7 +6,7 @@
 
 ## 目标与边界
 
-项目面向自行部署的 IMAP/SMTP 邮箱，通过官方 Rust MCP SDK 提供 Streamable HTTP 工具。当前架构为单节点、每实例一个邮箱、每个操作数据库一个服务进程，认证交给独立身份服务。运行时不依赖 Python 或 Node。
+项目面向自行部署的 IMAP/SMTP 邮箱，通过官方 Rust MCP SDK 提供 Streamable HTTP 工具。当前架构为单节点、每个操作数据库一个服务进程，认证交给独立身份服务。实例保留原默认邮箱及其写工具，可通过显式配置追加只读邮箱，账户授权和共享资源限制见[多账户设计](docs/multi-account-design.md)。运行时不依赖 Python 或 Node。
 
 优先保证授权正确、邮件状态正确和发送结果可解释，再在这些约束内优化常驻资源与性能。扩展功能前先说明用户需求、失败语义、资源成本和维护成本。多租户共享实例、跨节点共享操作数据库、服务端任意文件附件、无界邮件抓取不属于当前支持范围；引入这些能力需要新的设计决策和验收依据。
 
@@ -61,7 +61,7 @@
 
 Rust 使用 Cargo 和固定的 Cargo.lock；格式以 rustfmt 为准，Clippy 与构建使用同一工具链。临时 Python 脚本使用 uv，Node 工具使用 pnpm。业务边界沿用现有安全错误模型，不在不可信输入路径依赖 panic；测试或静态不变量中的断言需保持含义明确。存储事务保持短小，不跨越网络等待。
 
-新增依赖必须说明用途、许可证、替代方案和资源影响；升级不能绕过 lockfile 或审计。vendored 代码遵守 [PATCHES.md](vendor/async-imap/PATCHES.md)，同时更新来源、审计脚本和回归。
+新增依赖必须说明用途、许可证、替代方案和资源影响；升级不能绕过 lockfile 或审计。vendored 代码遵守 [async-imap 补丁记录](vendor/async-imap/PATCHES.md)与 [imap-proto 补丁记录](vendor/imap-proto/PATCHES.md)，同时更新来源、审计脚本和回归。
 
 ## 验证与完成标准
 
@@ -80,6 +80,8 @@ cargo build --locked --release
 cargo install cargo-audit --version 0.22.2 --locked
 bash scripts/audit-dependencies.sh
 ```
+
+审计脚本变更同时执行 `bash scripts/test-audit-dependencies.sh`，核对两个本地补丁包的身份恢复、错误传播、临时文件清理及原锁文件保持；CI 的 audit job 持续运行这些离线回归。
 
 容器、构建上下文或 path 依赖变化还需执行：
 
@@ -117,13 +119,13 @@ docker build --tag rust-email-mcp:local .
 | 项目 | 当前状态 | 完成条件与责任 |
 | --- | --- | --- |
 | 主分支门禁 | 2026-10-28 检查时 `main` 未保护，rulesets 为空 | 仓库维护者配置 PR/必需检查 `check`、`audit`、`container`，并记录最终配置及复核日期 |
-| 字符与字节契约 | R01 已分离读取码点限制与 UTF-8/modified UTF-7 字节预算，旧写输入规则保留；本地测试与交叉审阅已通过 | 具体提交和质量检查见[读取规划状态](docs/read-capabilities-plan.md#实施状态)及[验证记录](docs/validation.md)；后续输出契约由 R02 推进 |
+| 字符与字节契约 | R01/R02 已完成读取码点、UTF-8/modified UTF-7 字节预算与输出 Schema，旧写输入规则保留；测试、独立审阅和最终 CI 通过 | 具体提交和质量检查见[读取规划状态](docs/read-capabilities-plan.md#实施状态)及[验证记录](docs/validation.md)；契约变更继续按上述兼容性与验证要求维护 |
 | 持续审计 | CI 仅由 push/PR 触发 | 维护者按维护规程每周执行并留存结果；定时工作流落实后记录链接，继续覆盖本地补丁 |
-| 发布产物可复现 | 已有 v0.1.0 musl 资产，仓库尚无完整发布脚本/工作流 | 发布负责人补齐实际 musl 构建、打包、校验及对应目标验证证据；下一次发布遵循维护检查表 |
+| 发布产物可复现 | `scripts/package-release.sh` 从指定提交构建 musl、验收静态 ELF/恢复、打包并生成校验文件；自动发布工作流待接入 | 发布负责人按维护检查表记录候选提交、实际目标构建环境、恢复结果及归档 SHA-256；自动发布沿用同一验收入口 |
 
 发布与安全维护责任由仓库维护者承担；PR 作者负责本次变更的实现和证据，部署操作者负责具体环境的验收与恢复。角色可由同一人担任，记录中应明确执行结果。
 
-能力扩展的隔离验收尚待维护者另行授权：真实 IMAP 对新搜索、会话、统计和附件读取的兼容性；专用测试邮箱的批量标记/移动/删除；认证二进制下载及 ChatGPT 文件消费；持续附件并发/慢客户端内存；用户侧 ChatGPT 重连及自然刷新。源码测试通过不表示这些验收已完成。
+R13 已完成合成邮件、本地 IMAP/OIDC/MCP 下的双账户持续负载、四路附件并发/慢客户端资源和自然 JWKS 刷新验收，证据见[验证记录](docs/validation.md#2026-11-05-r13-整体验收与-022-候选)。真实 IMAP 对搜索、会话、统计和附件的兼容性，专用邮箱的批量标记/移动/删除，以及真实 ChatGPT 文件消费、重连和身份服务刷新，按部署验收流程另行授权与执行。
 
 ## 参考依据
 

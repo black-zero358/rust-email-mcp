@@ -1,7 +1,11 @@
 //! Contract checks run the real HTTP MCP handler against an isolated TLS IMAP
 //! fixture, then validate returned structured content with the standard engine.
 use super::*;
-use crate::{config, journal::Journal};
+use crate::{
+    accounts::AccountCatalog,
+    config::{self, ValidatedAccountSet},
+    journal::Journal,
+};
 use axum::{Router, body::Body, http::Request, middleware};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
@@ -20,7 +24,19 @@ use tokio_rustls::{
 };
 use tower::ServiceExt;
 
+mod accounts;
 mod attachments;
+mod body_parts;
+mod cache;
+mod condstore_acceptance;
+mod conversation;
+mod listing;
+mod parts;
+mod qresync_acceptance;
+#[cfg(target_os = "linux")]
+mod r13_acceptance;
+mod structure;
+mod sync_acceptance;
 
 fn validator(name: &str) -> jsonschema::Validator {
     let tool = tools("full").into_iter().find(|t| t.name == name).unwrap();
@@ -57,8 +73,28 @@ fn header(raw: &[u8]) -> &[u8] {
 
 struct Harness {
     app: Router,
-    service: Arc<MailService>,
+    service: Arc<MailRuntime>,
+    journal: Arc<Journal>,
+    roots: RootCertStore,
+    connections: Arc<std::sync::atomic::AtomicUsize>,
+    writes: Arc<std::sync::atomic::AtomicUsize>,
+    allow_writes: Arc<std::sync::atomic::AtomicBool>,
+    stall_greeting: Arc<std::sync::atomic::AtomicBool>,
+    active_connections: Arc<std::sync::atomic::AtomicUsize>,
+    reject_login: Arc<std::sync::atomic::AtomicBool>,
+    structure: Arc<structure::Protocol>,
+    parts: Arc<parts::Protocol>,
+    summary_flags: Arc<std::sync::Mutex<BTreeMap<u32, &'static str>>>,
+    summary_faults: Arc<std::sync::Mutex<BTreeMap<u32, listing::SummaryFault>>>,
+    stall_structure_uid: Arc<std::sync::atomic::AtomicU32>,
     imap: tokio::task::JoinHandle<()>,
+    _staging: tempfile::TempDir,
+}
+struct ActiveConnection(Arc<std::sync::atomic::AtomicUsize>);
+impl Drop for ActiveConnection {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 impl Drop for Harness {
     fn drop(&mut self) {
@@ -88,6 +124,24 @@ impl Harness {
         stall_greeting: bool,
         resource: Option<String>,
     ) -> Self {
+        Self::with_limits(
+            messages,
+            fatal_uid,
+            max_output,
+            stall_greeting,
+            resource,
+            None,
+        )
+        .await
+    }
+    async fn with_limits(
+        messages: BTreeMap<u32, Vec<u8>>,
+        fatal_uid: Option<u32>,
+        max_output: usize,
+        stall_greeting: bool,
+        resource: Option<String>,
+        max_message: Option<usize>,
+    ) -> Self {
         let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let cert = certified.cert.der().clone();
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
@@ -101,9 +155,14 @@ impl Harness {
         roots.add(cert).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut configuration = (*config::fixture()).clone();
+        let staging = tempfile::tempdir().unwrap();
+        configuration.attachment_staging_dir = Some(staging.path().join("mail-downloads"));
         configuration.imap_host = "localhost".into();
         configuration.imap_port = listener.local_addr().unwrap().port();
         configuration.max_output = max_output;
+        if let Some(max_message) = max_message {
+            configuration.max_message = max_message;
+        }
         if let Some(resource) = resource {
             configuration.resource = resource;
         }
@@ -112,27 +171,63 @@ impl Harness {
         } else {
             Duration::from_secs(5)
         };
+        let configuration = Arc::new(configuration);
+        let journal = Arc::new(Journal::open(std::path::Path::new(":memory:")).unwrap());
+        let catalog =
+            AccountCatalog::from_test_accounts(ValidatedAccountSet::legacy(configuration)).unwrap();
         let service = Arc::new(
-            MailService::new(
-                Arc::new(configuration),
-                Arc::new(Journal::open(std::path::Path::new(":memory:")).unwrap()),
-            )
-            .unwrap()
-            .with_test_imap_roots(roots),
+            MailRuntime::new(catalog, journal.clone())
+                .unwrap()
+                .with_test_imap_roots(roots.clone()),
         );
         let messages = Arc::new(messages);
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = connections.clone();
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let allow_writes = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let write_count = writes.clone();
+        let write_permission = allow_writes.clone();
+        let stall_greeting = Arc::new(std::sync::atomic::AtomicBool::new(stall_greeting));
+        let stall = stall_greeting.clone();
+        let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let active = active_connections.clone();
+        let reject_login = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let login_rejected = reject_login.clone();
+        let structure = Arc::new(structure::Protocol::default());
+        let structure_protocol = structure.clone();
+        let parts = Arc::new(parts::Protocol::default());
+        let parts_protocol = parts.clone();
+        let summary_flags = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+        let flags = summary_flags.clone();
+        let summary_faults = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+        let summary_protocol = summary_faults.clone();
+        let stall_structure_uid = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let stall_structure = stall_structure_uid.clone();
         let imap = tokio::spawn(async move {
             let acceptor = TlsAcceptor::from(Arc::new(tls));
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
+                let connection = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                 let acceptor = acceptor.clone();
                 let messages = messages.clone();
+                let write_count = write_count.clone();
+                let write_permission = write_permission.clone();
+                let stall = stall.clone();
+                let active = active.clone();
+                let login_rejected = login_rejected.clone();
+                let structure_protocol = structure_protocol.clone();
+                let parts_protocol = parts_protocol.clone();
+                let flags = flags.clone();
+                let summary_protocol = summary_protocol.clone();
+                let stall_structure = stall_structure.clone();
                 tokio::spawn(async move {
                     let Ok(stream) = acceptor.accept(stream).await else {
                         return;
                     };
+                    active.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _active = ActiveConnection(active);
                     let mut stream = BufReader::new(stream);
-                    if stall_greeting {
+                    if stall.load(std::sync::atomic::Ordering::SeqCst) {
                         // Diagnose waits for the server greeting until its
                         // deadline closes this isolated connection.
                         let _ = stream.read_u8().await;
@@ -155,10 +250,28 @@ impl Harness {
                             panic!("invalid fixture command");
                         };
                         let mut response = Vec::new();
+                        structure_protocol.record(connection, command);
                         if command.starts_with("LOGIN ") {
-                        } else if command.starts_with("EXAMINE ") {
+                            if login_rejected.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                                let _ = stream
+                                    .write_all(
+                                        format!("{tag} NO synthetic login refused\r\n").as_bytes(),
+                                    )
+                                    .await;
+                                return;
+                            }
+                        } else if command.starts_with("EXAMINE ") || command.starts_with("SELECT ")
+                        {
+                            if command.starts_with("SELECT ") {
+                                assert!(
+                                    write_permission.load(std::sync::atomic::Ordering::SeqCst),
+                                    "read issued SELECT"
+                                );
+                                write_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            }
                             let next = messages.keys().next_back().copied().unwrap_or(0) + 1;
-                            response.extend_from_slice(format!("* {} EXISTS\r\n* OK [UIDVALIDITY 9] stable\r\n* OK [UIDNEXT {next}] next\r\n",messages.len()).as_bytes());
+                            let validity = structure_protocol.validity(connection);
+                            response.extend_from_slice(format!("* {} EXISTS\r\n* OK [UIDVALIDITY {validity}] stable\r\n* OK [UIDNEXT {next}] next\r\n",messages.len()).as_bytes());
                         } else if command.starts_with("LIST ") {
                             response.extend_from_slice(b"* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n* LIST (\\NoSelect) NIL \"Group\"\r\n* LIST (\\Sent) \"/\" \"Sent\"\r\n");
                         } else if command.starts_with("STATUS ") {
@@ -203,40 +316,127 @@ impl Harness {
                                 .collect::<Vec<_>>()
                                 .join(" ");
                             response.extend_from_slice(format!("* SEARCH {ids}\r\n").as_bytes());
+                        } else if command.starts_with("UID STORE ") {
+                            assert!(
+                                write_permission.load(std::sync::atomic::Ordering::SeqCst),
+                                "read issued UID STORE"
+                            );
+                            write_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            response.extend_from_slice(b"* 1 FETCH (UID 7 FLAGS ())\r\n");
                         } else if let Some(fetch) = command.strip_prefix("UID FETCH ") {
-                            let (set, attrs) = fetch.split_once(' ').unwrap();
-                            for uid in set.split(',').map(|id| id.parse::<u32>().unwrap()) {
-                                let Some(raw) = messages.get(&uid) else {
-                                    continue;
-                                };
-                                if fatal_uid == Some(uid) && attrs.contains("BODY.PEEK[]") {
-                                    stream
-                                        .write_all(
-                                            format!("{tag} NO synthetic failure\r\n").as_bytes(),
-                                        )
-                                        .await
-                                        .unwrap();
+                            let stalled = stall_structure.load(std::sync::atomic::Ordering::SeqCst);
+                            if stalled != 0 && fetch == format!("{stalled} (UID BODYSTRUCTURE)") {
+                                let _ = stream.read_u8().await;
+                                return;
+                            }
+                            let summary = fetch.contains("(UID FLAGS RFC822.SIZE ");
+                            let reply = if summary {
+                                None
+                            } else {
+                                parts_protocol
+                                    .fetch(fetch)
+                                    .or_else(|| structure_protocol.fetch(fetch, &messages))
+                            };
+                            if let Some(reply) = reply {
+                                match reply {
+                                    structure::Reply::Data(data) => {
+                                        response.extend_from_slice(&data)
+                                    }
+                                    structure::Reply::No => {
+                                        let _ = stream
+                                            .write_all(
+                                                format!("{tag} NO synthetic structure refusal\r\n")
+                                                    .as_bytes(),
+                                            )
+                                            .await;
+                                        continue;
+                                    }
+                                    structure::Reply::Bad => {
+                                        let _ = stream
+                                            .write_all(
+                                                format!(
+                                                    "{tag} BAD synthetic structure refusal\r\n"
+                                                )
+                                                .as_bytes(),
+                                            )
+                                            .await;
+                                        continue;
+                                    }
+                                    structure::Reply::Eof => return,
+                                    structure::Reply::WrongTag => {
+                                        let _ = stream
+                                            .write_all(b"wrong-tag OK synthetic completion\r\n")
+                                            .await;
+                                        return;
+                                    }
+                                }
+                                if let Some(completion) = parts_protocol.completion(fetch, tag) {
+                                    response.extend_from_slice(&completion);
+                                    let _ = stream.write_all(&response).await;
                                     return;
                                 }
-                                if attrs == "(UID FLAGS)" {
-                                    response.extend_from_slice(
-                                        format!("* 1 FETCH (UID {uid} FLAGS ())\r\n").as_bytes(),
-                                    );
-                                } else if attrs == "(UID RFC822.SIZE)" {
-                                    response.extend_from_slice(
-                                        format!(
-                                            "* 1 FETCH (UID {uid} RFC822.SIZE {})\r\n",
-                                            raw.len()
-                                        )
-                                        .as_bytes(),
-                                    );
-                                } else {
-                                    let is_header = attrs.contains("HEADER");
-                                    let bytes = if is_header { header(raw) } else { raw };
-                                    let section = if is_header { "HEADER" } else { "" };
-                                    response.extend_from_slice(format!("* 1 FETCH (UID {uid} FLAGS () RFC822.SIZE {} BODY[{section}] {{{}}}\r\n",raw.len(),bytes.len()).as_bytes());
-                                    response.extend_from_slice(bytes);
-                                    response.extend_from_slice(b")\r\n");
+                            } else {
+                                let (set, attrs) = fetch.split_once(' ').unwrap();
+                                for uid in set.split(',').map(|id| id.parse::<u32>().unwrap()) {
+                                    let Some(raw) = messages.get(&uid) else {
+                                        continue;
+                                    };
+                                    if fatal_uid == Some(uid) && attrs.contains("BODY.PEEK[]") {
+                                        stream
+                                            .write_all(
+                                                format!("{tag} NO synthetic failure\r\n")
+                                                    .as_bytes(),
+                                            )
+                                            .await
+                                            .unwrap();
+                                        return;
+                                    }
+                                    if attrs == "(UID FLAGS)" {
+                                        response.extend_from_slice(
+                                            format!("* 1 FETCH (UID {uid} FLAGS ())\r\n")
+                                                .as_bytes(),
+                                        );
+                                    } else if attrs == "(UID RFC822.SIZE)" {
+                                        response.extend_from_slice(
+                                            format!(
+                                                "* 1 FETCH (UID {uid} RFC822.SIZE {})\r\n",
+                                                raw.len()
+                                            )
+                                            .as_bytes(),
+                                        );
+                                    } else {
+                                        let is_header = attrs.contains("HEADER");
+                                        let bytes = if is_header { header(raw) } else { raw };
+                                        let section = if is_header { "HEADER" } else { "" };
+                                        let count = attrs
+                                            .rsplit_once("]<0.")
+                                            .and_then(|(_, range)| range.split_once('>'))
+                                            .and_then(|(count, _)| count.parse::<usize>().ok());
+                                        let origin = if count.is_some() { "<0>" } else { "" };
+                                        let bytes =
+                                            &bytes[..count.unwrap_or(bytes.len()).min(bytes.len())];
+                                        if summary {
+                                            let flags = flags
+                                                .lock()
+                                                .unwrap()
+                                                .get(&uid)
+                                                .copied()
+                                                .unwrap_or("");
+                                            listing::summary_response(
+                                                &mut response,
+                                                uid,
+                                                raw.len(),
+                                                bytes,
+                                                count.unwrap(),
+                                                flags,
+                                                summary_protocol.lock().unwrap().get(&uid).copied(),
+                                            );
+                                            continue;
+                                        }
+                                        response.extend_from_slice(format!("* 1 FETCH (UID {uid} RFC822.SIZE {} BODY[{section}]{origin} {{{}}}\r\n",raw.len(),bytes.len()).as_bytes());
+                                        response.extend_from_slice(bytes);
+                                        response.extend_from_slice(b")\r\n");
+                                    }
                                 }
                             }
                         } else {
@@ -269,7 +469,25 @@ impl Harness {
                     next.run(request).await
                 },
             ));
-        Self { app, service, imap }
+        Self {
+            app,
+            service,
+            journal,
+            roots,
+            connections,
+            writes,
+            allow_writes,
+            stall_greeting,
+            active_connections,
+            reject_login,
+            structure,
+            parts,
+            summary_flags,
+            summary_faults,
+            stall_structure_uid,
+            imap,
+            _staging: staging,
+        }
     }
     async fn call(&self, name: &str, args: Value) -> Value {
         self.call_id(name, args, json!(1)).await
@@ -298,7 +516,7 @@ impl Harness {
             serde_json::from_str(wire["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(content, text);
         assert!(
-            bytes.len() <= self.service.config.max_output,
+            bytes.len() <= self.service.config().max_output,
             "actual HTTP JSON exceeds complete response budget"
         );
         content
@@ -375,7 +593,7 @@ async fn every_read_output_schema_validates_real_handler_success_and_empty_resul
     let accounts = h.call("list_accounts", json!({})).await;
     assert_eq!(
         accounts["data"]["accounts"][0]["capabilities"]["cross_mailbox_conversation"],
-        false
+        true
     );
     assert_eq!(
         accounts["data"]["accounts"][0]["limits"]["text_utf8_bytes"],
@@ -410,13 +628,11 @@ async fn every_read_output_schema_validates_real_handler_success_and_empty_resul
             .is_null()
     );
     for status in ["sending", "accepted", "rejected", "unknown"] {
-        h.service
-            .journal
+        h.journal
             .claim("owner", status, "hash", "<legacy@example.test>")
             .unwrap();
         if status != "sending" {
-            h.service
-                .journal
+            h.journal
                 .finish("owner", status, status, &["legacy-warning".into()])
                 .unwrap();
         }
@@ -598,12 +814,10 @@ async fn handler_contracts_cover_errors_details_downgrade_and_status_preserving_
         .await;
     assert_eq!(result["error"]["code"], "INVALID_INPUT");
     assert!(result["error"].get("details").is_none());
-    h.service
-        .journal
+    h.journal
         .claim("owner", "large", "hash", "<legacy@example.test>")
         .unwrap();
-    h.service
-        .journal
+    h.journal
         .finish("owner", "large", "accepted", &["large".repeat(10000)])
         .unwrap();
     let result = h

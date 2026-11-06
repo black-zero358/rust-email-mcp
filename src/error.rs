@@ -1,5 +1,14 @@
 use serde::Serialize;
 
+#[derive(Debug)]
+pub(crate) struct ConnectionBudgetExceeded;
+impl std::fmt::Display for ConnectionBudgetExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("IMAP connection byte budget exhausted")
+    }
+}
+impl std::error::Error for ConnectionBudgetExceeded {}
+
 #[derive(Debug, Clone, Serialize, thiserror::Error)]
 #[error("{code}: {message}")]
 pub struct MailError {
@@ -64,6 +73,8 @@ impl InputViolation {
 pub enum LimitKind {
     RawMessageBytes,
     DecodedAttachmentBytes,
+    ConnectionBytes,
+    PartFetchBytes,
     DecodedBodyBytes,
     MimeStructure,
     HeaderBytes,
@@ -84,6 +95,30 @@ pub struct ErrorDetails {
 }
 pub type Result<T> = std::result::Result<T, MailError>;
 impl MailError {
+    pub fn cursor_unavailable() -> Self {
+        Self {
+            code: "CURSOR_UNAVAILABLE",
+            message: "The conversation cursor is unavailable. Start a new conversation read or retry a concurrent request after it finishes.",
+            retryable: false,
+            details: None,
+        }
+    }
+    pub fn attachment_storage_unavailable() -> Self {
+        Self {
+            code: "ATTACHMENT_STORAGE_UNAVAILABLE",
+            message: "Attachment download storage is unavailable. Contact the service operator.",
+            retryable: false,
+            details: None,
+        }
+    }
+    pub fn account_unavailable() -> Self {
+        Self {
+            code: "ACCOUNT_UNAVAILABLE",
+            message: "The account is unavailable. List accessible accounts and choose one.",
+            retryable: false,
+            details: None,
+        }
+    }
     pub fn input() -> Self {
         Self {
             code: "INVALID_INPUT",

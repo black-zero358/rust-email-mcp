@@ -240,6 +240,12 @@ BODYSTRUCTURE 预算必须进入协议解析阶段，限制深度、节点、字
 
 服务器拒绝结构、可靠映射失败或特殊结构需要整体解析时，在整封预算内回退旧 reader；超限给出具体原因。协议失败后先关闭原连接，不能复用未完成命令的连接回退。
 
+R07 局部正文子包让 `get_email`、`get_emails` 和 `read_conversation` 共用正文读取编排。整个工具调用持有连接和一个固定期限；批量及会话中的最终读取目标每 UID 最多进行一次明确的 raw 策略回退。新连接重新 EXAMINE 并核对原 UIDVALIDITY，成功完成 raw 命令后继续服务后续 UID。候选头扫描不因本策略重连，传输或部件命令失败也不自动重试。
+
+正文候选规则与原 MIME 读取共享：alternative 优先完整纯文本候选，失败候选整体回滚；related 仅在没有 start 时取首子，存在 start 时精确匹配 Content-ID；附件子树保持剪枝。所有选中正文共用编码长度乘四的解码预留，字符集状态跨块保留，UTF-7 走有界 raw 回退。选中正文的字符集或解码失败按该正文返回错误，展示截断和 `max_body_length:0` 仍在完整正文验证后执行。
+
+继续批量读取依赖明确的命令完成状态：当前命令匹配 tagged OK 后发生的本地 MIME、字符集或展示错误可以记录为逐项错误；目标数据缺失、部件不匹配、协议或连接预算错误停止后续读取。批量返回 unprocessed，任何会话部分结果继续列出错误和遗漏。错误码与连接是否可继续使用分别记录。
+
 验收要求常见叶子附件只取得结构、必要 MIME 头和目标部件。覆盖单部件、alternative、related、mixed、multipart 整体附件、message/rfc822、RFC2231 名称、空附件、坏编码、断流、异步 FLAGS、世代变化。
 
 ## R08 预览与邮件头分类
@@ -382,12 +388,19 @@ UIDVALIDITY 改变立即停用旧世代数据、句柄和游标，后台清理�
 | --- | --- | --- |
 | 方案 | 已纳入 `7def28a`，按依赖推进 | 主 agent 统筹；执行使用 sol/high、无完整历史 fork |
 | R00 | 已完成选型及隔离探针，提交 `1b7afd3`；8 组 fixture、12 类负例通过 | [能力矩阵与证据](attachment-delivery-probe.md)；真实 ChatGPT 下载和读取测试后移 |
-| R01 | 已完成，提交 `7def28a`；121 单元 + 2 集成、fmt/clippy/release 通过，交叉审阅闭环 | [验证记录](validation.md#2026-11-02-r00r01-首批实现) |
-| R02 | 已完成，提交 `b60a686`；输出 Schema、default 持久身份、账户能力与文件夹用途 | 149 单元 + 2 集成、fmt/clippy/audit/release、Docker 上下文及镜像构建通过；见[验证记录](validation.md#2026-11-02-r02r03-读取契约与展示) |
+| R01 | 已完成，提交 `7def28a`；121 单元 + 2 集成、fmt/clippy/release 通过，交叉审阅闭环 | R00/R01 的 [PR #63](https://github.com/black-zero358/rust-email-mcp/pull/63) 已合并；[验证记录](validation.md#2026-11-02-r00r01-首批实现) |
+| R02 | 已完成，提交 `b60a686`；输出 Schema、default 持久身份、账户能力与文件夹用途 | R02/R03 的 [PR #64](https://github.com/black-zero358/rust-email-mcp/pull/64) 已合并，URI 审阅发现修复于 `928a866`；最终 CI 全部通过；见[验证记录](validation.md#2026-11-02-r00r04-pr-审阅与合并) |
 | R03 | 已完成，提交 `b60a686`；独立 HTML 展示策略，交叉审阅与预算修复闭环 | 随 R02 完成集成检查；旧转发与 MIME 候选回归通过 |
-| R04 | 本阶段已完成，提交 `60b8cca`；164 单元 + 2 集成、fmt/clippy/release、7 组客户端测试及 8 文件联调通过 | [离线验证记录](validation.md#2026-11-02-r04-附件离线下载与内容读取)；真实 ChatGPT 测试后移 |
-| R05–R09 | 待实施 | 账户隔离、部件读取、跨目录会话 |
-| R10–R13 | 待实施 | 持久化、完整回填、离线及发布验收 |
+| R04 | 本阶段已完成，提交 `60b8cca`；164 单元 + 2 集成、fmt/clippy/release、7 组客户端测试及 8 文件联调通过 | [PR #65](https://github.com/black-zero358/rust-email-mcp/pull/65) 已合并；最终 head `99aa4e4` 增补 URI 回归并通过全部 CI；[离线验证记录](validation.md#2026-11-02-r04-附件离线下载与内容读取)；真实 ChatGPT 测试后移 |
+| R05 | 已完成，源码 `ffd1bda`；200 单元 + 2 集成、fmt/clippy/release、8 文件客户端联调通过 | [PR #67](https://github.com/black-zero358/rust-email-mcp/pull/67) 最终 head `9019ef7` 全部 CI 通过，已合并为 `501e539`；[设计与配置](multi-account-design.md)、[离线验证](validation.md#2026-11-02-r05-多账户离线验证) |
+| R06 | 已完成，源码 `885a1ce`；234 单元 + 29 集成、fmt/clippy/release、8 文件联调、审计及实际镜像通过 | parser 基础 [PR #68](https://github.com/black-zero358/rust-email-mcp/pull/68) 已合并；清单与回退 [PR #69](https://github.com/black-zero358/rust-email-mcp/pull/69) 最终 head `351353b` 全部 CI 通过，已合并为 `41fb821`；[离线验证](validation.md#2026-11-03-r06-附件清单与受控回退) |
+| R07 | 已完成；附件部件下载与局部正文均已合并；正文源码 `b4b21da` 的 312 单元 + 34 集成、14 组正文 HTTP、fmt/clippy/release、8 文件联调及审计通过，独立审阅闭环 | 附件 [PR #70](https://github.com/black-zero358/rust-email-mcp/pull/70) 合并为 `7837396`；正文 [PR #71](https://github.com/black-zero358/rust-email-mcp/pull/71) 最终 head `0c07455` 的 check/audit/container 全通过，合并为 `f5e7877`，见[正文离线验证](validation.md#2026-11-05-r07-局部正文读取) |
+| R08 | 已完成；源码 `cc55dca` 的 339 单元 + 34 集成、13 项列表专项、fmt/clippy/release、8 文件联调通过；最终源码独立审阅闭环 | [PR #72](https://github.com/black-zero358/rust-email-mcp/pull/72) 最终 head `93ec230` 的 check/audit/container 全通过，合并为 `d853737`；见[离线验证](validation.md#2026-11-05-r08-正文预览与邮件头分类) |
+| R09 | 已完成；应用层源码 `4e499e4` 的 385 单元 + 44 集成、20 组会话 HTTP、fmt/clippy/release、8 文件离线联调、审计、实际镜像及独立审阅通过 | 搜索基础 [PR #73](https://github.com/black-zero358/rust-email-mcp/pull/73) 合并为 `2a07f31`；应用 [PR #74](https://github.com/black-zero358/rust-email-mcp/pull/74) 最终 head `21cc661` 的 check/audit/container 全通过，合并为 `3aeb3e2`；见[会话验证](validation.md#2026-11-05-r09-跨文件夹会话) |
+| R10 | 已完成；源码 `4516c1a` 的 420 单元 + 44 集成、fmt/clippy/release、8 文件联调、审计、断网恢复烟测及实际镜像通过，独立审阅闭环 | [PR #75](https://github.com/black-zero358/rust-email-mcp/pull/75) 最终 head `1b31464` 的 check/audit/container 全通过，合并为 `f422cbb`；[缓存设计](cache-design.md)、[验证记录](validation.md#2026-11-05-r10-持久元数据与会话游标) |
+| R11 | 基础 [PR #76](https://github.com/black-zero358/rust-email-mcp/pull/76) 已通过最终 CI 并合并为 `f403187`。应用源码 `4a14cfe` 已接入 full、V3 存储、完整离线工具矩阵、运行见证与既有写入口失效；482 单元 + 44 集成、fmt/clippy/release、8 文件联调及隔离恢复烟测通过，独立审阅问题已修复 | [实施设计](cache-content-design.md)、[应用验证](validation.md#2026-11-05-r11-完整离线读取)；应用 [PR #77](https://github.com/black-zero358/rust-email-mcp/pull/77) 最终 head `485232e` 的 check/audit/container 全部通过，独立审阅闭环，合并为 `5e45e59`；R11 全部完成 |
+| R12 | A/B/C/D 全部完成。D 批源码 `4963b8b` 接入 QRESYNC 同连接协商、独立删除水位、有界 VANISHED 与迟到写回围栏；560 单元 + 57 集成、fmt/clippy/release、八文件联调、V6 恢复、审计、实际镜像与独立审阅通过 | A 批 [PR #78](https://github.com/black-zero358/rust-email-mcp/pull/78) 合并为 `a226545`；B 批 [PR #79](https://github.com/black-zero358/rust-email-mcp/pull/79) 合并为 `68b3235`；C 批 [PR #80](https://github.com/black-zero358/rust-email-mcp/pull/80) 合并为 `62f353b`；D 批 [PR #81](https://github.com/black-zero358/rust-email-mcp/pull/81) 最终 head `4eaa844` 三项 CI 成功，合并为 `c4bdfc2`；[同步设计](cache-sync-design.md)、[QRESYNC 验证](validation.md#2026-11-05-r12-qresync-标记与删除同步) |
+| R13 | 实现与离线验收完成；源码 `706cbdc` 的 560 单元 + 57 集成、fmt/Clippy 与客户端联调通过；1812 秒持续验收核对双账户四范围 10,064 封及 1,006 附件全部物化，四路慢下载、资源和增量进度通过独立复核；提交绑定的 musl 静态候选与 V6 恢复通过 | [PR #82](https://github.com/black-zero358/rust-email-mcp/pull/82) 汇总最终 CI、独立审阅与合并记录；[整体验收及产物摘要](validation.md#2026-11-05-r13-整体验收与-022-候选)、[运行与发布流程](maintenance.md#离线持续验收)；真实 ChatGPT 与真实邮箱验收按独立授权安排 |
 
 ## 对照实现
 

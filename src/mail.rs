@@ -1,7 +1,7 @@
 use crate::{
     accounts::AccountKey,
     config::Config,
-    error::{LimitKind, MailError, Result},
+    error::{ConnectionBudgetExceeded, LimitKind, MailError, Result},
     imap_text::{display_name, mailbox_name, uid_field_search},
     input_limits::{InputLimits, ReadInputLimits},
     journal::{Journal, Operation},
@@ -9,10 +9,25 @@ use crate::{
     smtp::SmtpSender,
 };
 pub mod attachments;
+mod cache_read;
+mod cache_write_guard;
+mod classification;
+pub(crate) mod conversation;
 pub mod insights;
+mod listing;
+mod parts;
+mod persistence;
+pub(crate) mod read_source;
+mod runtime;
+pub(crate) mod scheduler;
+mod sync;
 use futures::TryStreamExt;
 use lettre::{address::Envelope, message::Mailbox};
 use mailparse::MailHeaderMap;
+use parts::map_read_imap_error;
+pub use persistence::PreparedCache;
+pub use runtime::MailRuntime;
+use scheduler::{ADMISSION_REQUESTS, EXECUTION_SLOTS};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -26,7 +41,6 @@ use std::{
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpStream,
-    sync::Semaphore,
 };
 use tokio_rustls::{
     TlsConnector,
@@ -40,16 +54,15 @@ pub struct BudgetStream<T> {
     inner: T,
     remaining: Arc<AtomicUsize>,
 }
+
 impl<T> BudgetStream<T> {
     pub fn new(inner: T, budget: usize) -> (Self, Arc<AtomicUsize>) {
         let remaining = Arc::new(AtomicUsize::new(budget));
-        (
-            Self {
-                inner,
-                remaining: remaining.clone(),
-            },
-            remaining,
-        )
+        (Self::with_remaining(inner, remaining.clone()), remaining)
+    }
+
+    fn with_remaining(inner: T, remaining: Arc<AtomicUsize>) -> Self {
+        Self { inner, remaining }
     }
 }
 impl<T: AsyncRead + Unpin> AsyncRead for BudgetStream<T> {
@@ -58,9 +71,12 @@ impl<T: AsyncRead + Unpin> AsyncRead for BudgetStream<T> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
         let limit = self.remaining.load(Ordering::Relaxed).min(buf.remaining());
         if limit == 0 {
-            return Poll::Ready(Err(std::io::Error::other("IMAP response byte limit")));
+            return Poll::Ready(Err(std::io::Error::other(ConnectionBudgetExceeded)));
         }
         let mut limited = ReadBuf::new(buf.initialize_unfilled_to(limit));
         match Pin::new(&mut self.inner).poll_read(cx, &mut limited) {
@@ -90,8 +106,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for BudgetStream<T> {
     }
 }
 type Session = async_imap::Session<BudgetStream<TlsStream<TcpStream>>>;
-const EXECUTION_SLOTS: usize = 4;
-const ADMISSION_REQUESTS: usize = 20;
+const BACKEND_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
 const BATCH_READ_ITEMS: usize = 10;
 const LIST_PAGE_ITEMS: usize = 50;
 const SCAN_UID_WINDOW: u32 = 500;
@@ -100,11 +115,13 @@ pub struct MailService {
     pub config: Arc<Config>,
     pub journal: Arc<Journal>,
     pub(crate) account: AccountKey,
-    slots: Semaphore,
-    admission: Semaphore,
-    smtp: SmtpSender,
-    pub attachments: attachments::AttachmentStore,
-    metadata_cache: std::sync::Mutex<insights::MetadataCache>,
+    pub(crate) alias: String,
+    smtp: Option<SmtpSender>,
+    pub attachments: Arc<attachments::AttachmentStore>,
+    backend_backoff: std::sync::Mutex<Option<std::time::Instant>>,
+    metadata_cache: Arc<std::sync::Mutex<insights::MetadataCache>>,
+    persistent: PreparedCache,
+    write_guards: Arc<cache_write_guard::WriteGuardPool>,
     #[cfg(test)]
     test_imap_roots: Option<RootCertStore>,
 }
@@ -119,26 +136,48 @@ impl MailService {
         journal: Arc<Journal>,
         account: AccountKey,
     ) -> anyhow::Result<Self> {
-        let smtp = SmtpSender::new(&config)?;
-        Ok(Self {
-            attachments: attachments::AttachmentStore::new(config.clone()),
-            metadata_cache: Default::default(),
+        let store = Arc::new(attachments::AttachmentStore::new(config.clone()));
+        Self::for_account(
             config,
             journal,
             account,
-            slots: Semaphore::new(EXECUTION_SLOTS),
-            admission: Semaphore::new(ADMISSION_REQUESTS),
+            "default".into(),
+            true,
+            store,
+            Default::default(),
+        )
+    }
+
+    fn for_account(
+        config: Arc<Config>,
+        journal: Arc<Journal>,
+        account: AccountKey,
+        alias: String,
+        is_legacy: bool,
+        attachments: Arc<attachments::AttachmentStore>,
+        metadata_cache: Arc<std::sync::Mutex<insights::MetadataCache>>,
+    ) -> anyhow::Result<Self> {
+        let smtp = if is_legacy && !config.smtp_host.is_empty() {
+            Some(SmtpSender::new(&config)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            attachments,
+            metadata_cache,
+            persistent: PreparedCache::default(),
+            write_guards: Arc::default(),
+            config,
+            journal,
+            account,
+            alias,
             smtp,
+            backend_backoff: Default::default(),
             #[cfg(test)]
             test_imap_roots: None,
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_test_imap_roots(mut self, roots: RootCertStore) -> Self {
-        self.test_imap_roots = Some(roots);
-        self
-    }
     fn imap_roots(&self) -> RootCertStore {
         let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         #[cfg(test)]
@@ -146,40 +185,108 @@ impl MailService {
         roots
     }
 
+    fn backend_ready(&self) -> Result<()> {
+        let mut deadline = self
+            .backend_backoff
+            .lock()
+            .map_err(|_| MailError::backend())?;
+        if deadline.is_some_and(|until| until > std::time::Instant::now()) {
+            return Err(MailError {
+                code: "BUSY",
+                message: "The mailbox connection is cooling down after a backend failure. Retry this read later.",
+                retryable: true,
+                details: None,
+            });
+        }
+        *deadline = None;
+        Ok(())
+    }
+    fn record_backend_failure(&self) {
+        if let Ok(mut deadline) = self.backend_backoff.lock() {
+            *deadline = Some(std::time::Instant::now() + BACKEND_BACKOFF);
+        }
+    }
+    fn backend_timeout(&self) -> MailError {
+        self.record_backend_failure();
+        MailError::timeout()
+    }
+
     async fn connect(&self) -> Result<Session> {
+        self.connect_for(false, None).await
+    }
+    async fn connect_read(&self) -> Result<Session> {
+        self.connect_for(true, None).await
+    }
+    async fn connect_for(
+        &self,
+        read: bool,
+        remaining: Option<Arc<AtomicUsize>>,
+    ) -> Result<Session> {
+        let result = self.connect_inner(read, remaining).await;
+        if result
+            .as_ref()
+            .is_err_and(|error| error.code == "MAIL_BACKEND")
+        {
+            self.record_backend_failure();
+        }
+        result
+    }
+
+    async fn connect_inner(
+        &self,
+        read: bool,
+        remaining: Option<Arc<AtomicUsize>>,
+    ) -> Result<Session> {
+        let remaining =
+            remaining.unwrap_or_else(|| Arc::new(AtomicUsize::new(self.config.max_message * 4)));
+        let budget = remaining.load(Ordering::Relaxed);
+        if budget == 0 {
+            return Err(MailError::limit_kind(LimitKind::ConnectionBytes));
+        }
         let tls = ClientConfig::builder()
             .with_root_certificates(self.imap_roots())
             .with_no_client_auth();
         let tcp = TcpStream::connect((&*self.config.imap_host, self.config.imap_port))
             .await
             .map_err(|_| MailError::backend())?;
+        // IMAP commands are sent as several small writes before waiting for
+        // the tagged reply. Avoid a Nagle delay on each sequential command.
+        tcp.set_nodelay(true).map_err(|_| MailError::backend())?;
         let name =
             ServerName::try_from(self.config.imap_host.clone()).map_err(|_| MailError::input())?;
         let stream = TlsConnector::from(Arc::new(tls))
             .connect(name, tcp)
             .await
             .map_err(|_| MailError::backend())?;
-        let budget = self.config.max_message * 4;
-        let (stream, _) = BudgetStream::new(stream, budget);
+        let stream = BudgetStream::with_remaining(stream, remaining);
         let mut client = async_imap::Client::with_buffer_limit(stream, budget);
-        client
-            .read_response()
-            .await
-            .map_err(|_| MailError::backend())?;
+        client.read_response().await.map_err(|error| {
+            if read {
+                map_read_imap_error(error.into())
+            } else {
+                MailError::backend()
+            }
+        })?;
         client
             .login(&self.config.address, &self.config.password)
             .await
-            .map_err(|_| MailError::backend())
+            .map_err(|(error, _)| {
+                if read {
+                    map_read_imap_error(error)
+                } else {
+                    MailError::backend()
+                }
+            })
     }
 
     fn account_discovery(&self) -> Value {
-        json!({
+        let mut discovery = json!({
             "default_account_id":"default",
             "accounts":[{
                 "id":"default", "address":self.config.address, "mode":self.config.mode, "default":true,
                 "capabilities":{
                     "attachment_delivery_modes":["inline_base64","authenticated_http"],
-                    "part_fetch":false, "cross_mailbox_conversation":false, "cache_modes":["off"]
+                    "part_fetch":true, "cross_mailbox_conversation":true, "cache_modes":["off"]
                 },
                 "limits":{
                     "mailbox_characters":ReadInputLimits::MAILBOX_CHARACTERS,
@@ -193,10 +300,21 @@ impl MailService {
                     "batch_read_items":BATCH_READ_ITEMS, "list_page_items":LIST_PAGE_ITEMS,
                     "scan_uid_window":SCAN_UID_WINDOW, "execution_slots":EXECUTION_SLOTS,
                     "admission_requests":ADMISSION_REQUESTS,
+                    "per_account_base_slots":scheduler::ACCOUNT_BASE_SLOTS,
+                    "background_slots":scheduler::BACKGROUND_SLOTS,
+                    "queue_wait_seconds":scheduler::QUEUE_WAIT.as_secs(),
+                    "backend_backoff_seconds":BACKEND_BACKOFF.as_secs(),
                     "operation_timeout_seconds":self.config.timeout.as_secs()
                 }
             }]
-        })
+        });
+        if let (Some(limits), Some(conversation)) = (
+            discovery["accounts"][0]["limits"].as_object_mut(),
+            conversation::public_limits(&self.config).as_object_mut(),
+        ) {
+            limits.append(conversation);
+        }
+        discovery
     }
     pub async fn execute(&self, name: &str, args: &Value, principal: &str) -> Result<Value> {
         if !["send_email", "send_draft", "reply_email", "forward_email"].contains(&name) {
@@ -210,22 +328,6 @@ impl MailService {
                 json!({"operation":self.journal.get(principal,text(args,"operation_key")?)?}),
             );
         }
-        let _admission = self.admission.try_acquire().map_err(|_| MailError {
-            code: "BUSY",
-            message: "Mailbox queue is full. Retry this read later; inspect write outcomes first.",
-            retryable: true,
-            details: None,
-        })?;
-        let _permit =
-            tokio::time::timeout(std::time::Duration::from_secs(10), self.slots.acquire())
-                .await
-                .map_err(|_| MailError {
-                    code: "BUSY",
-                    message: "Mailbox concurrency limit reached.",
-                    retryable: true,
-                    details: None,
-                })?
-                .map_err(|_| MailError::backend())?;
         // Sending has its own timeout and durable outcome handling. Never cancel it at the HTTP boundary.
         if ["send_email", "send_draft", "reply_email", "forward_email"].contains(&name) {
             return self.send(name, args, principal).await;
@@ -236,7 +338,7 @@ impl MailService {
                 self.prepare_attachment(name, args, principal),
             )
             .await
-            .map_err(|_| MailError::timeout())?;
+            .map_err(|_| self.backend_timeout())?;
         }
         if name == "diagnose_connectivity" {
             return self.diagnose_connectivity().await;
@@ -266,12 +368,25 @@ impl MailService {
                 _ => Ok(batch_unprocessed(&ids)),
             };
         }
+        if matches!(name, "list_emails" | "search_emails") {
+            let deadline = tokio::time::Instant::now() + self.config.timeout;
+            return tokio::time::timeout_at(deadline, self.list_operation(name, args, deadline))
+                .await
+                .map_err(|_| self.backend_timeout())?;
+        }
         tokio::time::timeout(self.config.timeout, self.imap_operation(name, args))
             .await
-            .map_err(|_| MailError::timeout())?
+            .map_err(|_| self.backend_timeout())?
     }
     async fn imap_operation(&self, name: &str, a: &Value) -> Result<Value> {
-        let mut s = self.connect().await?;
+        if matches!(name, "get_email" | "get_emails" | "read_conversation") {
+            return Box::pin(self.body_operation(name, a)).await;
+        }
+        let mut s = if runtime::account_read(name) {
+            self.connect_read().await?
+        } else {
+            self.connect().await?
+        };
         let result = self.with_session(&mut s, name, a).await;
         // Dropping the connection avoids CLOSE/EXPUNGE side effects and bounds logout latency.
         result
@@ -285,19 +400,37 @@ impl MailService {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
     {
+        Box::pin(self.with_session_guarded(s, name, a, &mut None)).await
+    }
+
+    async fn with_session_guarded<S>(
+        &self,
+        s: &mut async_imap::Session<S>,
+        name: &str,
+        a: &Value,
+        dirty: &mut Option<Option<cache_write_guard::DirtyWriteGuard>>,
+    ) -> Result<Value>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
+    {
         validate_legacy_write_inputs(name, a, &self.config)?;
-        match name {
-            "read_conversation" | "locate_message" | "get_mailbox_statistics" => {
-                self.insight_operation(s, name, a).await
+        let imap_error = |error| {
+            if runtime::account_read(name) {
+                map_read_imap_error(error)
+            } else {
+                MailError::backend()
             }
+        };
+        match name {
+            "locate_message" | "get_mailbox_statistics" => self.insight_operation(s, name, a).await,
             "list_mailboxes" => {
                 let list = s
                     .list(Some(""), Some("*"))
                     .await
-                    .map_err(|_| MailError::backend())?
+                    .map_err(imap_error)?
                     .try_collect::<Vec<_>>()
                     .await
-                    .map_err(|_| MailError::backend())?;
+                    .map_err(imap_error)?;
                 if list.len() > 200 {
                     return Err(MailError::limit_with(LimitKind::ScanItems, 200, list.len()));
                 }
@@ -305,128 +438,74 @@ impl MailService {
                     .iter()
                     .map(|m| mailbox_metadata(m, &self.config))
                     .collect::<Result<Vec<_>>>()?;
+                self.persist_mailboxes(&mailboxes);
                 Ok(json!({"mailboxes":mailboxes}))
             }
-            "list_emails" | "search_emails" => self.list(s, a, name == "search_emails").await,
-            "get_email" | "get_email_status" | "download_attachment" => {
+            "get_email_status" | "download_attachment" => {
                 let folder = folder(a, InputLimits::Read)?;
                 let uid = uid(a)?;
                 let state = s
                     .examine(mailbox_name(folder, InputLimits::Read)?)
                     .await
-                    .map_err(|_| MailError::backend())?;
+                    .map_err(imap_error)?;
+                self.observe_mailbox(folder, &state);
                 check_validity(a, state.uid_validity)?;
-                if name == "get_email_status" {
-                    return email_status(s, uid, state.uid_validity).await;
-                }
-                let raw = if name == "download_attachment" {
-                    self.raw_attachment(s, uid).await?
-                } else {
-                    self.raw(s, uid).await?
+                let observe = |error| {
+                    self.observe_fetch_error(folder, state.uid_validity, state.uid_next, uid, error)
                 };
-                if name == "download_attachment" {
-                    return attachments::inline_download(
-                        &raw,
-                        a,
-                        &self.account,
-                        folder,
-                        uid,
-                        state.uid_validity.ok_or_else(MailError::backend)?,
-                        self.config.max_output / 4,
-                    );
+                if name == "get_email_status" {
+                    return email_status(s, uid, state.uid_validity)
+                        .await
+                        .map_err(observe);
                 }
-                insights::parsed_with_options(
+                let raw = self.raw_attachment(s, uid).await.map_err(observe)?;
+                let value = attachments::inline_download(
                     &raw,
-                    uid,
-                    state.uid_validity,
-                    (self.config.max_output / 2).min(crate::config::MAX_DISPLAY_BODY),
                     a,
-                )
-            }
-            "get_emails" => {
-                let ids = a
-                    .get("uids")
-                    .and_then(Value::as_array)
-                    .ok_or_else(MailError::input)?;
-                if ids.is_empty() || ids.len() > BATCH_READ_ITEMS {
-                    return Err(MailError::input());
-                }
-                let state = s
-                    .examine(mailbox_name(
-                        folder(a, InputLimits::Read)?,
-                        InputLimits::Read,
-                    )?)
-                    .await
-                    .map_err(|_| MailError::backend())?;
-                check_validity(a, state.uid_validity)?;
-                let mut items = Vec::new();
-                let mut stopped = false;
-                let mut attempted = 0;
-                for id in ids {
-                    let id = id
-                        .as_u64()
-                        .filter(|n| *n > 0 && *n <= u32::MAX as u64)
-                        .ok_or_else(MailError::input)? as u32;
-                    if stopped {
-                        items.push(json!({"uid":id,"ok":false,"status":"unprocessed"}));
-                        continue;
+                    &self.account,
+                    folder,
+                    uid,
+                    state.uid_validity.ok_or_else(MailError::backend)?,
+                    self.config.max_output / 4,
+                );
+                if let Some(permit) = self.content_capture(folder) {
+                    if let Ok(part) = mime::parse(&raw) {
+                        self.persist_raw(folder, state.uid_validity, uid, &raw, &part);
                     }
-                    attempted += 1;
-                    let raw = match self.raw(s, id).await {
-                        Ok(raw) => raw,
-                        Err(error) => {
-                            // The FETCH may be incomplete or its transport budget
-                            // exhausted. Preserve the conservative stop boundary.
-                            items.push(json!({"uid":id,"ok":false,"error":error}));
-                            stopped = true;
-                            continue;
-                        }
-                    };
-                    // Both FETCH commands completed successfully. Local MIME
-                    // failures affect this message, not the synchronized session.
-                    match insights::parsed_with_options(&raw, id, state.uid_validity, 64 * 1024, a)
-                    {
-                        Ok(value) => items.push(json!({"uid":id,"ok":true,"email":value})),
-                        Err(error) => {
-                            items.push(json!({"uid":id,"ok":false,"error":error}));
-                        }
-                    }
+                    self.capture_raw(folder, state.uid_validity, uid, raw, permit);
                 }
-                Ok(json!({"items":items,"requested":ids.len(),"completed":attempted}))
+                value
             }
-            "save_draft" => save_draft(s, &self.config, a).await,
+            "save_draft" => save_draft(s, &self.config, a, Some(self)).await,
             "create_mailbox" => {
-                s.create(mailbox_name(text(a, "name")?, InputLimits::LegacyWrite)?)
-                    .await
-                    .map_err(|_| MailError::backend())?;
+                let name = text(a, "name")?;
+                let wire = mailbox_name(name, InputLimits::LegacyWrite)?;
+                let _dirty = self.cache_before_write(&[name]).await;
+                s.create(wire).await.map_err(imap_error)?;
                 Ok(json!({"status":"created"}))
             }
             "rename_mailbox" => {
-                s.rename(
-                    mailbox_name(text(a, "name")?, InputLimits::LegacyWrite)?,
-                    mailbox_name(text(a, "new_name")?, InputLimits::LegacyWrite)?,
-                )
-                .await
-                .map_err(|_| MailError::backend())?;
+                let source = mailbox_name(text(a, "name")?, InputLimits::LegacyWrite)?;
+                let destination = mailbox_name(text(a, "new_name")?, InputLimits::LegacyWrite)?;
+                let _dirty = self.cache_before_folder_tree_write().await;
+                s.rename(source, destination).await.map_err(imap_error)?;
                 Ok(json!({"status":"renamed"}))
             }
             "delete_mailbox" => {
                 if a["confirm"] != true {
                     return Err(MailError::input());
                 }
-                s.delete(mailbox_name(text(a, "name")?, InputLimits::LegacyWrite)?)
-                    .await
-                    .map_err(|_| MailError::backend())?;
+                let wire = mailbox_name(text(a, "name")?, InputLimits::LegacyWrite)?;
+                let _dirty = self.cache_before_folder_tree_write().await;
+                s.delete(wire).await.map_err(imap_error)?;
                 Ok(json!({"status":"deleted"}))
             }
             "move_email" | "delete_email" | "mark_email" => {
+                let source = folder(a, InputLimits::LegacyWrite)?;
                 let state = s
-                    .select(mailbox_name(
-                        folder(a, InputLimits::LegacyWrite)?,
-                        InputLimits::LegacyWrite,
-                    )?)
+                    .select(mailbox_name(source, InputLimits::LegacyWrite)?)
                     .await
-                    .map_err(|_| MailError::backend())?;
+                    .map_err(imap_error)?;
                 check_validity(a, state.uid_validity)?;
                 let uid = uid(a)?.to_string();
                 match name {
@@ -442,18 +521,21 @@ impl MailService {
                         } else {
                             "-FLAGS.SILENT"
                         };
+                        if dirty.is_none() {
+                            *dirty = Some(self.cache_before_write(&[source]).await);
+                        }
                         s.uid_store(uid, format!("{op} ({flag})"))
                             .await
-                            .map_err(|_| MailError::backend())?
+                            .map_err(imap_error)?
                             .try_collect::<Vec<_>>()
                             .await
-                            .map_err(|_| MailError::backend())?;
+                            .map_err(imap_error)?;
                     }
                     "delete_email" if a["permanent"] == true => {
                         if a["confirm"] != true {
                             return Err(MailError::input());
                         }
-                        let caps = s.capabilities().await.map_err(|_| MailError::backend())?;
+                        let caps = s.capabilities().await.map_err(imap_error)?;
                         if !caps.has_str("UIDPLUS") {
                             return Err(MailError {
                                 code: "UNSUPPORTED",
@@ -462,18 +544,21 @@ impl MailService {
                                 details: None,
                             });
                         }
+                        if dirty.is_none() {
+                            *dirty = Some(self.cache_before_write(&[source]).await);
+                        }
                         s.uid_store(&uid, "+FLAGS.SILENT (\\Deleted)")
                             .await
-                            .map_err(|_| MailError::backend())?
+                            .map_err(imap_error)?
                             .try_collect::<Vec<_>>()
                             .await
-                            .map_err(|_| MailError::backend())?;
+                            .map_err(imap_error)?;
                         s.uid_expunge(&uid)
                             .await
-                            .map_err(|_| MailError::backend())?
+                            .map_err(imap_error)?
                             .try_collect::<Vec<_>>()
                             .await
-                            .map_err(|_| MailError::backend())?;
+                            .map_err(imap_error)?;
                     }
                     _ => {
                         let dest = if name == "delete_email" {
@@ -481,7 +566,7 @@ impl MailService {
                         } else {
                             text(a, "destination")?
                         };
-                        let caps = s.capabilities().await.map_err(|_| MailError::backend())?;
+                        let caps = s.capabilities().await.map_err(imap_error)?;
                         if !caps.has_str("MOVE") {
                             return Err(MailError {
                                 code: "UNSUPPORTED",
@@ -490,9 +575,11 @@ impl MailService {
                                 details: None,
                             });
                         }
-                        s.uid_mv(&uid, mailbox_name(dest, InputLimits::LegacyWrite)?)
-                            .await
-                            .map_err(|_| MailError::backend())?;
+                        let wire = mailbox_name(dest, InputLimits::LegacyWrite)?;
+                        if dirty.is_none() {
+                            *dirty = Some(self.cache_before_write(&[source, dest]).await);
+                        }
+                        s.uid_mv(&uid, wire).await.map_err(imap_error)?;
                     }
                 }
                 Ok(json!({"status":"updated"}))
@@ -519,15 +606,9 @@ impl MailService {
             session: s,
             name: single,
             args: a,
+            dirty: None,
         };
         Ok(run_batch(&mut executor, &ids, deadline).await)
-    }
-
-    async fn raw<S>(&self, s: &mut async_imap::Session<S>, uid: u32) -> Result<Vec<u8>>
-    where
-        S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
-    {
-        self.raw_with_limits(s, uid, InputLimits::Read).await
     }
 
     async fn raw_with_limits<S>(
@@ -559,13 +640,17 @@ impl MailService {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
     {
+        let imap_error = |error| match limits {
+            InputLimits::Read => map_read_imap_error(error),
+            InputLimits::LegacyWrite => MailError::backend(),
+        };
         let metadata = s
             .uid_fetch(uid.to_string(), "(UID RFC822.SIZE)")
             .await
-            .map_err(|_| MailError::backend())?
+            .map_err(imap_error)?
             .try_collect::<Vec<_>>()
             .await
-            .map_err(|_| MailError::backend())?;
+            .map_err(imap_error)?;
         let size = metadata
             .iter()
             .filter(|f| f.uid == Some(uid))
@@ -582,10 +667,10 @@ impl MailService {
                 format!("(UID BODY.PEEK[]<0.{}>)", self.config.max_message + 1),
             )
             .await
-            .map_err(|_| MailError::backend())?
+            .map_err(imap_error)?
             .try_collect::<Vec<_>>()
             .await
-            .map_err(|_| MailError::backend())?;
+            .map_err(imap_error)?;
         let body = f
             .iter()
             .filter(|f| f.uid == Some(uid))
@@ -603,158 +688,6 @@ impl MailService {
         }
         Ok(body.to_vec())
     }
-    async fn list<S>(
-        &self,
-        s: &mut async_imap::Session<S>,
-        a: &Value,
-        search: bool,
-    ) -> Result<Value>
-    where
-        S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
-    {
-        let m = s
-            .examine(mailbox_name(
-                folder(a, InputLimits::Read)?,
-                InputLimits::Read,
-            )?)
-            .await
-            .map_err(|_| MailError::backend())?;
-        check_validity(a, m.uid_validity)?;
-        let limit = number(a, "limit", 20, 1, LIST_PAGE_ITEMS as u64)? as usize;
-        let before = number(
-            a,
-            "before_uid",
-            m.uid_next.unwrap_or(u32::MAX) as u64,
-            1,
-            u32::MAX as u64,
-        )? as u32;
-        if m.exists == 0 || before <= 1 {
-            return Ok(json!({"emails":[],"next_before_uid":null,"uid_validity":m.uid_validity}));
-        }
-        // Scan a finite UID window; callers explicitly advance the cursor even for sparse results.
-        let end = before - 1;
-        let start = end.saturating_sub(SCAN_UID_WINDOW - 1).max(1);
-        let mut filters = a.clone();
-        for field in ["query", "from", "to", "subject"] {
-            filters
-                .as_object_mut()
-                .ok_or_else(MailError::input)?
-                .remove(field);
-        }
-        let query = search_query(&filters, start, end, search)?;
-        let has_text = search
-            && ["query", "from", "to", "subject"]
-                .iter()
-                .any(|key| a.get(key).is_some());
-        let mut found = if has_text && query == format!("UID {start}:{end}") {
-            None
-        } else {
-            Some(
-                s.uid_search(query)
-                    .await
-                    .map_err(|_| MailError::backend())?,
-            )
-        };
-        if search {
-            for (field, key) in [
-                ("query", "TEXT"),
-                ("from", "FROM"),
-                ("to", "TO"),
-                ("subject", "SUBJECT"),
-            ] {
-                if a.get(field).is_some() {
-                    let matching = uid_field_search(s, start, end, key, text(a, field)?).await?;
-                    if let Some(ids) = &mut found {
-                        ids.retain(|uid| matching.contains(uid));
-                    } else {
-                        found = Some(matching);
-                    }
-                }
-            }
-        }
-        let found = found.unwrap_or_default();
-        let mut ids = found
-            .into_iter()
-            .filter(|u| *u >= start && *u <= end)
-            .collect::<Vec<_>>();
-        ids.sort_unstable_by(|a, b| b.cmp(a));
-        let mut last_examined = None;
-        if let Some(wanted) = a.get("has_attachment") {
-            let wanted = wanted.as_bool().ok_or_else(MailError::input)?;
-            let mut matches = Vec::new();
-            for id in &ids {
-                last_examined = Some(*id);
-                let raw = self.raw(s, *id).await?;
-                if attachments::has_attachment(&raw)? == wanted {
-                    matches.push(*id);
-                }
-                if matches.len() == limit {
-                    break;
-                }
-            }
-            // Retain the last examined UID, not the last server match: rejected
-            // BODYSTRUCTURE candidates must not be revisited or skipped incorrectly.
-            ids = matches;
-        }
-        let more = ids.len() > limit;
-        ids.truncate(limit);
-        let next = page_cursor(
-            start,
-            &ids,
-            limit,
-            more,
-            a.get("has_attachment").is_some(),
-            last_examined,
-        );
-        if ids.is_empty() {
-            return Ok(json!({"emails":[],"next_before_uid":next,"uid_validity":m.uid_validity}));
-        }
-        let set = ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
-        let fetched = s
-            .uid_fetch(set, "(UID FLAGS RFC822.SIZE BODY.PEEK[HEADER]<0.8192>)")
-            .await
-            .map_err(|_| MailError::backend())?
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(|_| MailError::backend())?;
-        #[derive(Default)]
-        struct Summary<'a> {
-            header: Option<&'a [u8]>,
-            size: Option<u32>,
-            flags: Vec<String>,
-        }
-        let mut summaries = std::collections::BTreeMap::<u32, Summary<'_>>::new();
-        for f in &fetched {
-            let Some(id) = f.uid.filter(|id| ids.contains(id)) else {
-                continue;
-            };
-            let summary = summaries.entry(id).or_default();
-            if let Some(header) = f.header() {
-                summary.header = Some(header);
-            }
-            if let Some(size) = f.size {
-                summary.size = Some(size);
-            }
-            if f.has_flags() {
-                summary.flags = f.flags().map(|flag| format!("{flag:?}")).collect();
-            }
-        }
-        let mut out = Vec::new();
-        for (id, summary) in summaries.into_iter().rev() {
-            // A FLAGS-only update is not evidence of an empty message header.
-            let Some(header) = summary.header else {
-                continue;
-            };
-            if header.len() < 8192 {
-                self.remember_headers(folder(a, InputLimits::Read)?, m.uid_validity, id, header);
-            }
-            let headers = mime::headers(header)?;
-            out.push(json!({"uid":id,"subject":headers.get_first_value("Subject"),"from":headers.get_first_value("From"),"date":headers.get_first_value("Date"),"size":summary.size,"flags":summary.flags}));
-        }
-        Ok(
-            json!({"emails":out,"uid_validity":m.uid_validity,"next_before_uid":next,"scanned_uid_range":[start,end]}),
-        )
-    }
     async fn send(&self, name: &str, a: &Value, principal: &str) -> Result<Value> {
         let key = text(a, "operation_key")?;
         if key.len() > 128 {
@@ -770,6 +703,10 @@ impl MailService {
                 json!({"operation":self.journal.claim(principal,key,&fingerprint,&old.message_id)?.ok_or_else(MailError::storage)?}),
             );
         }
+        let smtp = self
+            .smtp
+            .as_ref()
+            .ok_or_else(MailError::account_unavailable)?;
         validate_legacy_write_inputs(name, a, &self.config)?;
         let message_id = format!("<{}@email-mcp.local>", uuid::Uuid::new_v4());
         let (raw, envelope) = if name == "send_draft" {
@@ -823,7 +760,8 @@ impl MailService {
         if let Some(old) = self.claim_send(principal, key, &fingerprint, &message_id, &raw)? {
             return Ok(json!({"operation":old}));
         }
-        let submission = self.smtp.submit(&envelope, &raw).await;
+        let _dirty = self.cache_before_send().await;
+        let submission = smtp.submit(&envelope, &raw).await;
         let operation = record_send(
             &self.journal,
             principal,
@@ -860,20 +798,20 @@ struct SessionBatch<'a> {
     session: &'a mut Session,
     name: &'a str,
     args: &'a Value,
+    dirty: Option<Option<cache_write_guard::DirtyWriteGuard>>,
 }
 impl BatchExecutor for SessionBatch<'_> {
     async fn apply(&mut self, id: u32) -> Result<Value> {
         let mut args = self.args.clone();
         args["uid"] = json!(id);
         args.as_object_mut().unwrap().remove("uids");
+        let mailbox = folder(&args, InputLimits::LegacyWrite)?;
         let state = self
             .session
-            .select(mailbox_name(
-                folder(&args, InputLimits::LegacyWrite)?,
-                InputLimits::LegacyWrite,
-            )?)
+            .select(mailbox_name(mailbox, InputLimits::LegacyWrite)?)
             .await
             .map_err(|_| MailError::backend())?;
+        self.service.observe_mailbox(mailbox, &state);
         check_validity(&args, state.uid_validity)?;
         let found = self
             .session
@@ -884,11 +822,19 @@ impl BatchExecutor for SessionBatch<'_> {
             .await
             .map_err(|_| MailError::backend())?;
         if !found.iter().any(|f| f.uid == Some(id)) {
+            if found.is_empty() {
+                self.service
+                    .cache_tombstone(mailbox, state.uid_validity, state.uid_next, id);
+            }
             return Ok(json!({"uid":id,"status":"not_found"}));
         }
-        self.service
-            .with_session(self.session, self.name, &args)
-            .await?;
+        Box::pin(self.service.with_session_guarded(
+            self.session,
+            self.name,
+            &args,
+            &mut self.dirty,
+        ))
+        .await?;
         Ok(json!({"uid":id,"status":"updated"}))
     }
 }
@@ -1285,10 +1231,10 @@ where
     let fetched = s
         .uid_fetch(uid.to_string(), "(UID FLAGS)")
         .await
-        .map_err(|_| MailError::backend())?
+        .map_err(map_read_imap_error)?
         .try_collect::<Vec<_>>()
         .await
-        .map_err(|_| MailError::backend())?;
+        .map_err(map_read_imap_error)?;
     // FETCH may also contain unsolicited updates for other messages. A target
     // update replaces its previous flags, so use the last matching response.
     let target = fetched
@@ -1306,7 +1252,12 @@ where
     )
 }
 
-async fn save_draft<S>(s: &mut async_imap::Session<S>, config: &Config, a: &Value) -> Result<Value>
+async fn save_draft<S>(
+    s: &mut async_imap::Session<S>,
+    config: &Config,
+    a: &Value,
+    service: Option<&MailService>,
+) -> Result<Value>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
 {
@@ -1314,15 +1265,16 @@ where
     if raw.len() > config.max_message {
         return Err(MailError::limit());
     }
+    let mailbox = mailbox_name(&config.drafts, InputLimits::LegacyWrite)?;
+    let _dirty = if let Some(service) = service {
+        service.cache_before_write(&[&config.drafts]).await
+    } else {
+        None
+    };
     // async-imap serializes flags verbatim; RFC 3501 APPEND requires a flag list.
-    s.append(
-        mailbox_name(&config.drafts, InputLimits::LegacyWrite)?,
-        Some("(\\Draft)"),
-        None,
-        &raw,
-    )
-    .await
-    .map_err(|_| MailError::backend())?;
+    s.append(mailbox, Some("(\\Draft)"), None, &raw)
+        .await
+        .map_err(|_| MailError::backend())?;
     Ok(json!({"status":"saved","mailbox":config.drafts}))
 }
 
@@ -1477,22 +1429,13 @@ fn forward_body(raw: &[u8], note: &str) -> Result<String> {
     ))
 }
 
+#[cfg(test)]
 fn leaves<'a, 'b>(
     p: &'a mime::Part<'b>,
     out: &mut Vec<&'a mime::Part<'b>>,
     depth: usize,
 ) -> Result<()> {
-    if depth > mime::MAX_DEPTH || out.len() >= mime::MAX_PARTS {
-        return Err(MailError::limit());
-    }
-    if p.subparts.is_empty() || p.is_attachment() {
-        out.push(p);
-    } else {
-        for part in &p.subparts {
-            leaves(part, out, depth + 1)?;
-        }
-    }
-    Ok(())
+    parts::raw_leaves(p, out, depth)
 }
 #[cfg(test)]
 fn parsed(raw: &[u8], uid: u32, validity: Option<u32>, max: usize) -> Result<Value> {
@@ -1513,12 +1456,13 @@ fn parsed(raw: &[u8], uid: u32, validity: Option<u32>, max: usize) -> Result<Val
 }
 
 fn parsed_metadata(p: &mime::Part<'_>, uid: u32, validity: Option<u32>) -> Result<Value> {
-    let mut parts = Vec::new();
-    leaves(p, &mut parts, 0)?;
-    let attachments=parts.iter().enumerate().filter(|(_,p)|p.is_attachment()).map(|(i,p)|json!({"attachment_index":i,"content_type":p.ctype.mimetype,"filename":p.filename()})).collect::<Vec<_>>();
-    Ok(
-        json!({"uid":uid,"uid_validity":validity,"subject":p.headers.get_first_value("Subject"),"from":p.headers.get_first_value("From"),"to":p.headers.get_first_value("To"),"attachments":attachments,"content_trust":"untrusted"}),
-    )
+    let manifest = parts::from_raw(p)?;
+    Ok(insights::manifest_metadata(
+        &p.headers,
+        &manifest.manifest,
+        uid,
+        validity,
+    ))
 }
 #[cfg(test)]
 fn attachment(raw: &[u8], index: usize, max: usize) -> Result<Value> {
@@ -1541,6 +1485,74 @@ fn attachment(raw: &[u8], index: usize, max: usize) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn production_imap_login_enables_tcp_nodelay() {
+        use tokio::{
+            io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+            net::TcpListener,
+        };
+        use tokio_rustls::{
+            TlsAcceptor,
+            rustls::{
+                ServerConfig,
+                pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer},
+            },
+        };
+
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert = certified.cert.der().clone();
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            certified.signing_key.serialize_der(),
+        ));
+        let tls = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key)
+            .unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(cert).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = (*crate::config::fixture()).clone();
+        config.imap_host = "localhost".into();
+        config.imap_port = listener.local_addr().unwrap().port();
+        let journal = Arc::new(Journal::open(std::path::Path::new(":memory:")).unwrap());
+        let mut service = MailService::new(Arc::new(config), journal).unwrap();
+        service.test_imap_roots = Some(roots);
+        let backend = async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let stream = TlsAcceptor::from(Arc::new(tls))
+                .accept(socket)
+                .await
+                .unwrap();
+            let mut stream = BufReader::new(stream);
+            stream.write_all(b"* OK synthetic IMAP\r\n").await.unwrap();
+            stream.flush().await.unwrap();
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            let (tag, command) = line.split_once(' ').unwrap();
+            assert!(command.starts_with("LOGIN "));
+            stream
+                .write_all(format!("{tag} OK authenticated\r\n").as_bytes())
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+        };
+        let (session, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(service.connect_inner(true, None), backend)
+        })
+        .await
+        .unwrap();
+        assert!(
+            session
+                .unwrap()
+                .get_ref()
+                .inner
+                .get_ref()
+                .0
+                .nodelay()
+                .unwrap()
+        );
+    }
     #[test]
     fn readable_reads_use_one_display_policy_while_forward_keeps_legacy_body() {
         let raw = b"Subject: synthetic\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p><a href='https://example.test/'>Meeting</a></p><ul><li>Agenda</li></ul>";
@@ -1619,8 +1631,8 @@ mod tests {
         assert_eq!(account["address"], config.address);
         assert_eq!(account["mode"], config.mode);
         assert_eq!(account["default"], true);
-        assert_eq!(account["capabilities"]["part_fetch"], false);
-        assert_eq!(account["capabilities"]["cross_mailbox_conversation"], false);
+        assert_eq!(account["capabilities"]["part_fetch"], true);
+        assert_eq!(account["capabilities"]["cross_mailbox_conversation"], true);
         assert_eq!(account["capabilities"]["cache_modes"], json!(["off"]));
         assert_eq!(account["limits"]["raw_message_bytes"], config.max_message);
         assert_eq!(
@@ -1844,164 +1856,6 @@ mod tests {
         backend.await.unwrap();
     }
 
-    async fn batch_read_result(
-        messages: Vec<(u32, String)>,
-        failure: Option<&'static str>,
-        budget: usize,
-    ) -> Value {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        let dir = tempfile::tempdir().unwrap();
-        let service = MailService::new(
-            crate::config::fixture(),
-            Arc::new(Journal::open(&dir.path().join("db")).unwrap()),
-        )
-        .unwrap();
-        let uids = messages.iter().map(|(uid, _)| *uid).collect::<Vec<_>>();
-        let body_limit = service.config.max_message + 1;
-        let (client, server) = tokio::io::duplex(131072);
-        let backend = tokio::spawn(async move {
-            let mut script = vec![
-                (
-                    "LOGIN \"synthetic\" \"test-only\"".to_owned(),
-                    String::new(),
-                    "OK",
-                ),
-                (
-                    "EXAMINE \"INBOX\"".to_owned(),
-                    "* 3 EXISTS\r\n* OK [UIDVALIDITY 9] valid\r\n".to_owned(),
-                    "OK",
-                ),
-            ];
-            for (uid, raw) in messages {
-                script.push((
-                    format!("UID FETCH {uid} (UID RFC822.SIZE)"),
-                    format!("* 1 FETCH (UID {uid} RFC822.SIZE {})\r\n", raw.len()),
-                    "OK",
-                ));
-                script.push((
-                    format!("UID FETCH {uid} (UID BODY.PEEK[]<0.{body_limit}>)"),
-                    format!(
-                        "* 1 FETCH (UID {uid} BODY[] {{{}}}\r\n{raw})\r\n",
-                        raw.len()
-                    ),
-                    failure.unwrap_or("OK"),
-                ));
-                if failure.is_some() {
-                    break;
-                }
-            }
-            let mut server = BufReader::new(server);
-            for (expected, rows, status) in script {
-                let mut line = String::new();
-                if server.read_line(&mut line).await.unwrap() == 0 {
-                    return;
-                }
-                let (tag, command) = line.trim_end_matches("\r\n").split_once(' ').unwrap();
-                assert_eq!(command, expected);
-                let completion = match status {
-                    "EOF" => String::new(),
-                    "WRONG_TAG" => "other OK completed\r\n".into(),
-                    status => format!("{tag} {status} completed\r\n"),
-                };
-                server
-                    .write_all(format!("{rows}{completion}").as_bytes())
-                    .await
-                    .unwrap();
-                if ["EOF", "WRONG_TAG"].contains(&status) {
-                    return;
-                }
-            }
-            // After an unsafe FETCH failure the client must not issue another UID.
-            let mut extra = String::new();
-            assert_eq!(
-                server.read_line(&mut extra).await.unwrap(),
-                0,
-                "unexpected command: {extra}"
-            );
-        });
-        let (stream, remaining) = BudgetStream::new(client, 200000);
-        let mut session = async_imap::Client::new(stream)
-            .login("synthetic", "test-only")
-            .await
-            .unwrap();
-        remaining.store(budget, Ordering::Relaxed);
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            service.with_session(
-                &mut session,
-                "get_emails",
-                &json!({"uids":uids,"uid_validity":9}),
-            ),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        drop(session);
-        backend.await.unwrap();
-        result
-    }
-
-    #[tokio::test]
-    async fn batch_read_continues_after_local_content_errors() {
-        for (raw, code) in [
-            (
-                "Content-Type: application/octet-stream\r\n\r\nopaque".to_owned(),
-                "UNSUPPORTED_BODY",
-            ),
-            (
-                format!("Subject: {}\r\n\r\nbody", "x".repeat(129 * 1024)),
-                "LIMIT_EXCEEDED",
-            ),
-            (" orphaned-fold\r\n\r\nbody".to_owned(), "MAIL_BACKEND"),
-        ] {
-            assert_eq!(
-                insights::parsed_with_options(raw.as_bytes(), 7, Some(9), 16000, &json!({}))
-                    .unwrap_err()
-                    .code,
-                code
-            );
-            let result = batch_read_result(
-                vec![(7, raw), (8, "Subject: valid\r\n\r\nbody".into())],
-                None,
-                200000,
-            )
-            .await;
-            assert_eq!(result["requested"], 2);
-            assert_eq!(result["completed"], 2);
-            assert_eq!(result["items"][0]["ok"], false);
-            assert_eq!(result["items"][0]["error"]["code"], code);
-            assert_eq!(result["items"][1]["uid"], 8);
-            assert_eq!(result["items"][1]["ok"], true);
-            assert_eq!(result["items"][1]["email"]["body"], "body");
-        }
-    }
-
-    #[tokio::test]
-    async fn batch_read_stops_after_protocol_failure_or_transport_exhaustion() {
-        for (status, budget) in [
-            (Some("NO"), 200000),
-            (Some("BAD"), 200000),
-            (Some("EOF"), 200000),
-            (Some("WRONG_TAG"), 200000),
-            (None, 300),
-        ] {
-            let raw = format!("Subject: valid\r\n\r\n{}", "x".repeat(2000));
-            let result = batch_read_result(
-                vec![(7, raw), (8, "Subject: untouched\r\n\r\nbody".into())],
-                status,
-                budget,
-            )
-            .await;
-            assert_eq!(result["requested"], 2);
-            assert_eq!(result["completed"], 1);
-            assert_eq!(result["items"][0]["error"]["code"], "MAIL_BACKEND");
-            assert_eq!(
-                result["items"][1],
-                json!({"uid":8,"ok":false,"status":"unprocessed"})
-            );
-        }
-    }
-
     async fn fetch_script(
         script: Vec<(String, String, &'static str)>,
     ) -> (
@@ -2081,7 +1935,13 @@ mod tests {
                     (size_command.clone(), format!("{unrelated}{size_rows}"), "OK"),
                     (body_command.clone(), format!("* 2 FETCH (UID 99 BODY[] {{5}}\r\nother)\r\n* 3 FETCH (BODY[] {{5}}\r\nother)\r\n{body_rows}"), "OK"),
                 ]).await;
-                assert_eq!(service.raw(&mut session, 7).await.unwrap(), raw.as_bytes());
+                assert_eq!(
+                    service
+                        .raw_with_limits(&mut session, 7, InputLimits::Read)
+                        .await
+                        .unwrap(),
+                    raw.as_bytes()
+                );
                 backend.await.unwrap();
             }
         }
@@ -2100,7 +1960,11 @@ mod tests {
             }
             let (mut session, backend) = fetch_script(script).await;
             assert_eq!(
-                service.raw(&mut session, 7).await.unwrap_err().code,
+                service
+                    .raw_with_limits(&mut session, 7, InputLimits::Read)
+                    .await
+                    .unwrap_err()
+                    .code,
                 "MAIL_BACKEND"
             );
             backend.await.unwrap();
@@ -2117,7 +1981,11 @@ mod tests {
                 }
                 let (mut session, backend) = fetch_script(script).await;
                 assert_eq!(
-                    service.raw(&mut session, 7).await.unwrap_err().code,
+                    service
+                        .raw_with_limits(&mut session, 7, InputLimits::Read)
+                        .await
+                        .unwrap_err()
+                        .code,
                     "MAIL_BACKEND"
                 );
                 backend.await.unwrap();
@@ -2132,7 +2000,7 @@ mod tests {
             for header in [None, Some("")] {
                 let rows = match header {
                     Some(header) => format!(
-                        "* 1 FETCH (UID 7 FLAGS () BODY[HEADER] {{{}}}\r\n{header})\r\n",
+                        "* 1 FETCH (UID 7 FLAGS () BODY[HEADER]<0> {{{}}}\r\n{header})\r\n",
                         header.len()
                     ),
                     None => "* 1 FETCH (UID 7 FLAGS (\\Seen))\r\n".into(),
@@ -2152,13 +2020,10 @@ mod tests {
                     ),
                 ])
                 .await;
-                let result = service.list(&mut session, &json!({"limit":1}), false).await;
+                let result = list_summaries(&service, &mut session, 1, false).await;
                 backend.await.unwrap();
                 if status == "OK" {
-                    assert_eq!(
-                        result.unwrap()["emails"].as_array().unwrap().len(),
-                        usize::from(header.is_some())
-                    );
+                    assert_eq!(result.unwrap().len(), usize::from(header.is_some()));
                 } else {
                     assert_eq!(result.unwrap_err().code, "MAIL_BACKEND");
                 }
@@ -2172,10 +2037,10 @@ mod tests {
         let header = "Subject: split\r\n\r\n";
         let mut rows = String::new();
         for uid in [5, 6, 7] {
-            rows.push_str(&format!("* 1 FETCH (UID {uid} FLAGS (\\Flagged))\r\n* 1 FETCH (UID {uid} BODY[HEADER] {{{}}}\r\n{header})\r\n* 1 FETCH (UID {uid} RFC822.SIZE 100)\r\n", header.len()));
+            rows.push_str(&format!("* 1 FETCH (UID {uid} FLAGS (\\Flagged))\r\n* 1 FETCH (UID {uid} BODY[HEADER]<0> {{{}}}\r\n{header})\r\n* 1 FETCH (UID {uid} RFC822.SIZE 100)\r\n", header.len()));
         }
         rows.push_str(&format!(
-            "* 1 FETCH (BODY[HEADER] {{{}}}\r\n{header})\r\n",
+            "* 1 FETCH (BODY[HEADER]<0> {{{}}}\r\n{header})\r\n",
             header.len()
         ));
         let (mut session, backend) = fetch_script(vec![
@@ -2196,15 +2061,14 @@ mod tests {
             ),
         ])
         .await;
-        let result = service
-            .list(&mut session, &json!({"limit":2}), false)
+        let result = list_summaries(&service, &mut session, 2, false)
             .await
             .unwrap();
         backend.await.unwrap();
-        assert_eq!(result["emails"].as_array().unwrap().len(), 2);
-        assert_eq!(result["emails"][0]["uid"], 7);
-        assert_eq!(result["emails"][1]["uid"], 6);
-        for email in result["emails"].as_array().unwrap() {
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0]["uid"], 7);
+        assert_eq!(result[1]["uid"], 6);
+        for email in result {
             assert_eq!(email["subject"], "split");
             assert_eq!(email["flags"], json!(["Flagged"]));
             assert_eq!(email["size"], 100);
@@ -2216,7 +2080,7 @@ mod tests {
         let (_dir, service) = fetch_fixture();
         let header = "Subject: synthetic\r\nFrom: sender@example.invalid\r\n\r\n";
         let full = format!(
-            "* 1 FETCH (UID 7 FLAGS (\\Seen) RFC822.SIZE 100 BODY[HEADER] {{{}}}\r\n{header})\r\n",
+            "* 1 FETCH (UID 7 FLAGS (\\Seen) RFC822.SIZE 100 BODY[HEADER]<0> {{{}}}\r\n{header})\r\n",
             header.len()
         );
         for tool in ["list_emails", "search_emails"] {
@@ -2239,12 +2103,10 @@ mod tests {
                     ),
                 ])
                 .await;
-                let result = service
-                    .with_session(&mut session, tool, &json!({"limit":1}))
+                let emails = list_summaries(&service, &mut session, 1, tool == "search_emails")
                     .await
                     .unwrap();
                 backend.await.unwrap();
-                let emails = result["emails"].as_array().unwrap();
                 assert_eq!(emails.len(), 1);
                 assert_eq!(emails[0]["uid"], 7);
                 assert_eq!(emails[0]["subject"], "synthetic");
@@ -2259,6 +2121,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    async fn list_summaries<S>(
+        service: &MailService,
+        session: &mut async_imap::Session<S>,
+        limit: usize,
+        search: bool,
+    ) -> Result<Vec<Value>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
+    {
+        let page = list_test_page(service, session, &json!({"limit":limit}), search).await?;
+        Ok(page["emails"]
+            .as_array()
+            .expect("fixture summaries")
+            .clone())
+    }
+
+    async fn list_test_page<S>(
+        service: &MailService,
+        session: &mut async_imap::Session<S>,
+        args: &Value,
+        search: bool,
+    ) -> Result<Value>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
+    {
+        let mailbox = folder(args, InputLimits::Read)?;
+        let wire_mailbox = mailbox_name(mailbox, InputLimits::Read)?;
+        let state = listing::select_list_mailbox(session, &wire_mailbox).await?;
+        check_validity(args, state.uid_validity)?;
+        let Some(scan) = listing::scan_list(session, args, search, &state).await? else {
+            return Ok(
+                json!({"emails":[],"next_before_uid":null,"uid_validity":state.uid_validity}),
+            );
+        };
+        let (ids, next) = scan.unfiltered();
+        let emails = service
+            .fetch_summaries(session, mailbox, state.uid_validity, state.uid_next, &ids)
+            .await?;
+        Ok(json!({"emails":emails,"next_before_uid":next,"uid_validity":state.uid_validity}))
     }
 
     #[test]
@@ -2397,7 +2300,7 @@ mod tests {
                             assert_eq!(server.read_line(&mut line).await.unwrap(), 0);
                         });
                         let mut session = async_imap::Client::new(client).login("synthetic", "test-only").await.unwrap();
-                        let result = service.with_session(&mut session, tool, &json!({})).await;
+                        let result = list_test_page(&service, &mut session, &json!({}), tool == "search_emails").await;
                         drop(session);
                         backend.await.unwrap();
                         if completion == "OK" {
@@ -2445,7 +2348,7 @@ mod tests {
             });
             let service = MailService::new(crate::config::fixture(), Arc::new(Journal::open(std::path::Path::new(":memory:")).unwrap())).unwrap();
             let mut session = async_imap::Client::new(client).login("synthetic", "test-only").await.unwrap();
-            let found = service.with_session(&mut session, "search_emails", &json!({"mailbox":"项目&","uid_validity":9,"since":"2024-02-29","seen":false,"from":"sender@example.test","subject":"发票"})).await.unwrap();
+            let found = list_test_page(&service, &mut session, &json!({"mailbox":"项目&","uid_validity":9,"since":"2024-02-29","seen":false,"from":"sender@example.test","subject":"发票"}), true).await.unwrap();
             assert_eq!(found["emails"], json!([]));
             backend.await.unwrap();
         }).await.unwrap();
@@ -2518,7 +2421,7 @@ mod tests {
             service.with_session(&mut session, "delete_mailbox", &json!({"name":name,"confirm":true})).await.unwrap();
             service.with_session(&mut session, "move_email", &json!({"mailbox":name,"uid":7,"destination":"日本語"})).await.unwrap();
             service.with_session(&mut session, "delete_email", &json!({"mailbox":name,"uid":7})).await.unwrap();
-            let found = service.with_session(&mut session, "search_emails", &json!({"mailbox":name,"query":"发票"})).await.unwrap();
+            let found = list_test_page(&service, &mut session, &json!({"mailbox":name,"query":"发票"}), true).await.unwrap();
             assert_eq!(found["emails"], json!([]));
             service.with_session(&mut session, "save_draft", &json!({"to":["recipient@example.com"],"subject":"synthetic","body":"synthetic"})).await.unwrap();
             backend.await.unwrap();
@@ -2652,7 +2555,11 @@ mod tests {
                             }
                         });
                         let mut session = async_imap::Client::new(client).login("synthetic", "test-only").await.unwrap();
-                        let result = service.with_session(&mut session, tool, &json!({"folder":"INBOX","uid":7,"uid_validity":9,"flag":"seen","value":true,"permanent":true,"confirm":true,"query":"synthetic"})).await;
+                        let result = if tool == "search_emails" {
+                            list_test_page(&service, &mut session, &json!({"query":"synthetic","uid_validity":9}), true).await
+                        } else {
+                            service.with_session(&mut session, tool, &json!({"folder":"INBOX","uid":7,"uid_validity":9,"flag":"seen","value":true,"permanent":true,"confirm":true})).await
+                        };
                         assert_eq!(result.unwrap_err().code, "MAIL_BACKEND", "{tool}/{target}/{status}/{partial}");
                         drop(session);
                         backend.await.unwrap();
@@ -2713,7 +2620,7 @@ mod tests {
                         }
                     });
                     let mut session = async_imap::Client::new(client).login("synthetic", "test-only").await.unwrap();
-                    let result = save_draft(&mut session, &crate::config::fixture(), &json!({"to":["recipient@example.test"],"subject":"synthetic draft","body":"synthetic body"})).await;
+                    let result = save_draft(&mut session, &crate::config::fixture(), &json!({"to":["recipient@example.test"],"subject":"synthetic draft","body":"synthetic body"}), None).await;
                     if outcome == "OK" {
                         assert_eq!(result.unwrap(), json!({"status":"saved","mailbox":"Drafts"}), "{notices} notifications");
                         assert_eq!(session.unsolicited_responses.len(), notices);
@@ -2789,6 +2696,7 @@ mod tests {
             let result = tokio::time::timeout(std::time::Duration::from_secs(2), save_draft(
                 &mut session, &crate::config::fixture(),
                 &json!({"to":["recipient@example.com"],"bcc":["hidden@example.com"],"subject":"synthetic draft","body":"synthetic body"}),
+                None,
             )).await.unwrap();
             server.await.unwrap();
             if status == "OK" {
@@ -3295,7 +3203,10 @@ mod tests {
             assert!(!payload.contains("hidden@example.com"));
         });
         let mut service = MailService::new(crate::config::fixture(), journal.clone()).unwrap();
-        service.smtp = SmtpSender::fixture(port, std::time::Duration::from_millis(300));
+        service.smtp = Some(SmtpSender::fixture(
+            port,
+            std::time::Duration::from_millis(300),
+        ));
         let args = json!({"to":["receiver@example.com"],"bcc":["hidden@example.com"],"subject":"synthetic","body":"test","operation_key":"test-send"});
         let result = service.send("send_email", &args, "owner").await.unwrap();
         assert_eq!(
@@ -3525,5 +3436,27 @@ mod tests {
         let mut bytes = Vec::new();
         assert!(stream.read_to_end(&mut bytes).await.is_err());
         assert_eq!(bytes, b"1234");
+    }
+
+    #[tokio::test]
+    async fn replacement_stream_spends_only_the_page_budget_left_by_the_first() {
+        use tokio::io::AsyncReadExt;
+        let (mut first, remaining) = BudgetStream::new(&b"12"[..], 4);
+        let mut prefix = [0; 2];
+        first.read_exact(&mut prefix).await.unwrap();
+        assert_eq!(&prefix, b"12");
+        assert_eq!(remaining.load(Ordering::Relaxed), 2);
+        drop(first);
+
+        let mut replacement = BudgetStream::with_remaining(&b"3456"[..], remaining.clone());
+        let mut suffix = Vec::new();
+        let error = replacement.read_to_end(&mut suffix).await.unwrap_err();
+        assert_eq!(&suffix, b"34");
+        assert_eq!(remaining.load(Ordering::Relaxed), 0);
+        assert!(
+            error
+                .get_ref()
+                .is_some_and(|cause| cause.is::<ConnectionBudgetExceeded>())
+        );
     }
 }

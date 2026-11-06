@@ -77,10 +77,28 @@ impl Auth {
         })
     }
     pub async fn new(config: Arc<Config>) -> anyhow::Result<Arc<Self>> {
-        let client = reqwest::Client::builder()
+        Self::discover(config, Self::discovery_client().build()?).await
+    }
+
+    fn discovery_client() -> reqwest::ClientBuilder {
+        reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) async fn discover_with_test_ca(
+        config: Arc<Config>,
+        ca: reqwest::Certificate,
+    ) -> anyhow::Result<Arc<Self>> {
+        let client = Self::discovery_client()
+            .add_root_certificate(ca)
+            .no_proxy()
             .build()?;
+        Self::discover(config, client).await
+    }
+
+    async fn discover(config: Arc<Config>, client: reqwest::Client) -> anyhow::Result<Arc<Self>> {
         let discovery: serde_json::Value = bounded_json(
             client
                 .get(format!(
@@ -525,9 +543,13 @@ mod tests {
                 failed: false,
             }),
         });
+        let catalog = crate::accounts::AccountCatalog::from_test_accounts(
+            crate::config::ValidatedAccountSet::legacy(config),
+        )
+        .unwrap();
         let mail = Arc::new(
-            crate::mail::MailService::new(
-                config,
+            crate::mail::MailRuntime::new(
+                catalog,
                 Arc::new(crate::journal::Journal::open(std::path::Path::new(":memory:")).unwrap()),
             )
             .unwrap(),

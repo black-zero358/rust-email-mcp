@@ -15,6 +15,7 @@ fn transfer(service: &MailService) -> Transfer {
     Transfer {
         principal:"owner".into(),account:service.account.clone(),mailbox:"收件箱".into(),uid:7,validity:9,
         part: entries(b"Content-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=synthetic.bin\r\n\r\nx").unwrap().remove(0),
+        cache:None,
         expires:Instant::now()+HANDLE_TTL,
     }
 }
@@ -23,6 +24,7 @@ fn transfer(service: &MailService) -> Transfer {
 fn opaque_ids_bind_every_reference_dimension_and_preserve_all_mime_indices() {
     let account = AccountKey::synthetic();
     let reference = AttachmentReference {
+        alias: "default",
         account: &account,
         mailbox: "项目😀",
         uid: 7,
@@ -58,6 +60,7 @@ fn opaque_ids_bind_every_reference_dimension_and_preserve_all_mime_indices() {
     );
     assert_ne!(
         AttachmentReference {
+            alias: "default",
             account: &AccountKey::synthetic(),
             ..reference
         }
@@ -117,6 +120,7 @@ fn opaque_ids_bind_every_reference_dimension_and_preserve_all_mime_indices() {
 fn descriptor_distinguishes_unknown_encoding_size_accuracy_and_safe_names() {
     let account = AccountKey::synthetic();
     let reference = AttachmentReference {
+        alias: "default",
         account: &account,
         mailbox: "INBOX",
         uid: 7,
@@ -185,9 +189,10 @@ fn download_urls_encode_unicode_and_keep_the_configured_base_path() {
 }
 
 #[test]
-fn descriptor_delivery_modes_obey_the_shared_encoded_input_budget() {
+fn descriptor_keeps_inline_encoded_limits_and_admits_bounded_http_parts() {
     let account = AccountKey::synthetic();
     let reference = AttachmentReference {
+        alias: "default",
         account: &account,
         mailbox: "INBOX",
         uid: 7,
@@ -221,9 +226,40 @@ fn descriptor_delivery_modes_obey_the_shared_encoded_input_budget() {
     let mut over = parts[0].clone();
     over.wire_size = mime::attachment_input_limit(config.max_message) + 1;
     let metadata = descriptor(&over, &reference, &config, None);
+    assert_eq!(metadata["downloadable"], true);
+    assert_eq!(metadata["unavailable_reason"], Value::Null);
+    assert_eq!(
+        metadata["delivery"]["available_modes"],
+        json!(["authenticated_http"])
+    );
+    // An estimate does not establish that the complete decoded file is too large.
+    over.decoded_size = Some(config.max_message + 1);
+    let metadata = descriptor(&over, &reference, &config, None);
+    assert_eq!(metadata["downloadable"], true);
+    assert_eq!(
+        metadata["delivery"]["available_modes"],
+        json!(["authenticated_http"])
+    );
+    over.size_accuracy = "exact";
+    let metadata = descriptor(&over, &reference, &config, None);
     assert_eq!(metadata["downloadable"], false);
     assert_eq!(metadata["unavailable_reason"], "decoded_attachment_bytes");
     assert_eq!(metadata["delivery"]["available_modes"], json!([]));
+    over.size_accuracy = "estimate";
+    over.wire_size = config.max_message * 4;
+    let metadata = descriptor(&over, &reference, &config, None);
+    assert_eq!(metadata["downloadable"], false);
+    assert_eq!(metadata["unavailable_reason"], "connection_bytes");
+    assert_eq!(metadata["delivery"]["available_modes"], json!([]));
+    let mut large_message = parts[0].clone();
+    large_message.wire_size = 4;
+    large_message.raw_message_size = Some(config.max_message + 1);
+    let metadata = descriptor(&large_message, &reference, &config, None);
+    assert_eq!(metadata["downloadable"], true);
+    assert_eq!(
+        metadata["delivery"]["available_modes"],
+        json!(["authenticated_http"])
+    );
 }
 
 #[tokio::test]
@@ -370,6 +406,7 @@ async fn r00_csv_xlsx_pdf_bytes_survive_mime_decode_and_authenticated_download()
         ),
     ];
     let reference = AttachmentReference {
+        alias: "default",
         account: &service.account,
         mailbox: "收件箱",
         uid: 7,

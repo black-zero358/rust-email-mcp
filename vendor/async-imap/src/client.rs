@@ -12,7 +12,7 @@ use extensions::id::{format_identification, parse_id};
 use extensions::quota::parse_get_quota_root;
 use futures_util::{Stream, TryStreamExt, io};
 use imap_proto::rfc5464::Metadata;
-use imap_proto::{RequestId, Response};
+use imap_proto::{MailboxDatum, RequestId, Response, Status};
 #[cfg(feature = "runtime-tokio")]
 use tokio::io::{AsyncRead as Read, AsyncWrite as Write, AsyncWriteExt};
 
@@ -1287,6 +1287,70 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
         Ok(uids)
     }
 
+    /// Run a UID SEARCH with at most 200 UID entries and 128 KiB across all
+    /// responses. A result requires one SEARCH response and matching tagged OK.
+    /// Supply a complete query without synchronizing literals.
+    pub async fn uid_search_bounded<S: AsRef<str>>(
+        &mut self,
+        query: S,
+        max_uids: usize,
+    ) -> Result<Vec<Uid>> {
+        let tag = self
+            .run_command_with_limits(
+                format!("UID SEARCH {}", query.as_ref()),
+                CommandReadLimits::search(CommandReadLimits::MAX_SEARCH_RESPONSE_BYTES, max_uids),
+            )
+            .await?;
+        let result = self.collect_bounded_search(&tag).await;
+        if result.is_err() {
+            self.conn.stream.close();
+        }
+        result
+    }
+
+    async fn collect_bounded_search(&mut self, tag: &RequestId) -> Result<Vec<Uid>> {
+        let mut found = None;
+        loop {
+            let response = self.read_response().await?.ok_or(Error::ConnectionLost)?;
+            match response.parsed() {
+                Response::MailboxData(MailboxDatum::Search(uids)) => {
+                    if uids
+                        .iter()
+                        .enumerate()
+                        .any(|(index, uid)| uids[..index].contains(uid))
+                    {
+                        return Err(io::Error::other("Duplicate IMAP SEARCH UID").into());
+                    }
+                    found = Some(uids.clone());
+                }
+                Response::Done {
+                    tag: received,
+                    status,
+                    ..
+                } if received == tag => {
+                    return match status {
+                        Status::Ok => {
+                            found.ok_or_else(|| io::Error::other("Missing IMAP SEARCH data").into())
+                        }
+                        Status::No => Err(Error::No("UID SEARCH rejected".into())),
+                        Status::Bad => Err(Error::Bad("UID SEARCH rejected".into())),
+                        _ => Err(io::Error::other("Invalid IMAP SEARCH completion").into()),
+                    };
+                }
+                Response::Done { .. } => {
+                    return Err(io::Error::other("Unexpected IMAP SEARCH command tag").into());
+                }
+                Response::MailboxData(MailboxDatum::Exists(_) | MailboxDatum::Recent(_))
+                | Response::Expunge(_) => {
+                    handle_unilateral(response, self.unsolicited_responses_tx.clone());
+                }
+                // Other legal notifications are consumed within the command
+                // without retaining their parser backing buffers.
+                _ => {}
+            }
+        }
+    }
+
     /// The [`GETQUOTA` command](https://tools.ietf.org/html/rfc2087#section-4.2)
     pub async fn get_quota(&mut self, quota_root: &str) -> Result<Quota> {
         let id = self
@@ -1399,6 +1463,32 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
         let id = self.conn.run_command(command.as_ref()).await?;
 
         Ok(id)
+    }
+
+    /// Run one command with response limits until its matching completion.
+    /// Consume every response through that completion before issuing another command.
+    pub async fn run_command_with_limits<S: AsRef<str>>(
+        &mut self,
+        command: S,
+        limits: CommandReadLimits,
+    ) -> Result<RequestId> {
+        let id = self.conn.request_ids.next().unwrap();
+        self.conn.stream.set_command_limits(id.clone(), limits)?;
+        self.conn
+            .stream
+            .encode(Request(
+                Some(id.clone()),
+                command.as_ref().as_bytes().into(),
+            ))
+            .await?;
+        self.conn.stream.flush().await?;
+        Ok(id)
+    }
+
+    /// Prevent further reads and writes after the consumer rejects bounded
+    /// command evidence. Drop the session before opening a replacement.
+    pub fn abort_bounded_command(&mut self) {
+        self.conn.stream.close();
     }
 
     /// Runs an arbitrary command, without adding a tag to it.

@@ -1,6 +1,6 @@
 [package]
 name = "rust-email-mcp"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 license = "MIT"
 description = "Bounded IMAP/SMTP MCP server with durable send tracking and OIDC authentication"
@@ -11,6 +11,7 @@ async-imap = { version = "0.12", default-features = false, features = ["runtime-
 axum = "0.8"
 base64 = "0.22"
 futures = "0.3"
+encoding_rs = "=0.8.42"
 imap-proto = "0.17"
 html5ever = { version = "0.40.1", default-features = false }
 jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
@@ -18,7 +19,7 @@ lettre = { version = "0.11", default-features = false, features = ["builder", "s
 mailparse = "0.18"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rmcp = { version = "=3.8.0", features = ["server", "transport-streamable-http-server"] }
-rusqlite = { version = "0.41", features = ["bundled", "backup"] }
+rusqlite = { version = "0.41", features = ["bundled", "backup", "blob"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -35,6 +36,7 @@ webpki-roots = "1"
 charset = "0.1.5"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 tempfile = "3"
 aws-lc-rs = "1"
 rcgen = "0.14.10"
@@ -42,6 +44,7 @@ jsonschema = { version = "=0.60.2", default-features = false }
 
 [patch.crates-io]
 async-imap = { path = "vendor/async-imap" }
+imap-proto = { path = "vendor/imap-proto" }
 
 [profile.release]
 lto = "thin"

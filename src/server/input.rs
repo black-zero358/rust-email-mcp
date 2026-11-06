@@ -1,5 +1,6 @@
 //! Read-only argument contracts. Write inputs retain the legacy validator.
 use crate::{
+    accounts::{ACCOUNT_ID_MAX_CHARACTERS, valid_account_id},
     error::{InputViolation, MAX_INPUT_VIOLATIONS, MailError, Result},
     input_limits::ReadInputLimits,
 };
@@ -7,9 +8,21 @@ use serde_json::{Value, json};
 
 /// Standard schema lengths count code points; the extension publishes the
 /// independent UTF-8 budget consumed by this validator.
-pub(super) fn read_properties(mut properties: Value) -> Value {
-    if properties.get("attachment_id").is_some() || properties.get("attachment_offset").is_some() {
-        properties["account_id"] = json!({"type":"string","enum":["default"],"default":"default"});
+pub(super) fn read_properties(name: &str, mut properties: Value) -> Value {
+    if let Some((field, default)) = crate::mail::read_source::source_field(name) {
+        properties[field] = json!({
+            "type":"string", "enum":[default,"cache"], "default":default,
+            "description":"Choose cache explicitly for locally available coverage with no IMAP connection."
+        });
+    }
+    if name == "search_emails" {
+        properties["cache_cursor"] = json!({
+            "type":"string","minLength":51,"maxLength":51,"pattern":"^[A-Za-z0-9_-]+$",
+            "description":"Use next_cache_cursor from the same cache query, keeping its filters and scope."
+        });
+    }
+    if super::is_account_read(name) {
+        properties["account_id"] = json!({"type":"string","minLength":1,"maxLength":ACCOUNT_ID_MAX_CHARACTERS,"x-maxUtf8Bytes":ACCOUNT_ID_MAX_CHARACTERS,"pattern":format!("^[A-Za-z0-9][A-Za-z0-9._-]{{0,{}}}$",ACCOUNT_ID_MAX_CHARACTERS-1),"description":"Omit to select the configured default read account; list_accounts shows accounts available to this principal."});
     }
     if properties.get("body_mode").is_some() {
         properties["html_display"] =
@@ -243,6 +256,79 @@ fn structural(value: &Value, schema: &Value, field: &str, out: &mut Vec<InputVio
 }
 
 fn semantic(name: &str, args: &Value, out: &mut Vec<InputViolation>) {
+    if name == "search_emails" && args.get("cache_cursor").is_some() {
+        for (field, condition) in [
+            ("/before_uid", args.get("before_uid").is_none()),
+            ("/search_source", args["search_source"] == "cache"),
+            ("/query", args.get("query").is_some()),
+        ] {
+            if !condition {
+                let mut issue =
+                    InputViolation::new(field, "conflicting_field", "remove_conflicting_field");
+                issue.related_field = Some("/cache_cursor");
+                push(out, issue);
+            }
+        }
+    }
+    if name == "read_conversation" {
+        let conflicting = |field: &str, related: &'static str, out: &mut Vec<InputViolation>| {
+            let mut issue = InputViolation::new(
+                &pointer("", field),
+                "conflicting_field",
+                "remove_conflicting_field",
+            );
+            issue.related_field = Some(related);
+            push(out, issue);
+        };
+        if args.get("cursor").is_some() {
+            for field in [
+                "mailbox",
+                "uid",
+                "uid_validity",
+                "before_uid",
+                "candidate_limit",
+                "limit",
+                "body_mode",
+                "html_display",
+                "max_body_length",
+                "mailboxes",
+                "scope",
+            ] {
+                if args.get(field).is_some() {
+                    conflicting(field, "/cursor", out);
+                }
+            }
+        } else {
+            for field in ["uid", "uid_validity"] {
+                if args.get(field).is_none() {
+                    push(
+                        out,
+                        InputViolation::new(&pointer("", field), "required_field", "provide_field"),
+                    );
+                }
+            }
+            if args.get("scope").is_some() && args.get("mailboxes").is_some() {
+                conflicting("mailboxes", "/scope", out);
+            }
+            if args.get("before_uid").is_some() {
+                if args.get("scope").is_some() {
+                    conflicting("before_uid", "/scope", out);
+                } else if args.get("mailboxes").is_some() {
+                    conflicting("before_uid", "/mailboxes", out);
+                }
+            }
+        }
+    }
+    if super::is_account_read(name)
+        && args["account_id"]
+            .as_str()
+            .is_some_and(|id| !valid_account_id(id))
+    {
+        push(
+            out,
+            InputViolation::new("/account_id", "invalid_account_id", "list_accounts"),
+        );
+    }
     if matches!(name, "download_attachment" | "prepare_attachment_download") {
         if args.get("attachment_id").is_none() && args.get("attachment_index").is_none() {
             push(
@@ -697,6 +783,53 @@ mod tests {
             check(
                 "list_attachments",
                 json!({"uid":7,"uid_validity":9,"attachment_offset":1024})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn read_account_aliases_share_catalog_syntax_and_never_extend_write_or_journal_inputs() {
+        let schema = schema("get_email");
+        let property = &schema["properties"]["account_id"];
+        let standard = jsonschema::draft202012::options().build(property).unwrap();
+        for alias in [
+            "default".to_owned(),
+            "Billing-A.1".to_owned(),
+            "a".repeat(ACCOUNT_ID_MAX_CHARACTERS),
+        ] {
+            assert!(valid_account_id(&alias));
+            assert!(standard.is_valid(&json!(alias)));
+            check(
+                "get_email",
+                json!({"account_id":alias,"uid":7,"uid_validity":9}),
+            )
+            .unwrap();
+        }
+        for alias in [
+            "".to_owned(),
+            "private account".to_owned(),
+            "账户".to_owned(),
+            "_private".to_owned(),
+            "a".repeat(ACCOUNT_ID_MAX_CHARACTERS + 1),
+        ] {
+            assert!(!valid_account_id(&alias));
+            assert!(!standard.is_valid(&json!(alias)));
+            let error = check(
+                "get_email",
+                json!({"account_id":alias,"uid":7,"uid_validity":9}),
+            )
+            .unwrap_err();
+            assert!(
+                !serde_json::to_string(&error)
+                    .unwrap()
+                    .contains("private account")
+            );
+        }
+        assert!(
+            check(
+                "get_operation",
+                json!({"operation_key":"old","account_id":"default"})
             )
             .is_err()
         );

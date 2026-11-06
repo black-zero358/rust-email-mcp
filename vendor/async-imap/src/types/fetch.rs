@@ -217,10 +217,15 @@ impl Fetch {
                     _ => None,
                 })
                 .next()
-                .and_then(|date_time| DateTime::parse_from_str(date_time, DATE_TIME_FORMAT).ok())
+                .and_then(Self::parse_internal_date)
         } else {
             unreachable!()
         }
+    }
+
+    /// Parse a raw INTERNALDATE attribute using the ordinary FETCH format.
+    pub fn parse_internal_date(value: &str) -> Option<DateTime<FixedOffset>> {
+        DateTime::parse_from_str(value, DATE_TIME_FORMAT).ok()
     }
 
     /// Extract the `BODYSTRUCTURE` of a `FETCH` response

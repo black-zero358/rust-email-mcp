@@ -2,6 +2,484 @@
 
 本文件保存带版本与环境边界的证据。每次新增记录注明提交/tag、日期与时区、环境、命令、结果、CI 链接及未覆盖项；保留历史结果，不把其测试数量或部署状态当作当前版本的证明。验证要求见 [贡献指南](../CONTRIBUTING.md#验证与完成标准)。
 
+## 2026-11-05 R13 整体验收与 0.2.2 候选
+
+源码提交 `706cbdc4fc6f8d60cb71cf109cfce2356d3879f0`，父提交为 R12D 合并 `c4bdfc293123bd648068c4ce6dd426dfd86d9a4b`。本次增加独立进程的 Linux release 验收、实际 musl 打包与恢复脚本，并将版本提升至兼容新增的 0.2.2。服务与验收共用 `server::http_router`，认证客户端共用生产发现逻辑；根证书注入及资源观测仅在 Linux 测试构建中启用。
+
+### 精确输入与本地质量检查
+
+长跑使用提前冻结的树 `55d6e1c28597f29d099fd2450056f2c0c5a2d247`。最终源码提交的 `src`、`vendor`、Cargo.toml、Cargo.lock、rust-toolchain.toml、入口 Python 及整个 `scripts/r13` 的 Git 对象均与该树逐项一致；后来增加的文档和发布脚本单独审阅。harness SHA-256 为 `cd1788d510b5f19a6c566e96d3e0732e3d3c14550cacbf9ab4ab16d6e8217688`，driver.py 为 `9b42da2562079a38268c0b345f4cbe9fdd6db49a406396d17e32f4a9ac9c3b8d`；运行前后均核对 harness 与五份 Python 文件的摘要。
+
+WSL Ubuntu 24.04.4、Linux 6.18.54.1-microsoft-standard-WSL2、16 vCPU、Rust 1.99.1、Node 24.15.0。R13 默认整仓测试通过 **560 单元 + 57 集成**，4 项显式测试默认忽略；fmt、all-target Clippy 通过，显式 Rust→Node 八文件下载与内容读取通过，pnpm 客户端适配器 7/7 通过。最终 harness 构建前再次通过 fmt、Clippy 及缓存组 13/13。此前 130 秒联调通过，两阶段容量与双账户尾部推进均成功。测量期间暂停本机 Cargo/Docker 重编译。
+
+### 30 分钟持续验收
+
+运行窗口为 2026-11-05 22:28:49–22:59:15（Asia/Shanghai），完整模式返回 `passed:true`，驱动退出码 0，模拟服务与邮件服务正常关闭。独立网络命名空间仅启用 loopback；IMAP、HTTPS OIDC、MCP、主体及全部邮件均为本地合成数据。两账户各管理 INBOX 2500 封和 Archive 2532 封，总计 **10,064 封、1,006 个附件**；包含长中文折叠头、多层 MIME、跨目录副本和另设的 32 MiB 边界附件。验收配置为全局 10 GiB、每账户 5 GiB、同步间隔 1 秒、核对间隔 45 秒、auto 协议。
+
+持续混合负载为 **1812.164 秒**。在第 **1812.163 秒**重新取得四个初始冻结范围的完整状态：存在性/FLAGS、完整列表事实、头部、精确线程索引、部件清单、raw、full body 和正文索引各覆盖 10,064 封，附件实际物化 1,006 个；缺口、待处理、重试、配额阻塞、终止错误均为零。期间六次常规新增波次加一次慢下载重叠注入，两账户最终确认到 UID 2507；各执行 91 次 QRESYNC FETCH。JWKS 请求由 1 增至 7，沿用实际五分钟缓存期限。
+
+| 观测项 | default | second |
+| --- | --- | --- |
+| 冷 live get，8 个实际 cache miss 后的样本，p50/p95 ms | 25.375 / 39.373 | 27.484 / 34.594 |
+| 热显式 cache get，942 个成功样本，p50/p95 ms | 25.102 / 40.203 | 25.030 / 43.456 |
+| 预热 UID 的 live get，p50/p95 ms | 25.983 / 38.439 | 25.656 / 36.390 |
+| 持续窗口内成功前台请求 | 3808 | 3805 |
+| 持续窗口内最长成功间隔，秒 | 0.956 | 0.967 |
+| IMAP 完整命令/匹配完成 | 106769 / 106769 | 106765 / 106765 |
+| IMAP 连接数 | 28832 | 28828 |
+| 应用发送/接收明文字节 | 5347236 / 86846470 | 5404624 / 86728404 |
+
+冷/热表按请求类别分别统计；预热 UID 的 live 调用允许原有缓存探测和 BODYSTRUCTURE 路径。持续期间记录 39 次 `CACHE_NEEDS_VERIFICATION`（两账户 18/21），单独归入失败计数；启动阶段另记录 16 次冷探测 cache miss、1 次预热 miss 和容量测试的一次 BUSY。以上延迟是该合成负载与主动同步频率下的实测值。
+
+持续阶段服务进程 CPU 消耗 406.17 秒，折合单核平均 22.414%；峰值 RSS/HWM 为 **69,283,840 字节（66.1 MiB）**，低于 1 GiB 额度。1780 条采样独立复算一致，服务 PID 的 start_ticks 全程相同。缓存物理计费峰值 **170,135,552 字节**，含暂存/操作库在内的全部磁盘分配峰值 **237,219,840 字节**；缓存 SQLite 侧车峰值 225,280 字节。暂存最多 4 个文件、单文件最大 32 MiB；运行/后台/传输许可峰值分别 4/1/4。持续窗口内前台 7910 次、后台 114623 次已授予调度的排队 p50/p95 均落在不超过 10 微秒的直方图区间。
+
+初段与中段各执行两种容量场景：先由模拟 IMAP 挂起四个真实 GET 的首块 BODY.PEEK 回复，占满四个后端与传输许可；再让四个 HTTP 客户端停读并持有文件/传输许可，后端槽位已释放。两种状态的第五路均返回 429，取消后暂存清空，额外下载及摘要校验成功。初段排队请求在 10017.032 ms 返回 BUSY；中段释放后排队请求在 186.245 ms 成功。中段四个停读 lease 仍持有时，两账户前台读取成功，新增 UID 2504 均已同步完成。65,537 字节、16 MiB、32 MiB 及 257 字节多层附件摘要全部匹配；尾部中文正文检索得到 5 个命中，并找到 INBOX/Archive 的关联副本。
+
+### 验收矩阵与审阅
+
+R13 长跑覆盖规模、完整物化、双账户、持续鉴权刷新、冷热读取、中文索引、跨目录副本及慢下载公平性。其余场景由同一源码的专项回归补齐：
+
+- HTML 链接/列表/表格及 Unicode/预算由 readable、body_parts、listing 和 input 回归验证；HTML 使用纯本地 tokenizer 渲染，签名样例核对 tracking 内容处理，长跑使用仅 loopback 的网络隔离。
+- 成功、partial、错误和 wire fallback 的 outputSchema 由真实签名 HTTP 回归核验。账户同 UID/Message-ID/附件身份、撤权与零越权连接由 accounts 回归覆盖。
+- raw/parts 字节一致、无关部件省读、chunk/EOF 和协议错误由 body_parts、structure、parts 及 vendored 预算回归覆盖。
+- 精确在线缓存命中的 EXAMINE+SIZE 路径、断 IMAP 的离线正文/附件、重启、配额恢复、FLAGS/移动/删除和 UIDVALIDITY 由 cache、sync_acceptance、qresync_acceptance 与账户回归覆盖。
+- 八文件客户端下载复核相同 fixture 摘要；CSV/XLSX 金额与 PDF 文本解析沿用对应摘要的隔离解析探针证据，详见 R04 验证。此次长跑另核验边界和多层附件摘要。
+
+独立审阅逐项核对计划要求、生产接线、脚本、冻结输入、最终 JSON 和 1780 条采样，未发现待修复问题。报告 SHA-256 为 `3b6e67bd20ca231f1cc1bdf51039d3f774d933e50d0da5e3033541a319c742bb`，NDJSON 为 `d2bd66ea6bce80cbc950e3f4d265a5dab50a65e61c2f389306c5cc012d28b120`，退出日志为 `21b65750e9dbf614591a6b2c5d2654d4a8814acde3ffceb22f84c42725645acf`。完整证据私有保存于运行目录 `r13-acceptance-0.2.2-cd1788d5.gP4XSN`；目录 0700、报告/采样/日志 0600。附件客户端验收范围保持离线，真实 ChatGPT 接入和生产部署按独立流程安排。
+
+### 提交绑定的 musl 候选
+
+正式产物从 `706cbdc4fc6f8d60cb71cf109cfce2356d3879f0` 的 Git archive 导出，在脚本创建的独立 Cargo target 中执行 `cargo +1.99.1 build --release --locked --target x86_64-unknown-linux-musl`。环境为 Ubuntu 24.04.4 amd64、rustc/cargo 1.99.1、musl-gcc GCC 13.3、GNU ld/readelf 2.42、uv 0.11.18。首次命令因缺少 rustup shim PATH 在编译前退出；补齐 PATH 后正式构建用时 1 分 18 秒，退出码 0。
+
+命令为 `bash scripts/package-release.sh --source-sha 706cbdc4fc6f8d60cb71cf109cfce2356d3879f0 --output <新的绝对目录> --schema-version 6`。产物解包后再次核验为 ELF64 amd64 static PIE，程序头无 PT_INTERP，动态段无 DT_NEEDED；实际 V6 恢复代次 1/2/3、off 启动见证更新、损坏见证先于 Journal 拒绝、操作库哨兵及 0700/0600 均通过。
+
+| 产物 | 字节 | SHA-256 |
+| --- | --- | --- |
+| `rust-email-mcp-0.2.2-x86_64-unknown-linux-musl.tar.gz` | 9206385 | `f9c92c10c6d0d835d0c73c2ccfefc3ed1de0f8086579dde6e3459aaf0ba42bc4` |
+| 归档内 `rust-email-mcp` | 21738544 | `d9b307af1cdec85549b596016135f02915419d5ce9ad144dafce4558c95cd758` |
+
+归档含程序、README、LICENSE、SOURCE.txt 四个文件；SOURCE 标识 `source_kind=commit` 和完整源码 SHA，README/LICENSE 与该提交逐字节一致。Linux `sha256sum -c` 和 Windows 副本摘要均通过。构建/复验日志保存于私有目录 `r13-release-build-706cbdc`，候选包及 SHA256SUMS 交付目录为 `rust-email-mcp-r13/release-706cbdc`。快照模式另外验证了相同输入归档与校验文件逐字节一致，以及动态 ELF、已存在目录/符号链接和无效提交参数的拒绝。
+
+源码、持续验收和候选包由 [PR #82](https://github.com/black-zero358/rust-email-mcp/pull/82) 统一交付；该 PR 用于记录最终提交的 check/audit/container、独立审阅与合并结果。候选包绑定上述源码提交，随后文档提交仅补充交付证据。
+
+## 2026-11-05 R12 QRESYNC 标记与删除同步
+
+[PR #81](https://github.com/black-zero358/rust-email-mcp/pull/81) 最终 head `4eaa8440b59095a3ed0f0e946da0abf2fac5fe23` 的 [CI 42049072675](https://github.com/black-zero358/rust-email-mcp/actions/runs/42049072675) 中 check、audit、container 全部通过。精确源码与最终文档独立审阅闭环；GitHub 自动审阅遇到账户限流，评论及空 review threads 已核对。合并为 `c4bdfc293123bd648068c4ce6dd426dfd86d9a4b`，本地与远端 main/开发分支四个引用同步，R13 工作区保留。
+
+源码 `4963b8b6f24fcc7678516f3e8579be1938d1b111`，父提交为 CONDSTORE 合并 `62f353bdc297836aae72b27cd46f44a4cb9c44d9`。独立验证树为 `e658583e89a49d15c90ca287005db7daf9060c5c`；最终提交的全部 QRESYNC 生产、协议、存储和测试与该树一致，另继承 PR #80 已验证的缓存就绪测试修复及两份文档。环境为 WSL Ubuntu、Rust 1.99.1、Node 24.15.0；使用本地模拟服务、签名 HTTP 客户端和合成邮件。
+
+### 实现与审阅
+
+- auto 优先 QRESYNC，要求同一认证连接上的 CAPABILITY、ENABLE、明确 ENABLED QRESYNC 和匹配 tagged OK。完整非空已知集合至多 200 UID 时使用只读 EXAMINE QRESYNC；较大集合使用 EXAMINE CONDSTORE 和精确 UID 页 CHANGEDSINCE VANISHED；空集合跳过 FETCH。
+- 生成命令连同 tag 和 CRLF 最多 8192 字节；每条命令完整回复最多 128 KiB。VANISHED 保持压缩区间，解析前约束端点和范围数。EARLIER 属于精确请求集合且先于 FETCH；实时删除按 UIDNEXT、世代和事件顺序核对，FLAGS 后删除以删除为最终事实。协议回退共用最多两条实际连接、原期限和传输预算。
+- FLAGS 与 FLAGS/删除沿用 V6 的独立水位，预览/开始/分页/提交核对范围修订及 UID 序列。每页事实和位置原子提交，末页才推进冻结目标。最低显式水位、最终值和 NOMODSEQ 分别保留，两条已提交水位与候选共同参与回退判断。
+- 大范围已确认删除先暂停该范围离线交付和 clean receipt，持久化新 dirty 修订后开始新的完整 rev1 核对。前台读写在网络前捕获证据修订，正向写回在入队和执行时核验，恢复完成后仍拒绝旧请求的迟到写回；已经执行的 FIFO 写入通过屏障结清，再冻结新的核对范围。
+- 独立审阅发现并修复了“先前未缓存 UID 的旧网络结果在完整核对后返回”及“旧 FIFO 写已开始执行”两类竞态，均由真实签名请求与可控同步点回归。V1–V6 schema、Cargo 版本/锁文件与父提交一致；公开状态新增独立 qresync 水位和固定回退类别。
+
+### 验证结果
+
+| 检查 | 结果 |
+| --- | --- |
+| fmt、默认完整测试 | 560 单元、57 集成通过，2 项默认忽略；单元 41.74 秒 |
+| all-target Clippy `-D warnings` | 通过，15.32 秒 |
+| release 构建 | 通过，46.87 秒；SHA-256 `ad912db99390b717a7aadfa58f453ec049c61f05f523dbf4268450b4f7a0fa22` |
+| Rust→Node 附件客户端 | 八文件下载、SHA-256 与内容读取通过，4.78 秒 |
+| 实际 release V6 恢复 | 代次 1/2/3、off 失败启动见证轮换、损坏见证先于 Journal 拒绝、操作库哨兵和 0700/0600 通过 |
+| 专用审计与上下文 | 20 项适配回归、340 依赖/1409 公告检查和 Docker allowlist 通过；沿用已有维护告警策略 |
+| 精确源码独立复核 | QRESYNC 源码与验证树逐文件一致，继承的 C 测试补丁单独复核通过 |
+
+签名 QRESYNC 10 项、CONDSTORE 9 项、差分存储 25 项、同步协议/辅助层 27 项及根 QRESYNC 预算 4 项专项通过并纳入完整测试。覆盖分页重启、撤权、能力/ENABLE 失败、双失败实际两连接、低水位与 NOMODSEQ、压缩删除范围、128 KiB 完整命令预算及两种迟到写回竞态。
+
+本地实际 Docker 构建覆盖 QRESYNC 实现树 `e04e3b5a94cfa0c48e5727ddd7c3e5a62694df64`，镜像 `rust-email-mcp:r12-qresync-local` 的 manifest list 为 `sha256:f5f2355e3820abad0acd445540015381bf1d8418924609ce352d4decaa5a1085`；同一次构建完成，release 步骤 18 分 59 秒，主要时间用于索引和依赖下载。随后集成 TCP_NODELAY 的最终验证树为上述 `e658583`，最终提交的镜像由 PR CI 构建核对。
+
+跨归档复用 Cargo target 时，分别清理本包与两个 vendored path 包的 dev 和 release 产物后重新验证；记录中的最终 release 摘要已核对并另存归档。R13 的大规模持续负载使用独立候选继续执行。
+
+## 2026-11-05 R12 CONDSTORE 标记同步
+
+[PR #80](https://github.com/black-zero358/rust-email-mcp/pull/80) 最终 head `4d65fec6aa8bc72e9f59ceb75175dc9f9615c93a` 的 [CI 42045282182](https://github.com/black-zero358/rust-email-mcp/actions/runs/42045282182) 中 check、audit、container 全部通过。精确源码、追加修复及最终文档的独立审阅完成；GitHub 自动审阅遇到账户限流，评论与空 review threads 已核对。合并提交为 `62f353bdc297836aae72b27cd46f44a4cb9c44d9`，本地 main、开发分支及对应远端引用已同步，后续批次工作区保留。
+
+源码 `b5366fd6f66fb2f182d5c656a60f6866b67c5910`，父提交为 R12B 合并 `68b32353c2214b238c6f4ed33768316254d1275e`。环境为 WSL Ubuntu、固定 Rust 1.99.1、Node 24.15.0；所有邮箱、身份、文件和失败场景使用合成数据、本地模拟 TLS IMAP/HTTP 服务及隔离目录。
+
+### 行为与修复
+
+- full 管理配置新增 `sync.protocol:rev1|auto`，默认 rev1。auto 在后台认证连接上探测并使用只读 EXAMINE/CONDSTORE，周期 rev1 核对继续处理存在性和 dirty。状态分别公开配置策略、实际协议、固定回退类别和十进制字符串 MODSEQ。
+- 独立 V6 保存基线及 FLAGS/删除两条水位，C 批只接入 FLAGS 加速。V1–V5 的 SQL 与父提交逐常量字节核对一致；迁移失败保留 V5、已有头部及元数据，重试升级成功。管理员缩小目录范围并重启后，旧扫描与差分页凭据受到当前范围校验。
+- 最多 200 个已知 UID 一页，遗漏的 CHANGEDSINCE UID 保留存在性，显式空 FLAGS 正确更新。同 UID 选择最高 MODSEQ；同序冲突拒收。事实与页位置短事务提交，最后页才推进冻结 target；范围内成员/FLAGS 修订、恢复、dirty、活跃 claim 和撤权均参与 CAS。
+- 首次基线必须在同一完整 rev1 核对首个页面前取得。跨页或命令内的最低水位与最后值分别保留；只低于候选时撤销候选，低于已提交值或 NOMODSEQ 时撤销扩展水位。临时退回普通协议时保留已提交值并撤销未完成候选。撤销先登记进程内标记再写 SQLite，失败保留标记并阻止 clean；同一轮后续更高水位也无法重新建立已撤候选。
+- CONDSTORE 命令使用独立 grammar、完整 128 KiB 线路预算及分配前容器预算。未终止的长 FLAGS/CAPABILITY/status token 和空白在第一个越界字节拒绝，合法分片保持 Incomplete。匹配 tagged OK、明确 READ-ONLY、正 63 位 MODSEQ 和完整选择证据共同约束收据。
+
+### 验证结果
+
+最终整仓命令链全部通过：fmt；**539 单元测试与 53 集成测试**（另 2 项默认忽略）；all-target Clippy `-D warnings`；release 构建；显式 Rust→Node 八文件附件下载、SHA-256 与内容读取；V6 release 恢复烟测；依赖审计与 Docker 上下文检查。
+
+签名 CONDSTORE 9 项、同步存储 21 项、同步协议/辅助层 21 项和根协议预算 6 项专项通过，已包含于整仓测试。新增签名场景覆盖 201 UID 跨页重启、撤权取消、能力缺失/撤回/拒绝、NOMODSEQ、跨页候选回退、最后基线页中的较低水位，以及活跃差分先返回低值或 NOMODSEQ 再返回较高值。原后台同步、缓存读取与配置回归继续通过。
+
+最终单元测试耗时 49.56 秒，release 构建 34.24 秒，显式八文件客户端联调 14.13 秒。release 二进制 SHA-256 为 `cb37cda1a6d04408218cee72efd163f47eb97db4931c6d55a36225ad132ebaed`。恢复烟测在独立网络命名空间验证 schema 6、恢复代次 1/2/3、off 失败启动时运行见证更新、损坏见证在 Journal 前拒绝、操作库哨兵原字节及目录/文件 0700/0600。
+
+专用审计核对 340 个依赖与 1409 条公告，20 项审计适配回归通过；保留已有 pin-utils 未维护告警允许项 RUSTSEC-2026-0441。Cargo.toml、Cargo.lock 和上游包身份保持。148 个本地文档链接及锚点检查通过。独立审阅发现的长 token 扫描、范围缩小、候选回退及命令内最低水位问题均已修复并回归，最终精确源码复核完成。
+
+实际镜像从 `git archive b5366fd6f66fb2f182d5c656a60f6866b67c5910` 的独立目录构建通过，标签 `rust-email-mcp:r12-condstore-local`，manifest list digest 为 `sha256:7666fde3a0df79a7cec106317ab55079c9afc05de171178a1538ad901554da6b`。Docker release 步骤共 16 分 24 秒，其中索引和依赖下载约 15 分钟；同一次构建持续完成。QRESYNC 与 R13 持续负载由后续批次验收；真实 ChatGPT 接入与生产部署按各自流程安排。
+
+### CI 修复与复验
+
+[PR #80](https://github.com/black-zero358/rust-email-mcp/pull/80) 的文档 head `f56087f9353e0d583323a6047c39da515dfa6025` 在 [CI 42037937705](https://github.com/black-zero358/rust-email-mcp/actions/runs/42037937705) 中通过 audit/container，check 出现两项缓存快照争用及一项配额恢复 fixture 网络等待失败。修复提交 `656861b634f0084bb225a6e14fed85d6279251b3` 仅修改两份测试文件：离线列表只对 `CACHE_NEEDS_VERIFICATION` 在原等待期限内重试，成功后继续严格核对 FLAGS；模拟 TLS IMAP 在 greeting、登录和完整 tagged 回复边界调用 flush。生产源码、邮件样本大小及操作期限保持原值。刷新语义依据 [tokio-rustls 0.26.6 文档](https://docs.rs/tokio-rustls/0.26.6/tokio_rustls/#why-do-i-need-to-call-poll_flush)。
+
+隔离诊断在 4 MiB 邮件最后一块 `BODY.PEEK[]<4194304.184>` 的底层密文写入处注入一次 Pending：无 flush 时 28.33 秒失败并复现相同 network 缺口；增加 flush 后 10.36 秒通过。相同补丁的精确快照在默认并发下通过 fmt、539 单元与 53 集成（2 项默认忽略）、all-target Clippy 和 release；单元 52.09 秒、Clippy 12.02 秒、release 32.34 秒。额外单 CPU 并发诊断中配额恢复通过，两项原先通过的后台测试达到各自 25 秒等待上限；本次保留其等待期限。独立补丁审阅完成，后续合并以新 head 的三项 CI 为准。
+
+### 连续命令延迟修复
+
+文档 head `47b79a4c71bef80dfc6f037d88dbfa31f852c1e7` 的 [CI 42040350521](https://github.com/black-zero358/rust-email-mcp/actions/runs/42040350521) 中两项 CONDSTORE 用例通过，配额恢复仍触及网络期限。逐块诊断观察到 IMAP 编码器的四次小 TLS 写入与延迟 ACK 累积等待。源码 `c8daed44c045fa3710f6882dcd6b187c1feed80b` 在 TCP 连接成功后、TLS 握手前启用 TCP_NODELAY，并增加真实 TLS 登录后读取客户端 socket 选项的确定性回归；继续使用原 4 MiB 邮件、64 KiB 分块、请求期限和错误映射。
+
+同一 ACK 控制条件下，分块命令间隔中位数由 68 ms 降至 1 ms，读至 EOF 由 5.062 秒降至 0.414 秒。四 CPU 加每块 55 ms 人工延迟的额外压力实验中，两种配置均触及原期限，NODELAY 多完成 6–9 块；该实验用于定位等待来源。精确源码快照使用独立 target 通过 fmt、**540 单元 + 53 集成**（2 项默认忽略）、all-target Clippy、release、显式 Node 八文件下载与内容读取以及 V6 隔离恢复；单元 26.72 秒、Clippy 12.55 秒、release 94 秒、八文件 4.07 秒。新 release SHA-256 为 `a3571a23c2fbbd60a84d79d524a2c74d9c4fcc8c7956cea0bfbf40a64f97972c`。恢复验证覆盖代次 1/2/3、运行见证、损坏见证先于 Journal 拒绝、操作库哨兵和 0700/0600。独立补丁审阅通过，最终 CI 随新 head 重新执行。
+
+### 缓存就绪与软期限回归
+
+head `e26184bb800f2875aa43157373d1176945de0c11` 的 [CI 42043024618](https://github.com/black-zero358/rust-email-mcp/actions/runs/42043024618) 已通过原三项失败用例；一项旧缓存测试遇到合法的 bodystructure 回退，却直接要求命中缓存；生产缓存探测仍保留 100 ms 软期限。测试修复 `e77e9880403efb1d0ccc52e212aac160ed712574` 先等待指定 UID 和正文真正可离线读取，再在 2 秒的测试观察窗口内验证实际缓存命中；只有正文完全相同的 bodystructure 回退允许重试，其他错误立即失败。最终命中请求必须恰好新建一条连接并发送 EXAMINE 与目标 UID 的 SIZE，两者之后没有正文 FETCH。相邻三封预热逐封等待可读，避免超过最佳努力写回的两个 payload 许可；删除、tombstone、零网络及局部错误断言继续保留。
+
+该提交仅修改测试文件。独立审阅通过；四 CPU、八测试线程的缓存组 13 项通过，精确快照 fmt、540 单元 + 53 集成（2 项默认忽略）、all-target Clippy 通过，单元 27.13 秒、Clippy 13.90 秒。生产源码与 `c8daed4` 相同，沿用其 release、八文件与 V6 恢复证据，最终提交重新执行三项 CI。
+
+## 2026-11-05 R12 后台同步与有界回收
+
+[PR #79](https://github.com/black-zero358/rust-email-mcp/pull/79) 最终 head `80fd706f7852982dcc99f010eabe94d81213b7c7` 的 [CI 42030094273](https://github.com/black-zero358/rust-email-mcp/actions/runs/42030094273) 中 check、audit、container 全部通过。精确源码及最终文档 head 的独立交叉审阅完成；GitHub 自动审阅遇到账户限流，已核对评论和空 review threads。合并提交为 `68b32353c2214b238c6f4ed33768316254d1275e`，本地 main、开发分支及对应远端引用已同步；R12C 工作区改动保留。
+
+源码 `506f877badaa3218b14f45c10c985b9e0cb0fd65`，父提交为 R12A 合并 `a226545df5d99424ba0bcfb51f78ecd3095abda8`。环境为 WSL Ubuntu、固定 Rust 1.99.1、Node 24.15.0 和 Docker Desktop。所有邮箱、身份、原件、附件及异常均使用合成数据、本地 TLS IMAP/HTTP 服务与隔离目录。
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo +1.99.1 fmt --check` | 通过 |
+| `cargo +1.99.1 test --locked --quiet` | 513 单元、47 集成通过；2 项显式测试默认忽略；单元 45.54 秒 |
+| `cargo +1.99.1 clippy --locked --all-targets -- -D warnings` | 通过，2.47 秒 |
+| `cargo +1.99.1 build --locked --release` | 通过，32.95 秒 |
+| 显式 Rust→Node 附件客户端测试 | 8 文件下载、SHA-256 与内容读取通过，11.85 秒 |
+| V5 发布程序隔离恢复烟测 | schema v5、恢复世代 1/2/3、运行见证、操作库哨兵、0700/0600 权限通过 |
+| 专用依赖审计与适配回归 | 340 项依赖、20 项审计适配回归通过；沿用既有维护告警策略 |
+| Docker 上下文及实际镜像 | allowlist 检查与精确源码归档的生产 Dockerfile 构建通过 |
+| 独立源码与文档复核 | 精确源码审阅通过；146 个相对链接/锚点通过；V1/V2/V3/V4 DDL 与父提交逐字节一致 |
+
+最终专项均纳入整仓结果：同步 15 项、签名后台同步 4 项、既有签名缓存 13 项、调度 9 项、配置 3 项和清洁关闭 1 项；存储专项 10 项。较早的缓存组 71 项在 V5 集成时通过，最终整仓结果包含后续新增及修复。
+
+签名 HTTP 运行真实生产 Runtime、后台 Supervisor、TLS IMAP 和 SQLite，覆盖 501 封懒生成历史、接近 u32 上界的稀疏 UID、冻结过程中新增、独立 tail 与历史断点重启；同时覆盖 FLAGS 清空、删除、移动、新 UIDVALIDITY 复用、真实写入口 dirty 与受控 FLAGS 竞争。配额用例验证真实 3 MiB 额度暂停、管理员暂停/扩容、raw 第二块读取时停机、暂存文件清理与许可归零，以及清洁重启后的继续物化。前台排队优先、双账户/目录轮转与撤权中止使用真实共享调度器核对。
+
+后台内容与扫描使用持久化收据和短事务。专用真实 execute 测试在仅有本地完整原件时连续完成清单、正文和索引三步，确认零新 TCP 连接、dirty 保持、精确 work/BlobId CAS 及每步许可归还。软期限在总期限内为持久 RetryAt 预留最多 500 ms，取消信号传入实际阻塞任务，执行许可持续保留到文件/SQLite 工作结束。已观察到失效且证据待落盘时保留缓存屏障；未持久化的新世代还阻止登记清洁关闭凭据。
+
+V5 独立迁移持久化派生副本的前台访问顺序，迁移回滚、metadata 重开及原有 DDL 不变均有回归。正文、预览、内联附件及二进制最后块的成功读取更新顺序并再次核对引用；回收复核访问序号、原件/派生字节与租约。范围完成要求发现、存在性/FLAGS 核对及对应层任务收敛，完整头、头部索引、精确标识索引与全文索引分别报告。
+
+GC 以每步最多 16 个候选的 keyset 页检查资格，空批保留继续位置，阶段冻结上界。真实双账户 8 MiB 压力回归先确认日志预留失败阻止 12 条退休任务删除，随后仍释放至少 2 MiB 孤立文件，下一轮完成 12 条元数据清理，另一账户原件保持。活跃租约对应释放量为零；实际物理释放才唤醒各受阻范围。压力恢复仅重排真正受阻任务，主动驱逐副本保留可派生和物化缺口；两次配额事件与跨范围唤醒另有回归。
+
+恢复烟测使用 `uv run --no-project python` 在独立网络命名空间及清空环境中运行实际 release 程序，验证 off 失败启动推进见证、损坏见证在 Journal 前拒绝、原操作库哨兵字节不变。发布二进制 SHA-256 为 `c70f2b4b4d62471e7ab08fdcb7e16c2a783faafda402a9181ec5ce0446b57967`。本批 Cargo.toml、Cargo.lock、vendored 源码及 Docker 配置保持父提交值。
+
+实际镜像从 `git archive 506f877badaa3218b14f45c10c985b9e0cb0fd65` 的独立目录构建，标签 `rust-email-mcp:r12-background-sync-local`，manifest list digest 为 `sha256:7f8dcadb44a172305d75d8ed032f776aa2b996da90f4cb37a902c466dd9a433b`。构建中的依赖下载自动重试后成功，固定 Rust 1.99.1 的 release 编译用时 3 分 27 秒。
+
+本批交付 rev1 生产后台同步，最终 PR CI 与合并结果在完成后追加。CONDSTORE/QRESYNC 加速继续分批，R13 执行至少 10,000 封合成邮件和 30 分钟持续负载。真实 ChatGPT 接入与生产部署另行安排。
+
+## 2026-11-05 R12 可恢复同步基础
+
+源码 `331775f18942d17ba35c78331abd87494134c87c`，父提交为 R11 合并 `5e45e59af058fafc562d873fa7ad1dce11b2e740`。环境为 WSL Ubuntu、Rust 1.99.1、Node 24.15.0 与 Docker Desktop。邮箱、身份、附件与故障输入全部使用合成数据和本地模拟服务。
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo +1.99.1 fmt --check` | 通过 |
+| `cargo +1.99.1 test --locked --quiet` | 500 单元、47 集成通过；2 项显式测试默认忽略；单元 38.82 秒 |
+| `cargo +1.99.1 clippy --locked --all-targets -- -D warnings` | 通过 |
+| `cargo +1.99.1 build --locked --release` | 通过，29.87 秒 |
+| 显式 Rust→Node 附件客户端测试 | 8 文件下载、SHA-256 与内容读取通过，9.53 秒 |
+| 同步、正文 HTTP、缓存及协议专项 | 13、14、67、13 项分别通过；包含在整仓测试中 |
+| 发布程序隔离恢复烟测 | full schema v4、恢复世代 1/2/3、运行见证、0700/0600 权限及 Journal 哨兵通过 |
+| 专用依赖审计及脚本回归 | 340 项依赖审计通过，20 项审计适配回归通过；保留既有 pin-utils 维护告警策略 |
+| Docker 上下文与实际镜像 | allowlist 检查及精确源码归档构建通过 |
+| 独立交叉审阅 | 存储、协议、内容物化及精确源码提交复核通过 |
+
+V4 使用独立事务迁移，保留 V1/V2/V3 既有 DDL。历史发现、独立新增扫描和已知 UID keyset 核对分别保存冻结上界与检查点；仅合法单条 SEARCH 的数量溢出可在新连接复核 UIDVALIDITY 后缩窗。重复 SEARCH/UID、错误 tag、NO、EOF、取消与错误账户收据保持原进度。metadata FETCH 在分配前分别限制命令与头部字节，保留拆分属性、显式空 FLAGS 和严格 INTERNALDATE。
+
+内容回填以真实持久化收据登记 Manifest、raw、完整正文、全文索引与附件，支持依赖、终态、省略、重试与配额暂停。原件超限时继续物化小正文/附件；超过 HTML 索引预算时保存完整正文并登记该索引层终态。64 KiB 分块、EOF 探测、tagged completion、摘要、取消清理和实际配额回收均有合成回归。Facts 提交与完整头部/精确索引覆盖分开计算。
+
+恢复烟测使用 `uv run --no-project python`、独立网络命名空间和清空的进程环境运行实际 release 程序。正常恢复及 off 模式失败启动推进运行见证，损坏见证在 Journal 前拒绝；操作库哨兵与私有文件权限保持。发布二进制 SHA-256 为 `2342dc6effd41aac6c03e2dacd00fd361fb181b02e2d32eec190fac7beec5930`。
+
+实际镜像从 `git archive 331775f18942d17ba35c78331abd87494134c87c` 的独立目录构建，标签 `rust-email-mcp:r12-sync-foundation-local`，镜像 manifest list digest 为 `sha256:6d691a3f79eaac375f8174f98632b878017c4f6eafde1b26c44c19aa76be10ab`。构建使用固定 Rust 1.99.1 和现有生产 Dockerfile；Cargo.toml、Cargo.lock 及部署配置保持原值。
+
+本批同步协议和内容驱动通过内部测试入口验收；生产后台循环、管理员启停配置、只读状态及运行期清理由 R12B 接入。真实 ChatGPT 接入与生产部署另行安排。
+
+[PR #78](https://github.com/black-zero358/rust-email-mcp/pull/78) 最终 head `68111294fe694fd27d0b05d273af195b3dd408d5` 仅在源码上追加三份文档，修正发现扫描与独立 keyset 核对的说明并保存验证记录；98 个相对链接/锚点及最终差异独立复核通过。[CI 42025118017](https://github.com/black-zero358/rust-email-mcp/actions/runs/42025118017) 的 check/audit/container 全部成功。GitHub 自动代码/安全审阅遇到账户额度限制，合并前 reviews/review threads 均为空。PR 合并为 `a226545df5d99424ba0bcfb51f78ecd3095abda8`，本地 main、开发分支及对应远端已同步，B 批改动保留在工作区。
+
+## 2026-11-05 R11 完整离线读取
+
+源码 `4a14cfef5f0fd957f42c0386f6de0457e59f2439`；环境为 WSL Ubuntu、固定 Rust 1.99.1、Node 24.15.0。所有邮箱、SMTP、身份、文件及故障输入均为合成数据，使用本地模拟服务与私有临时目录。
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo +1.99.1 fmt --check` | 通过 |
+| `cargo +1.99.1 test --locked --quiet` | 482 单元、44 集成通过；2 项显式测试默认忽略；单元 37.66 秒 |
+| `cargo +1.99.1 clippy --locked --all-targets -- -D warnings` | 通过，10.58 秒 |
+| `cargo +1.99.1 build --locked --release` | 通过，29.68 秒 |
+| 显式 Rust→Node 附件客户端测试 | 8 文件下载、摘要与内容读取通过，9.90 秒 |
+| 最终 UID 水位定向回归 | 缓存签名 HTTP 13、缓存会话 3、生产写入口 3、存储水位 1、持久队列 3，全部通过并纳入全量测试 |
+| 发布程序隔离恢复烟测 | full schema v3、恢复世代 1/2/3、运行见证、文件权限及操作库隔离全部通过 |
+| 独立交叉审阅与文档 | 实现与最终水位修复审阅闭环；137 个本地链接/锚点、diff 检查通过 |
+
+full 工具矩阵覆盖本地列表、单封/批量正文、附件清单/内联/认证 GET、中文全文搜索、精确 Message-ID 定位、原单目录与跨目录会话。签名 HTTP 用真实账户 ACL 与 JSON-RPC 预算核对断开模拟 IMAP 后零连接、正常重启、双账户同 UID 隔离、在线退避期间的离线读取、HTML 展示、完整正文索引和被裁减响应。大邮件中的小附件验证 raw omitted、单部件物化及离线摘要一致；原始邮件派生路径保留二进制/NUL 字节与原 MIME 索引。
+
+V3 是独立于已发布 V2 的新事务迁移，完整正文文本与有界叶元数据分别保存。正文可见性和筛选证据改变时更新搜索修订；重复相同证据保持修订。会话 source 绑定格式与线上 v1 分离，454 字节旧 codec fixture 验证原字段及容量记账；最终 SQLite CAS 还核对未落盘的删除观察，拒绝提交时保留原 token/replay。
+
+真实生产调用入口连接本地 TLS IMAP/SMTP，验证 MOVE、软删除、APPEND、目录操作和发送在首个实际副作用前登记 dirty；APPEND 拒绝不发送 literal。SMTP 先持久 claim，再登记缓存范围，再连接；accepted/unknown、已接受后 Journal 更新失败及操作键重放均保留原结果。批量写前 UID 存在性查询按原会话 UIDNEXT 处理缺失，保留 unknown/unprocessed。Sent 角色阻塞查询与取消清理持有共享许可至实际结束。
+
+已完成的严格 FETCH 缺失观察覆盖列表筛选、预览、正文、附件、头部、指纹及批量写前检查。未来 UID、缺少原会话 UIDNEXT、UID 仍存在但缺必要属性和 tagged NO 保持各自语义；水位以内尚未落库的 UID 留下持久墓碑，阻止迟到旧证据。回归模拟未来 UID 先获得新内容，再处理早先空结果的时序，确认新内容继续可读。旧 UIDVALIDITY 的队列失败仅清除原引用的 pending 标记。
+
+根目录锁释放回归通过克隆锁描述符确定性重现原重开失败，修复为全部 SQLite 连接关闭后显式 unlock，活动实例继续互斥。完整测试使用默认线程栈；大异步分支使用明确的 Box 边界。所有启动（包括 off 和初始化失败）推进注册库旁运行见证；关闭核对写准入、后台阻塞任务、下载、载荷、租约和 dirty claim 后再登记清洁凭据。
+
+恢复烟测以 `uv run --no-project python` 启动隔离脚本，在 `unshare --user --map-root-user --net` 与 `env -i` 环境运行实际 release 程序。三次 `--cache-restored` 依次得到 epoch 1、2、3；off 模式遇到合成无效 Journal 时仍推进见证，缓存 epoch 保持；损坏见证在 Journal 前拒绝。操作库哨兵字节保持，无 sidecar 和附件暂存目录；缓存目录 0700、文件 0600。二进制 SHA-256 为 `d97f73452647f66a18c400441518036f1f6c2e5bbf021d23e2a3beded389bcfa`。
+
+[PR #77](https://github.com/black-zero358/rust-email-mcp/pull/77) 首次最终 head `ec2ed442441d668f8f86d92431880a812a81bfe9` 的 [CI 42019754751](https://github.com/black-zero358/rust-email-mcp/actions/runs/42019754751) 中 audit/container 通过，check 的取消请求测试在旧 2 秒连接就绪窗口失败（active=0、accepted=0）；其余 481 项单元通过。原用例只等待四条连接，随后即假设全部二十条请求已准入。
+
+测试修复 `6a5c2c45600d257f918a33e763a409606a9d06d5` 使用只在测试构建存在的调度快照，分别等待 `(admitted,running)=(4,4)` 和 `(20,4)`，JoinSet 立即报告提前返回的 HTTP 请求，再检查 overflow BUSY。排队就绪与 overflow 共用 8 秒截止点，短于真实 10 秒队列上限；取消和资源归零也共用独立截止点。只为该用例延长刻意阻塞的模拟 greeting 期限，生产调度及请求限额保持原值。
+
+修复从 `git archive ec2ed44` 的隔离源码仅覆盖三份测试相关文件验证：默认线程栈、单 CPU、12 个测试线程的账户组连续两轮各 9 项通过（8.48/8.28 秒）；普通并发全量 482 单元、44 集成通过（38.67 秒）。最后共用截止点微调后，最终三文件快照的 fmt、all-target Clippy 及单 CPU/12 线程账户组 9 项通过（9.47 秒）。独立差异审阅通过；新的最终 PR CI 与合并结果在完成后追加。
+
+最终 head `485232e38051f5f38936b0d241ce702a85858199` 的 [CI 42021538312](https://github.com/black-zero358/rust-email-mcp/actions/runs/42021538312) 中 check/audit/container 全部通过，最终源码与测试修复的独立复核完成。GitHub 自动代码/安全审阅遇到账户额度限制；合并前 reviews/review threads 为空。[PR #77](https://github.com/black-zero358/rust-email-mcp/pull/77) 合并为 `5e45e59af058fafc562d873fa7ad1dce11b2e740`，本地 main、开发分支及对应远端同步，R12 改动保留在工作区。
+
+全历史回填、周期增量/删除核对和运行期自动回收继续由 R12 交付；R13 执行至少 10,000 封合成邮件与 30 分钟负载。附件验收继续采用离线客户端，真实 ChatGPT 接入及生产操作按单独流程安排。此批依赖、Cargo.lock 与 Docker 构建配置保持原值。
+
+## 2026-11-05 R11 文件缓存与失效基础
+
+源码 `d2673f7bf6c5e49d768b80be7b5132a56ee3bb44`；WSL Ubuntu / Rust 1.99.1 / Node 24.15.0。R11 第一批提供内部 full 存储 API 和 test-only 写入 guard。用户 full 配置、生产写路径及显式离线工具由后续应用批次接入。
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo +1.99.1 fmt --check` | 通过 |
+| `cargo +1.99.1 test --locked --quiet` | 441 单元、44 集成通过；2 项显式测试默认忽略 |
+| `cargo +1.99.1 clippy --locked --all-targets -- -D warnings` | 通过 |
+| `cargo +1.99.1 build --locked --release` | 通过 |
+| 显式 Rust→Node 附件客户端测试 | 8 文件下载、摘要与内容读取通过 |
+| 存储与写入 guard 专项 | 37 项 cache 测试、5 项真实 crate guard 测试通过，均纳入上方全量结果 |
+| 独立源码与文档复核 | 交叉审阅闭环，60 个本地链接/锚点有效，diff 检查通过 |
+
+新增 16 项真实文件存储回归验证 V1→V2 迁移与 DDL 失败回滚、metadata 重开 v2、原文及派生层状态、跨账户暂存预留与 32 MiB 文件边界、重命名后取消、超长输入、tombstone 与 pin、未观察目录的多 scope dirty、清洁/异常/恢复重启、孤儿/缺文件/坏摘要，以及提交后诊断与清理失败。已知附件索引通过显式 Missing 保留缺口，重复登记保留已知原因；驱逐前验证 raw 并持租约，可重建副本退为 Derivable，坏 raw 保留仍可用的派生文件。
+
+原始邮件的长度与 SHA-256 独立于 blob 引用持久保存；运行时隔离或重启发现文件缺失后，仍拒绝同邮件引用的不同原文，允许校验原始摘要后修复。离线 lease 在 dirty 清除后继续核对原修订，live/离线 lease 及 stage 保留恢复世代；核对 stamp 和 ticket 绑定 Cache 实例，跨实例凭据拒绝使用。
+
+5 项 guard 回归使用真实 cache 和 SQLite，覆盖首个副作用前多目录保护、活跃 claim 阻止取得核对 stamp、过时 stamp 的 CAS 拒绝、容量/期限失败先关闭离线，以及真实 SQLite 写锁阻塞超时后许可由阻塞任务持有至清理完成。生产调用尚未接入。
+
+源码独立复核关闭了并发核对清 dirty、原文损坏后旧派生内容保留、同摘要幂等校验、已知 Missing 覆盖丢失、坏 raw 驱逐、实例/恢复世代绑定及租约释放顺序等问题。现有主库与 journal 联合 max_page_count 上界涵盖初始化的连续短事务。GC 每批最多处理 200 个候选，后续后台调度继续限制扫描工作量。依赖版本、Cargo.lock、生产配置和工具契约保持 R10 值。
+
+[PR #76](https://github.com/black-zero358/rust-email-mcp/pull/76) 最终 head `979a507eb8238c22c42a421095285f8be1e02da6` 只追加进度与验证记录，独立复核通过。[CI 42009840047](https://github.com/black-zero358/rust-email-mcp/actions/runs/42009840047) 的 check/audit/container 全部成功，包含实际生产 Dockerfile 构建。GitHub 自动代码及安全审阅遇到账户额度限制；合并前 reviews/review threads 均为空。合并提交为 `f4031879fdde1ae77164ef19f9fb44586fa94db9`，本地 main、开发分支和对应远端全部同步，R11 应用层改动保留在工作区。
+
+## 2026-11-05 R10 持久元数据与会话游标
+
+源码 `4516c1adb4f8d93fc610fefefba77fc442643f05`；环境为 WSL Ubuntu、固定 Rust 1.99.1、Node 24.15.0 和 Docker Desktop。缓存、邮箱、身份和附件验证均使用隔离目录及合成数据。
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo +1.99.1 fmt --check` | 通过 |
+| `cargo +1.99.1 test --locked --quiet` | 420 单元、44 集成通过；2 项显式测试默认忽略 |
+| `cargo +1.99.1 clippy --locked --all-targets -- -D warnings` | 通过 |
+| `cargo +1.99.1 build --locked --release` | 通过 |
+| 显式 Rust→Node 附件客户端测试 | 8 文件下载、摘要与内容读取通过 |
+| 专用依赖审计及 Docker context 检查 | 1409 条公告、340 个依赖审计通过；上下文白名单通过 |
+| 发布二进制缓存恢复烟测 | 无网络命名空间中连续两次恢复成功；epoch、权限及操作库隔离检查通过 |
+
+存储 16 项回归覆盖账户/目录世代、迟到的旧 UIDVALIDITY、tombstone、中文 trigram 与短词有界扫描、退休分区磁盘记账、事务配额、根目录所有权、未知 schema、恢复标记，以及提交前取消和提交后诊断故障。会话核心共 35 项回归，包含持久编解码、近 8 MiB 状态恢复、全局槽位、租约、取消、原期限和重放。5 组新缓存 HTTP 场景覆盖默认关闭、完整证据索引、当前 ACL、世代、运行时重启、恢复、存储故障和额度耗尽；既有跨目录 HTTP 及完整 wire 预算测试一并通过。
+
+恢复烟测使用仓库 `deploy/cache.json.example`、合成身份和独立临时目录，在 `unshare --user --map-root-user --net` 内以 `env -i` 运行 release 程序的 `--cache-restored`。两次仅输出固定事件 `cache_restore_marked`，manifest 与 SQLite owner epoch 依次为 1、2，clean=false。缓存目录权限 0700，manifest、数据库、锁和注册库文件 0600。无效 SQLite 操作库哨兵的 SHA-256 两次保持一致，未生成操作库 sidecar 或附件暂存目录。二进制 SHA-256 为 `bb941cd942c440a3fc697a48af89a1ff5fab15fa0734b2f69e3cd6efdc5795d8`。
+
+独立交叉审阅已修复提交后诊断覆盖已知结果、首次并发观察世代倒退、FTS 候选扫描界限、持久解码临时空间计量和额度失败状态可见性。R10 新增的 rusqlite `blob` feature 使用现有锁定版本，Cargo.lock 保持原值。实际生产 Dockerfile 对 `git archive 4516c1a` 精确源码快照构建成功，镜像 `rust-email-mcp:r10-metadata-local`，release 步骤 7 分 51 秒，构建引用 `ira7gvgwnvxkw1bb8z1jdq1o8`。
+
+[PR #75](https://github.com/black-zero358/rust-email-mcp/pull/75) 最终 head `1b3146453ac3fe064d9f432664f65542219637bc` 相对源码只追加七份文档，独立审阅通过，75 个本地链接与锚点有效。[CI 42006284171](https://github.com/black-zero358/rust-email-mcp/actions/runs/42006284171) 的 check/audit/container 全部成功。GitHub 自动代码及安全审阅遇到账户额度限制；合并前 reviews/review threads 均为空。PR 合并为 `f422cbb48cec7fbea83b918517cf37ec181b0926`，本地 main、开发分支及对应远端全部同步，R11 改动保留在工作区。
+
+## 2026-11-05 R09 跨文件夹会话
+
+源码提交 `4e499e4ccbaf4278630c609ec4d09b4553f8718a`，基于搜索基础合并 `2a07f31360ceffdc4929fc5b765813ceefadcea7`。环境为 WSL Ubuntu、Rust 1.99.1、Node 24.15.0 和 Docker Desktop；邮件、账户、JWT 与 TLS IMAP 后端均使用合成数据。
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo fmt --check`、`git diff --check` | 通过；变更文档的本地链接目标已核对 |
+| `cargo test --locked --quiet` | 385 单元 + 44 集成通过；单元 33.37 秒，搜索专项 10 项 0.86 秒 |
+| `cargo clippy --locked --all-targets -- -D warnings` | 通过，7.72 秒；vendored async-imap 保留上游 4 条 deprecated 宏提示 |
+| `cargo build --locked --release` | 通过，35.65 秒 |
+| 显式 Rust→Node 附件联调 | 8 文件下载、SHA-256 及内容读取通过，9.81 秒 |
+| `pnpm --dir scripts/attachment-client-adapter test` | 7 项通过 |
+| `scripts/audit-dependencies.sh` | 1409 条公告、340 个依赖，退出 0；保留已登记的 pin-utils unmaintained 提示 |
+| `scripts/test-docker-context.sh` | 上下文白名单通过 |
+| 生产 Dockerfile | `git archive 4e499e4` 独立源码快照实际构建通过，镜像 `rust-email-mcp:r09-conversation-local`；依赖索引一次 TLS 重试，release 步骤合计 11 分 42 秒，最终镜像导出成功 |
+
+20 组签名 HTTP 回归覆盖旧参数兼容和 Schema、收件/已发送/管理员归档的精确关联、同 UID 跨目录来源、多副本和内容冲突、standard 用途排除、固定水位、失败窗口续查、候选/结果/正文全页预算、健康副本代表、UIDVALIDITY、主体和撤权、非默认账户与跨已授权账户游标隔离、过期/重启、并发/取消及 60 秒期限。虚拟时钟用于期限和 601 秒过期推进。完整输出预算用真实转义 JSON-RPC id 核验，失败后旧 token 可继续，已裁减页换短 id 重放仍保留完整元数据且不重复 FETCH。
+
+24 项纯状态/身份/存储回归覆盖 quoted/Unicode ID、原始关键头证据、完整指纹方法、循环图、逐字段窗口和候选检查点、变体/位置增量、实际容量及租出状态记账、租约取消、首次请求回收、原页错误/覆盖/裁减快照，以及无进展成功页的 token 轮换和原 TTL。两项新增配置测试并扩展既有 file_only 测试，通过真实环境/JSON 加载核对归档目录的账户隔离、空/控制/超长拒绝与环境混用拒绝。
+
+集成中修复了大型 async 状态导致默认测试线程栈溢出的问题，使用 Box 固定关键异步边界；最终全量测试采用默认线程栈。独立审阅修复了 raw 指纹读取上限、同页同引用重复失败读取、完成页重放目录复核、健康副本代表、响应裁减标记与无进展页重放，并复核最终源码与文档。新增 Tokio `test-util` 仅用于开发测试，Cargo.lock 和生产依赖版本保持原值。账户注册库、发送操作库和旧单目录调用沿用原格式；跨目录游标当前为有界内存状态。
+
+最终源码及 docs-only head 已通过交叉独立审阅。最终 head `21cc6611296852e9f6f269b7a7fefc3ac311872b` 的 [CI 42001971225](https://github.com/black-zero358/rust-email-mcp/actions/runs/42001971225) 中 check/audit/container 全部通过。[PR #74](https://github.com/black-zero358/rust-email-mcp/pull/74) 合并为 `3aeb3e23337ce1f14bd0a6818387c1c8a4590610`，本地 main、开发分支及对应远端已同步，R10 改动保留在开发工作区。GitHub 自动 Codex review 遇到账户额度限制；合并前 reviews/review threads 均为空。
+
+## 2026-11-05 R09 有界搜索基础
+
+源码提交 `f6b7c4c8d22e367d07f292268bc5bc420098df1d`。环境为 WSL Ubuntu、Rust 1.99.1、Docker Desktop 和 Node 24.15.0；仅使用合成协议输入及本地模拟 IMAP/MCP 客户端。
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo fmt --check`、`git diff --check` | 通过 |
+| `cargo test --locked --quiet` | 339 单元 + 44 集成通过；单元 26.37 秒，新增搜索 10 项 0.73 秒 |
+| `cargo clippy --locked --all-targets -- -D warnings` | 通过；vendored async-imap 保留上游 4 条 deprecated 宏提示 |
+| `cargo build --locked --release` | 通过，25.79 秒 |
+| 显式 `standalone_node_adapter_consumes_real_rust_mcp_and_authorized_get -- --ignored` | 8 文件下载、摘要及内容读取通过，9.63 秒 |
+| `scripts/test-audit-dependencies.sh` | 20 项离线审计适配回归通过 |
+| `scripts/audit-dependencies.sh` | 1403 条公告、340 个依赖，退出 0 |
+| `scripts/test-docker-context.sh` | 上下文白名单通过 |
+| `docker build --tag rust-email-mcp:r09-search-local <源码快照>` | 使用 `git archive f6b7c4c` 导出的独立目录，通过；依赖索引遇到一次 TLS 网络重试，发布构建共 11 分 50 秒，最终镜像导出成功 |
+
+新增 10 项根集成回归覆盖解析器和实际 async client：199/200/201 个 UID、合法输入的每个分片前缀、显式空结果、重复/缺失 SEARCH、重复 UID、NO/BAD/BYE/EOF、错 tag、意外 continuation、128 KiB 精确命令阈值及少一字节、超长 literal 声明提前失败、错误后读写闭锁、命令前 SEARCH 隔离和完成后缓冲尾恢复。普通 SEARCH 超过 200 个结果仍按原入口工作。
+
+独立审阅实测 20,027 字节的 FETCH/FLAGS 输入原可创建 393,216 字节的 flags 向量。本批为有界 SEARCH 引入专用通知解析，FLAGS/FETCH 嵌套容器分配前共用 128 KiB 记账；状态文本、响应码和尾空白仅扫描，其他扩展响应拒绝。高层 collector 只转交标量邮箱通知，120 条合法 FLAGS 回归核对原始响应不积留在通知队列。typed 错误只携带类别和数字，既有 BODYSTRUCTURE、部件 FETCH、完成状态回归全部通过。
+
+最终源码与契约文档已通过独立复核。两份 vendored 上游版本、校验和及 Cargo.lock 保持原值，PATCHES.md 同步接口与替换验证要求。本子包交付搜索解析与传输基础；跨文件夹会话、状态存储及客户端契约随后接线。
+
+最终 head `caf87844dfededaba97a989e74066dc27f726138` 的 [CI 41997378653](https://github.com/black-zero358/rust-email-mcp/actions/runs/41997378653) 中 check、audit、container 全部通过。[PR #73](https://github.com/black-zero358/rust-email-mcp/pull/73) 已合并为 `2a07f31360ceffdc4929fc5b765813ceefadcea7`，本地 main、开发分支及对应远端已同步。GitHub 自动 Codex review 遇到账户额度限制，独立最终源码及文档审阅已完成；合并前 reviews/review threads 均为空。
+
+## 2026-11-05 R08 正文预览与邮件头分类
+
+源码提交 `cc55dca9c4acffa7e74c9b7c2d797ae290f5cdbc`。环境为 WSL Ubuntu、Rust 1.99.1、Node 24.15.0；测试使用合成邮件、本地 TLS IMAP 与签名 JWT/MCP/HTTP。
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo fmt --check`、`git diff --check` | 通过；相关文档的相对文件链接通过 |
+| `cargo test --locked --quiet` | 339 单元 + 34 集成通过；单元 26.14 秒；2 项默认忽略为另行执行的 Node 联调及父测试调用的跨进程锁探针 |
+| `cargo clippy --locked --all-targets -- -D warnings` | 通过；vendored async-imap 保留上游 4 条 deprecated 宏提示 |
+| `cargo build --locked --release` | 通过，22.53 秒 |
+| 显式 `standalone_node_adapter_consumes_real_rust_mcp_and_authorized_get -- --ignored` | 8 文件下载、摘要及内容读取通过，9.37 秒 |
+| `pnpm --dir scripts/attachment-client-adapter test` | 7 项通过 |
+
+列表专项共 13 项：12 组认证 HTTP 场景覆盖默认关闭预览、非首正文部件、跨叶空白、HTML 与字符截断、取样和页预算、完整/截断邮件头分类、FLAGS 合并、严格头部 FETCH、逐项错误和超时、附件筛选游标，以及筛选 raw 回退与预览组合只读取一次。另一个完整响应预算测试覆盖状态字段单独超限、成功/错误混合预览、992 字节转义 ID、结构化与文本副本、Schema、精确预算阈值及少一字节。
+
+分类专项覆盖固定信号顺序、重复头、CFWS/参数、完整逻辑头边界，以及 RFC 6068 的编码本地部分、UTF-8/IDNA 域名、查询字段名和地址分隔符。无效百分号域名、坏 UTF-8、裸保留字符和非法查询字段均有负例。预览共用有界 MIME 选择、编码和 HTML 策略；截断样本不执行完整 EOF 收束，UTF-7 给逐项错误，已取得 raw 的本地取样完成后复核期限。
+
+独立审阅在最终源码提交上完成，修复了退订地址误判，以及预览状态字段占满输出时整页丢失的问题。最终降级依次移除预览内容和全部可选预览字段，保留可容纳的摘要、分类与游标；基础摘要本身超限返回 `LIMIT_EXCEEDED`。配置、依赖锁定及持久化格式沿用现有值。附件继续离线验收；真实 ChatGPT 连接测试留在后续阶段。PR 最终提交的 check/audit/container 作为合并门禁。
+
+最终 PR head `93ec2301ff3bf30f818825d102129ef17047b0b0` 相对源码只追加验证记录与实施状态。[CI 41993366234](https://github.com/black-zero358/rust-email-mcp/actions/runs/41993366234) 的 check/audit/container 全部通过。GitHub 自动 Codex review 因账户额度限制未执行，最终源码及文档由独立 agent 复核通过；合并前 reviews/review threads 为空。[PR #72](https://github.com/black-zero358/rust-email-mcp/pull/72) 合并为 `d8537374f4b2a0ff16997c194f9a0d0d48a4654c`，本地 main、开发分支及对应远端均已同步，R09 的开发改动保留在工作区。
+
+## 2026-11-05 R07 局部正文读取
+
+源码提交 `b4b21dab3a787ebb4ccfe070e717e56890b01b46`。环境为 WSL Ubuntu、Rust 1.99.1、Docker Desktop、Node 24.15.0；使用本地 TLS IMAP、签名 JWT/MCP/HTTP 和合成邮件。
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo fmt --check`、`git diff --check` | 通过 |
+| `cargo test --locked` | 312 单元 + 34 集成通过；单元 24.61 秒；2 项默认忽略分别为单独执行的 Node 联调和父测试调用的跨进程锁探针 |
+| `cargo clippy --locked --all-targets -- -D warnings` | 通过，vendored async-imap 保留上游 4 条 deprecated 宏提示 |
+| `cargo build --locked --release` | 通过，21.71 秒 |
+| 显式 `standalone_node_adapter_consumes_real_rust_mcp_and_authorized_get -- --ignored` | 8 文件下载、校验、内容读取通过，9.34 秒 |
+| `pnpm --dir scripts/attachment-client-adapter test` | 7 项通过 |
+| `scripts/audit-dependencies.sh` | 1403 条公告、340 个依赖，退出 0 |
+| `scripts/test-audit-dependencies.sh`、`scripts/test-docker-context.sh` | 20 项离线审计回归与上下文白名单通过 |
+| `docker build --tag rust-email-mcp:r07-body-local .` | 通过；首次下载依赖遇到网络重试，builder 完成耗时 19 分 19 秒，最终镜像导出成功 |
+
+14 组正文认证 HTTP 场景覆盖单封、批量、会话与旧 raw 结果的逐字段对照；模拟服务声明 40 MiB 邮件，在正文省略 charset、BODYSTRUCTURE 补 US-ASCII 的情况下只读取第二个小正文部件。另覆盖完整 alternative 回滚、related 精确 CID、HTML 跨叶预算、跨 64 KiB 字符集、UTF-7 一次回退、新连接 UIDVALIDITY、重复 UID、完整 JSON-RPC 转义预算及 `max_body_length:0` 完整验证。原客户端的 8 个合成 CSV/XLSX/PDF 等文件继续校验字节、摘要和解析内容。
+
+协议故障矩阵覆盖部件第二块、raw 回退和候选 HEADER 的错 origin/section、重复、短读、多读、NO/BAD、错 tag、BYE/EOF；逐项核对批量及会话停止后续正文读取。局部 charset/内容错误只在命令已完成时继续，结构映射预算与未完成命令失败分别处理。底层映射新增全树 8192 行预算、默认 charset 与 MIME 候选差分；编码器覆盖 BOM、坏字节、跨块状态、输出边界和原字符解码结果。
+
+独立审阅修复了 raw/候选头匹配、重复 UID 回退、全树头部行预算、逐叶错误顺序、非结构命令意外 BODYSTRUCTURE 预算错误，以及默认字符集映射。正文缺目标数据保持原 `MAIL_BACKEND`；输出增加可选 `read_diagnostics`，`part_fetch` 更新为 true。`encoding_rs 0.8.42` 从既有传递依赖显式声明为直接依赖，锁定包版本保持一致；配置和持久化格式沿用原值。附件与正文均采用离线验收，真实 ChatGPT 连接测试保留到后续阶段。
+
+最终 PR head `0c07455c5973440047c6964fdae6bdfc7c6c09b5` 相对源码仅更新验证记录与实施状态。[CI 41989646668](https://github.com/black-zero358/rust-email-mcp/actions/runs/41989646668) 的 check/audit/container 全部通过，包含实际生产 Dockerfile 构建；GitHub 自动审阅遇到 Codex 额度限制，独立 agent 的最终源码审阅已完成并记录在 [PR #71](https://github.com/black-zero358/rust-email-mcp/pull/71)。合并前复查 reviews/review threads 均为空，合并提交为 `f5e7877a0f46ca6c7d6055341b0303ffcafc83cb`。本地 main、开发分支及对应远端同步到该提交，R08 的进行中改动继续保留在开发工作区。
+
+## 2026-11-03 R07 附件部件下载
+
+源码提交 `d0a1e624c037346564c07c4543fb352136c4f8f9`。环境为 WSL Ubuntu、Rust 1.99.1、Docker Desktop、Node 24.15.0；仅使用合成文件和本地模拟 TLS IMAP、JWT/MCP/HTTP。
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo fmt --check`；变更的 vendor 文件显式 rustfmt | 通过 |
+| `cargo test --locked` | 277 单元 + 34 集成通过，20.03 秒；2 项默认忽略分别为单独执行的 Node 联调和由父测试实际调用的跨进程锁探针 |
+| `cargo clippy --locked --all-targets -- -D warnings` | 通过，沿用上游 4 条 deprecated 宏提示 |
+| `cargo build --locked --release` | 通过，23.04 秒 |
+| 显式 Rust→Node 8 文件下载/校验/内容读取 | 通过，9.15 秒 |
+| 依赖审计、审计脚本故障回归 | 1402 条公告、340 个依赖，退出 0；20 项离线脚本回归通过 |
+| Docker context 与 `docker build --tag rust-email-mcp:r07-attachments-local .` | 通过，builder 发布编译 1 分 36 秒；构建后仅调整测试断言和文档，生产代码保持一致 |
+
+增量解码回归覆盖 5000 组 oracle 差分、Identity/Base64/QP、每字节拆分、64 KiB 边界、32 MiB 精确及超限、QP 尾部空白、EOF 分步完成。暂存模块覆盖四份文件额度、私密权限、跨进程锁、重启恢复、写入/读取/校验错误，以及 Begin/Write/Finish/Read 阶段真实阻塞任务取消后继续持有许可。
+
+10 组认证 HTTP 流程测试包含 18 种编码与尺寸组合、40 MiB 整封邮件中的小附件、首块/后续块错误、收到数据后 NO/BAD/EOF/错 tag、末端额外数据、解码超限、账户/UIDVALIDITY 重查、四路慢消费和文件清理。5 项底层测试验证任意 UID/section 的 literal 声明先限、合法 section 及每个前缀、quoted 逻辑字节、typed 错误隐私/关流、匹配 tag 后恢复普通 raw 解析。
+
+独立审阅发现并闭环 HEADER.FIELDS 分片、quoted 转义长度和暂存创建阶段期限；最终提交复核无遗留发现，记录见 [PR #70](https://github.com/black-zero358/rust-email-mcp/pull/70)。首轮全量有四项旧断言/模拟响应与新合同不一致，已精确更新；同轮并行镜像构建时，取消测试一次未在 2 秒内达到等待状态。该用例保留原期限与 20/4、零连接断言，增加阶段/连接计数；独立、账户并行子集及最终全量均通过。
+
+本批完成附件部件下载。内联 Base64 保持 raw 路径，特殊 MIME 的 raw 回退继续受 32 MiB 整封上限约束；局部正文读取列入 R07 下一 PR。真实邮箱和 ChatGPT 连接测试后移。
+
+[PR #70](https://github.com/black-zero358/rust-email-mcp/pull/70) 最终 head 为 `bcb2b450a963b4ab0c430e72f04c0c27e0b89b63`，相对已审源码仅追加验证文档。[CI 41565410482](https://github.com/black-zero358/rust-email-mcp/actions/runs/41565410482) 的 check/audit/container 全部通过；合并前复核 GitHub reviews/review threads 为空，独立审阅记录已写入 PR。合并提交 `7837396ac749f7c79eeca20668a99807b466d77e` 已同步到本地 main、开发分支和对应远端。
+
+## 2026-11-03 R06 附件清单与受控回退
+
+源码提交 `885a1ce3791f73140aa7ff3efe6d6bfb96434f3c`。环境为 WSL Ubuntu、Rust 1.99.1、Docker Desktop、Node 24.15.0；附件验证只使用本地 TLS IMAP、认证 MCP/HTTP 和合成文件。
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo fmt --check`；变更的 vendor 源码显式 rustfmt | 通过 |
+| `cargo test --locked` | 234 单元 + 29 集成通过；可选 Node 项单独执行 |
+| `cargo clippy --locked --all-targets -- -D warnings` | 通过；保留上游已有的 4 条 deprecated 宏提示 |
+| `cargo build --locked --release` | 通过，48.49 秒 |
+| 显式 Rust→Node 下载与内容读取 | 1 项通过，8 组文件字节及摘要核对一致 |
+| `bash scripts/audit-dependencies.sh` | 1402 条公告、340 个依赖，退出 0 |
+| `bash scripts/test-audit-dependencies.sh` | 20 项离线故障回归通过 |
+| `bash scripts/test-docker-context.sh` | 通过 |
+| `docker build --tag rust-email-mcp:r06-manifest-local .` | 通过，builder 发布编译 2 分 31 秒 |
+
+新增回归覆盖统一原 DFS 索引、逐节点完整 MIME 头、RFC2231、整体 multipart/message 附件、重复元数据、64 命令和 1 MiB 头证据预算。8 项真实 HTTP 流程测试核对结构路径仅取元数据、明确拒绝/预算的一次新连接回退、UIDVALIDITY 重验、协议失败终止、同一编号的内联和 GET 字节。双账户同 UID 的结构结果继续保持引用及授权隔离。
+
+独立审阅发现并修复了跳过原始头、Base64/QP multipart 和缺 boundary multipart 的索引差异。审阅者在源码提交上复核修复、全部新增文件及相关调用路径，无遗留发现，记录见 [PR #69](https://github.com/black-zero358/rust-email-mcp/pull/69)。
+
+完整请求测试另发现深层结构解析的临时栈占用过大；改用顺序字段解析和流式类型前缀分派，保留深度、节点和分配预算。精确小字符串预算的 TEXT/MESSAGE 全部前缀回归通过，32 层结构在真实 HTTP 流程中按结构预算回退。流式前缀行为依据锁定 [nom 8.0.0 的 tag_no_case](https://github.com/rust-bakery/nom/blob/8.0.0/src/bytes/streaming.rs#L35-L77)。
+
+R06 已实现结构预算、统一清单、读取错误分类及一次受控回退。实际附件下载继续使用整封 reader，`part_fetch=false`；R07 接入部件读取。真实 ChatGPT 连接与真实邮件测试后移。
+
+[PR #69](https://github.com/black-zero358/rust-email-mcp/pull/69) 最终 head 为 `351353b4884dee3a55b324a7a61cb922c7a1b965`，相对已审源码仅增加进度及验证文档。[CI 41559868647](https://github.com/black-zero358/rust-email-mcp/actions/runs/41559868647) 的 check/audit/container 全部通过；合并前复核 GitHub reviews/review threads 为空，独立审阅记录已写入 PR。合并提交 `41fb821f583a9342aaf47d9b8372e03622ab7e0c` 已同步到本地 main、开发分支和对应远端。
+
+## 2026-11-02 R06 parser 预算基础验证
+
+源码提交 `e85dd988db2913fa17c990a4a259db4f5e072fbd`，最终源码及字节 fixture 提交 `e0433a9693c96e596e876adf079addc5e8e0aa61`。环境为 WSL Ubuntu、Rust 1.99.1、Docker Desktop；协议测试使用合成响应和本地 duplex 流。
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo fmt --check`；修改的 vendor 文件显式 rustfmt | 通过 |
+| `cargo test --locked` | 200 单元 + 28 集成通过，1 项可选 Node 测试默认忽略；新增预算/Client 集成 26 项进入默认 CI |
+| `cargo clippy --locked --all-targets -- -D warnings` | 通过；测试中两处 repeat/take 等价改为 repeat_n |
+| `cargo build --locked --release` | 通过，30.51 秒 |
+| `bash scripts/test-audit-dependencies.sh` | 20 项离线故障回归通过 |
+| `bash scripts/audit-dependencies.sh` | 实时更新后加载 1396 条公告，扫描 340 个依赖，退出 0；两个本地包均映射至已核验上游身份 |
+| `bash scripts/test-docker-context.sh` | 真实构建器核验仅放行两个 vendor 目录及所需源码 |
+| `docker build --tag rust-email-mcp:r06-parser-local .` | 通过，builder 发布编译约 1 分 48 秒 |
+| 独立上游对照 | 2179 个合法响应前缀/完整 AST 对照、1000 组字节 literal 的 lossy 内容与真实 String 容量核验通过 |
+
+独立审阅发现并修复了 `NIL` 分段时误吞 `Incomplete`，以及 `from_utf8_lossy` 的实际持有容量大于内容长度；增加正常拆包、精确预算、实际容量和 Client 终止回归。最终提交复核另补入四份 `include_bytes!` fixture，并以 binary Git 属性保留 CRLF；四份 Git blob 与工作区原字节逐一核对一致。审阅者将源码、两项修复和 fixture 完整性绑定到 `e0433a9`，无剩余发现。
+
+本子包交付分配前解析预算、静态 typed limit 错误、默认 Client 接线、双依赖来源/审计及容器配置。后续 R06 PartManifest 子包负责工具层 `LIMIT_EXCEEDED/mime_structure` 映射、必要头核对和受控整封回退；R07 负责部件下载。当前未执行真实邮箱或 ChatGPT 连接测试。
+
+[PR #68](https://github.com/black-zero358/rust-email-mcp/pull/68) 最终 head 为 `0c4e431b3af616131cd2f160bc512bfbf8cc23b1`，相对已审源码仅增加验证文档。[CI 41429841352](https://github.com/black-zero358/rust-email-mcp/actions/runs/41429841352) 的 check/audit/container 全部通过；合并前复查 reviews/review threads 为空，独立审阅记录及发现修复已写入 PR。合并提交为 `6f106d5ead8a957b72698473faad676376303784`，随后本地 main、开发分支与对应远端全部同步。
+
+## 2026-11-02 R05 多账户离线验证
+
+实现提交 `c3136348ff75709b1208d1cc40750f2c10b3e2a0`，同步 main 的合并提交 `a0a81aac391a240902881df52109c1ab23b5557a` 与其 tree 一致。最终源码 `ffd1bda62ac80de4bfd13008675334173e2962b6` 仅追加 Clippy 要求的静态错误回退简化。环境为 WSL Ubuntu、Rust 1.99.1、锁定 Cargo.lock 和本地模拟 IMAP/JWT/MCP；附件均为合成文件。
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo fmt --check` | 通过 |
+| `cargo test --locked` | `a0a81aa`：200 单元、2 集成通过；1 个可选 Node 联调默认忽略；8.21 秒 |
+| `cargo clippy --locked --all-targets -- -D warnings` | `ffd1bda` 通过；vendored 上游保留原有 4 条 deprecated 宏提示 |
+| `cargo build --locked --release` | `ffd1bda` 通过，21.54 秒 |
+| 显式执行 `standalone_node_adapter_consumes_real_rust_mcp_and_authorized_get -- --ignored` | `ffd1bda`：1 项通过，7.12 秒；Node 24.15.0 下载并校验 8 组 fixture |
+| 独立审阅 | 配置/注册由协议执行者审阅；协议、授权和 runtime/GET 由配置执行者审阅；主 agent 复核集成。最终源码 head 复核无剩余发现 |
+
+新增验证覆盖严格 JSON 与秘密文件限制、v1/v2 迁移失败恢复、原 Journal 字节保持、同 UID 双账户读取/附件隔离、每次请求 ACL、固定旧写账户、撤权后的历史操作查询、全局 4 槽/20 请求、256 项/16 MiB 缓存、账户独立退避、完整响应预算。真实 HTTP 取消测试分别覆盖 4 个运行加 16 个排队读取，以及附件 GET 断连/撤权/账户移除后的连接与许可释放。
+
+审阅发现并修复了读取任务 detach 导致取消后继续运行，以及附件 GET/连接诊断超时退避记账遗漏；写任务保留原独立生命周期。调度明确采用基础份额优先、同一层级前台优先。全部测试离线完成，真实 ChatGPT 连接与真实邮件测试后移。Linux 文件凭据权限校验已执行，Windows 使用环境变量引用；Windows 专用拒绝文件引用回归待该平台 Rust 环境执行。
+
+[PR #67](https://github.com/black-zero358/rust-email-mcp/pull/67) 的最终 head 为 `9019ef7a2edbcdaded854933b6d0b95fcc37ecf1`，相对最终源码仅追加验证文档。[CI 41426244691](https://github.com/black-zero358/rust-email-mcp/actions/runs/41426244691) 的 check/audit/container 全部通过；合并前复查 GitHub reviews 与 review threads 均为空，独立交叉审阅记录已写入 PR。合并提交为 `501e53989ccab7562d2c1ced28602594f0350b0a`，随后本地 main、开发分支及两者远端引用全部同步到该提交。
+
+## 2026-11-02 R00–R04 PR 审阅与合并
+
+按工作包依赖顺序完成审阅和合并，远端 main 与本地 main 同步到 `8b659baf2551ecfec7060e275c29cd13b0ed7f36`。R05 在开发分支继续推进。
+
+| 范围 | PR 与最终 head | CI | 合并提交 |
+| --- | --- | --- | --- |
+| R00/R01 | [#63](https://github.com/black-zero358/rust-email-mcp/pull/63)，`d654ace` | [check/audit/container 成功](https://github.com/black-zero358/rust-email-mcp/actions/runs/41419415243) | `896126a1d57128d5b87a3cc8353c3e7704524498` |
+| R02/R03 | [#64](https://github.com/black-zero358/rust-email-mcp/pull/64)，`928a866` | [check/audit/container 成功](https://github.com/black-zero358/rust-email-mcp/actions/runs/41421214346) | `c13a59826af3c392c42f1018b6974a6dc57b5746` |
+| R04 | [#65](https://github.com/black-zero358/rust-email-mcp/pull/65)，`99aa4e4` | [check/audit/container 成功](https://github.com/black-zero358/rust-email-mcp/actions/runs/41421541914) | `8b659baf2551ecfec7060e275c29cd13b0ed7f36` |
+
+GitHub Codex 自动审阅遇到账户额度限制。此次改由未实现相应模块的子 agent 交叉审阅指定提交，主 agent 复核集成差异，结果逐一记录在 PR。审阅发现 R02 的 `download_url` URI Schema 与直接拼接 Unicode 资源地址冲突；修复 `928a866` 使用 URL 编码，并增加真实 MCP→本地 IMAP 的 Unicode 配置回归。原发现者复核闭环后才合并 #64。#65 整合该修复，生产代码保持原 R04 实现，新增同一回归，最终提交重新通过 CI。合并时三个 PR 均无未解决 review thread。
+
 ## 2026-11-02 R04 附件离线下载与内容读取
 
 源码提交 `60b8cca`，本地分支 `codex/read-capabilities-plan`。按用户确认的范围，本阶段使用本地模拟 IMAP、JWT/MCP 服务和合成文件完成离线测试；ChatGPT 实际连接测试放到后续阶段。

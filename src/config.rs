@@ -1,4 +1,15 @@
-use std::{env, path::PathBuf, sync::Arc, time::Duration};
+use std::{ffi::OsString, path::PathBuf, sync::Arc, time::Duration};
+
+#[path = "config/account_config.rs"]
+mod account_config;
+pub use account_config::{
+    AccountConfigSource, ValidatedAccountConfig, ValidatedAccountSet, load_runtime,
+};
+mod cache_config;
+#[cfg(test)]
+pub(crate) use cache_config::load_cache_file;
+pub use cache_config::{CacheSettings, load_cache_configuration};
+pub(crate) use cache_config::{Mode as CacheMode, SyncPolicy, SyncProtocol};
 
 pub const DEFAULT_MAX_MESSAGE: usize = 32 * 1024 * 1024;
 pub const DEFAULT_MAX_OUTPUT: usize = 2 * 1024 * 1024;
@@ -15,6 +26,7 @@ pub struct Config {
     pub smtp_starttls: bool,
     pub drafts: String,
     pub trash: String,
+    pub archive: Option<String>,
     pub mode: String,
     pub timeout: Duration,
     pub max_message: usize,
@@ -27,6 +39,7 @@ pub struct Config {
     pub bind: String,
     pub database: String,
     pub account_registry: Option<PathBuf>,
+    pub attachment_staging_dir: Option<PathBuf>,
 }
 
 #[cfg(test)]
@@ -41,6 +54,7 @@ pub(crate) fn fixture() -> Arc<Config> {
         smtp_starttls: false,
         drafts: "Drafts".into(),
         trash: "Trash".into(),
+        archive: None,
         mode: "full".into(),
         timeout: Duration::from_secs(2),
         max_message: 8 * 1024 * 1024,
@@ -53,23 +67,61 @@ pub(crate) fn fixture() -> Arc<Config> {
         bind: "127.0.0.1:0".into(),
         database: ":memory:".into(),
         account_registry: None,
+        attachment_staging_dir: None,
     })
 }
 impl Config {
     pub fn load() -> anyhow::Result<Arc<Self>> {
-        let required = |key: &str| env::var(key).map_err(|_| anyhow::anyhow!("Missing {key}"));
-        let value = |key: &str, fallback: &str| env::var(key).unwrap_or_else(|_| fallback.into());
+        Ok(load_runtime()?.service_config)
+    }
+
+    fn legacy_from_environment(
+        lookup: &dyn Fn(&str) -> Option<OsString>,
+    ) -> anyhow::Result<Arc<Self>> {
+        let required =
+            |key: &str| lookup_string(lookup, key)?.ok_or_else(|| anyhow::anyhow!("Missing {key}"));
+        let value = |key: &str, fallback: &str| -> anyhow::Result<String> {
+            Ok(lookup_string(lookup, key)?.unwrap_or_else(|| fallback.into()))
+        };
+        Self::from_mail(
+            MailValues {
+                address: required("EMAIL_ADDRESS")?,
+                password: required("EMAIL_PASSWORD")?,
+                imap_host: required("IMAP_HOST")?,
+                imap_port: value("IMAP_PORT", "993")?.parse()?,
+                smtp_host: required("SMTP_HOST")?,
+                smtp_port: value("SMTP_PORT", "465")?.parse()?,
+                smtp_starttls: value("SMTP_STARTTLS", "false")?.parse()?,
+                drafts: value("DRAFTS_MAILBOX", "Drafts")?,
+                trash: value("TRASH_MAILBOX", "Trash")?,
+                archive: lookup_string(lookup, "ARCHIVE_MAILBOX")?,
+                mode: value("MAIL_MODE", "read")?,
+            },
+            lookup,
+        )
+    }
+
+    fn from_mail(
+        mail: MailValues,
+        lookup: &dyn Fn(&str) -> Option<OsString>,
+    ) -> anyhow::Result<Arc<Self>> {
+        let required =
+            |key: &str| lookup_string(lookup, key)?.ok_or_else(|| anyhow::anyhow!("Missing {key}"));
+        let value = |key: &str, fallback: &str| -> anyhow::Result<String> {
+            Ok(lookup_string(lookup, key)?.unwrap_or_else(|| fallback.into()))
+        };
         let c = Self {
-            address: required("EMAIL_ADDRESS")?,
-            password: required("EMAIL_PASSWORD")?,
-            imap_host: required("IMAP_HOST")?,
-            imap_port: value("IMAP_PORT", "993").parse()?,
-            smtp_host: required("SMTP_HOST")?,
-            smtp_port: value("SMTP_PORT", "465").parse()?,
-            smtp_starttls: value("SMTP_STARTTLS", "false").parse()?,
-            drafts: value("DRAFTS_MAILBOX", "Drafts"),
-            trash: value("TRASH_MAILBOX", "Trash"),
-            mode: value("MAIL_MODE", "read"),
+            address: mail.address,
+            password: mail.password,
+            imap_host: mail.imap_host,
+            imap_port: mail.imap_port,
+            smtp_host: mail.smtp_host,
+            smtp_port: mail.smtp_port,
+            smtp_starttls: mail.smtp_starttls,
+            drafts: mail.drafts,
+            trash: mail.trash,
+            archive: mail.archive,
+            mode: mail.mode,
             timeout: Duration::from_secs(60),
             max_message: DEFAULT_MAX_MESSAGE,
             max_output: DEFAULT_MAX_OUTPUT,
@@ -80,10 +132,11 @@ impl Config {
                 .split(',')
                 .map(str::to_owned)
                 .collect(),
-            scope: value("OIDC_SCOPE", "email:mcp"),
-            bind: value("BIND", "127.0.0.1:18590"),
-            database: value("DATABASE_PATH", "data/operations.sqlite"),
-            account_registry: env::var_os("ACCOUNT_REGISTRY_PATH").map(PathBuf::from),
+            scope: value("OIDC_SCOPE", "email:mcp")?,
+            bind: value("BIND", "127.0.0.1:18590")?,
+            database: value("DATABASE_PATH", "data/operations.sqlite")?,
+            account_registry: lookup("ACCOUNT_REGISTRY_PATH").map(PathBuf::from),
+            attachment_staging_dir: lookup("ATTACHMENT_STAGING_DIR").map(PathBuf::from),
         };
         anyhow::ensure!(
             ["read", "draft", "send", "full"].contains(&c.mode.as_str()),
@@ -97,6 +150,47 @@ impl Config {
             !c.subjects.iter().any(String::is_empty),
             "Empty subject allowlist"
         );
+        validate_archive(c.archive.as_deref())?;
         Ok(Arc::new(c))
     }
+}
+
+fn lookup_string(
+    lookup: &dyn Fn(&str) -> Option<OsString>,
+    key: &str,
+) -> anyhow::Result<Option<String>> {
+    lookup(key)
+        .map(|value| {
+            value
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("Invalid configuration encoding"))
+        })
+        .transpose()
+}
+
+struct MailValues {
+    address: String,
+    password: String,
+    imap_host: String,
+    imap_port: u16,
+    smtp_host: String,
+    smtp_port: u16,
+    smtp_starttls: bool,
+    drafts: String,
+    trash: String,
+    archive: Option<String>,
+    mode: String,
+}
+
+fn validate_archive(archive: Option<&str>) -> anyhow::Result<()> {
+    if let Some(archive) = archive {
+        anyhow::ensure!(
+            !archive.is_empty() && !archive.chars().any(char::is_control),
+            "Invalid archive mailbox"
+        );
+        crate::input_limits::InputLimits::Read
+            .mailbox(archive, "/archive")
+            .map_err(|_| anyhow::anyhow!("Invalid archive mailbox"))?;
+    }
+    Ok(())
 }

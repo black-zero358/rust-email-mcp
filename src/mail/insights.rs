@@ -5,12 +5,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-const HEADER_LIMIT: usize = 128 * 1024;
+pub(super) const HEADER_LIMIT: usize = 128 * 1024;
 const CACHE_BYTES: usize = 16 * 1024 * 1024;
 const CACHE_ITEMS: usize = 256;
 const CACHE_TTL: Duration = Duration::from_secs(60);
 
 struct Entry {
+    account: AccountKey,
     folder: String,
     validity: u32,
     uid: u32,
@@ -25,6 +26,7 @@ pub(super) struct MetadataCache {
 impl MetadataCache {
     fn get(
         &mut self,
+        account: &AccountKey,
         folder: &str,
         validity: Option<u32>,
         uid: u32,
@@ -32,21 +34,33 @@ impl MetadataCache {
     ) -> Option<Vec<u8>> {
         self.entries.retain(|e| {
             now.duration_since(e.inserted) < CACHE_TTL
-                && (e.folder != folder || Some(e.validity) == validity)
+                && (&e.account != account || e.folder != folder || Some(e.validity) == validity)
         });
         let validity = validity?;
         self.entries
             .iter()
-            .find(|e| e.folder == folder && e.validity == validity && e.uid == uid)
+            .find(|e| {
+                &e.account == account
+                    && e.folder == folder
+                    && e.validity == validity
+                    && e.uid == uid
+            })
             .map(|e| e.headers.clone())
     }
-    fn insert(&mut self, folder: &str, validity: Option<u32>, uid: u32, headers: Vec<u8>) {
+    fn insert(
+        &mut self,
+        account: &AccountKey,
+        folder: &str,
+        validity: Option<u32>,
+        uid: u32,
+        headers: Vec<u8>,
+    ) {
         let Some(validity) = validity else { return };
         if headers.len() > HEADER_LIMIT {
             return;
         }
         self.entries
-            .retain(|e| !(e.folder == folder && e.uid == uid));
+            .retain(|e| !(&e.account == account && e.folder == folder && e.uid == uid));
         while self.entries.len() >= CACHE_ITEMS
             || self.entries.iter().map(|e| e.headers.len()).sum::<usize>() + headers.len()
                 > CACHE_BYTES
@@ -54,6 +68,7 @@ impl MetadataCache {
             self.entries.pop_front();
         }
         self.entries.push_back(Entry {
+            account: account.clone(),
             folder: folder.into(),
             validity,
             uid,
@@ -79,7 +94,7 @@ impl MailService {
             return;
         }
         if let Ok(mut cache) = self.metadata_cache.lock() {
-            cache.insert(mailbox, validity, uid, bytes.to_vec());
+            cache.insert(&self.account, mailbox, validity, uid, bytes.to_vec());
         }
     }
 
@@ -87,50 +102,72 @@ impl MailService {
         &self,
         s: &mut async_imap::Session<S>,
         mailbox: &str,
-        validity: Option<u32>,
+        state: &async_imap::types::Mailbox,
         uid: u32,
     ) -> Result<Vec<u8>>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
     {
+        self.cached_headers_checked(s, mailbox, state, uid)
+            .await
+            .map_err(|fault| fault.error)
+    }
+
+    pub(super) async fn cached_headers_checked<S>(
+        &self,
+        s: &mut async_imap::Session<S>,
+        mailbox: &str,
+        state: &async_imap::types::Mailbox,
+        uid: u32,
+    ) -> std::result::Result<Vec<u8>, parts::body::ReadFault>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
+    {
+        let validity = state.uid_validity;
         if let Some(headers) = self
             .metadata_cache
             .lock()
-            .map_err(|_| MailError::backend())?
-            .get(mailbox, validity, uid, Instant::now())
+            .map_err(|_| parts::body::ReadFault::local(MailError::backend()))?
+            .get(&self.account, mailbox, validity, uid, Instant::now())
         {
             return Ok(headers);
         }
-        let items = s
-            .uid_fetch(
-                uid.to_string(),
-                format!("(UID BODY.PEEK[HEADER]<0.{}>)", HEADER_LIMIT + 1),
-            )
+        let headers = parts::fetch::message_header(s, uid, HEADER_LIMIT + 1)
             .await
-            .map_err(|_| MailError::backend())?
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(|_| MailError::backend())?;
-        let bytes = items
-            .iter()
-            .filter(|f| f.uid == Some(uid))
-            .find_map(|f| f.header())
-            .ok_or_else(MailError::backend)?;
-        if bytes.len() > HEADER_LIMIT {
-            return Err(MailError::limit_with(
+            .map_err(|error| {
+                parts::body::ReadFault::command(self.observe_fetch_error(
+                    mailbox,
+                    validity,
+                    state.uid_next,
+                    uid,
+                    error,
+                ))
+            })?;
+        if headers.len() > HEADER_LIMIT {
+            return Err(parts::body::ReadFault::local(MailError::limit_with(
                 LimitKind::HeaderBytes,
                 HEADER_LIMIT,
-                bytes.len(),
-            ));
+                headers.len(),
+            )));
         }
-        if !(bytes.ends_with(b"\r\n\r\n") || bytes.ends_with(b"\n\n")) {
-            return Err(MailError::limit());
+        if !(headers.ends_with(b"\r\n\r\n") || headers.ends_with(b"\n\n")) {
+            return Err(parts::body::ReadFault::local(MailError::limit()));
         }
-        let headers = bytes.to_vec();
         self.metadata_cache
             .lock()
-            .map_err(|_| MailError::backend())?
-            .insert(mailbox, validity, uid, headers.clone());
+            .map_err(|_| parts::body::ReadFault::local(MailError::backend()))?
+            .insert(&self.account, mailbox, validity, uid, headers.clone());
+        if self.persists(mailbox)
+            && let Ok(parsed) = mime::headers(&headers)
+        {
+            self.persist_headers(
+                mailbox,
+                validity,
+                vec![persistence::HeaderObservation::new(
+                    uid, &headers, true, &parsed,
+                )],
+            );
+        }
         Ok(headers)
     }
 
@@ -145,7 +182,6 @@ impl MailService {
     {
         match name {
             "locate_message" => self.locate(s, a).await,
-            "read_conversation" => self.conversation(s, a).await,
             "get_mailbox_statistics" => self.statistics(s, a).await,
             _ => Err(MailError::input()),
         }
@@ -165,7 +201,8 @@ impl MailService {
             let state = s
                 .examine(mailbox_name(mailbox, InputLimits::Read)?)
                 .await
-                .map_err(|_| MailError::backend())?;
+                .map_err(map_read_imap_error)?;
+            self.observe_mailbox(mailbox, &state);
             require_reference(&state)?;
             let (start, end) = window(a, state.uid_next)?;
             let mut ids = if state.exists == 0 || end == 0 {
@@ -176,7 +213,7 @@ impl MailService {
                     quote(&target)?
                 ))
                 .await
-                .map_err(|_| MailError::backend())?
+                .map_err(map_read_imap_error)?
                 .into_iter()
                 .filter(|id| *id >= start && *id <= end)
                 .collect::<Vec<_>>()
@@ -189,9 +226,7 @@ impl MailService {
                 if matches.len() >= limit {
                     break;
                 }
-                let headers = self
-                    .cached_headers(s, mailbox, state.uid_validity, id)
-                    .await?;
+                let headers = self.cached_headers(s, mailbox, &state, id).await?;
                 checked += 1;
                 let h = thread_headers(&headers)?;
                 // IMAP HEADER is substring matching; verify the entire parsed identifier.
@@ -208,31 +243,30 @@ impl MailService {
         )
     }
 
-    async fn conversation<S>(&self, s: &mut async_imap::Session<S>, a: &Value) -> Result<Value>
-    where
-        S: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug,
-    {
+    pub(super) async fn conversation_parts(
+        &self,
+        reader: &mut parts::body::BodyReadSession<'_>,
+        a: &Value,
+    ) -> Result<Value> {
         let mailbox = folder(a, InputLimits::Read)?;
         let seed = uid(a)?;
-        let state = s
-            .examine(mailbox_name(mailbox, InputLimits::Read)?)
-            .await
-            .map_err(|_| MailError::backend())?;
+        let state = reader.state.clone();
         require_reference(&state)?;
-        check_validity(a, state.uid_validity)?;
         let candidate_limit = number(a, "candidate_limit", 100, 1, 200)? as usize;
         let limit = number(a, "limit", 10, 1, 20)? as usize;
         let seed_headers = self
-            .cached_headers(s, mailbox, state.uid_validity, seed)
+            .cached_headers(reader.session()?, mailbox, &state, seed)
             .await?;
         let seed_links = thread_headers(&seed_headers)?;
         let (start, end) = window(a, state.uid_next)?;
         let mut ids = if state.exists == 0 || end == 0 {
             Vec::new()
         } else {
-            s.uid_search(format!("UID {start}:{end}"))
+            reader
+                .session()?
+                .uid_search(format!("UID {start}:{end}"))
                 .await
-                .map_err(|_| MailError::backend())?
+                .map_err(map_read_imap_error)?
                 .into_iter()
                 .filter(|id| *id >= start && *id <= end && *id != seed)
                 .collect::<Vec<_>>()
@@ -250,18 +284,17 @@ impl MailService {
         let mut headers = Vec::new();
         let mut skipped_candidates = Vec::new();
         for id in ids {
-            // cached_headers only emits LIMIT_EXCEEDED after FETCH completed.
-            // Transport/protocol failures still stop the connection.
+            // Only local validation after a completed FETCH can skip a candidate.
             let raw = match self
-                .cached_headers(s, mailbox, state.uid_validity, id)
+                .cached_headers_checked(reader.session()?, mailbox, &state, id)
                 .await
             {
                 Ok(raw) => raw,
-                Err(error) if error.code == "LIMIT_EXCEEDED" => {
-                    skipped_candidates.push(json!({"uid":id,"error":error}));
+                Err(fault) if fault.reusable => {
+                    skipped_candidates.push(json!({"uid":id,"error":fault.error}));
                     continue;
                 }
-                Err(error) => return Err(error),
+                Err(fault) => return Err(fault.error),
             };
             match thread_headers(&raw) {
                 Ok(value) => headers.push((id, value)),
@@ -277,25 +310,14 @@ impl MailService {
         let mut response_budget_omitted = false;
         let mut message_errors = Vec::new();
         for id in selected {
-            let raw = match self.raw(s, id).await {
-                Ok(raw) => raw,
-                Err(error) if error.code == "LIMIT_EXCEEDED" => {
-                    message_errors.push(json!({"uid":id,"error":error}));
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            let mut value = match parsed_with_options(
-                &raw,
-                id,
-                state.uid_validity,
-                remaining.min(64 * 1024),
-                a,
-            ) {
+            let mut value = match reader.read_item(id, remaining.min(64 * 1024), a).await {
                 Ok(value) => value,
-                Err(error) => {
-                    message_errors.push(json!({"uid":id,"error":error}));
-                    continue;
+                Err(fault) => {
+                    message_errors.push(json!({"uid":id,"error":fault.error}));
+                    if fault.reusable {
+                        continue;
+                    }
+                    break;
                 }
             };
             bound_conversation_metadata(&mut value);
@@ -350,7 +372,8 @@ impl MailService {
             let state = s
                 .examine(mailbox_name(mailbox, InputLimits::Read)?)
                 .await
-                .map_err(|_| MailError::backend())?;
+                .map_err(map_read_imap_error)?;
+            self.observe_mailbox(mailbox, &state);
             require_reference(&state)?;
             let (lower, upper) = window(a, state.uid_next)?;
             let mut day = start;
@@ -366,7 +389,7 @@ impl MailService {
                         next.imap()
                     ))
                     .await
-                    .map_err(|_| MailError::backend())?
+                    .map_err(map_read_imap_error)?
                     .iter()
                     .filter(|id| **id >= lower && **id <= upper)
                     .count()
@@ -384,11 +407,15 @@ impl MailService {
     /// Every returned string is static. Never return hostnames, credentials, banners or backend errors.
     pub(super) async fn diagnose_connectivity(&self) -> Result<Value> {
         let mut stages = vec![json!({"stage":"mcp_auth","status":"passed"})];
+        let failed_backend = |stages: &mut Vec<Value>, phase: &str| {
+            self.record_backend_failure();
+            Ok::<Value, MailError>(diagnostic_failure(stages, phase))
+        };
         let diagnose = async {
             let tcp =
                 match TcpStream::connect((&*self.config.imap_host, self.config.imap_port)).await {
                     Ok(tcp) => tcp,
-                    Err(_) => return diagnostic_failure(&mut stages, "tcp"),
+                    Err(_) => return failed_backend(&mut stages, "tcp"),
                 };
             stages.push(json!({"stage":"tcp","status":"passed"}));
             let tls = ClientConfig::builder()
@@ -396,31 +423,35 @@ impl MailService {
                 .with_no_client_auth();
             let name = match ServerName::try_from(self.config.imap_host.clone()) {
                 Ok(name) => name,
-                Err(_) => return diagnostic_failure(&mut stages, "tls"),
+                Err(_) => return Ok(diagnostic_failure(&mut stages, "tls")),
             };
             let stream = match TlsConnector::from(Arc::new(tls)).connect(name, tcp).await {
                 Ok(stream) => stream,
-                Err(_) => return diagnostic_failure(&mut stages, "tls"),
+                Err(_) => return failed_backend(&mut stages, "tls"),
             };
             stages.push(json!({"stage":"tls","status":"passed"}));
             let (stream, _) = BudgetStream::new(stream, 128 * 1024);
-            let mut client = async_imap::Client::new(stream);
-            if !client
-                .read_response()
-                .await
-                .ok()
-                .flatten()
-                .is_some_and(|response| {
-                    matches!(
-                        response.parsed(),
-                        imap_proto::Response::Data {
-                            status: imap_proto::Status::Ok,
-                            ..
-                        }
-                    )
-                })
-            {
-                return diagnostic_failure(&mut stages, "greeting");
+            let mut client = async_imap::Client::with_buffer_limit(stream, 128 * 1024);
+            let greeting = match client.read_response().await {
+                Ok(response) => response,
+                Err(error) => {
+                    let error = async_imap::error::Error::Io(error);
+                    if async_imap::error::body_structure_limit(&error).is_some() {
+                        return Err(map_read_imap_error(error));
+                    }
+                    return failed_backend(&mut stages, "greeting");
+                }
+            };
+            if !greeting.is_some_and(|response| {
+                matches!(
+                    response.parsed(),
+                    imap_proto::Response::Data {
+                        status: imap_proto::Status::Ok,
+                        ..
+                    }
+                )
+            }) {
+                return failed_backend(&mut stages, "greeting");
             }
             stages.push(json!({"stage":"greeting","status":"passed"}));
             let mut session = match client
@@ -428,22 +459,37 @@ impl MailService {
                 .await
             {
                 Ok(session) => session,
-                Err(_) => return diagnostic_failure(&mut stages, "login"),
+                Err((error, _)) => {
+                    if async_imap::error::body_structure_limit(&error).is_some() {
+                        return Err(map_read_imap_error(error));
+                    }
+                    return failed_backend(&mut stages, "login");
+                }
             };
             stages.push(json!({"stage":"login","status":"passed"}));
             let capabilities = match session.capabilities().await {
                 Ok(caps) => json!({"move":caps.has_str("MOVE"),"uidplus":caps.has_str("UIDPLUS"),
                     "imap4rev1":caps.has_str("IMAP4rev1"),"imap4rev2":caps.has_str("IMAP4rev2")}),
-                Err(_) => return diagnostic_failure(&mut stages, "capability"),
+                Err(error) => {
+                    if async_imap::error::body_structure_limit(&error).is_some() {
+                        return Err(map_read_imap_error(error));
+                    }
+                    return Ok(diagnostic_failure(&mut stages, "capability"));
+                }
             };
             stages.push(json!({"stage":"capability","status":"passed"}));
-            json!({"ok":true,"stages":stages,"capabilities":capabilities,"service":"imap","smtp_tested":false})
+            Ok(
+                json!({"ok":true,"stages":stages,"capabilities":capabilities,"service":"imap","smtp_tested":false}),
+            )
         };
         match tokio::time::timeout(self.config.timeout, diagnose).await {
-            Ok(value) => Ok(value),
-            Err(_) => Ok(
-                json!({"ok":false,"stages":stages,"failure":"timeout","service":"imap","smtp_tested":false}),
-            ),
+            Ok(value) => value,
+            Err(_) => {
+                self.record_backend_failure();
+                Ok(
+                    json!({"ok":false,"stages":stages,"failure":"timeout","service":"imap","smtp_tested":false}),
+                )
+            }
         }
     }
 }
@@ -584,6 +630,72 @@ pub(super) fn parsed_with_options(
     hard_limit: usize,
     a: &Value,
 ) -> Result<Value> {
+    let p = mime::parse(raw)?;
+    parsed_with_part(&p, uid, validity, hard_limit, a)
+}
+
+pub(super) fn parsed_with_part(
+    p: &mime::Part<'_>,
+    uid: u32,
+    validity: Option<u32>,
+    hard_limit: usize,
+    a: &Value,
+) -> Result<Value> {
+    let displayed = p.display_body(display_format(a)?)?;
+    with_displayed(
+        parsed_metadata(p, uid, validity)?,
+        &p.headers,
+        displayed,
+        hard_limit,
+        a,
+    )
+}
+
+pub(super) fn display_format(a: &Value) -> Result<crate::html::HtmlDisplay> {
+    Ok(match a.get("html_display") {
+        None => crate::html::HtmlDisplay::Legacy,
+        Some(Value::String(value)) if value == "legacy" => crate::html::HtmlDisplay::Legacy,
+        Some(Value::String(value)) if value == "readable" => crate::html::HtmlDisplay::Readable,
+        _ => return Err(MailError::input()),
+    })
+}
+
+pub(super) fn manifest_metadata(
+    headers: &[mailparse::MailHeader<'_>],
+    manifest: &parts::PartManifest,
+    uid: u32,
+    validity: Option<u32>,
+) -> Value {
+    let attachments = manifest
+        .parts
+        .iter()
+        .filter(|part| part.is_attachment)
+        .map(|part| {
+            json!({
+                "attachment_index": part.attachment_index,
+                "content_type": part.content_type,
+                "filename": part.filename,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "uid": uid,
+        "uid_validity": validity,
+        "subject": headers.get_first_value("Subject"),
+        "from": headers.get_first_value("From"),
+        "to": headers.get_first_value("To"),
+        "attachments": attachments,
+        "content_trust": "untrusted",
+    })
+}
+
+pub(super) fn with_displayed(
+    mut value: Value,
+    headers: &[mailparse::MailHeader<'_>],
+    displayed: crate::html::DisplayBody,
+    hard_limit: usize,
+    a: &Value,
+) -> Result<Value> {
     let mode = a.get("body_mode").and_then(Value::as_str).unwrap_or("full");
     if !["full", "trimmed"].contains(&mode) || a.get("body_mode").is_some_and(|v| !v.is_string()) {
         return Err(MailError::input());
@@ -599,15 +711,6 @@ pub(super) fn parsed_with_options(
     } else {
         hard_limit
     };
-    let p = mime::parse(raw)?;
-    let format = match a.get("html_display") {
-        None => crate::html::HtmlDisplay::Legacy,
-        Some(Value::String(value)) if value == "legacy" => crate::html::HtmlDisplay::Legacy,
-        Some(Value::String(value)) if value == "readable" => crate::html::HtmlDisplay::Readable,
-        _ => return Err(MailError::input()),
-    };
-    let displayed = p.display_body(format)?;
-    let mut value = parsed_metadata(&p, uid, validity)?;
     value["html_display_metadata"] =
         serde_json::to_value(displayed.metadata).map_err(|_| MailError::backend())?;
     let full = displayed.text;
@@ -626,9 +729,9 @@ pub(super) fn parsed_with_options(
     value["signature_omitted"] = json!(signature_omitted);
     value["body_original_bytes"] = json!(full.len());
     value["body_byte_limit"] = json!(limit);
-    value["message_id"] = json!(p.headers.get_first_value("Message-ID"));
-    value["references"] = json!(p.headers.get_first_value("References"));
-    value["in_reply_to"] = json!(p.headers.get_first_value("In-Reply-To"));
+    value["message_id"] = json!(headers.get_first_value("Message-ID"));
+    value["references"] = json!(headers.get_first_value("References"));
+    value["in_reply_to"] = json!(headers.get_first_value("In-Reply-To"));
     Ok(value)
 }
 fn utf8_prefix(s: &str, max: usize) -> &str {
@@ -668,7 +771,7 @@ fn trim_body(body: &str) -> (&str, bool, bool) {
         signature_offset < body.len(),
     )
 }
-fn bound_conversation_metadata(value: &mut Value) {
+pub(super) fn bound_conversation_metadata(value: &mut Value) {
     let attachments = value["attachments"].as_array().map_or(0, Vec::len);
     value["attachments"] = json!([]);
     value["attachment_metadata_omitted"] = json!(attachments > 0);
@@ -774,9 +877,9 @@ pub(crate) fn tool_specs() -> Vec<(&'static str, &'static str, Value, Vec<&'stat
     vec![
         (
             "read_conversation",
-            "Read a bounded same-folder conversation linked by message identifiers; inspect scope and omission flags.",
-            json!({"mailbox":mailbox,"uid":uid,"uid_validity":uid,"before_uid":uid,"candidate_limit":{"type":"integer","minimum":1,"maximum":200},"limit":{"type":"integer","minimum":1,"maximum":20},"body_mode":{"type":"string","enum":["full","trimmed"]},"max_body_length":{"type":"integer","minimum":0,"maximum":524288}}),
-            vec!["uid", "uid_validity"],
+            "Read a conversation linked by message identifiers. Supply mailboxes or scope standard for a cross-folder scan, then pass its cursor and account_id to continue. Omit those fields for the original single-folder read.",
+            json!({"mailbox":mailbox,"uid":uid,"uid_validity":uid,"before_uid":uid,"candidate_limit":{"type":"integer","minimum":1,"maximum":200},"limit":{"type":"integer","minimum":1,"maximum":20},"body_mode":{"type":"string","enum":["full","trimmed"]},"max_body_length":{"type":"integer","minimum":0,"maximum":524288},"mailboxes":{"type":"array","minItems":1,"maxItems":20,"items":{"type":"string","minLength":1,"maxLength":512}},"scope":{"type":"string","const":"standard"},"cursor":{"type":"string","minLength":36,"maxLength":36}}),
+            vec![],
         ),
         (
             "locate_message",
@@ -801,136 +904,6 @@ pub(crate) fn tool_specs() -> Vec<(&'static str, &'static str, Value, Vec<&'stat
 
 #[cfg(test)]
 mod tests {
-    #[tokio::test]
-    async fn conversation_large_headers_skip_local_failures_but_stop_protocol_errors() {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        for (refused, bad_body) in [(false, false), (false, true), (true, false)] {
-            let seed_header = format!(
-                "Message-ID: <seed@example.test>\r\nX-Trace: {}\r\n\r\n",
-                "x".repeat(18000)
-            );
-            let linked_header =
-                "Message-ID: <linked@example.test>\r\nReferences: <seed@example.test>\r\n\r\n";
-            let too_large = format!("X-Trace: {}\r\n\r\n", "x".repeat(HEADER_LIMIT));
-            let raw_seed = format!("{seed_header}seed body");
-            let raw_linked = if bad_body {
-                "Content-Type: text/plain\r\nContent-Transfer-Encoding: unsupported\r\n\r\nopaque"
-                    .to_owned()
-            } else {
-                format!("{linked_header}linked body")
-            };
-            let literal = |uid, section: &str, raw: &str| {
-                format!(
-                    "* 1 FETCH (UID {uid} FLAGS ())\r\n* 1 FETCH (UID {uid} {section} {{{}}}\r\n{raw})\r\n",
-                    raw.len()
-                )
-            };
-            let mut script = vec![
-                (
-                    "LOGIN \"synthetic\" \"test\"".to_owned(),
-                    String::new(),
-                    "OK",
-                ),
-                (
-                    "EXAMINE \"INBOX\"".to_owned(),
-                    "* 3 EXISTS\r\n* OK [UIDVALIDITY 9] valid\r\n* OK [UIDNEXT 4] next\r\n"
-                        .to_owned(),
-                    "OK",
-                ),
-                (
-                    format!(
-                        "UID FETCH 1 (UID BODY.PEEK[HEADER]<0.{}>)",
-                        HEADER_LIMIT + 1
-                    ),
-                    literal(1, "BODY[HEADER]", &seed_header),
-                    "OK",
-                ),
-                (
-                    "UID SEARCH UID 1:3".to_owned(),
-                    "* SEARCH 1 2 3\r\n".to_owned(),
-                    "OK",
-                ),
-                (
-                    format!(
-                        "UID FETCH 3 (UID BODY.PEEK[HEADER]<0.{}>)",
-                        HEADER_LIMIT + 1
-                    ),
-                    literal(3, "BODY[HEADER]", linked_header),
-                    "OK",
-                ),
-                (
-                    format!(
-                        "UID FETCH 2 (UID BODY.PEEK[HEADER]<0.{}>)",
-                        HEADER_LIMIT + 1
-                    ),
-                    literal(2, "BODY[HEADER]", &too_large),
-                    if refused { "NO" } else { "OK" },
-                ),
-            ];
-            if !refused {
-                for (uid, raw) in [(1, raw_seed), (3, raw_linked)] {
-                    script.push((
-                        format!("UID FETCH {uid} (UID RFC822.SIZE)"),
-                        format!("* 1 FETCH (UID {uid} RFC822.SIZE {})\r\n", raw.len()),
-                        "OK",
-                    ));
-                    script.push((
-                        format!("UID FETCH {uid} (UID BODY.PEEK[]<0.8388609>)"),
-                        literal(uid, "BODY[]", &raw),
-                        "OK",
-                    ));
-                }
-            }
-            let (client, server) = tokio::io::duplex(262144);
-            let backend = tokio::spawn(async move {
-                let mut server = BufReader::new(server);
-                server.get_mut().write_all(b"* OK test\r\n").await.unwrap();
-                for (expected, data, status) in script {
-                    let mut line = String::new();
-                    server.read_line(&mut line).await.unwrap();
-                    let (tag, cmd) = line.trim_end().split_once(' ').unwrap();
-                    assert_eq!(cmd, expected);
-                    server
-                        .get_mut()
-                        .write_all(format!("{data}{tag} {status} completed\r\n").as_bytes())
-                        .await
-                        .unwrap();
-                }
-            });
-            let mut client = async_imap::Client::new(client);
-            client.read_response().await.unwrap();
-            let mut session = client.login("synthetic", "test").await.unwrap();
-            let service = MailService::new(
-                crate::config::fixture(),
-                Arc::new(Journal::open(std::path::Path::new(":memory:")).unwrap()),
-            )
-            .unwrap();
-            let result = service
-                .insight_operation(
-                    &mut session,
-                    "read_conversation",
-                    &json!({"uid":1,"uid_validity":9}),
-                )
-                .await;
-            if refused {
-                assert_eq!(result.unwrap_err().code, "MAIL_BACKEND");
-            } else {
-                let result = result.unwrap();
-                assert_eq!(result["skipped_candidates"][0]["uid"], 2);
-                assert_eq!(result["complete"], false);
-                assert_eq!(
-                    result["messages"].as_array().unwrap().len(),
-                    if bad_body { 1 } else { 2 }
-                );
-                assert_eq!(
-                    result["message_errors"].as_array().unwrap().len(),
-                    usize::from(bad_body)
-                );
-            }
-            drop(session);
-            backend.await.unwrap();
-        }
-    }
     #[test]
     fn new_reads_require_nonzero_reference_metadata() {
         let mut state = async_imap::types::Mailbox::default();
@@ -1045,26 +1018,198 @@ mod tests {
     #[test]
     fn header_cache_expires_invalidates_and_bounds_capacity() {
         let mut cache = MetadataCache::default();
-        cache.insert("INBOX", Some(1), 1, b"header".to_vec());
-        assert!(cache.get("Other", Some(1), 1, Instant::now()).is_none());
-        assert!(cache.get("INBOX", Some(1), 1, Instant::now()).is_some());
-        assert!(cache.get("INBOX", Some(2), 1, Instant::now()).is_none());
-        assert!(cache.entries.is_empty());
-        cache.insert("INBOX", Some(1), 1, b"header".to_vec());
+        let account = AccountKey::synthetic();
+        cache.insert(&account, "INBOX", Some(1), 1, b"header".to_vec());
         assert!(
             cache
-                .get("INBOX", Some(1), 1, Instant::now() + CACHE_TTL)
+                .get(&account, "Other", Some(1), 1, Instant::now())
+                .is_none()
+        );
+        assert!(
+            cache
+                .get(&account, "INBOX", Some(1), 1, Instant::now())
+                .is_some()
+        );
+        assert!(
+            cache
+                .get(&account, "INBOX", Some(2), 1, Instant::now())
+                .is_none()
+        );
+        assert!(cache.entries.is_empty());
+        cache.insert(&account, "INBOX", Some(1), 1, b"header".to_vec());
+        assert!(
+            cache
+                .get(&account, "INBOX", Some(1), 1, Instant::now() + CACHE_TTL)
                 .is_none()
         );
         for uid in 1..=200 {
-            cache.insert("INBOX", Some(1), uid, vec![b'x'; HEADER_LIMIT]);
+            cache.insert(&account, "INBOX", Some(1), uid, vec![b'x'; HEADER_LIMIT]);
         }
         assert!(cache.entries.len() <= CACHE_ITEMS);
         assert!(cache.entries.iter().map(|e| e.headers.len()).sum::<usize>() <= CACHE_BYTES);
-        assert!(cache.get("INBOX", Some(1), 1, Instant::now()).is_none());
-        cache.insert("INBOX", None, 201, vec![0; 10]);
+        assert!(
+            cache
+                .get(&account, "INBOX", Some(1), 1, Instant::now())
+                .is_none()
+        );
+        cache.insert(&account, "INBOX", None, 201, vec![0; 10]);
         assert!(!cache.entries.iter().any(|e| e.uid == 201));
     }
+    #[test]
+    fn header_cache_account_namespaces_share_one_item_and_byte_quota() {
+        let mut cache = MetadataCache::default();
+        let accounts = (0..16).map(|_| AccountKey::synthetic()).collect::<Vec<_>>();
+        cache.insert(&accounts[0], "INBOX", Some(1), 7, b"first".to_vec());
+        cache.insert(&accounts[1], "INBOX", Some(1), 7, b"second".to_vec());
+        assert_eq!(
+            cache
+                .get(&accounts[0], "INBOX", Some(1), 7, Instant::now())
+                .unwrap(),
+            b"first"
+        );
+        assert_eq!(
+            cache
+                .get(&accounts[1], "INBOX", Some(1), 7, Instant::now())
+                .unwrap(),
+            b"second"
+        );
+        assert!(
+            cache
+                .get(&accounts[0], "INBOX", Some(2), 7, Instant::now())
+                .is_none()
+        );
+        assert_eq!(
+            cache
+                .get(&accounts[1], "INBOX", Some(1), 7, Instant::now())
+                .unwrap(),
+            b"second"
+        );
+        for account in &accounts {
+            for uid in 1..=20 {
+                cache.insert(account, "INBOX", Some(1), uid, vec![0; 1]);
+            }
+        }
+        assert_eq!(cache.entries.len(), CACHE_ITEMS);
+        for account in &accounts {
+            for uid in 1..=20 {
+                cache.insert(account, "INBOX", Some(1), uid, vec![0; HEADER_LIMIT]);
+                assert!(cache.entries.len() <= CACHE_ITEMS);
+                assert!(
+                    cache.entries.iter().map(|e| e.headers.len()).sum::<usize>() <= CACHE_BYTES
+                );
+            }
+        }
+        assert_eq!(
+            cache.entries.iter().map(|e| e.headers.len()).sum::<usize>(),
+            CACHE_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostics_backoff_tracks_connection_stages_and_timeout_not_capability_failure() {
+        use tokio::{
+            io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+            net::TcpListener,
+        };
+        use tokio_rustls::{
+            TlsAcceptor,
+            rustls::{
+                ServerConfig,
+                pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer},
+            },
+        };
+        for phase in ["greeting", "login", "capability", "timeout"] {
+            let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+            let cert = certified.cert.der().clone();
+            let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                certified.signing_key.serialize_der(),
+            ));
+            let tls = ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert.clone()], key)
+                .unwrap();
+            let mut roots = RootCertStore::empty();
+            roots.add(cert).unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut config = (*crate::config::fixture()).clone();
+            config.imap_host = "localhost".into();
+            config.imap_port = listener.local_addr().unwrap().port();
+            config.timeout = if phase == "timeout" {
+                Duration::from_millis(150)
+            } else {
+                Duration::from_secs(2)
+            };
+            let mut service = MailService::new(
+                Arc::new(config),
+                Arc::new(Journal::open(std::path::Path::new(":memory:")).unwrap()),
+            )
+            .unwrap();
+            service.test_imap_roots = Some(roots);
+            let backend = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let stream = TlsAcceptor::from(Arc::new(tls))
+                    .accept(stream)
+                    .await
+                    .unwrap();
+                let mut stream = BufReader::new(stream);
+                if phase == "greeting" {
+                    return;
+                }
+                if phase == "timeout" {
+                    let _ = stream.read_u8().await;
+                    return;
+                }
+                stream
+                    .get_mut()
+                    .write_all(b"* OK synthetic\r\n")
+                    .await
+                    .unwrap();
+                let mut line = String::new();
+                stream.read_line(&mut line).await.unwrap();
+                assert!(line.contains(" LOGIN "));
+                let tag = line.split_whitespace().next().unwrap();
+                let status = if phase == "login" {
+                    "NO refused"
+                } else {
+                    "OK accepted"
+                };
+                stream
+                    .get_mut()
+                    .write_all(format!("{tag} {status}\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                if phase == "login" {
+                    return;
+                }
+                line.clear();
+                stream.read_line(&mut line).await.unwrap();
+                assert!(line.contains(" CAPABILITY"));
+                let tag = line.split_whitespace().next().unwrap();
+                stream
+                    .get_mut()
+                    .write_all(format!("{tag} NO refused\r\n").as_bytes())
+                    .await
+                    .unwrap();
+            });
+            let result = service.diagnose_connectivity().await.unwrap();
+            assert_eq!(result["ok"], false, "{phase}: {result}");
+            if phase == "capability" {
+                assert!(service.backend_ready().is_ok());
+            } else {
+                assert_eq!(service.backend_ready().unwrap_err().code, "BUSY", "{phase}");
+            }
+            if phase == "timeout" {
+                assert_eq!(result["failure"], "timeout");
+            } else {
+                assert_eq!(
+                    result["stages"].as_array().unwrap().last().unwrap()["stage"],
+                    phase
+                );
+            }
+            backend.await.unwrap();
+        }
+    }
+
     #[test]
     fn body_modes_preserve_utf8_and_report_each_omission() {
         let raw="Subject: hi\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n你好\n\nOn Tue wrote:\n> previous".as_bytes();

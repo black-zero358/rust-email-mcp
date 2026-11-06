@@ -9,6 +9,24 @@ use std::{
 };
 use uuid::Uuid;
 
+mod cache_run;
+#[path = "accounts/catalog.rs"]
+mod catalog;
+pub use cache_run::{CacheRun, CacheRunIdentity};
+pub use catalog::{AccountCatalog, AccountLease, open_catalog};
+
+pub const DEFAULT_ACCOUNT_ID: &str = "default";
+pub const LEGACY_REGISTRATION_KEY: &str = "legacy-default";
+pub const ACCOUNT_ID_MAX_CHARACTERS: usize = 64;
+pub fn valid_account_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= ACCOUNT_ID_MAX_CHARACTERS
+        && value.as_bytes()[0].is_ascii_alphanumeric()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
 const MAX_REGISTRY_BYTES: u64 = 256 * 1024;
 const REGISTRY_ERROR: &str = "Account registry is unavailable or invalid. Restore the account registry with its operation database before starting.";
 const BINDING_ERROR: &str = "Legacy default account binding changed. Keep its mailbox and operation database path fixed; use an explicit account migration before starting.";
@@ -20,10 +38,11 @@ const TABLE_SQL: &str = "CREATE TABLE legacy_default (
             operation_path_fingerprint TEXT NOT NULL)";
 
 #[cfg(test)]
+#[path = "accounts/tests.rs"]
 mod tests;
 
 /// External account aliases may change in later configurations; references use this key.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct AccountKey {
     uuid: Uuid,
     generation: u64,
@@ -158,6 +177,12 @@ fn paths_conflict(operation: &Path, registry: &Path) -> anyhow::Result<bool> {
             ".staging-journal",
             ".staging-wal",
             ".staging-shm",
+            ".v1-backup",
+            ".previous",
+            ".previous-staging",
+            ".cache-run",
+            ".cache-run.lock",
+            ".cache-run.stage",
         ] {
             if same_file(&operation_file, &sidecar(registry, registry_suffix))? {
                 return Ok(true);

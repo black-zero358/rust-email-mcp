@@ -236,7 +236,7 @@ fn check_input(html: &str) -> Result<()> {
 }
 
 pub(crate) fn to_text(html: &str) -> Result<String> {
-    tokenize(html, None).map(|(text, _)| text)
+    tokenize(html, None, true).map(|(text, _)| text)
 }
 
 pub(crate) fn render_selected(html: &str, context: &mut DisplayContext) -> Result<String> {
@@ -244,7 +244,16 @@ pub(crate) fn render_selected(html: &str, context: &mut DisplayContext) -> Resul
     if context.format() == HtmlDisplay::Legacy {
         return to_text(html);
     }
-    let (text, next) = tokenize(html, Some(std::mem::take(context)))?;
+    render_readable(html, context, true)
+}
+
+pub(crate) fn render_selected_prefix(html: &str, context: &mut DisplayContext) -> Result<String> {
+    context.html_part();
+    render_readable(html, context, false)
+}
+
+fn render_readable(html: &str, context: &mut DisplayContext, complete: bool) -> Result<String> {
+    let (text, next) = tokenize(html, Some(std::mem::take(context)), complete)?;
     *context = next.ok_or_else(MailError::backend)?;
     Ok(text)
 }
@@ -252,6 +261,7 @@ pub(crate) fn render_selected(html: &str, context: &mut DisplayContext) -> Resul
 fn tokenize(
     html: &str,
     context: Option<DisplayContext>,
+    complete: bool,
 ) -> Result<(String, Option<DisplayContext>)> {
     check_input(html)?;
     let input = BufferQueue::default();
@@ -266,7 +276,11 @@ fn tokenize(
     if !input.is_empty() {
         return Err(unsupported());
     }
-    tokenizer.end();
+    // At a sampling boundary the tokenizer may be holding a partial token.
+    // Keep only output emitted from the available prefix.
+    if complete {
+        tokenizer.end();
+    }
     let mut text = tokenizer.sink.0.into_inner();
     if text.unsupported {
         return Err(unsupported());
@@ -275,7 +289,7 @@ fn tokenize(
         return Err(MailError::limit());
     }
     if let Some(readable) = text.readable {
-        return readable.finish(text.tokens, text.parse_error, html);
+        return readable.finish(text.tokens, text.parse_error, html, complete);
     }
     while text.out.ends_with('\n') {
         text.out.pop();
@@ -298,6 +312,36 @@ pub(crate) fn unsupported() -> MailError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readable_prefix_preserves_only_complete_visible_tokens() {
+        for (html, expected) in [
+            ("<p>中文 &amp; text</p><img alt='UNFINISHED", "中文 & text"),
+            ("<p>visible</p>&#x1f6", "visible"),
+            ("<p>visible</p><script>PRIVATE_SCRIPT", "visible"),
+            ("<a href='https://example.test/prefix'>visible", "visible"),
+        ] {
+            let mut context = DisplayContext::new(HtmlDisplay::Readable);
+            assert_eq!(
+                render_selected_prefix(html, &mut context).unwrap(),
+                expected
+            );
+        }
+        let mut context = DisplayContext::new(HtmlDisplay::Readable);
+        assert_eq!(
+            render_selected_prefix("visible<svg><text>opaque", &mut context)
+                .unwrap_err()
+                .code,
+            "UNSUPPORTED_BODY"
+        );
+        let mut context = DisplayContext::new(HtmlDisplay::Readable);
+        assert_eq!(
+            render_selected_prefix(&"<b>".repeat(MAX_INPUT / 3 + 1), &mut context)
+                .unwrap_err()
+                .code,
+            "LIMIT_EXCEEDED"
+        );
+    }
     #[test]
     fn html_text_preserves_entities_unicode_blocks_and_alt() {
         let html = "<html><head><title>metadata</title><style>.x { color: red }</style><script>if (a < b) { document.write('SCRIPT_ONLY'); }</script></head><body><h1>Invoice &amp; Friday</h1><p>中 &euro; &#x1F600;</p><p><a href='https://example.test/'>visible link</a><img src='https://example.test/image' alt=' image description'></p></body></html>";

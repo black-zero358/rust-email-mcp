@@ -1,6 +1,8 @@
 //! Resource accounting before MIME object creation and transfer/charset decoding.
 //! mailparse's tree entry point cannot enforce a global part/header budget. Keep
 //! structure parsing here, and use its header and leaf codecs only on bounded input.
+pub(crate) mod selection;
+
 use crate::error::{LimitKind, MailError, Result};
 use mailparse::{MailHeader, MailHeaderMap, ParsedContentType, body::Body};
 
@@ -8,7 +10,7 @@ pub(crate) const MAX_PARTS: usize = 1024;
 pub(crate) const MAX_DEPTH: usize = 32;
 const MAX_HEADER_BLOCK: usize = 128 * 1024;
 const MAX_HEADER_BYTES: usize = 1024 * 1024;
-const MAX_HEADER_LINES: usize = 8192;
+pub(crate) const MAX_HEADER_LINES: usize = 8192;
 const MAX_DECODE_BYTES: usize = 32 * 1024 * 1024;
 
 pub(crate) fn attachment_input_limit(decoded_limit: usize) -> usize {
@@ -260,6 +262,10 @@ impl Part<'_> {
         self.body.len()
     }
 
+    pub(crate) fn encoded_body(&self) -> &[u8] {
+        self.body
+    }
+
     pub(crate) fn attachment_encoding_supported(&self) -> bool {
         self.transfer_encoding().is_ok()
     }
@@ -340,133 +346,8 @@ impl Part<'_> {
         remaining: &mut usize,
         context: &mut crate::html::DisplayContext,
     ) -> Result<()> {
-        let mut selected = Vec::new();
-        if self.select_text(&mut selected, true) {
-            return Err(crate::html::unsupported());
-        }
-        for part in selected {
-            part.append_plain_leaf(out, remaining, context)?;
-        }
-        Ok(())
-    }
-
-    // The bool reports non-empty inline content unsupported in this mode,
-    // including HTML during a plain-only probe. Probes do not decode; one
-    // shared budget still covers all selected leaf codecs.
-    fn select_text<'a>(&'a self, out: &mut Vec<&'a Self>, html: bool) -> bool {
-        if self.is_attachment() {
-            return false;
-        }
-        if self.transfer_encoding().is_err() {
-            return !self.body.is_empty();
-        }
-        if self.subparts.is_empty() {
-            match self.ctype.mimetype.as_str() {
-                "text/plain" => out.push(self),
-                "text/html" if html => out.push(self),
-                _ => return !self.body.is_empty(),
-            }
-            return false;
-        }
-        match self.ctype.mimetype.as_str() {
-            "multipart/alternative" => {
-                // Representations are alternatives, not consecutive body text.
-                // Prefer a complete plain representation, including a genuinely
-                // empty plain body. A mixed candidate containing HTML is not
-                // plain just because it also has a plain signature. Roll back
-                // all fragments of incomplete probes before trying another.
-                let mut unsupported = false;
-                for child in self.subparts.iter().rev() {
-                    let before = out.len();
-                    let failed = child.select_text(out, false);
-                    if failed {
-                        out.truncate(before);
-                        unsupported = true;
-                        continue;
-                    }
-                    if out.len() != before {
-                        return failed;
-                    }
-                    unsupported |= failed;
-                }
-                if html {
-                    for child in self.subparts.iter().rev() {
-                        let before = out.len();
-                        let failed = child.select_text(out, true);
-                        if failed {
-                            out.truncate(before);
-                            unsupported = true;
-                            continue;
-                        }
-                        if out.len() != before {
-                            return failed;
-                        }
-                        unsupported |= failed;
-                    }
-                }
-                unsupported
-            }
-            "multipart/related" => {
-                let root = match self.ctype.params.get("start") {
-                    Some(start) => self.subparts.iter().find(|p| {
-                        p.headers
-                            .get_first_value("Content-ID")
-                            .is_some_and(|id| id.trim() == start.trim())
-                    }),
-                    None => self.subparts.first(),
-                };
-                if let Some(root) = root {
-                    root.select_text(out, html)
-                } else {
-                    !self.body.is_empty()
-                }
-            }
-            _ => {
-                // Mixed inline parts remain consecutive body content. An
-                // attachment at any level prunes its entire subtree above.
-                let mut unsupported = false;
-                for child in &self.subparts {
-                    unsupported |= child.select_text(out, html);
-                }
-                unsupported
-            }
-        }
-    }
-
-    fn append_plain_leaf(
-        &self,
-        out: &mut String,
-        remaining: &mut usize,
-        context: &mut crate::html::DisplayContext,
-    ) -> Result<()> {
-        if matches!(self.ctype.mimetype.as_str(), "text/plain" | "text/html") {
-            if !self.body.is_empty()
-                && charset::Charset::for_label_no_replacement(self.ctype.charset.as_bytes())
-                    .is_none()
-            {
-                return Err(crate::html::unsupported());
-            }
-            // Reserve conservatively before decoding: transfer output <= input,
-            // and charset-to-UTF8 conversion needs at most four bytes per input
-            // byte. All leaves share one budget, including temporary strings.
-            let reserve = self
-                .body
-                .len()
-                .checked_mul(4)
-                .ok_or_else(|| MailError::limit_kind(LimitKind::DecodedBodyBytes))?;
-            *remaining = remaining
-                .checked_sub(reserve)
-                .ok_or_else(|| MailError::limit_kind(LimitKind::DecodedBodyBytes))?;
-            let text = match self.encoded()? {
-                Body::Base64(b) | Body::QuotedPrintable(b) => b.get_decoded_as_string(),
-                Body::SevenBit(b) | Body::EightBit(b) => b.get_as_string(),
-                Body::Binary(b) => b.get_as_string(),
-            }
-            .map_err(|_| MailError::backend())?;
-            if text.len() > reserve {
-                return Err(MailError::limit_kind(LimitKind::DecodedBodyBytes));
-            }
-            let text = if self.ctype.mimetype == "text/html" {
+        self.decoded_display_leaves(remaining, |text, html, reserve| {
+            let text = if html {
                 crate::html::render_selected(&text, context)?
             } else {
                 text
@@ -475,12 +356,51 @@ impl Part<'_> {
             // indentation/address bytes beyond encoded*4; its shared formatter
             // independently enforces the 1 MiB output cap across selected leaves.
             if text.len() > reserve
-                && !(self.ctype.mimetype == "text/html"
-                    && context.format() == crate::html::HtmlDisplay::Readable)
+                && !(html && context.format() == crate::html::HtmlDisplay::Readable)
             {
                 return Err(MailError::limit_kind(LimitKind::DecodedBodyBytes));
             }
             out.push_str(&text);
+            Ok(())
+        })
+    }
+
+    pub(crate) fn decoded_display_leaves(
+        &self,
+        remaining: &mut usize,
+        mut consume: impl FnMut(String, bool, usize) -> Result<()>,
+    ) -> Result<()> {
+        let mut selected = Vec::new();
+        // Raw entities always have known encoded emptiness.
+        if selection::select(self, &mut selected, true).unwrap_or(true) {
+            return Err(crate::html::unsupported());
+        }
+        for part in selected {
+            let html = part.ctype.mimetype == "text/html";
+            if !html && part.ctype.mimetype != "text/plain" {
+                continue;
+            }
+            if !part.body.is_empty()
+                && charset::Charset::for_label_no_replacement(part.ctype.charset.as_bytes())
+                    .is_none()
+            {
+                return Err(crate::html::unsupported());
+            }
+            // Transfer output never exceeds input. UTF-8 can require up to
+            // four bytes per input byte, charged across all selected leaves.
+            let limit = || MailError::limit_kind(LimitKind::DecodedBodyBytes);
+            let reserve = part.body.len().checked_mul(4).ok_or_else(limit)?;
+            *remaining = remaining.checked_sub(reserve).ok_or_else(limit)?;
+            let text = match part.encoded()? {
+                Body::Base64(b) | Body::QuotedPrintable(b) => b.get_decoded_as_string(),
+                Body::SevenBit(b) | Body::EightBit(b) => b.get_as_string(),
+                Body::Binary(b) => b.get_as_string(),
+            }
+            .map_err(|_| MailError::backend())?;
+            if text.len() > reserve {
+                return Err(limit());
+            }
+            consume(text, html, reserve)?;
         }
         Ok(())
     }
