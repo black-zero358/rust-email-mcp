@@ -57,6 +57,10 @@ R11B 每次启动在账户注册库旁推进独立运行见证，off 模式也�
 
 涉及认证、发送结果、MIME/附件预算或数据库语义的变更，必须把相应故障回归和迁移检查列入发布记录。性能或内存结论须注明负载、环境和采样条件；单次空闲快照不能代替峰值或持续负载结论。
 
+推送新的 `v<version>` tag 会触发 [Release 工作流](../.github/workflows/release.yml)。先确认同一提交在 `main` 上的最新 CI 运行中，`check`、`audit` 和 `container` 均通过。工作流核对 tag 与 `Cargo.toml` 版本，执行提交模式打包和恢复验收，再将 Linux amd64 musl 归档及 `SHA256SUMS` 上传到对应 Release。新建 Release 会在附件上传完成后发布。维护者复核自动生成的变更说明，并补充该版本的兼容性和升级事项。
+
+若 CI 或附件上传暂时失败，排查后重新运行失败的 Release 工作流。同名附件与本次产物的 SHA-256 一致时直接复用，有冲突时停止发布。修正已发布产物时按新版本发布。
+
 ## 离线持续验收
 
 在 Linux 上使用固定工具链执行 `cargo test --release --locked --lib --no-run --message-format=json`，从 Cargo 的 `compiler-artifact` 消息选择本包 `test:true` 的 executable，并将其复制到独立私有目录。使用 `uv run --no-project python scripts/run-r13-acceptance.py --harness <该可执行文件的绝对路径> --output <新建报告的绝对路径> --fixture-log <新建日志的绝对路径>` 启动完整验收。系统需提供 `unshare`、`ip`，并允许无特权用户/网络命名空间；脚本自动建立仅 loopback 的隔离环境，默认持续至少 1800 秒，初始范围完整物化最迟等待至 4800 秒。`--smoke --duration-seconds 130` 用于快速联调。
@@ -99,7 +103,7 @@ R10 为现有锁定的 `rusqlite 0.41.0` 启用 `blob` 功能，使用 SQLite �
 2. `scope` 只对列入白名单的纯 Markdown 文档跳过 Rust 检查、依赖审计和容器构建。混合改动或无法确认差异时运行完整检查。
 3. 启用 `main` 规则集时，要求经 PR 合并，指定 GitHub Actions 的 `scope`、`check`、`audit`、`container` 为必需检查。复核绕过权限，并分别用纯文档和代码 PR 核验门禁。
 
-依赖审计每周运行，定时触发落地前手动留存结果。musl 发布自动化沿用本规程的构建与产物验收。
+依赖审计每周运行，定时触发落地前手动留存结果。
 
 这些要求的实际配置状态及后续项统一记录在 [待闭环事项](../CONTRIBUTING.md#待闭环事项)，不在多份文档重复维护状态。只有取得配置、运行或发布证据后，才能标记为已落实。
 

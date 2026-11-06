@@ -10,6 +10,7 @@ Start with [CONTRIBUTING.md](CONTRIBUTING.md). Read the relevant design and its 
 - Keep README focused on setup and distinguish main from tagged downloads. Record routine evidence in the PR, milestones in the [read-capability plan](docs/read-capabilities-plan.md#实施状态) or [issue campaign ledger](ISSUE_PROGRESS.md), and reusable evidence in [validation](docs/validation.md). Track follow-ups in [CONTRIBUTING](CONTRIBUTING.md#待闭环事项) or issues.
 - For the read-capability campaign, the lead owns scope, integration and acceptance. Delegate execution to `gpt-6.1-sol` at high effort with `fork_turns=none` and explicit file ownership. Track implementation, local verification and client acceptance separately. Attachment acceptance is offline. Draft, reply, forward and scheduling enhancements remain deferred.
 - Use the [R13 release harness](docs/maintenance.md#离线持续验收) for sustained acceptance and [commit-bound packaging](docs/maintenance.md#发布检查) for release candidates. Label prebuilt packages as snapshots.
+- Push a new `v<version>` tag only after full CI passes on the exact main commit. The [release workflow](.github/workflows/release.yml) verifies and publishes the commit-bound archive and checksum.
 
 ## Read before changing these areas
 
