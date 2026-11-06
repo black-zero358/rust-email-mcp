@@ -202,6 +202,8 @@ full 配置经 `Cache::open_full_with_run` 绑定运行见证。`cache/blob` 保
 
 `cache/dirty` 在同账户事务中登记多个源/目标 scope，包括尚未 EXAMINE 的配置目录。dirty ticket 绑定当前 Cache 实例、恢复世代及 claim ID，关联受影响 scopes；核对 stamp 另绑定 UIDVALIDITY 和 scope 修订；存在活跃 claim 时拒绝取得核对 stamp，清除时再用 UIDVALIDITY/修订/无活跃 claim 条件 CAS。结束 claim 保留 dirty，异常退出和备份恢复要求核对。`mail/cache_write_guard` 在既有写操作的首个实际副作用前登记范围，保留超时、取消和阻塞清理的所有权；缓存失败先关闭离线访问，再保留邮件操作的实际结果。
 
+前台列表和搜索在读取 FLAGS 的 UID FETCH 前捕获所选 UIDVALIDITY 和 SQLite 目录修订。捕获时要求该目录没有活跃写 claim，写入列表事实的同一事务再检查账户、目录、世代、恢复世代、修订及活跃 claim。写前的读取或排队证据在写后核对完成后仍会跳过缓存写回，在线结果照常返回。回归覆盖延迟回包、排队写入、写后新读及清洁重启。
+
 `accounts/cache_run` 在每次启动（包括 off）于 Journal 前发布注册库旁的私有运行见证，并持有生命周期锁。full 清洁凭据绑定前驱运行、规范根目录及选定范围。写操作在调度排队前取得准入，关闭时封闭准入并等待既有写入及清理，再写入清洁凭据；异常退出和恢复使旧范围待核对。具体路径、备份和旧程序降级流程见[部署规程](deployment.md#持久缓存备份与恢复)。
 
 `mail/cache_read` 和离线会话先授权，再使用与在线调用相同的 4 槽/20 请求调度；本地 blocking 工作持有共享许可直到实际结束。显式 cache 分支执行本地查询与完整性核对，保持零 IMAP；默认 live 分支继续核对 UIDVALIDITY 和目标存在性。结果报告来源、观察时间和覆盖；FLAGS 缺失保留未知状态。完整正文的文本负载与有界叶元数据分离，维持单文件 32 MiB，渲染与输出裁减在读取时执行；全文索引只接收完整内容。
