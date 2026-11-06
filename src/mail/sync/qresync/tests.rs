@@ -161,17 +161,27 @@ async fn realtime_deletion_fences_offline_access_before_fetch_completion() {
         "timeout",
         "cancel",
         "earlier only",
+        "range budget",
         "OK",
     ] {
+        let earlier = if case == "range budget" {
+            // Repeated set members normalize to one UID but consume the
+            // cumulative range budget before the real-time removal arrives.
+            std::iter::repeat_n("8", MAX_VANISHED_RANGES)
+                .collect::<Vec<_>>()
+                .join(",")
+        } else {
+            "8".to_owned()
+        };
         let mut response =
-            "* VANISHED (EARLIER) 8\r\n* 3 FETCH (UID 9 FLAGS () MODSEQ (8))\r\n".to_owned();
+            format!("* VANISHED (EARLIER) {earlier}\r\n* 3 FETCH (UID 9 FLAGS () MODSEQ (8))\r\n");
         if case != "earlier only" {
             response.push_str("* VANISHED 7\r\n");
         }
         match case {
             "NO" | "earlier only" => response.push_str("{tag} NO failed\r\n"),
             "BAD" => response.push_str("{tag} BAD failed\r\n"),
-            "OK" => response.push_str("{tag} OK done\r\n"),
+            "OK" | "range budget" => response.push_str("{tag} OK done\r\n"),
             _ => {}
         }
         let (client, peer) = scripted_session(vec![

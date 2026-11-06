@@ -254,15 +254,15 @@ where
             &command,
             CommandReadLimits::qresync(),
             |response| {
-                collector.observe(response)?;
-                // The mailbox is already selected. Realtime deletions are
-                // independent of this FETCH's completion and cancellation.
+                // The mailbox is already selected and the frame was parsed
+                // within its bounds. Fence before validating the full page,
+                // which may reject this deletion on cumulative or order limits.
                 if matches!(response, Response::Vanished { earlier: false, .. })
                     && !fence_live_deletion()
                 {
                     return Err(MailError::backend());
                 }
-                Ok(())
+                collector.observe(response)
             },
         )
         .await?;
