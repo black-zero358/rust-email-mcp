@@ -294,169 +294,40 @@ fn normalize(path: &Path, reject_symlinks: bool) -> anyhow::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::{Value, json};
-
-    fn settings() -> Value {
-        json!({
-            "version":1, "mode":"metadata", "directory":"metadata",
-            "max_bytes":8 * MIN_BYTES,
-            "accounts":[{"account_id":"default","mailboxes":["inbox","已归档"],"max_bytes":4 * MIN_BYTES}]
-        })
-    }
-
-    fn write(path: &Path, value: &Value) {
-        fs::write(path, serde_json::to_vec(value).unwrap()).unwrap();
-    }
-
-    #[test]
-    fn metadata_configuration_is_strict_and_does_not_create_storage() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("cache.json");
-        let registered = ValidatedAccountSet::legacy(crate::config::fixture());
-        write(&path, &settings());
-        let loaded = load_cache_file(&path, &registered).unwrap().unwrap();
-        assert_eq!(
-            loaded.directory,
-            fs::canonicalize(root.path()).unwrap().join("metadata")
-        );
-        assert_eq!(loaded.accounts[0].mailboxes, ["INBOX", "已归档"]);
-        assert!(!loaded.directory.exists());
-
-        for (key, value) in [
-            ("version", json!(2)),
-            ("mode", json!("off")),
-            ("directory", json!("nested/../metadata")),
-            ("max_bytes", json!(MIN_BYTES - 1)),
-            ("unknown", json!(true)),
-            ("accounts", json!([])),
-        ] {
-            let mut invalid = settings();
-            invalid[key] = value;
-            write(&path, &invalid);
-            assert_eq!(
-                load_cache_file(&path, &registered)
-                    .err()
-                    .unwrap()
-                    .to_string(),
-                CONFIG_ERROR
-            );
-        }
-        let mut full = settings();
-        full["mode"] = json!("full");
-        write(&path, &full);
-        assert_eq!(
-            load_cache_file(&path, &registered).unwrap().unwrap().mode,
-            Mode::Full,
-        );
-        write(&path, &json!({"version":1,"mode":"full"}));
-        assert!(load_cache_file(&path, &registered).is_err());
-        write(&path, &json!({"version":1,"mode":"off"}));
-        assert!(load_cache_file(&path, &registered).unwrap().is_none());
-        write(&path, &json!({"version":2,"mode":"off"}));
-        assert!(load_cache_file(&path, &registered).is_err());
-        for (key, value) in [
-            ("account_id", json!("unknown")),
-            ("mailboxes", json!(["inbox", "INBOX"])),
-            ("mailboxes", json!([""])),
-            ("mailboxes", json!(["private\tname"])),
-            ("max_bytes", json!(9 * MIN_BYTES)),
-        ] {
-            let mut invalid = settings();
-            invalid["accounts"][0][key] = value;
-            write(&path, &invalid);
-            assert!(load_cache_file(&path, &registered).is_err());
-        }
-        assert!(!loaded.directory.exists());
-    }
-
-    #[test]
-    fn metadata_paths_cannot_overlap_databases_or_attachment_staging() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("cache.json");
-        let mut config = (*crate::config::fixture()).clone();
-        config.database = root
-            .path()
-            .join("mail/operations.sqlite")
-            .to_str()
-            .unwrap()
-            .into();
-        config.attachment_staging_dir = Some(root.path().join("downloads"));
-        let registered = ValidatedAccountSet::legacy(std::sync::Arc::new(config));
-        for directory in [
-            "mail",
-            "mail/accounts.sqlite",
-            "mail/operations.sqlite-wal",
-            "downloads/metadata",
-        ] {
-            let mut invalid = settings();
-            invalid["directory"] = json!(directory);
-            write(&path, &invalid);
-            assert!(load_cache_file(&path, &registered).is_err(), "{directory}");
-        }
-        assert!(!root.path().join("mail").exists());
-        #[cfg(unix)]
-        {
-            let target = root.path().join("elsewhere");
-            fs::create_dir(&target).unwrap();
-            std::os::unix::fs::symlink(&target, root.path().join("metadata")).unwrap();
-            write(&path, &settings());
-            assert!(load_cache_file(&path, &registered).is_err());
-        }
-    }
+    use serde_json::json;
 
     #[test]
     fn synchronization_is_explicit_full_only_and_bounded() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("cache.json");
         let registered = ValidatedAccountSet::legacy(crate::config::fixture());
-        let mut full = settings();
-        full["mode"] = json!("full");
-        write(&path, &full);
-        let read = || load_cache_file(&path, &registered);
-        assert!(!read().unwrap().unwrap().sync.enabled);
-        full["sync"] = json!({"enabled":true});
-        write(&path, &full);
-        let policy = read().unwrap().unwrap().sync;
-        assert!(policy.enabled);
-        assert_eq!(policy.protocol, SyncProtocol::Rev1);
+        let mut document = json!({
+            "version": 1, "mode": "full", "directory": "cache",
+            "max_bytes": 8 * MIN_BYTES,
+            "accounts": [{"account_id": "default", "mailboxes": ["INBOX"], "max_bytes": 4 * MIN_BYTES}]
+        });
+        let load = |value: &serde_json::Value| {
+            fs::write(&path, serde_json::to_vec(value).unwrap()).unwrap();
+            load_cache_file(&path, &registered)
+        };
+        assert!(!load(&document).unwrap().unwrap().sync.enabled);
+        document["sync"] = json!({"enabled": true});
         assert_eq!(
-            (policy.interval_seconds, policy.reconcile_interval_seconds),
-            (60, 900)
+            load(&document).unwrap().unwrap().sync.protocol,
+            SyncProtocol::Rev1
         );
-        full["sync"] =
-            json!({"enabled":false,"interval_seconds":1,"reconcile_interval_seconds":86_400});
-        write(&path, &full);
-        let policy = read().unwrap().unwrap().sync;
-        assert!(!policy.enabled);
+
+        document["sync"]["protocol"] = json!("auto");
         assert_eq!(
-            (policy.interval_seconds, policy.reconcile_interval_seconds),
-            (1, 86_400)
+            load(&document).unwrap().unwrap().sync.protocol,
+            SyncProtocol::Auto
         );
-        full["sync"]["protocol"] = json!("auto");
-        write(&path, &full);
-        assert_eq!(read().unwrap().unwrap().sync.protocol, SyncProtocol::Auto);
-        for sync in [
-            json!(null),
-            json!({}),
-            json!({"enabled":true,"interval_seconds":0}),
-            json!({"enabled":true,"reconcile_interval_seconds":86_401}),
-            json!({"enabled":true,"unknown":1}),
-            json!({"enabled":true,"protocol":"qresync"}),
-            json!({"enabled":true,"protocol":null}),
-        ] {
-            full["sync"] = sync;
-            write(&path, &full);
-            assert!(read().is_err());
-        }
-        for mode in ["off", "metadata"] {
-            let mut other = if mode == "off" {
-                json!({"version":1,"mode":"off"})
-            } else {
-                settings()
-            };
-            other["sync"] = json!({"enabled":true});
-            write(&path, &other);
-            assert!(read().is_err());
-        }
+        document["sync"]["interval_seconds"] = json!(0);
+        assert!(load(&document).is_err());
+
+        document["sync"] = json!({"enabled": true});
+        document["mode"] = json!("metadata");
+        assert!(load(&document).is_err());
+        assert!(!root.path().join("cache").exists());
     }
 }

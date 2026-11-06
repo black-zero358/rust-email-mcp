@@ -236,3 +236,7 @@ ENABLE and subsequent commands to one connection. The application limits
 generated extension command lines to 8192 bytes including framing, retaining
 the exact UID set or taking its bounded fallback. Run
 `cargo test --locked --test sync_qresync_budget`.
+
+## Test suite reduction (2026-11-06)
+
+The vendored crate-local test modules were removed as part of the repository-wide test maintenance reduction. Runtime source and upstream identity remain the same. Current parser/client verification runs through the root package integration tests in `tests/`; historical test commands above describe the earlier patch acceptance.

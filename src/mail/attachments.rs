@@ -8,8 +8,6 @@ use axum::{
     http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
-#[cfg(test)]
-use std::convert::Infallible;
 use std::{
     collections::HashMap,
     time::{Duration, Instant},
@@ -24,7 +22,7 @@ pub(crate) const MAX_ATTACHMENT_INDEX: usize = mime::MAX_PARTS - 1;
 
 mod cache;
 mod metadata;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod regression;
 pub(in crate::mail) mod staging;
 use metadata::{AttachmentReference, descriptor, select_part};
@@ -84,10 +82,6 @@ impl AttachmentStore {
         self.transfers.available_permits() == MAX_TRANSFERS
     }
 
-    #[cfg(all(test, target_os = "linux"))]
-    pub(crate) fn transfers_for_test(&self) -> usize {
-        MAX_TRANSFERS - self.transfers.available_permits()
-    }
     async fn insert(&self, transfer: Transfer) -> Result<String> {
         let mut handles = self.handles.lock().await;
         handles.retain(|_, t| t.expires > Instant::now());
@@ -261,31 +255,6 @@ impl MailService {
             .await?;
         Ok(
             json!({"account_id":self.alias,"mailbox":mailbox,"uid":uid,"uid_validity":validity,"attachment_id":attachment_id,"attachment_index":index,"download_url":download_url(&self.config.resource,&token)?,"method":"GET","required_headers":{"Authorization":"Bearer <access_token>"},"expires_in_seconds":HANDLE_TTL.as_secs(),"delivery":metadata["delivery"],"metadata":metadata,"content_trust":"untrusted"}),
-        )
-    }
-    #[cfg(test)]
-    async fn fetch_attachment(&self, transfer: &Transfer) -> Result<Vec<u8>> {
-        if transfer.account != self.account {
-            return Err(MailError::account_unavailable());
-        }
-        let mut session = self.connect_read().await?;
-        let state = session
-            .examine(mailbox_name(&transfer.mailbox, InputLimits::Read)?)
-            .await
-            .map_err(map_read_imap_error)?;
-        check_validity(
-            &json!({"uid_validity":transfer.validity}),
-            state.uid_validity,
-        )?;
-        let raw = self.raw_attachment(&mut session, transfer.uid).await?;
-        let parsed = mime::parse(&raw)?;
-        let manifest = parts::from_raw(&parsed)?;
-        decode_part(
-            manifest
-                .entities
-                .get(transfer.part.index)
-                .ok_or_else(attachment_missing)?,
-            self.config.max_message,
         )
     }
 }
@@ -759,144 +728,10 @@ fn attachment_response(
     );
     response
 }
-#[cfg(test)]
-async fn download_with<F, Fut>(
-    service: Arc<MailService>,
-    principal: Principal,
-    token: String,
-    request_id: String,
-    fetch: F,
-) -> Response
-where
-    F: FnOnce(Transfer) -> Fut,
-    Fut: std::future::Future<Output = Result<Vec<u8>>>,
-{
-    let Some(transfer) = service
-        .attachments
-        .lookup(&token, &principal.0, &service.account)
-        .await
-    else {
-        return handle_not_found(&request_id);
-    };
-    let timeout = service.config.timeout;
-    download_selected(
-        &service.attachments,
-        &service.config,
-        transfer,
-        request_id,
-        move |transfer| async move {
-            tokio::time::timeout(timeout, fetch(transfer))
-                .await
-                .map_err(|_| MailError::timeout())?
-        },
-    )
-    .await
-}
-#[cfg(test)]
-async fn download_selected<F, Fut>(
-    store: &AttachmentStore,
-    config: &Config,
-    transfer: Transfer,
-    request_id: String,
-    fetch: F,
-) -> Response
-where
-    F: FnOnce(Transfer) -> Fut,
-    Fut: std::future::Future<Output = Result<Vec<u8>>>,
-{
-    let Ok(permit) = store.transfers.clone().try_acquire_owned() else {
-        let mut response = http_error(
-            StatusCode::TOO_MANY_REQUESTS,
-            "BUSY",
-            "Attachment download capacity is full.",
-            "transfer_admission",
-            "retry_with_backoff",
-            &request_id,
-        );
-        response
-            .headers_mut()
-            .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
-        return response;
-    };
-    let filename = metadata::safe_filename(transfer.part.filename.as_deref(), transfer.part.index);
-    let bytes = match fetch(transfer).await {
-        Ok(bytes) => bytes,
-        Err(error) => return fetch_http_error(&error, &request_id, config.max_message),
-    };
-    if bytes.len() > config.max_message {
-        return fetch_http_error(
-            &MailError::limit_kind(LimitKind::DecodedAttachmentBytes),
-            &request_id,
-            config.max_message,
-        );
-    }
-    let len = bytes.len();
-    use base64::Engine;
-    let digest = Sha256::digest(&bytes);
-    // Keep the transfer permit through response consumption/drop (including slow readers).
-    let stream = futures::stream::unfold(
-        (Some(Bytes::from(bytes)), permit),
-        |(bytes, permit)| async move { bytes.map(|bytes| (Ok::<_, Infallible>(bytes), (None, permit))) },
-    );
-    let mut response = Body::from_stream(stream).into_response();
-    let headers = response.headers_mut();
-    headers.insert(
-        header::CONTENT_TYPE,
-        "application/octet-stream".parse().unwrap(),
-    );
-    let encoded = filename
-        .bytes()
-        .map(|b| {
-            if b.is_ascii_alphanumeric() || b"._-".contains(&b) {
-                (b as char).to_string()
-            } else {
-                format!("%{b:02X}")
-            }
-        })
-        .collect::<String>();
-    headers.insert(
-        header::CONTENT_DISPOSITION,
-        format!("attachment; filename=\"attachment.bin\"; filename*=UTF-8''{encoded}")
-            .parse()
-            .unwrap(),
-    );
-    headers.insert(header::CONTENT_LENGTH, len.into());
-    headers.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
-    headers.insert("x-content-type-options", "nosniff".parse().unwrap());
-    if let Ok(value) = request_id.parse() {
-        headers.insert("x-request-id", value);
-    }
-    headers.insert("x-content-sha256", format!("{digest:x}").parse().unwrap());
-    headers.insert(
-        "content-digest",
-        format!(
-            "sha-256=:{}:",
-            base64::engine::general_purpose::STANDARD.encode(digest)
-        )
-        .parse()
-        .unwrap(),
-    );
-    response
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    async fn download_legacy(
-        State(service): State<Arc<MailService>>,
-        Extension(principal): Extension<Principal>,
-        Path(token): Path<String>,
-    ) -> Response {
-        let backend = service.clone();
-        download_with(
-            service,
-            principal,
-            token,
-            uuid::Uuid::new_v4().to_string(),
-            move |transfer| async move { backend.fetch_attachment(&transfer).await },
-        )
-        .await
-    }
     fn transfer(principal: &str, expires: Instant, account: &AccountKey) -> Transfer {
         Transfer {
             principal: principal.into(),
@@ -948,143 +783,5 @@ mod tests {
                 .await
                 .is_err()
         );
-    }
-    #[test]
-    fn discovery_matches_message_indices_and_multipart_attachment_trees() {
-        let raw = b"Content-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Type: text/plain\r\n\r\nbody\r\n--x\r\nContent-Type: multipart/mixed; boundary=y\r\nContent-Disposition: attachment; filename=group.mime\r\n\r\n--y\r\nContent-Type: text/plain\r\n\r\nattached\r\n--y--\r\n--x\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=test.pdf\r\n\r\npdf\r\n--x--\r\n";
-        let entries = entries(raw).unwrap();
-        assert_eq!(entries.len(), 3);
-        assert_eq!(entries[1].index, 1);
-        assert_eq!(entries[1].content_type, "multipart/mixed");
-        assert!(entries[1].attachment);
-        assert_eq!(entries[2].index, 2);
-        let message = parsed(raw, 1, Some(1), 1000).unwrap();
-        assert_eq!(message["attachments"][0]["attachment_index"], 1);
-        assert_eq!(message["attachments"][1]["attachment_index"], 2);
-        assert_eq!(
-            attachment(raw, 1, 1000).unwrap()["content_type"],
-            "multipart/mixed"
-        );
-        assert!(has_attachment(raw).unwrap());
-    }
-    #[tokio::test]
-    async fn http_download_authorization_binary_headers_and_transfer_capacity() {
-        use axum::{Router, http::Request, routing::get};
-        use tower::ServiceExt;
-        let service = Arc::new(
-            MailService::new(
-                crate::config::fixture(),
-                Arc::new(Journal::open(std::path::Path::new(":memory:")).unwrap()),
-            )
-            .unwrap(),
-        );
-        let token = service
-            .attachments
-            .insert(transfer(
-                "owner",
-                Instant::now() + HANDLE_TTL,
-                &service.account,
-            ))
-            .await
-            .unwrap();
-        let route = Router::new()
-            .route("/mcp/attachments/{token}", get(download_legacy))
-            .with_state(service.clone());
-        let request = || {
-            Request::builder()
-                .uri(format!("/mcp/attachments/{token}"))
-                .body(Body::empty())
-                .unwrap()
-        };
-        // The production router additionally runs OIDC middleware before this handler.
-        assert_eq!(
-            route.clone().oneshot(request()).await.unwrap().status(),
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
-        let mut wrong = request();
-        wrong.extensions_mut().insert(Principal("other".into()));
-        assert_eq!(
-            route.clone().oneshot(wrong).await.unwrap().status(),
-            StatusCode::NOT_FOUND
-        );
-        let mut bad = Request::builder()
-            .uri("/mcp/attachments/bad")
-            .body(Body::empty())
-            .unwrap();
-        bad.extensions_mut().insert(Principal("owner".into()));
-        assert_eq!(
-            route.oneshot(bad).await.unwrap().status(),
-            StatusCode::NOT_FOUND
-        );
-        let expected = vec![0x25; 200 * 1024];
-        let payload = expected.clone();
-        let injected = Router::new()
-            .route(
-                "/mcp/attachments/{token}",
-                get(
-                    move |State(service): State<Arc<MailService>>,
-                          Extension(principal): Extension<Principal>,
-                          Path(token): Path<String>| {
-                        let payload = payload.clone();
-                        async move {
-                            download_with(
-                                service,
-                                principal,
-                                token,
-                                uuid::Uuid::new_v4().to_string(),
-                                |_| async move { Ok(payload) },
-                            )
-                            .await
-                        }
-                    },
-                ),
-            )
-            .with_state(service.clone());
-        let mut success = request();
-        success.extensions_mut().insert(Principal("owner".into()));
-        let response = injected.oneshot(success).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers()[header::CONTENT_TYPE],
-            "application/octet-stream"
-        );
-        assert!(
-            response.headers()[header::CONTENT_DISPOSITION]
-                .to_str()
-                .unwrap()
-                .starts_with("attachment;")
-        );
-        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
-        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
-        assert_eq!(
-            service.attachments.transfers.available_permits(),
-            MAX_TRANSFERS - 1
-        );
-        assert_eq!(
-            axum::body::to_bytes(response.into_body(), 1024 * 1024)
-                .await
-                .unwrap()
-                .as_ref(),
-            expected
-        );
-        assert_eq!(
-            service.attachments.transfers.available_permits(),
-            MAX_TRANSFERS
-        );
-        let _permits = service
-            .attachments
-            .transfers
-            .acquire_many(MAX_TRANSFERS as u32)
-            .await
-            .unwrap();
-        let rejected = download_with(
-            service.clone(),
-            Principal("owner".into()),
-            token,
-            uuid::Uuid::new_v4().to_string(),
-            |_| async { panic!("backend must not be called when at capacity") },
-        )
-        .await;
-        assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 }

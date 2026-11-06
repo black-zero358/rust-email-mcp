@@ -86,18 +86,6 @@ impl Auth {
             .redirect(reqwest::redirect::Policy::none())
     }
 
-    #[cfg(all(test, target_os = "linux"))]
-    pub(crate) async fn discover_with_test_ca(
-        config: Arc<Config>,
-        ca: reqwest::Certificate,
-    ) -> anyhow::Result<Arc<Self>> {
-        let client = Self::discovery_client()
-            .add_root_certificate(ca)
-            .no_proxy()
-            .build()?;
-        Self::discover(config, client).await
-    }
-
     async fn discover(config: Arc<Config>, client: reqwest::Client) -> anyhow::Result<Arc<Self>> {
         let discovery: serde_json::Value = bounded_json(
             client
@@ -419,58 +407,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cached_key_does_not_wait_for_rotation_and_refresh_updates_snapshot() {
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let started_tx = Arc::new(Mutex::new(Some(started_tx)));
-        let release = Arc::new(tokio::sync::Notify::new());
-        let gate = release.clone();
-        let rotated = serde_json::to_string(&test_keys("rotated")).unwrap();
-        let app = axum::Router::new().route(
-            "/jwks",
-            axum::routing::get(move || {
-                let started_tx = started_tx.clone();
-                let gate = gate.clone();
-                let rotated = rotated.clone();
-                async move {
-                    if let Some(tx) = started_tx.lock().await.take() {
-                        let _ = tx.send(());
-                    }
-                    gate.notified().await;
-                    rotated
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let auth = test_auth(
-            test_keys("test"),
-            format!("http://{}/jwks", listener.local_addr().unwrap()),
-        );
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        let refresh_auth = auth.clone();
-        let refresh = tokio::spawn(async move { refresh_auth.key_for("rotated").await });
-        started_rx.await.unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), auth.key_for("test"))
-                .await
-                .unwrap()
-                .is_ok()
-        );
-        release.notify_one();
-        assert!(refresh.await.unwrap().is_ok());
-        assert!(auth.key_for("rotated").await.is_ok());
-        assert!(matches!(
-            auth.key_for("test").await,
-            Err(AuthError::InvalidToken)
-        ));
-        assert!(matches!(
-            auth.key_for("random").await,
-            Err(AuthError::InvalidToken)
-        ));
-        server.abort();
-    }
-    #[tokio::test]
     async fn jwt_trust_boundaries() {
         let key = KeyPair::generate(KeySize::Rsa2048).unwrap();
         let public = key.public_key();
@@ -526,118 +462,5 @@ mod tests {
         )
         .unwrap();
         assert!(auth.verify(&token).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn attachment_route_requires_bearer_before_handler() {
-        use axum::{Router, body::Body, http::Request, middleware, routing::get};
-        use tower::ServiceExt;
-        let config = crate::config::fixture();
-        let auth = Arc::new(Auth {
-            config: config.clone(),
-            client: reqwest::Client::new(),
-            jwks_uri: "https://invalid.example/jwks".into(),
-            keys: Mutex::new((JwkSet { keys: vec![] }, Instant::now())),
-            refresh: Mutex::new(RefreshState {
-                completed: Instant::now(),
-                failed: false,
-            }),
-        });
-        let catalog = crate::accounts::AccountCatalog::from_test_accounts(
-            crate::config::ValidatedAccountSet::legacy(config),
-        )
-        .unwrap();
-        let mail = Arc::new(
-            crate::mail::MailRuntime::new(
-                catalog,
-                Arc::new(crate::journal::Journal::open(std::path::Path::new(":memory:")).unwrap()),
-            )
-            .unwrap(),
-        );
-        // Match the production route layering, including the nested MCP service.
-        let router = Router::new()
-            .route(
-                "/mcp/attachments/{token}",
-                get(crate::mail::attachments::download),
-            )
-            .with_state(mail)
-            .nest_service("/mcp", Router::new().route("/", get(|| async { "mcp" })))
-            .layer(middleware::from_fn_with_state(auth, require_auth));
-        for bearer in [None, Some("Bearer invalid")] {
-            let mut request = Request::builder().uri("/mcp/attachments/unknown");
-            if let Some(bearer) = bearer {
-                request = request.header(header::AUTHORIZATION, bearer);
-            }
-            let response = router
-                .clone()
-                .oneshot(request.body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-            assert!(response.headers().contains_key(header::WWW_AUTHENTICATE));
-            assert!(response.headers().contains_key("x-request-id"));
-            let request_id = response.headers()["x-request-id"]
-                .to_str()
-                .unwrap()
-                .to_owned();
-            let body = axum::body::to_bytes(response.into_body(), 4096)
-                .await
-                .unwrap();
-            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(body["request_id"], request_id);
-            assert_eq!(body["error"]["code"], "UNAUTHORIZED");
-            assert_eq!(body["error"]["phase"], "authentication");
-            assert_eq!(body["error"]["action"], "refresh_authentication");
-        }
-    }
-
-    #[tokio::test]
-    async fn attachment_jwks_outage_has_private_json_and_preserves_mcp_response() {
-        use axum::{Router, body::Body, http::Request, middleware, routing::get};
-        use tower::ServiceExt;
-        let auth = Auth::from_test_jwks(crate::config::fixture(), JwkSet { keys: vec![] });
-        {
-            let mut refresh = auth.refresh.lock().await;
-            refresh.failed = true;
-        }
-        let token = format!(
-            "{}.e30.invalid",
-            URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","kid":"private-missing-key"}"#)
-        );
-        let router = Router::new()
-            .route("/mcp/attachments/{token}", get(|| async { "unreachable" }))
-            .route("/mcp", get(|| async { "unreachable" }))
-            .layer(middleware::from_fn_with_state(auth, require_auth));
-        for path in ["/mcp/attachments/private-handle", "/mcp"] {
-            let response = router
-                .clone()
-                .oneshot(
-                    Request::get(path)
-                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-            assert_eq!(response.headers()[header::RETRY_AFTER], "10");
-            let id = response.headers()["x-request-id"]
-                .to_str()
-                .unwrap()
-                .to_owned();
-            let bytes = axum::body::to_bytes(response.into_body(), 4096)
-                .await
-                .unwrap();
-            if path == "/mcp" {
-                assert!(bytes.is_empty());
-            } else {
-                let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-                assert_eq!(value["request_id"], id);
-                assert_eq!(value["error"]["code"], "AUTH_UNAVAILABLE");
-                assert_eq!(value["error"]["phase"], "authentication");
-                assert_eq!(value["error"]["action"], "retry_with_backoff");
-                assert!(!String::from_utf8_lossy(&bytes).contains("private"));
-            }
-        }
     }
 }

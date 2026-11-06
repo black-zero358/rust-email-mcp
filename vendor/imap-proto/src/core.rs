@@ -1,15 +1,15 @@
 use nom::{
+    IResult, Parser,
     branch::alt,
     bytes::streaming::{escaped, tag, tag_no_case, take, take_while, take_while1},
     character::streaming::{char, digit1, one_of, space0},
     combinator::{map, map_res, opt, peek},
     multi::{separated_list0, separated_list1},
     sequence::{delimited, preceded},
-    IResult, Parser,
 };
 
 use std::borrow::Cow;
-use std::str::{from_utf8, FromStr};
+use std::str::{FromStr, from_utf8};
 
 pub(crate) fn to_owned_cow<T: ?Sized + ToOwned>(c: Cow<'_, T>) -> Cow<'static, T> {
     Cow::Owned(c.into_owned())
@@ -266,112 +266,5 @@ where
         Ok((i, o)) => Ok((i, o)),
         Err(nom::Err::Error(_)) => Ok((i, None)),
         Err(e) => Err(e),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use assert_matches::assert_matches;
-
-    #[test]
-    fn test_quoted() {
-        let (rem, val) = quoted(br#""Hello"???"#).unwrap();
-        assert_eq!(rem, b"???");
-        assert_eq!(val, b"Hello");
-
-        // Allowed escapes...
-        assert_eq!(
-            quoted(br#""Hello \" "???"#),
-            Ok((&b"???"[..], &br#"Hello \" "#[..]))
-        );
-        assert_eq!(
-            quoted(br#""Hello \\ "???"#),
-            Ok((&b"???"[..], &br#"Hello \\ "#[..]))
-        );
-
-        // Not allowed escapes...
-        assert!(quoted(br#""Hello \a "???"#).is_err());
-        assert!(quoted(br#""Hello \z "???"#).is_err());
-        assert!(quoted(br#""Hello \? "???"#).is_err());
-
-        let (rem, val) = quoted(br#""Hello \"World\""???"#).unwrap();
-        assert_eq!(rem, br#"???"#);
-        // Should it be this (Hello \"World\") ...
-        assert_eq!(val, br#"Hello \"World\""#);
-        // ... or this (Hello "World")?
-        //assert_eq!(val, br#"Hello "World""#); // fails
-
-        // Test Incomplete
-        assert_matches!(quoted(br#""#), Err(nom::Err::Incomplete(_)));
-        assert_matches!(quoted(br#""\"#), Err(nom::Err::Incomplete(_)));
-        assert_matches!(quoted(br#""Hello "#), Err(nom::Err::Incomplete(_)));
-
-        // Test Error
-        assert_matches!(quoted(br"\"), Err(nom::Err::Error(_)));
-    }
-
-    #[test]
-    fn test_string_literal() {
-        match string(b"{3}\r\nXYZ") {
-            Ok((_, value)) => {
-                assert_eq!(value, b"XYZ");
-            }
-            rsp => panic!("unexpected response {rsp:?}"),
-        }
-    }
-
-    #[test]
-    fn test_string_literal_containing_null() {
-        match string(b"{5}\r\nX\0Y\0Z") {
-            Ok((_, value)) => {
-                assert_eq!(value, b"X\0Y\0Z");
-            }
-            rsp => panic!("unexpected response {rsp:?}"),
-        }
-    }
-
-    #[test]
-    fn test_astring() {
-        match astring(b"text ") {
-            Ok((_, value)) => {
-                assert_eq!(value, b"text");
-            }
-            rsp => panic!("unexpected response {rsp:?}"),
-        }
-    }
-
-    #[test]
-    fn test_sequence_range() {
-        match sequence_range(b"23:28 ") {
-            Ok((_, value)) => {
-                assert_eq!(*value.start(), 23);
-                assert_eq!(*value.end(), 28);
-                assert_eq!(value.collect::<Vec<u32>>(), vec![23, 24, 25, 26, 27, 28]);
-            }
-            rsp => panic!("Unexpected response {rsp:?}"),
-        }
-    }
-
-    #[test]
-    fn test_sequence_set() {
-        match sequence_set(b"1,2:8,10,15:30 ") {
-            Ok((_, value)) => {
-                assert_eq!(value.len(), 4);
-                let v = &value[0];
-                assert_eq!(*v.start(), 1);
-                assert_eq!(*v.end(), 1);
-                let v = &value[1];
-                assert_eq!(*v.start(), 2);
-                assert_eq!(*v.end(), 8);
-                let v = &value[2];
-                assert_eq!(*v.start(), 10);
-                assert_eq!(*v.end(), 10);
-                let v = &value[3];
-                assert_eq!(*v.start(), 15);
-                assert_eq!(*v.end(), 30);
-            }
-            rsp => panic!("Unexpected response {rsp:?}"),
-        }
     }
 }

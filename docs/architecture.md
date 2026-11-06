@@ -240,26 +240,20 @@ JSON 日志使用固定事件名和受控字段，记录服务端生成的 reque
 
 ## Invariants and verification
 
-R13 的 Linux release 验收由 `server::output_tests::r13_acceptance` 与 `scripts/run-r13-acceptance.py` 驱动。服务进程和 `main` 共用 `server::http_router`，保持相同的认证、Host/Origin、请求体和 JSON-RPC id 限制；测试根证书注入与资源观测接口仅在 Linux 测试构建中启用。模拟 IMAP/OIDC、服务和负载驱动分进程运行，独立网络命名空间仅开放 loopback；CPU/RSS 采样绑定服务 PID，磁盘统计覆盖缓存数据库、日志、blob、暂存及打开后已删除的文件。
+当前验证采用精简默认测试与发布恢复烟测。2026-11-06 以 `42873c0` 为基线削减测试规模，统计入口为 `uv run scripts/test-inventory.py`。代表性回归直接调用生产实现，HTTP 场景共用 `server::http_router`，同时验证签名身份、Schema 和实际邮件后端行为。
 
-该验收对应 D1/D2/D3/D5：至少 10,000 封双账户合成邮件，持续至少 30 分钟，并在验收窗口内重新观察初始范围的原件、正文、完整索引和附件均已物化。分别验证四路 IMAP 读取占满后端，以及四路 HTTP 慢消费持有文件/传输许可但释放后端的场景；检查第五路拒绝、前台排队结果、两账户增量进度与取消清理。真实 HTTPS 发现/JWKS 刷新、冷/热请求、中文检索、跨目录副本及边界附件由同一运行记录。恢复与迁移继续由专用存储回归及 `scripts/check-cache-recovery.py` 验证；运行方法见[维护规程](maintenance.md#离线持续验收)。
+| 原则 | 当前验证入口 |
+| --- | --- |
+| D1 身份与授权 | `auth::tests::jwt_trust_boundaries`、`failed_refresh_is_shared_and_expired_keys_fail_closed`；`server::output_tests` 的 HTTP 请求鉴权、账户隔离及附件主体检查 |
+| D2 读取与引用 | `mail::tests` 的目标 UID 属性匹配、FLAGS 合并、rev1 文件夹往返；`tests/imap_completion.rs` 的完成状态；HTTP 同 UID 双账户与过期 UIDVALIDITY |
+| D3 资源有界 | 六个 `tests/*.rs` 协议集成入口；MIME 头部/解码预算、HTML 分词前属性预算；`server::tests` 的完整 wire 预算与正文前缀；暂存取消与调度配额 |
+| D4 发送与幂等 | `journal::tests` 的重启/主体隔离与并发 claim；`mail::tests` 的 SMTP 未知结果及 accepted 持久化；`smtp::tests` 的 DATA 格式和最终结果 |
+| D5 隐私与内容 | `mail::tests::draft_envelope_and_privacy_filter_share_canonical_fields`；MIME 未知编码与完整 alternative 选择；附件精确字节、授权 GET 及私有暂存 |
+| D6 维护与恢复 | `src/accounts`、`src/cache` 的注册库/世代/迁移/回放回归；CI fmt/test/clippy、依赖审计和容器 release 构建；`scripts/check-cache-recovery.py` 的实际候选二进制恢复检查 |
 
-下表把总纲原则映射到当前实现和已有验证入口。它不宣称每条约束都有自动化覆盖；涉及真实部署的检查需按变更范围补充验收记录，测试名称变化时同步更新映射。
+测试精简移除了大量故障排列、细粒度边界组合、独立客户端原型和 R13 持续负载设施。开发者针对新缺陷增加最小回归，并同步替换重叠用例，保持总体量预算。历史长跑和完整矩阵记录位于 [validation](validation.md)，下方设计记录中的旧测试名称随对应历史工作包保留。
 
-| 原则 | 实现入口 | 现有验证与审阅入口 |
-| --- | --- | --- |
-| D1 身份与授权 | `auth`、`server::allowed/call_tool`、`main` 接线 | `jwt_trust_boundaries`、`failed_refresh_is_shared_and_expired_keys_fail_closed`、`cached_key_does_not_wait_for_rotation_and_refresh_updates_snapshot`、`schemas_match_policy`；另做隔离 OAuth/登录资产验收 |
-| D2 读取无副作用与 UIDVALIDITY | `mail`、`imap_text`、vendored completion boundary | `status_uses_only_target_uid_and_distinguishes_missing_from_empty_flags`、`raw_fetch_ignores_interleaved_flags_and_requires_target_attributes`、`list_fetch_merges_uid_attributes_and_only_actual_flag_updates`、`list_fetch_requires_header_and_successful_tagged_completion`、`list_fetch_split_attributes_keep_unique_requested_uids_and_order`、`rev1_mailbox_names_round_trip_through_tools`、`statistics_status_requires_complete_matching_snapshot_and_tag`、`refused_imap_tools_return_backend_error_and_stop_delete`、`batch_read_continues_after_local_content_errors`、`batch_read_stops_after_protocol_failure_or_transport_exhaustion`、`mailbox_commands_require_matching_tagged_completion`、`empty_mailbox_pages_require_completed_examine`、`tests/imap_completion.rs`；只读邮箱验收核对读前后 flags |
-| D3 资源有界 | `BudgetStream`、vendored `ImapStream::Buffer`、`mime`、`html`、`server` | `bounded_parser_rejects_incomplete_response_at_application_limit`、`bounded_parser_accepts_fragmented_text_and_normal_literal`、`bounded_parser_handles_exact_text_budget_and_unknown_need`、vendored `application_limit_rejects_growth_before_allocation`、`headers_and_decode_are_bounded_before_allocation`、`attributes_are_bounded_before_tokenization_without_whitespace`、`final_wire_budget_covers_duplicates_escaping_unicode_and_attachments`、`email_body_prefix_fits_real_wire_budget_and_preserves_metadata`、`long_parsed_email_returns_a_wire_bounded_readable_prefix`、`oversized_rpc_id_is_rejected_before_execution` |
-| D4 发送结果与幂等 | `journal`、`mail::send`、`smtp` | `durable_dedup_and_principal_isolation`、`concurrent_claim_has_single_winner`、`smtp_lost_reply_does_not_resend`、`smtp_accepted_is_persisted_before_unresponsive_quit`、`smtp_accepted_survives_quit_timeout_and_journal_failure` |
-| D5 隐私与不可信内容 | `mail`、`mime`、`html`、`main` 日志 | `discovery_matches_message_indices_and_multipart_attachment_trees`、`http_download_authorization_binary_headers_and_transfer_capacity`、`draft_envelope_and_privacy_filter_share_canonical_fields`、`ambiguous_draft_headers_are_rejected`、`text_attachments_stay_downloadable_but_leave_body_and_forward`、`html_read_and_forward_preserve_original_content`、`disposition_classification_preserves_empty_inline_and_filename_rules`、`alternative_read_and_forward_require_complete_representations`、`plain_probes_require_all_inline_parts_and_prune_only_attachments`；日志字段和 panic 脱敏仍需代码审阅 |
-| D6 简单可维护与明确范围 | 模块边界、工具链、补丁来源、部署模板 | CI 的 fmt/test/clippy/build；`scripts/audit-dependencies.sh`；`scripts/test-docker-context.sh` 和生产 Dockerfile 构建；升级/恢复证据见维护与部署指南 |
-
-vendored 构建依赖必须由 `.dockerignore` 明确允许并复制进 Docker builder；允许范围不能扩大到 vendor 同级目录、秘密或部署数据。Docker context 检查使用合成哨兵与真实构建器。普通 `cargo audit` 会跳过 path package，因此本地与 CI 统一运行专用审计脚本，同时独立审阅本地补丁代码；升级时同步更新来源、脚本和回归测试。
-
-CTE 支持性对应 D3/D5：`mime::Part::transfer_encoding/encoded/select_text` 与 `parse_part` 的验证入口为 `transfer_encodings_require_known_decoders_before_interpretation`、`unknown_transfer_encoding_cannot_be_read_forwarded_or_downloaded_as_decoded`；覆盖不透明 multipart、完整 alternative 回退与下载拒绝，不替代真实邮箱验收。
-
-SMTPUTF8 需求与确定拒绝对应 D3/D4：`mime::requires_smtputf8`、`smtp::submit/transaction` 和 `mail::record_send` 由 `smtp_utf8_inspection_uses_raw_headers_and_shared_budgets`、`smtp_utf8_covers_preserved_draft_headers_but_not_body_bytes`、`smtp_utf8_refusal_is_recorded_as_rejected_without_mail` 验证；原发送故障/QUIT 回归继续验证 accepted/unknown 边界。
+Vendored 包的协议回归集中在根包 `tests/`。两个上游身份继续由 `scripts/audit-dependencies.sh` 检查，Docker 上下文由 `scripts/test-docker-context.sh` 以合成哨兵和实际构建器核验。
 
 ## Decision records
 

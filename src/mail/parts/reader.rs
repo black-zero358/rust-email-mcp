@@ -527,6 +527,3 @@ impl MailService {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

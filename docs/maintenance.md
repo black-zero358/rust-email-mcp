@@ -59,9 +59,11 @@ R11B 每次启动在账户注册库旁推进独立运行见证，off 模式也�
 
 ## 离线持续验收
 
-在 Linux 上使用固定工具链执行 `cargo test --release --locked --lib --no-run --message-format=json`，从 Cargo 的 `compiler-artifact` 消息选择本包 `test:true` 的 executable，并将其复制到独立私有目录。使用 `uv run --no-project python scripts/run-r13-acceptance.py --harness <该可执行文件的绝对路径> --output <新建报告的绝对路径> --fixture-log <新建日志的绝对路径>` 启动完整验收。系统需提供 `unshare`、`ip`，并允许无特权用户/网络命名空间；脚本自动建立仅 loopback 的隔离环境，默认持续至少 1800 秒，初始范围完整物化最迟等待至 4800 秒。`--smoke --duration-seconds 130` 用于快速联调。
+当前测试策略采用精简的默认 Rust 回归和发布二进制恢复烟测。运行 `cargo test --locked` 验证生产工具入口、鉴权、协议完成与预算、发送结果和缓存持久化，发布时由 `scripts/package-release.sh` 自动执行 `scripts/check-cache-recovery.py`。
 
-固定并记录 harness 与五份 Python 输入的摘要，测量期间保持输入不变，并暂停同机重编译或镜像构建。报告和 NDJSON 采样保存为私有文件；核对 `mode:acceptance`、`passed:true`、持续时间、窗口内完整物化、冷/热延迟、IMAP 流量、服务 PID 资源、双账户增量和两种附件并发场景后，将脱敏结果写入 validation。fixture 日志与控制目录保留 0600/0700 权限。正式 musl 候选在负载测量结束后按前述发布检查构建。
+2026-11-06 精简移除了 R13 长跑驱动、独立 Node 客户端原型测试和 Python 文件解析探针。既有 R13 30 分钟负载与附件消费实验保留在 [validation](validation.md) 作为历史记录。后续性能或真实客户端兼容性工作按目标场景单独设计实验。
+
+使用 `uv run scripts/test-inventory.py --revision 42873c0` 与 `uv run scripts/test-inventory.py` 对比测试源码行数、字节数和 Rust 用例数。统计包含独立测试文件、内嵌测试及其辅助模块、vendored 测试、专项脚本、恢复烟测与计数脚本本身。每项均保持在原基线的 20% 以下。
 
 ## 持续维护
 
@@ -69,7 +71,7 @@ R11B 每次启动在账户注册库旁推进独立运行见证，off 模式也�
 
 R02 的 `jsonschema = 0.60.2`（MIT）仅作为开发依赖检验真实工具结果，默认特性关闭，使用本地 Schema 定义；产品运行时依赖保持原集合。对应官方 [API](https://docs.rs/jsonschema/0.60.2/jsonschema/) 与[许可证](https://github.com/Stranger6667/jsonschema/blob/master/LICENSE)作为维护入口；锁文件变化继续执行专用审计和容器验证。
 
-R04 的[客户端适配工具](../scripts/attachment-client-adapter/README.md)单独使用 pnpm 锁文件，唯一直接开发依赖 `@modelcontextprotocol/ext-apps = 2.0.4`（MIT）用于官方 UI 消息 Schema 验证。标准下载客户端只使用 Node 内置模块；Node 与该 SDK 均不进入 Rust 产品镜像。依赖升级时重跑适配器测试及显式 Rust→Node 联调，核对官方宿主接口；模拟 UI 候选的接收结果和目标 ChatGPT 文件消费分别记录。
+R04 的独立 Node/Python 附件原型已归档到 Git 历史；当前下载回归通过 Rust 服务的实际暂存和授权 HTTP GET 路径核对字节。历史工具的依赖与实测结果见 [validation](validation.md)。
 
 R06 将已锁定的 `imap-proto 0.17.0` 纳入本地补丁，以便在 BODYSTRUCTURE 解析及容器扩容前执行预算。版本和依赖解析保持原值；归档 SHA-256 为 `5ccf963d57074747b455398a1763d174da80bcaba6f51e3671a82252b531a68b`，许可证 MIT OR Apache-2.0。来源、API、边界和替换条件见[补丁记录](../vendor/imap-proto/PATCHES.md)。根 Cargo patch 同时覆盖直接依赖和 async-imap 的传递依赖。
 

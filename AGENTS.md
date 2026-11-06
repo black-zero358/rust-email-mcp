@@ -9,7 +9,7 @@ Start with [CONTRIBUTING.md](CONTRIBUTING.md). Read the relevant design and its 
 - Use synthetic mail and isolated OAuth clients and users. Keep secrets, mail content and deployment identities out of Git and logs. Real mail writes and production deployment, cutover or rollback require separate authorization. See [deployment](docs/deployment.md#验收与回滚).
 - Keep README focused on setup and distinguish main from tagged downloads. Record routine evidence in the PR, milestones in the [read-capability plan](docs/read-capabilities-plan.md#实施状态) or [issue campaign ledger](ISSUE_PROGRESS.md), and reusable evidence in [validation](docs/validation.md). Track follow-ups in [CONTRIBUTING](CONTRIBUTING.md#待闭环事项) or issues.
 - For the read-capability campaign, the lead owns scope, integration and acceptance. Delegate execution to `gpt-6.1-sol` at high effort with `fork_turns=none` and explicit file ownership. Track implementation, local verification and client acceptance separately. Attachment acceptance is offline. Draft, reply, forward and scheduling enhancements remain deferred.
-- Use the [R13 release harness](docs/maintenance.md#离线持续验收) for sustained acceptance and [commit-bound packaging](docs/maintenance.md#发布检查) for release candidates. Label prebuilt packages as snapshots.
+- Keep the compact test suite below 20% of the 42873c0 baseline in source lines, bytes and Rust cases, measured by `uv run scripts/test-inventory.py`. Maintain representative regressions through production entry points and update the architecture verification map when replacing tests. Use [commit-bound packaging](docs/maintenance.md#发布检查) with its isolated recovery smoke test for release candidates. Label prebuilt packages as snapshots.
 
 ## Read before changing these areas
 

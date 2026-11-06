@@ -56,8 +56,6 @@ pub enum ManifestOutcome {
 pub struct PartManifest {
     pub parts: Vec<ManifestPart>,
     pub(super) body: BodyTree,
-    #[cfg(test)]
-    pub(super) accounted_bytes: usize,
 }
 
 impl PartManifest {
@@ -484,8 +482,6 @@ pub fn map(
     Ok(ManifestOutcome::Ready(PartManifest {
         parts: builder.parts,
         body: builder.body,
-        #[cfg(test)]
-        accounted_bytes: builder.budget.bytes,
     }))
 }
 struct Builder<'a> {
@@ -724,7 +720,3 @@ impl Builder<'_> {
 }
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-#[path = "mapping/body_selection_tests.rs"]
-mod body_selection_tests;

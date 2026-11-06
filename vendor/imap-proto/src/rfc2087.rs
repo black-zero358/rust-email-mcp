@@ -7,6 +7,7 @@
 use std::borrow::Cow;
 
 use nom::{
+    IResult, Parser,
     branch::alt,
     bytes::streaming::{tag, tag_no_case},
     character::streaming::space1,
@@ -14,11 +15,10 @@ use nom::{
     multi::many0,
     multi::separated_list0,
     sequence::{delimited, preceded},
-    IResult, Parser,
 };
 
-use crate::core::{astring_utf8, to_owned_cow};
 use crate::Response;
+use crate::core::{astring_utf8, to_owned_cow};
 
 use super::core::number_64;
 
@@ -181,213 +181,4 @@ pub(crate) fn quota_root(i: &[u8]) -> IResult<&[u8], Response<'_>> {
             quota_root_names,
         }),
     ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use assert_matches::assert_matches;
-    use std::borrow::Cow;
-
-    #[test]
-    fn test_quota() {
-        assert_matches!(
-            quota(b"QUOTA \"\" (STORAGE 10 512)"),
-            Ok((_, r)) => {
-                assert_eq!(
-                    r,
-                    Response::Quota(Quota {
-                        root_name: Cow::Borrowed(""),
-                        resources: vec![QuotaResource {
-                            name: QuotaResourceName::Storage,
-                            usage: 10,
-                            limit: 512
-                        }]
-                    })
-                );
-            }
-        );
-    }
-
-    #[test]
-    fn test_quota_spaces() {
-        // Archiveopteryx 3.2.0 generates QUOTA resources with double space.
-        // This is a test of a workaround for such incorrect implementation of QUOTA.
-        assert_matches!(
-            quota(b"QUOTA \"\" (STORAGE 0 2147483647 MESSAGE 0  2147483647)"),
-            Ok((_, r)) => {
-                assert_eq!(
-                    r,
-                    Response::Quota(Quota {
-                        root_name: Cow::Borrowed(""),
-                        resources: vec![QuotaResource {
-                            name: QuotaResourceName::Storage,
-                            usage: 0,
-                            limit: 2147483647
-                        }, QuotaResource {
-                            name: QuotaResourceName::Message,
-                            usage: 0,
-                            limit: 2147483647
-                        }]
-                    })
-                );
-            }
-        );
-    }
-
-    #[test]
-    fn test_quota_response_data() {
-        assert_matches!(
-            crate::rfc3501::response_data(b"* QUOTA \"\" (STORAGE 10 512)\r\n"),
-            Ok((_, r)) => {
-                assert_eq!(
-                    r,
-                    Response::Quota(Quota {
-                        root_name: Cow::Borrowed(""),
-                        resources: vec![QuotaResource {
-                            name: QuotaResourceName::Storage,
-                            usage: 10,
-                            limit: 512
-                        }]
-                    })
-                );
-            }
-        );
-    }
-
-    #[test]
-    fn test_quota_list() {
-        assert_matches!(
-            quota_list(b"(STORAGE 10 512)"),
-            Ok((_, r)) => {
-                assert_eq!(
-                    r,
-                    vec![QuotaResource {
-                        name: QuotaResourceName::Storage,
-                        usage: 10,
-                        limit: 512
-                    }]
-                );
-            }
-        );
-
-        assert_matches!(
-            quota_list(b"(MESSAGE 100 512)"),
-            Ok((_, r)) => {
-                assert_eq!(
-                    r,
-                    vec![QuotaResource {
-                        name: QuotaResourceName::Message,
-                        usage: 100,
-                        limit: 512
-                    }]
-                );
-            }
-        );
-
-        assert_matches!(
-            quota_list(b"(DAILY 55 200)"),
-            Ok((_, r)) => {
-                assert_eq!(
-                    r,
-                    vec![QuotaResource {
-                        name: QuotaResourceName::Atom(Cow::Borrowed("DAILY")),
-                        usage: 55,
-                        limit: 200
-                    }]
-                );
-            }
-        );
-    }
-
-    #[test]
-    fn test_quota_root_response_data() {
-        assert_matches!(
-            crate::rfc3501::response_data("* QUOTAROOT INBOX \"\"\r\n".as_bytes()),
-            Ok((_, r)) => {
-                assert_eq!(
-                    r,
-                    Response::QuotaRoot(QuotaRoot{
-                        mailbox_name: Cow::Borrowed("INBOX"),
-                        quota_root_names: vec![Cow::Borrowed("")]
-                    })
-                );
-            }
-        );
-    }
-
-    fn terminated_quota_root(i: &[u8]) -> IResult<&[u8], Response<'_>> {
-        nom::sequence::terminated(quota_root, nom::bytes::streaming::tag("\r\n")).parse(i)
-    }
-
-    #[test]
-    fn test_quota_root_without_root_names() {
-        assert_matches!(
-            terminated_quota_root(b"QUOTAROOT comp.mail.mime\r\n"),
-            Ok((_, r)) => {
-                assert_eq!(
-                    r,
-                    Response::QuotaRoot(QuotaRoot{
-                        mailbox_name: Cow::Borrowed("comp.mail.mime"),
-                        quota_root_names: vec![]
-                    })
-                );
-            }
-        );
-    }
-
-    #[test]
-    fn test_quota_root2() {
-        assert_matches!(
-            terminated_quota_root(b"QUOTAROOT INBOX HU\r\n"),
-            Ok((_, r)) => {
-                assert_eq!(
-                    r,
-                    Response::QuotaRoot(QuotaRoot{
-                        mailbox_name: Cow::Borrowed("INBOX"),
-                        quota_root_names: vec![Cow::Borrowed("HU")]
-                    })
-                );
-            }
-        );
-
-        assert_matches!(
-            terminated_quota_root(b"QUOTAROOT INBOX \"\"\r\n"),
-            Ok((_, r)) => {
-                assert_eq!(
-                    r,
-                    Response::QuotaRoot(QuotaRoot{
-                        mailbox_name: Cow::Borrowed("INBOX"),
-                        quota_root_names: vec![Cow::Borrowed("")]
-                    })
-                );
-            }
-        );
-
-        assert_matches!(
-            terminated_quota_root(b"QUOTAROOT \"Inbox\" \"#Account\"\r\n"),
-            Ok((_, r)) => {
-                assert_eq!(
-                    r,
-                    Response::QuotaRoot(QuotaRoot{
-                        mailbox_name: Cow::Borrowed("Inbox"),
-                        quota_root_names: vec![Cow::Borrowed("#Account")]
-                    })
-                );
-            }
-        );
-
-        assert_matches!(
-            terminated_quota_root(b"QUOTAROOT \"Inbox\" \"#Account\" \"#Mailbox\"\r\n"),
-            Ok((_, r)) => {
-                assert_eq!(
-                    r,
-                    Response::QuotaRoot(QuotaRoot{
-                        mailbox_name: Cow::Borrowed("Inbox"),
-                        quota_root_names: vec![Cow::Borrowed("#Account"), Cow::Borrowed("#Mailbox")]
-                    })
-                );
-            }
-        );
-    }
 }

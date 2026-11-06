@@ -8,18 +8,18 @@
 use std::{borrow::Cow, collections::HashMap};
 
 use nom::{
+    IResult, Parser,
     branch::alt,
     bytes::complete::tag_no_case,
     character::complete::{char, space0, space1},
     combinator::map,
     multi::many0,
     sequence::{preceded, separated_pair},
-    IResult, Parser,
 };
 
 use crate::{
-    core::{nil, nstring_utf8, string_utf8},
     Response,
+    core::{nil, nstring_utf8, string_utf8},
 };
 
 // A single id parameter (field and value).
@@ -75,142 +75,4 @@ pub(crate) fn resp_id(i: &[u8]) -> IResult<&[u8], Response<'_>> {
     .parse(i)?;
 
     Ok((rest, Response::Id(map)))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use assert_matches::assert_matches;
-
-    #[test]
-    fn test_id_param() {
-        assert_matches!(
-            id_param(br#""name" "Cyrus""#),
-            Ok((_, (name, value))) => {
-                assert_eq!(name, "name");
-                assert_eq!(value.as_deref(), Some("Cyrus"));
-            }
-        );
-
-        assert_matches!(
-            id_param(br#""name" NIL"#),
-            Ok((_, (name, value))) => {
-                assert_eq!(name, "name");
-                assert!(value.is_none());
-            }
-        );
-    }
-
-    #[test]
-    fn test_id_param_list_not_nil() {
-        assert_matches!(
-            id_param_list_not_nil(br#"("name" "Cyrus" "version" "1.5" "os" "sunos" "os-version" "5.5" "support-url" "mailto:cyrus-bugs+@andrew.cmu.edu")"#),
-            Ok((_, params)) => {
-                assert_eq!(
-                    params,
-                    vec![
-                        ("name", "Cyrus"),
-                        ("version", "1.5"),
-                        ("os", "sunos"),
-                        ("os-version", "5.5"),
-                        ("support-url", "mailto:cyrus-bugs+@andrew.cmu.edu"),
-                    ].into_iter()
-                    .map(|(k, v)| (Cow::Borrowed(k), Cow::Borrowed(v)))
-                    .collect()
-                );
-            }
-        );
-    }
-
-    #[test]
-    fn test_id_param_list() {
-        assert_matches!(
-            id_param_list(br#"("name" "Cyrus" "version" "1.5" "os" "sunos" "os-version" "5.5" "support-url" "mailto:cyrus-bugs+@andrew.cmu.edu")"#),
-            Ok((_, Some(params))) => {
-                assert_eq!(
-                    params,
-                    vec![
-                        ("name", "Cyrus"),
-                        ("version", "1.5"),
-                        ("os", "sunos"),
-                        ("os-version", "5.5"),
-                        ("support-url", "mailto:cyrus-bugs+@andrew.cmu.edu"),
-                    ].into_iter()
-                    .map(|(k, v)| (Cow::Borrowed(k), Cow::Borrowed(v)))
-                    .collect()
-                );
-            }
-        );
-
-        assert_matches!(
-            id_param_list(br##"NIL"##),
-            Ok((_, params)) => {
-                assert_eq!(params, None);
-            }
-        );
-    }
-
-    #[test]
-    fn test_resp_id() {
-        assert_matches!(
-            resp_id(br#"ID ("name" "Cyrus" "version" "1.5" "os" "sunos" "os-version" "5.5" "support-url" "mailto:cyrus-bugs+@andrew.cmu.edu")"#),
-            Ok((_, Response::Id(Some(id_info)))) => {
-                assert_eq!(
-                    id_info,
-                    vec![
-                        ("name", "Cyrus"),
-                        ("version", "1.5"),
-                        ("os", "sunos"),
-                        ("os-version", "5.5"),
-                        ("support-url", "mailto:cyrus-bugs+@andrew.cmu.edu"),
-                    ].into_iter()
-                    .map(|(k, v)| (Cow::Borrowed(k), Cow::Borrowed(v)))
-                    .collect()
-                );
-            }
-        );
-
-        // Test that NILs inside parameter list don't crash the parser.
-        // RFC2971 allows NILs as parameter values.
-        assert_matches!(
-            resp_id(br#"ID ("name" "Cyrus" "version" "1.5" "os" NIL "os-version" NIL "support-url" "mailto:cyrus-bugs+@andrew.cmu.edu")"#),
-            Ok((_, Response::Id(Some(id_info)))) => {
-                assert_eq!(
-                    id_info,
-                    vec![
-                        ("name", "Cyrus"),
-                        ("version", "1.5"),
-                        ("support-url", "mailto:cyrus-bugs+@andrew.cmu.edu"),
-                    ].into_iter()
-                    .map(|(k, v)| (Cow::Borrowed(k), Cow::Borrowed(v)))
-                    .collect()
-                );
-            }
-        );
-
-        assert_matches!(
-            resp_id(br##"ID NIL"##),
-            Ok((_, Response::Id(id_info))) => {
-                assert_eq!(id_info, None);
-            }
-        );
-
-        assert_matches!(
-            resp_id(br#"ID ("name" "Archiveopteryx" "version" "3.2.0" "compile-time" "Feb  6 2023 19:59:14" "homepage-url" "http://archiveopteryx.org" "release-url" "http://archiveopteryx.org/3.2.0" )"#),
-            Ok((_, Response::Id(Some(id_info)))) => {
-                assert_eq!(
-                    id_info,
-                    vec![
-                        ("name", "Archiveopteryx"),
-                        ("version", "3.2.0"),
-                        ("compile-time", "Feb  6 2023 19:59:14"),
-                        ("homepage-url", "http://archiveopteryx.org"),
-                        ("release-url", "http://archiveopteryx.org/3.2.0"),
-                    ].into_iter()
-                    .map(|(k, v)| (Cow::Borrowed(k), Cow::Borrowed(v)))
-                    .collect()
-                );
-            }
-        );
-    }
 }

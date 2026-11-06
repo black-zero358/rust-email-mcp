@@ -1,929 +1,522 @@
-//! Contract checks run the real HTTP MCP handler against an isolated TLS IMAP
-//! fixture, then validate returned structured content with the standard engine.
+//! A small TLS IMAP fixture for exercising the production HTTP entry points.
 use super::*;
 use crate::{
     accounts::AccountCatalog,
-    config::{self, ValidatedAccountSet},
+    auth::Auth,
+    config::{self, Config, ValidatedAccountConfig, ValidatedAccountSet},
     journal::Journal,
 };
-use axum::{Router, body::Body, http::Request, middleware};
-use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+use aws_lc_rs::{
+    encoding::{AsDer, Pkcs8V1Der},
+    rsa::{KeyPair, KeySize},
+    signature::KeyPair as _,
 };
-use std::{collections::BTreeMap, time::Duration};
+use axum::{
+    Router,
+    body::{Body, to_bytes},
+    http::{Request, StatusCode, header},
+};
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use std::{
+    path::Path,
+    sync::atomic::{AtomicUsize, Ordering},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
+    task::JoinHandle,
 };
 use tokio_rustls::{
     TlsAcceptor,
-    rustls::{
-        RootCertStore, ServerConfig,
-        pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer},
-    },
+    rustls::{RootCertStore, pki_types::PrivateKeyDer},
 };
+use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
-mod accounts;
-mod attachments;
-mod body_parts;
-mod cache;
-mod condstore_acceptance;
-mod conversation;
-mod listing;
-mod parts;
-mod qresync_acceptance;
-#[cfg(target_os = "linux")]
-mod r13_acceptance;
-mod structure;
-mod sync_acceptance;
+const PART_HEADER: &[u8] = b"Content-Type: application/octet-stream; name=part.bin\r\nContent-Disposition: attachment; filename=part.bin\r\nContent-Transfer-Encoding: base64\r\n\r\n";
+const TEXT_HEADER: &[u8] =
+    b"Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n";
+const ATTACHMENT: &[u8] = &[0, 10, 128, 255];
 
-fn validator(name: &str) -> jsonschema::Validator {
-    let tool = tools("full").into_iter().find(|t| t.name == name).unwrap();
-    let schema = serde_json::to_value(tool.output_schema.unwrap()).unwrap();
-    jsonschema::draft202012::options()
-        .should_validate_formats(true)
-        .build(&schema)
-        .unwrap()
-}
-fn assert_contract(name: &str, content: &Value) {
-    let validator = validator(name);
-    let errors = validator
-        .iter_errors(content)
-        .map(|error| format!("{}: {error}", error.instance_path()))
-        .collect::<Vec<_>>();
-    assert!(
-        errors.is_empty(),
-        "{name}: {}\n{content}",
-        errors.join("\n")
-    );
+struct Message {
+    text: String,
+    encoded: String,
+    header: Vec<u8>,
+    raw: Vec<u8>,
 }
 
-fn raw(uid: u32, body: &str) -> Vec<u8> {
-    format!("Message-ID: <id{uid}@example.test>\r\nReferences: <id7@example.test>\r\nSubject: 合成 \\\"\r\nFrom: sender@example.test\r\nTo: owner@example.test\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{body}").into_bytes()
-}
-fn multipart() -> Vec<u8> {
-    b"Message-ID: <id7@example.test>\r\nSubject: synthetic\r\nFrom: sender@example.test\r\nContent-Type: multipart/mixed; boundary=m\r\n\r\n--m\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nHello \"quoted\" \\ escaped\r\n--m\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=same.txt\r\nContent-Transfer-Encoding: base64\r\n\r\nYWJj\r\n--m\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=same.txt\r\n\r\nxyz\r\n--m--\r\n".to_vec()
-}
-fn header(raw: &[u8]) -> &[u8] {
-    raw.windows(4)
-        .position(|part| part == b"\r\n\r\n")
-        .map_or(raw, |i| &raw[..i + 4])
+impl Message {
+    fn new(text: &str) -> Self {
+        let header = b"Subject: Synthetic\r\nMessage-ID: <message@example.test>\r\nContent-Type: multipart/mixed; boundary=test\r\n\r\n".to_vec();
+        let encoded = STANDARD.encode(ATTACHMENT);
+        let mut raw = header.clone();
+        raw.extend_from_slice(b"--test\r\n");
+        raw.extend_from_slice(TEXT_HEADER);
+        raw.extend_from_slice(text.as_bytes());
+        raw.extend_from_slice(b"\r\n--test\r\n");
+        raw.extend_from_slice(PART_HEADER);
+        raw.extend_from_slice(encoded.as_bytes());
+        raw.extend_from_slice(b"\r\n--test--\r\n");
+        Self {
+            text: text.into(),
+            encoded,
+            header,
+            raw,
+        }
+    }
+
+    fn fetch(&self, attrs: &str) -> Vec<u8> {
+        if attrs == "(UID BODYSTRUCTURE)" {
+            return format!(
+                "* 1 FETCH (UID 7 BODYSTRUCTURE ((\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"8BIT\" {} 1 NIL NIL NIL NIL)(\"APPLICATION\" \"OCTET-STREAM\" (\"NAME\" \"part.bin\") NIL NIL \"BASE64\" {} NIL NIL NIL NIL) \"MIXED\" (\"BOUNDARY\" \"test\") NIL NIL))\r\n",
+                self.text.len(), self.encoded.len()
+            ).into_bytes();
+        }
+        let mut response = "* 1 FETCH (UID 7".to_owned();
+        if attrs.contains("FLAGS") {
+            response.push_str(" FLAGS ()");
+        }
+        if attrs.contains("RFC822.SIZE") {
+            response.push_str(&format!(" RFC822.SIZE {}", self.raw.len()));
+        }
+        if attrs.contains("INTERNALDATE") {
+            response.push_str(" INTERNALDATE \" 7-Feb-2025 09:00:00 +0000\"");
+        }
+        let mut response = response.into_bytes();
+        for selector in attrs.split("BODY.PEEK[").skip(1) {
+            let (section, tail) = selector.split_once(']').unwrap();
+            let bytes = match section {
+                "" => self.raw.as_slice(),
+                "HEADER" => self.header.as_slice(),
+                "1.MIME" => TEXT_HEADER,
+                "1" => self.text.as_bytes(),
+                "2.MIME" => PART_HEADER,
+                "2" => self.encoded.as_bytes(),
+                _ => panic!("unexpected FETCH section: {section}"),
+            };
+            let (origin, bytes) = if let Some((offset, count)) = tail
+                .strip_prefix('<')
+                .and_then(|range| range.split_once('>'))
+                .and_then(|(range, _)| range.split_once('.'))
+            {
+                let offset = offset.parse::<usize>().unwrap();
+                let count = count.parse::<usize>().unwrap();
+                let tail = bytes.get(offset..).unwrap_or_default();
+                (format!("<{offset}>"), &tail[..tail.len().min(count)])
+            } else {
+                (String::new(), bytes)
+            };
+            response.extend_from_slice(
+                format!(" BODY[{section}]{origin} {{{}}}\r\n", bytes.len()).as_bytes(),
+            );
+            response.extend_from_slice(bytes);
+        }
+        response.extend_from_slice(b")\r\n");
+        response
+    }
 }
 
-struct Harness {
-    app: Router,
-    service: Arc<MailRuntime>,
-    journal: Arc<Journal>,
-    roots: RootCertStore,
-    connections: Arc<std::sync::atomic::AtomicUsize>,
-    writes: Arc<std::sync::atomic::AtomicUsize>,
-    allow_writes: Arc<std::sync::atomic::AtomicBool>,
-    stall_greeting: Arc<std::sync::atomic::AtomicBool>,
-    active_connections: Arc<std::sync::atomic::AtomicUsize>,
-    reject_login: Arc<std::sync::atomic::AtomicBool>,
-    structure: Arc<structure::Protocol>,
-    parts: Arc<parts::Protocol>,
-    summary_flags: Arc<std::sync::Mutex<BTreeMap<u32, &'static str>>>,
-    summary_faults: Arc<std::sync::Mutex<BTreeMap<u32, listing::SummaryFault>>>,
-    stall_structure_uid: Arc<std::sync::atomic::AtomicU32>,
-    imap: tokio::task::JoinHandle<()>,
-    _staging: tempfile::TempDir,
+struct Backend {
+    port: u16,
+    connections: Arc<AtomicUsize>,
+    task: JoinHandle<()>,
 }
-struct ActiveConnection(Arc<std::sync::atomic::AtomicUsize>);
-impl Drop for ActiveConnection {
+
+impl Drop for Backend {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.task.abort();
     }
 }
-impl Drop for Harness {
-    fn drop(&mut self) {
-        self.imap.abort();
-    }
-}
-impl Harness {
-    async fn new(
-        messages: BTreeMap<u32, Vec<u8>>,
-        fatal_uid: Option<u32>,
-        max_output: usize,
-    ) -> Self {
-        Self::configured(messages, fatal_uid, max_output, false).await
-    }
-    async fn configured(
-        messages: BTreeMap<u32, Vec<u8>>,
-        fatal_uid: Option<u32>,
-        max_output: usize,
-        stall_greeting: bool,
-    ) -> Self {
-        Self::with_resource(messages, fatal_uid, max_output, stall_greeting, None).await
-    }
-    async fn with_resource(
-        messages: BTreeMap<u32, Vec<u8>>,
-        fatal_uid: Option<u32>,
-        max_output: usize,
-        stall_greeting: bool,
-        resource: Option<String>,
-    ) -> Self {
-        Self::with_limits(
-            messages,
-            fatal_uid,
-            max_output,
-            stall_greeting,
-            resource,
-            None,
-        )
-        .await
-    }
-    async fn with_limits(
-        messages: BTreeMap<u32, Vec<u8>>,
-        fatal_uid: Option<u32>,
-        max_output: usize,
-        stall_greeting: bool,
-        resource: Option<String>,
-        max_message: Option<usize>,
-    ) -> Self {
-        let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-        let cert = certified.cert.der().clone();
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-            certified.signing_key.serialize_der(),
-        ));
-        let tls = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert.clone()], key)
-            .unwrap();
-        let mut roots = RootCertStore::empty();
-        roots.add(cert).unwrap();
+
+impl Backend {
+    async fn start(tls: TlsAcceptor, text: &str) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut configuration = (*config::fixture()).clone();
-        let staging = tempfile::tempdir().unwrap();
-        configuration.attachment_staging_dir = Some(staging.path().join("mail-downloads"));
-        configuration.imap_host = "localhost".into();
-        configuration.imap_port = listener.local_addr().unwrap().port();
-        configuration.max_output = max_output;
-        if let Some(max_message) = max_message {
-            configuration.max_message = max_message;
-        }
-        if let Some(resource) = resource {
-            configuration.resource = resource;
-        }
-        configuration.timeout = if stall_greeting {
-            Duration::from_millis(100)
-        } else {
-            Duration::from_secs(5)
-        };
-        let configuration = Arc::new(configuration);
-        let journal = Arc::new(Journal::open(std::path::Path::new(":memory:")).unwrap());
-        let catalog =
-            AccountCatalog::from_test_accounts(ValidatedAccountSet::legacy(configuration)).unwrap();
-        let service = Arc::new(
-            MailRuntime::new(catalog, journal.clone())
-                .unwrap()
-                .with_test_imap_roots(roots.clone()),
-        );
-        let messages = Arc::new(messages);
-        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = connections.clone();
-        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let allow_writes = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let write_count = writes.clone();
-        let write_permission = allow_writes.clone();
-        let stall_greeting = Arc::new(std::sync::atomic::AtomicBool::new(stall_greeting));
-        let stall = stall_greeting.clone();
-        let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let active = active_connections.clone();
-        let reject_login = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let login_rejected = reject_login.clone();
-        let structure = Arc::new(structure::Protocol::default());
-        let structure_protocol = structure.clone();
-        let parts = Arc::new(parts::Protocol::default());
-        let parts_protocol = parts.clone();
-        let summary_flags = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
-        let flags = summary_flags.clone();
-        let summary_faults = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
-        let summary_protocol = summary_faults.clone();
-        let stall_structure_uid = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let stall_structure = stall_structure_uid.clone();
-        let imap = tokio::spawn(async move {
-            let acceptor = TlsAcceptor::from(Arc::new(tls));
-            loop {
-                let (stream, _) = listener.accept().await.unwrap();
-                let connection = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                let acceptor = acceptor.clone();
-                let messages = messages.clone();
-                let write_count = write_count.clone();
-                let write_permission = write_permission.clone();
-                let stall = stall.clone();
-                let active = active.clone();
-                let login_rejected = login_rejected.clone();
-                let structure_protocol = structure_protocol.clone();
-                let parts_protocol = parts_protocol.clone();
-                let flags = flags.clone();
-                let summary_protocol = summary_protocol.clone();
-                let stall_structure = stall_structure.clone();
+        let port = listener.local_addr().unwrap().port();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let count = connections.clone();
+        let message = Arc::new(Message::new(text));
+        let task = tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::SeqCst);
+                let tls = tls.clone();
+                let message = message.clone();
                 tokio::spawn(async move {
-                    let Ok(stream) = acceptor.accept(stream).await else {
+                    let Ok(stream) = tls.accept(socket).await else {
                         return;
                     };
-                    active.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let _active = ActiveConnection(active);
                     let mut stream = BufReader::new(stream);
-                    if stall.load(std::sync::atomic::Ordering::SeqCst) {
-                        // Diagnose waits for the server greeting until its
-                        // deadline closes this isolated connection.
-                        let _ = stream.read_u8().await;
-                        return;
-                    }
-                    if stream
-                        .write_all(b"* OK isolated fixture\r\n")
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
+                    stream.write_all(b"* OK fixture\r\n").await.unwrap();
                     loop {
                         let mut line = String::new();
                         if stream.read_line(&mut line).await.unwrap_or(0) == 0 {
-                            break;
+                            return;
                         }
-                        let Some((tag, command)) = line.trim_end_matches("\r\n").split_once(' ')
-                        else {
-                            panic!("invalid fixture command");
+                        let (tag, command) = line.trim_end().split_once(' ').unwrap();
+                        let mut reply = match command {
+                            "CAPABILITY" => b"* CAPABILITY IMAP4rev1\r\n".to_vec(),
+                            "EXAMINE INBOX" | "EXAMINE \"INBOX\"" => b"* 1 EXISTS\r\n* OK [UIDVALIDITY 9] valid\r\n* OK [UIDNEXT 8] next\r\n".to_vec(),
+                            command if command.starts_with("LOGIN ") => Vec::new(),
+                            command if command.starts_with("LIST ") => b"* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n".to_vec(),
+                            command if command.starts_with("UID SEARCH ") => b"* SEARCH 7\r\n".to_vec(),
+                            command if command.starts_with("UID FETCH ") => {
+                                let (uids, attrs) = command.strip_prefix("UID FETCH ").unwrap().split_once(' ').unwrap();
+                                if uids.split(',').any(|uid| uid == "7") {
+                                    message.fetch(attrs)
+                                } else {
+                                    Vec::new()
+                                }
+                            }
+                            _ => panic!("unexpected IMAP command: {command}"),
                         };
-                        let mut response = Vec::new();
-                        structure_protocol.record(connection, command);
-                        if command.starts_with("LOGIN ") {
-                            if login_rejected.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                                let _ = stream
-                                    .write_all(
-                                        format!("{tag} NO synthetic login refused\r\n").as_bytes(),
-                                    )
-                                    .await;
-                                return;
-                            }
-                        } else if command.starts_with("EXAMINE ") || command.starts_with("SELECT ")
+                        reply.extend_from_slice(format!("{tag} OK complete\r\n").as_bytes());
+                        if stream.write_all(&reply).await.is_err() || stream.flush().await.is_err()
                         {
-                            if command.starts_with("SELECT ") {
-                                assert!(
-                                    write_permission.load(std::sync::atomic::Ordering::SeqCst),
-                                    "read issued SELECT"
-                                );
-                                write_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            }
-                            let next = messages.keys().next_back().copied().unwrap_or(0) + 1;
-                            let validity = structure_protocol.validity(connection);
-                            response.extend_from_slice(format!("* {} EXISTS\r\n* OK [UIDVALIDITY {validity}] stable\r\n* OK [UIDNEXT {next}] next\r\n",messages.len()).as_bytes());
-                        } else if command.starts_with("LIST ") {
-                            response.extend_from_slice(b"* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n* LIST (\\NoSelect) NIL \"Group\"\r\n* LIST (\\Sent) \"/\" \"Sent\"\r\n");
-                        } else if command.starts_with("STATUS ") {
-                            let next = messages.keys().next_back().copied().unwrap_or(0) + 1;
-                            response.extend_from_slice(format!("* STATUS INBOX (MESSAGES {} UNSEEN 0 RECENT 0 UIDNEXT {next} UIDVALIDITY 9)\r\n",messages.len()).as_bytes());
-                        } else if command == "CAPABILITY" {
-                            response.extend_from_slice(b"* CAPABILITY IMAP4rev1 UIDPLUS MOVE\r\n");
-                        } else if command.starts_with("UID SEARCH ") {
-                            if let Some(size) = command
-                                .strip_suffix('}')
-                                .and_then(|s| s.rsplit_once('{'))
-                                .and_then(|(_, n)| n.parse::<usize>().ok())
-                            {
-                                stream.write_all(b"+ literal\r\n").await.unwrap();
-                                let mut literal = vec![0; size + 2];
-                                stream.read_exact(&mut literal).await.unwrap();
-                            }
-                            let range = command
-                                .split_whitespace()
-                                .skip_while(|s| *s != "UID")
-                                .nth(1)
-                                .unwrap_or("");
-                            // The first UID belongs to UID SEARCH; obtain the
-                            // final numerical range independently of text filters.
-                            let range = command
-                                .split_whitespace()
-                                .find(|s| {
-                                    s.contains(':')
-                                        && s.bytes().all(|b| b.is_ascii_digit() || b == b':')
-                                })
-                                .unwrap_or(range);
-                            let (start, end) = range
-                                .split_once(':')
-                                .and_then(|(a, b)| {
-                                    Some((a.parse::<u32>().ok()?, b.parse::<u32>().ok()?))
-                                })
-                                .unwrap_or((1, u32::MAX));
-                            let ids = messages
-                                .keys()
-                                .filter(|uid| **uid >= start && **uid <= end)
-                                .map(u32::to_string)
-                                .collect::<Vec<_>>()
-                                .join(" ");
-                            response.extend_from_slice(format!("* SEARCH {ids}\r\n").as_bytes());
-                        } else if command.starts_with("UID STORE ") {
-                            assert!(
-                                write_permission.load(std::sync::atomic::Ordering::SeqCst),
-                                "read issued UID STORE"
-                            );
-                            write_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            response.extend_from_slice(b"* 1 FETCH (UID 7 FLAGS ())\r\n");
-                        } else if let Some(fetch) = command.strip_prefix("UID FETCH ") {
-                            let stalled = stall_structure.load(std::sync::atomic::Ordering::SeqCst);
-                            if stalled != 0 && fetch == format!("{stalled} (UID BODYSTRUCTURE)") {
-                                let _ = stream.read_u8().await;
-                                return;
-                            }
-                            let summary = fetch.contains("(UID FLAGS RFC822.SIZE ");
-                            let reply = if summary {
-                                None
-                            } else {
-                                parts_protocol
-                                    .fetch(fetch)
-                                    .or_else(|| structure_protocol.fetch(fetch, &messages))
-                            };
-                            if let Some(reply) = reply {
-                                match reply {
-                                    structure::Reply::Data(data) => {
-                                        response.extend_from_slice(&data)
-                                    }
-                                    structure::Reply::No => {
-                                        let _ = stream
-                                            .write_all(
-                                                format!("{tag} NO synthetic structure refusal\r\n")
-                                                    .as_bytes(),
-                                            )
-                                            .await;
-                                        continue;
-                                    }
-                                    structure::Reply::Bad => {
-                                        let _ = stream
-                                            .write_all(
-                                                format!(
-                                                    "{tag} BAD synthetic structure refusal\r\n"
-                                                )
-                                                .as_bytes(),
-                                            )
-                                            .await;
-                                        continue;
-                                    }
-                                    structure::Reply::Eof => return,
-                                    structure::Reply::WrongTag => {
-                                        let _ = stream
-                                            .write_all(b"wrong-tag OK synthetic completion\r\n")
-                                            .await;
-                                        return;
-                                    }
-                                }
-                                if let Some(completion) = parts_protocol.completion(fetch, tag) {
-                                    response.extend_from_slice(&completion);
-                                    let _ = stream.write_all(&response).await;
-                                    return;
-                                }
-                            } else {
-                                let (set, attrs) = fetch.split_once(' ').unwrap();
-                                for uid in set.split(',').map(|id| id.parse::<u32>().unwrap()) {
-                                    let Some(raw) = messages.get(&uid) else {
-                                        continue;
-                                    };
-                                    if fatal_uid == Some(uid) && attrs.contains("BODY.PEEK[]") {
-                                        stream
-                                            .write_all(
-                                                format!("{tag} NO synthetic failure\r\n")
-                                                    .as_bytes(),
-                                            )
-                                            .await
-                                            .unwrap();
-                                        return;
-                                    }
-                                    if attrs == "(UID FLAGS)" {
-                                        response.extend_from_slice(
-                                            format!("* 1 FETCH (UID {uid} FLAGS ())\r\n")
-                                                .as_bytes(),
-                                        );
-                                    } else if attrs == "(UID RFC822.SIZE)" {
-                                        response.extend_from_slice(
-                                            format!(
-                                                "* 1 FETCH (UID {uid} RFC822.SIZE {})\r\n",
-                                                raw.len()
-                                            )
-                                            .as_bytes(),
-                                        );
-                                    } else {
-                                        let is_header = attrs.contains("HEADER");
-                                        let bytes = if is_header { header(raw) } else { raw };
-                                        let section = if is_header { "HEADER" } else { "" };
-                                        let count = attrs
-                                            .rsplit_once("]<0.")
-                                            .and_then(|(_, range)| range.split_once('>'))
-                                            .and_then(|(count, _)| count.parse::<usize>().ok());
-                                        let origin = if count.is_some() { "<0>" } else { "" };
-                                        let bytes =
-                                            &bytes[..count.unwrap_or(bytes.len()).min(bytes.len())];
-                                        if summary {
-                                            let flags = flags
-                                                .lock()
-                                                .unwrap()
-                                                .get(&uid)
-                                                .copied()
-                                                .unwrap_or("");
-                                            listing::summary_response(
-                                                &mut response,
-                                                uid,
-                                                raw.len(),
-                                                bytes,
-                                                count.unwrap(),
-                                                flags,
-                                                summary_protocol.lock().unwrap().get(&uid).copied(),
-                                            );
-                                            continue;
-                                        }
-                                        response.extend_from_slice(format!("* 1 FETCH (UID {uid} RFC822.SIZE {} BODY[{section}]{origin} {{{}}}\r\n",raw.len(),bytes.len()).as_bytes());
-                                        response.extend_from_slice(bytes);
-                                        response.extend_from_slice(b")\r\n");
-                                    }
-                                }
-                            }
-                        } else {
-                            panic!("unexpected or writable fixture command: {command}");
-                        }
-                        response.extend_from_slice(format!("{tag} OK complete\r\n").as_bytes());
-                        if stream.write_all(&response).await.is_err() {
-                            break;
+                            return;
                         }
                     }
                 });
             }
         });
-        let mail = service.clone();
-        let transport = StreamableHttpService::new(
-            move || Ok(EmailServer(mail.clone())),
-            Arc::new(LocalSessionManager::default()),
-            StreamableHttpServerConfig::default()
-                .with_legacy_session_mode(false)
-                .with_json_response(true),
+        Self {
+            port,
+            connections,
+            task,
+        }
+    }
+}
+
+struct Credentials {
+    auth: Arc<Auth>,
+    signing: EncodingKey,
+    header: Header,
+    config: Arc<Config>,
+}
+
+impl Credentials {
+    fn new(config: Arc<Config>) -> Self {
+        let key = KeyPair::generate(KeySize::Rsa2048).unwrap();
+        let public = key.public_key();
+        let jwks = serde_json::from_value(json!({"keys":[{"kty":"RSA","kid":"fixture","alg":"RS256","use":"sig","n":URL_SAFE_NO_PAD.encode(public.modulus().big_endian_without_leading_zero()),"e":URL_SAFE_NO_PAD.encode(public.exponent().big_endian_without_leading_zero())}]})).unwrap();
+        let der = AsDer::<Pkcs8V1Der>::as_der(&key).unwrap();
+        let pem = format!(
+            "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+            STANDARD.encode(der.as_ref())
         );
-        let app = Router::new()
-            .nest_service("/mcp", transport)
-            .layer(middleware::from_fn(
-                |mut request: axum::extract::Request, next: middleware::Next| async move {
-                    request.extensions_mut().insert(Principal("owner".into()));
-                    request
-                        .extensions_mut()
-                        .insert(HttpRequestId("synthetic-request".into()));
-                    next.run(request).await
-                },
-            ));
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("fixture".into());
+        Self {
+            auth: Auth::from_test_jwks(config.clone(), jwks),
+            signing: EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap(),
+            header,
+            config,
+        }
+    }
+
+    fn token(&self, subject: &str) -> String {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        encode(
+            &self.header,
+            &json!({"sub":subject,"iss":self.config.issuer,"aud":self.config.audience,"exp":now+300,"nbf":now-1,"scope":self.config.scope,"typ":"Bearer"}),
+            &self.signing,
+        ).unwrap()
+    }
+}
+
+struct Harness {
+    app: Router,
+    credentials: Credentials,
+    backends: [Backend; 2],
+    cache: crate::mail::PreparedCache,
+    _staging: tempfile::TempDir,
+}
+
+impl Harness {
+    async fn new(metadata_cache: bool) -> Self {
+        let signed = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert = signed.cert.der().clone();
+        let tls = tokio_rustls::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.clone()],
+                PrivateKeyDer::Pkcs8(signed.signing_key.serialize_der().into()),
+            )
+            .unwrap();
+        let tls = TlsAcceptor::from(Arc::new(tls));
+        let mut roots = RootCertStore::empty();
+        roots.add(cert).unwrap();
+        let backends = [
+            Backend::start(tls.clone(), "第一个邮箱").await,
+            Backend::start(tls, "Second mailbox").await,
+        ];
+        let staging = tempfile::tempdir().unwrap();
+        let mut config = (*config::fixture()).clone();
+        config.imap_host = "localhost".into();
+        config.imap_port = backends[0].port;
+        config.subjects = vec!["owner".into(), "billing".into()];
+        config.attachment_staging_dir = Some(staging.path().join("downloads"));
+        let config = Arc::new(config);
+        let mut secondary = (*config).clone();
+        secondary.imap_port = backends[1].port;
+        secondary.address = "billing@example.test".into();
+        secondary.mode = "read".into();
+        let mut settings = ValidatedAccountSet::legacy(config.clone());
+        settings.source = config::AccountConfigSource::ExtendLegacy;
+        settings.accounts[0].read_subjects = vec!["owner".into()];
+        settings.accounts[0].write_subjects = vec!["owner".into()];
+        settings.accounts.push(ValidatedAccountConfig {
+            registration_key: "billing-registration".into(),
+            alias: "billing".into(),
+            display_name: "Billing".into(),
+            config: Arc::new(secondary),
+            read_subjects: vec!["billing".into()],
+            write_subjects: vec![],
+            is_legacy: false,
+        });
+        let catalog = AccountCatalog::from_test_accounts(settings.clone()).unwrap();
+        let cache_settings = metadata_cache.then(|| {
+            let path = staging.path().join("cache.json");
+            std::fs::write(&path, br#"{"version":1,"mode":"metadata","directory":"metadata","max_bytes":33554432,"accounts":[{"account_id":"default","mailboxes":["INBOX"],"max_bytes":8388608}]}"#).unwrap();
+            config::load_cache_file(&path, &settings).unwrap().unwrap()
+        });
+        let cache = MailRuntime::prepare_cache(&catalog, cache_settings).unwrap();
+        let journal = Arc::new(Journal::open(Path::new(":memory:")).unwrap());
+        let mail = Arc::new(
+            MailRuntime::with_cache(catalog, journal, cache.clone())
+                .unwrap()
+                .with_test_imap_roots(roots),
+        );
+        let credentials = Credentials::new(config.clone());
+        let app = http_router(
+            &config,
+            mail,
+            credentials.auth.clone(),
+            CancellationToken::new(),
+        )
+        .unwrap();
         Self {
             app,
-            service,
-            journal,
-            roots,
-            connections,
-            writes,
-            allow_writes,
-            stall_greeting,
-            active_connections,
-            reject_login,
-            structure,
-            parts,
-            summary_flags,
-            summary_faults,
-            stall_structure_uid,
-            imap,
+            credentials,
+            backends,
+            cache,
             _staging: staging,
         }
     }
-    async fn call(&self, name: &str, args: Value) -> Value {
-        self.call_id(name, args, json!(1)).await
-    }
-    async fn call_id(&self, name: &str, args: Value, id: Value) -> Value {
-        let response = self.app.clone().oneshot(Request::post("/mcp")
-            .header("Host","localhost")
-            .header("Content-Type","application/json").header("Accept","application/json, text/event-stream")
-            .header("MCP-Protocol-Version","2025-06-18")
-            .body(Body::from(json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":args}}).to_string())).unwrap()).await.unwrap();
-        let status = response.status();
-        let bytes = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
-            .await
-            .unwrap();
-        assert!(
-            status.is_success(),
-            "HTTP {status}: {}",
-            String::from_utf8_lossy(&bytes)
-        );
-        let wire: Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(wire.get("error").is_none(), "{wire}");
-        assert_eq!(wire["id"], id);
-        let content = wire["result"]["structuredContent"].clone();
-        assert_contract(name, &content);
-        let text: Value =
-            serde_json::from_str(wire["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(content, text);
-        assert!(
-            bytes.len() <= self.service.config().max_output,
-            "actual HTTP JSON exceeds complete response budget"
-        );
-        content
-    }
-}
 
-#[tokio::test]
-async fn attachment_download_url_is_a_uri_for_unicode_resource_configuration() {
-    let h = Harness::with_resource(
-        BTreeMap::from([(7, multipart())]),
-        None,
-        64 * 1024,
-        false,
-        Some("https://邮件.example/入口/mcp/".into()),
-    )
-    .await;
-    let result = h
-        .call(
-            "prepare_attachment_download",
-            json!({"uid":7,"uid_validity":9,"attachment_index":1}),
-        )
-        .await;
-    let url = result["data"]["download_url"].as_str().unwrap();
-    assert!(url.is_ascii());
-    let parsed = reqwest::Url::parse(url).unwrap();
-    assert!(parsed.host_str().unwrap().starts_with("xn--"));
-    assert!(
-        parsed
-            .path()
-            .starts_with("/%E5%85%A5%E5%8F%A3/mcp/attachments/")
-    );
-}
+    fn connections(&self) -> [usize; 2] {
+        self.backends
+            .each_ref()
+            .map(|backend| backend.connections.load(Ordering::SeqCst))
+    }
 
-#[tokio::test]
-async fn every_read_output_schema_validates_real_handler_success_and_empty_results() {
-    let h = Harness::new(BTreeMap::from([(7, multipart())]), None, 64 * 1024).await;
-    for (name, args) in [
-        ("list_accounts", json!({})),
-        ("list_mailboxes", json!({})),
-        ("list_emails", json!({})),
-        ("search_emails", json!({"subject":"中文"})),
-        ("get_email", json!({"uid":7,"uid_validity":9})),
-        ("get_email_status", json!({"uid":7,"uid_validity":9})),
-        ("get_emails", json!({"uids":[7],"uid_validity":9})),
-        (
-            "download_attachment",
-            json!({"uid":7,"uid_validity":9,"attachment_index":1}),
-        ),
-        ("list_attachments", json!({"uid":7,"uid_validity":9})),
-        (
-            "prepare_attachment_download",
-            json!({"uid":7,"uid_validity":9,"attachment_index":2}),
-        ),
-        ("get_operation", json!({"operation_key":"missing"})),
-        ("read_conversation", json!({"uid":7,"uid_validity":9})),
-        (
-            "locate_message",
-            json!({"message_id":"<id7@example.test>","mailboxes":["INBOX"]}),
-        ),
-        (
-            "get_mailbox_statistics",
-            json!({"date_start":"2024-02-28","date_end":"2024-03-01"}),
-        ),
-        ("diagnose_connectivity", json!({})),
-    ] {
-        let content = h.call(name, args).await;
-        assert!(content.get("data").is_some(), "{name}: {content}");
-    }
-    let empty = Harness::new(BTreeMap::new(), None, 64 * 1024).await;
-    for name in ["list_emails", "search_emails", "get_mailbox_statistics"] {
-        let content = empty.call(name, json!({})).await;
-        assert!(content.get("data").is_some());
-    }
-    let accounts = h.call("list_accounts", json!({})).await;
-    assert_eq!(
-        accounts["data"]["accounts"][0]["capabilities"]["cross_mailbox_conversation"],
-        true
-    );
-    assert_eq!(
-        accounts["data"]["accounts"][0]["limits"]["text_utf8_bytes"],
-        2048
-    );
-    let folders = h.call("list_mailboxes", json!({})).await;
-    assert_eq!(folders["data"]["mailboxes"][0]["role_source"], "protocol");
-    assert_eq!(folders["data"]["mailboxes"][1]["selectable"], false);
-    assert!(folders["data"]["mailboxes"][1]["delimiter"].is_null());
-    assert_eq!(
-        folders["data"]["mailboxes"][2]["special_use"],
-        json!(["sent"])
-    );
-    let page = h.call("search_emails", json!({"before_uid":1001})).await;
-    assert_eq!(page["data"]["emails"], json!([]));
-    assert_eq!(page["data"]["next_before_uid"], 501);
-    let locate = h
-        .call(
-            "locate_message",
-            json!({"message_id":"<missing@example.test>","mailboxes":["INBOX"]}),
-        )
-        .await;
-    assert_eq!(locate["data"]["matches"], json!([]));
-    assert_eq!(locate["data"]["complete"], false);
-    assert_eq!(
-        h.call("diagnose_connectivity", json!({})).await["data"]["ok"],
-        true
-    );
-    assert!(
-        h.call("get_operation", json!({"operation_key":"missing"}))
-            .await["data"]["operation"]
-            .is_null()
-    );
-    for status in ["sending", "accepted", "rejected", "unknown"] {
-        h.journal
-            .claim("owner", status, "hash", "<legacy@example.test>")
-            .unwrap();
-        if status != "sending" {
-            h.journal
-                .finish("owner", status, status, &["legacy-warning".into()])
-                .unwrap();
+    async fn rpc(
+        &self,
+        subject: Option<&str>,
+        id: Value,
+        method: &str,
+        params: Value,
+    ) -> axum::response::Response {
+        let mut request = Request::post("/mcp")
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", "2025-06-18");
+        if let Some(subject) = subject {
+            request = request.header(
+                header::AUTHORIZATION,
+                format!("Bearer {}", self.credentials.token(subject)),
+            );
         }
-        let content = h
-            .call("get_operation", json!({"operation_key":status}))
-            .await;
-        assert_eq!(content["data"]["operation"]["status"], status);
-    }
-}
-
-#[tokio::test]
-async fn handler_html_display_metadata_and_single_message_errors_match_contracts() {
-    let html = b"Message-ID: <id7@example.test>\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p><a href='https://example.test/'>good</a><a href='javascript:bad'>bad</a><img src='https://tracking.test/' alt='picture'></p>".to_vec();
-    let h = Harness::new(BTreeMap::from([(7, html)]), None, 64 * 1024).await;
-    for (name, args, path) in [
-        (
-            "get_email",
-            json!({"uid":7,"uid_validity":9,"html_display":"readable"}),
-            "/data",
-        ),
-        (
-            "get_emails",
-            json!({"uids":[7],"uid_validity":9,"html_display":"readable"}),
-            "/data/items/0/email",
-        ),
-        (
-            "read_conversation",
-            json!({"uid":7,"uid_validity":9,"html_display":"readable"}),
-            "/data/messages/0",
-        ),
-    ] {
-        let content = h.call(name, args).await;
-        let message = content.pointer(path).unwrap();
-        assert_eq!(
-            message["html_display_metadata"]["format_version"],
-            "readable-v1"
-        );
-        assert_eq!(message["html_display_metadata"]["html_parts"], 1);
-        assert_eq!(message["html_display_metadata"]["omitted"], true);
-        assert!(
-            message["body"]
-                .as_str()
-                .unwrap()
-                .contains("https://example.test/")
-        );
-        assert!(!message["body"].as_str().unwrap().contains("tracking.test"));
-    }
-    let no_attachments = h
-        .call("list_attachments", json!({"uid":7,"uid_validity":9}))
-        .await;
-    assert_eq!(no_attachments["data"]["attachments"], json!([]));
-    assert!(no_attachments["data"]["next_attachment_offset"].is_null());
-    assert_eq!(
-        h.call("get_email", json!({"uid":7,"uid_validity":8})).await["error"]["code"],
-        "STALE_UID"
-    );
-    assert_eq!(
-        h.call("get_email_status", json!({"uid":99,"uid_validity":9}))
-            .await["error"]["code"],
-        "NOT_FOUND"
-    );
-    let huge = raw(7, &"body".repeat(100));
-    let mut subject = b"Subject: ".to_vec();
-    subject.extend_from_slice(&vec![b'x'; 40000]);
-    subject.extend_from_slice(b"\r\n");
-    subject.extend_from_slice(&huge);
-    let small = Harness::new(BTreeMap::from([(7, subject)]), None, 8192).await;
-    let fallback = small
-        .call("get_email", json!({"uid":7,"uid_validity":9}))
-        .await;
-    assert_eq!(
-        fallback["error"]["details"]["limit_kind"],
-        "wire_response_bytes"
-    );
-}
-
-#[tokio::test]
-async fn handler_contracts_cover_item_errors_unprocessed_and_conversation_omissions() {
-    let bad = b"Message-ID: <id8@example.test>\r\nReferences: <id7@example.test>\r\nContent-Type: text/plain\r\nContent-Transfer-Encoding: unsupported\r\n\r\nbody".to_vec();
-    let data = BTreeMap::from([
-        (7, raw(7, "text")),
-        (8, bad),
-        (9, raw(9, "later")),
-        (10, raw(10, "unprocessed")),
-    ]);
-    let h = Harness::new(data.clone(), Some(9), 64 * 1024).await;
-    let result = h
-        .call("get_emails", json!({"uids":[7,8,9,10],"uid_validity":9}))
-        .await;
-    assert_eq!(result["data"]["items"][0]["ok"], true);
-    assert_eq!(
-        result["data"]["items"][1]["error"]["code"],
-        "UNSUPPORTED_BODY"
-    );
-    assert_eq!(result["data"]["items"][2]["error"]["code"], "MAIL_BACKEND");
-    assert_eq!(result["data"]["items"][3]["status"], "unprocessed");
-    let h = Harness::new(data, None, 64 * 1024).await;
-    let result = h
-        .call(
-            "read_conversation",
-            json!({"uid":7,"uid_validity":9,"limit":2}),
-        )
-        .await;
-    assert!(
-        !result["data"]["message_errors"]
-            .as_array()
+        let body = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
+        self.app
+            .clone()
+            .oneshot(request.body(Body::from(body.to_string())).unwrap())
+            .await
             .unwrap()
-            .is_empty()
-    );
-    assert_eq!(result["data"]["complete"], false);
-    assert!(
-        !result["data"]["omitted_uids"]
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
-    let mut seed = b"Subject: ".to_vec();
-    seed.extend_from_slice(&vec![b's'; 2048]);
-    seed.extend_from_slice(b"\r\n");
-    seed.extend_from_slice(&raw(7, "seed"));
-    let mut too_large_header = b"Subject: ".to_vec();
-    too_large_header.extend_from_slice(&vec![b'h'; 128 * 1024]);
-    too_large_header.extend_from_slice(b"\r\n");
-    too_large_header.extend_from_slice(&raw(8, "candidate"));
-    let h = Harness::new(
-        BTreeMap::from([(7, seed), (8, too_large_header)]),
-        None,
-        64 * 1024,
-    )
-    .await;
-    let result = h
-        .call("read_conversation", json!({"uid":7,"uid_validity":9}))
-        .await;
-    assert_eq!(
-        result["data"]["skipped_candidates"][0]["error"]["details"]["limit_kind"],
-        "header_bytes"
-    );
-    assert_eq!(
-        result["data"]["messages"][0]["metadata_fields_omitted"],
-        json!(["subject"])
-    );
-    assert!(result["data"]["messages"][0]["subject"].is_null());
-    assert_eq!(result["data"]["complete"], false);
-}
+    }
 
-#[tokio::test]
-async fn handler_contracts_cover_errors_details_downgrade_and_status_preserving_fallback() {
-    let h = Harness::new(
-        BTreeMap::from([(7, raw(7, &"中😀\"\\\n".repeat(16000)))]),
-        None,
-        8192,
-    )
-    .await;
-    let id = json!("\\\"中".repeat(60));
-    let result = h
-        .call_id("get_email", json!({"uid":7,"uid_validity":9}), id.clone())
-        .await;
-    assert_eq!(result["data"]["body_truncated"], true);
-    assert!(!result["data"]["body"].as_str().unwrap().is_empty());
-    for tool in tools("read") {
-        let result = h
-            .call_id(
-                &tool.name,
-                json!({"private-unknown-key":"private-value"}),
+    async fn call(&self, subject: &str, name: &str, arguments: Value) -> Value {
+        let id = json!("逃逸 \"\\");
+        let response = self
+            .rpc(
+                Some(subject),
                 id.clone(),
+                "tools/call",
+                json!({"name":name,"arguments":arguments}),
             )
             .await;
-        assert_eq!(result["error"]["code"], "INVALID_INPUT");
-        assert!(result["error"].get("details").is_some());
-        assert!(!result.to_string().contains("private-unknown-key"));
-        assert!(!result.to_string().contains("private-value"));
+        assert_eq!(response.status(), StatusCode::OK);
+        let request_id = response.headers()["x-request-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let bytes = to_bytes(response.into_body(), self.credentials.config.max_output)
+            .await
+            .unwrap();
+        let wire: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(wire["id"], id);
+        let result = &wire["result"];
+        let content = &result["structuredContent"];
+        assert_eq!(content["request_id"], request_id);
+        assert_eq!(
+            serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap()).unwrap(),
+            *content
+        );
+        let tool = tools("full")
+            .into_iter()
+            .find(|tool| tool.name == name)
+            .unwrap();
+        let schema = serde_json::to_value(tool.output_schema.unwrap()).unwrap();
+        jsonschema::draft202012::options()
+            .should_validate_formats(true)
+            .build(&schema)
+            .unwrap()
+            .validate(content)
+            .unwrap_or_else(|error| panic!("{name} {content}: {error}"));
+        content.clone()
     }
-    let compact = Harness::new(BTreeMap::new(), None, 1800).await;
-    let result = compact
-        .call(
-            "get_emails",
-            json!({"uids":vec!["wrong";20],"uid_validity":0}),
-        )
-        .await;
-    assert_eq!(result["error"]["code"], "INVALID_INPUT");
-    assert!(result["error"].get("details").is_none());
-    h.journal
-        .claim("owner", "large", "hash", "<legacy@example.test>")
-        .unwrap();
-    h.journal
-        .finish("owner", "large", "accepted", &["large".repeat(10000)])
-        .unwrap();
-    let result = h
-        .call_id("get_operation", json!({"operation_key":"large"}), id)
-        .await;
-    assert_eq!(result["error"]["code"], "LIMIT_EXCEEDED");
-    assert_eq!(result["operation"]["status"], "accepted");
-    assert_eq!(result["retry_allowed"], false);
-    assert_eq!(
-        result["error"]["details"]["limit_kind"],
-        "wire_response_bytes"
-    );
-    let no_record = h
-        .call(
-            "get_operation",
-            json!({"operation_key":"large-as-other-principal"}),
-        )
-        .await;
-    assert!(no_record["data"]["operation"].is_null());
+
+    async fn attachment(&self, subject: &str, url: &str) -> axum::response::Response {
+        let url = reqwest::Url::parse(url).unwrap();
+        self.app
+            .clone()
+            .oneshot(
+                Request::get(url.path())
+                    .header(header::HOST, "localhost")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", self.credentials.token(subject)),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
 }
 
 #[tokio::test]
-async fn handler_contracts_cover_diagnostic_failures_and_collection_wire_compression() {
-    let mut closed = Harness::new(BTreeMap::new(), None, 8192).await;
-    closed.imap.abort();
-    let _ = (&mut closed.imap).await;
-    let failed = closed.call("diagnose_connectivity", json!({})).await;
-    assert_eq!(failed["data"]["ok"], false);
-    assert_eq!(failed["data"]["failure"], "connection_check_failed");
-    assert_eq!(
-        failed["data"]["stages"].as_array().unwrap().last().unwrap()["status"],
-        "failed"
-    );
-    let stalled = Harness::configured(BTreeMap::new(), None, 8192, true).await;
-    let timeout = stalled.call("diagnose_connectivity", json!({})).await;
-    assert_eq!(timeout["data"]["ok"], false);
-    assert_eq!(timeout["data"]["failure"], "timeout");
-    let body = "中😀\"\\\n".repeat(12000);
-    let h = Harness::new(
-        BTreeMap::from([(7, raw(7, &body)), (8, raw(8, &body)), (9, raw(9, &body))]),
-        None,
-        12000,
-    )
-    .await;
-    for (name, args, path) in [
-        (
-            "get_emails",
-            json!({"uids":[7,8,9],"uid_validity":9,"html_display":"readable"}),
-            "/data/items",
-        ),
-        (
-            "read_conversation",
-            json!({"uid":7,"uid_validity":9,"html_display":"readable"}),
-            "/data/messages",
-        ),
+async fn signed_http_reads_keep_same_uid_in_each_authorized_account() {
+    let h = Harness::new(false).await;
+    let denied = h
+        .call(
+            "billing",
+            "get_email",
+            json!({"account_id":"default","uid":7,"uid_validity":9}),
+        )
+        .await;
+    assert!(denied["error"].is_object(), "{denied}");
+    assert_eq!(h.connections(), [0, 0]);
+    for (subject, account, expected) in [
+        ("owner", "default", "第一个邮箱"),
+        ("billing", "billing", "Second mailbox"),
     ] {
-        let content = h.call_id(name, args, json!("\\\"中".repeat(60))).await;
-        let items = content.pointer(path).unwrap().as_array().unwrap();
-        assert_eq!(items.len(), 3);
-        for (index, item) in items.iter().enumerate() {
-            let message = item.get("email").unwrap_or(item);
-            assert_eq!(message["body_truncated"], true);
-            if name == "get_emails" || index == 0 {
-                assert!(!message["body"].as_str().unwrap().is_empty());
-                assert!(
-                    message["body"].as_str().unwrap().len()
-                        < message["body_byte_limit"].as_u64().unwrap() as usize
-                );
-            } else {
-                // The conversation's shared display budget was already spent
-                // on its first body; wire fitting keeps these omission flags.
-                assert_eq!(message["body_omitted"], true);
-            }
-            assert!(body.starts_with(message["body"].as_str().unwrap()));
-            assert_eq!(
-                message["html_display_metadata"]["format_version"],
-                "readable-v1"
-            );
-            assert_eq!(message["html_display_metadata"]["html_parts"], 0);
-        }
+        let body = h
+            .call(
+                subject,
+                "get_email",
+                json!({"account_id":account,"uid":7,"uid_validity":9}),
+            )
+            .await;
+        assert_eq!(body["data"]["account_id"], account, "{body}");
+        assert_eq!(body["data"]["body"], expected, "{body}");
     }
+    let stale = h
+        .call("owner", "get_email", json!({"uid":7,"uid_validity":8}))
+        .await;
+    assert_eq!(stale["error"]["code"], "STALE_UID", "{stale}");
 }
 
-#[test]
-fn read_output_schemas_are_closed_and_reject_broken_discriminants_and_nullability() {
-    for tool in tools("full") {
-        assert_eq!(tool.output_schema.is_some(), is_read(&tool.name));
-        if is_read(&tool.name) {
-            validator(&tool.name);
+#[tokio::test]
+async fn http_auth_and_rpc_id_gate_each_request_before_mail() {
+    let h = Harness::new(false).await;
+    let params = json!({"name":"get_email","arguments":{"uid":7,"uid_validity":9}});
+    let response = h.rpc(None, json!(1), "tools/call", params.clone()).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let oversized = h
+        .rpc(Some("owner"), json!("x".repeat(1023)), "tools/call", params)
+        .await;
+    assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(h.connections(), [0, 0]);
+}
+
+#[tokio::test]
+async fn signed_target_attachment_get_rechecks_subject_and_returns_exact_binary() {
+    let h = Harness::new(false).await;
+    let listed = h
+        .call(
+            "owner",
+            "list_attachments",
+            json!({"uid":7,"uid_validity":9}),
+        )
+        .await;
+    assert_eq!(
+        listed["data"]["read_diagnostics"]["source"], "bodystructure",
+        "{listed}"
+    );
+    let descriptor = &listed["data"]["attachments"][0];
+    assert_eq!(descriptor["filename"], "part.bin", "{listed}");
+    let prepared = h
+        .call(
+            "owner",
+            "prepare_attachment_download",
+            json!({"uid":7,"uid_validity":9,"attachment_id":descriptor["attachment_id"]}),
+        )
+        .await;
+    let url = prepared["data"]["download_url"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{prepared}"));
+    let before = h.connections();
+    assert_eq!(
+        h.attachment("billing", url).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(h.connections(), before);
+    let response = h.attachment("owner", url).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "application/octet-stream"
+    );
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    assert_eq!(
+        to_bytes(response.into_body(), 4096).await.unwrap().as_ref(),
+        ATTACHMENT
+    );
+}
+
+#[tokio::test]
+async fn metadata_cache_status_reports_live_evidence_without_an_imap_read() {
+    let h = Harness::new(true).await;
+    let live = h
+        .call("owner", "get_email", json!({"uid":7,"uid_validity":9}))
+        .await;
+    assert_eq!(live["data"]["body"], "第一个邮箱", "{live}");
+    let before = h.connections();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = h.call("owner", "get_cache_status", json!({})).await;
+            assert_eq!(
+                status["data"]["write_health"]["failed_writes"], 0,
+                "{status}"
+            );
+            if status["data"]["storage"]["folders"][0]["verified_parts"] == 1 {
+                assert_eq!(status["data"]["storage"]["folders"][0]["uid_validity"], 9);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-    }
-    let batch = validator("get_emails");
-    for broken in [
-        json!({"data":{"items":[{"uid":7,"ok":true,"status":"unprocessed"}],"requested":1,"completed":0},"request_id":"r"}),
-        json!({"data":{"items":[{"uid":7,"ok":false,"email":{}}],"requested":1,"completed":0},"request_id":"r"}),
-        json!({"data":{},"request_id":"r"}),
-        json!({"data":null,"request_id":"r"}),
-    ] {
-        assert!(!batch.is_valid(&broken), "{broken}");
-    }
-    let operations = validator("get_operation");
-    assert!(operations.is_valid(&json!({"data":{"operation":null},"request_id":"r"})));
-    assert!(
-        !operations.is_valid(&json!({"data":{"operation":{"status":"accepted"}},"request_id":"r"}))
-    );
-    assert!(
-        !operations.is_valid(&json!({"data":{"operation":null},"request_id":"r","extra":true}))
-    );
+    })
+    .await
+    .unwrap();
+    assert_eq!(h.connections(), before);
+    drop(h.app);
+    h.cache.finish().await;
 }

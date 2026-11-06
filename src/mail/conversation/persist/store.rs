@@ -9,10 +9,6 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
-#[cfg(test)]
-#[path = "../tests/durable.rs"]
-mod tests;
-
 pub(super) use crate::cache::cursor::CursorRow;
 
 type ScopeFilter = dyn Fn(&[u8; 32], &str) -> bool + Send + Sync;

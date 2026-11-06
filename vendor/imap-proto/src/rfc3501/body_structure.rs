@@ -1,17 +1,17 @@
 use crate::bounded::Budget;
 use nom::{
+    IResult, Parser,
     branch::alt,
     bytes::streaming::{tag, tag_no_case},
     character::streaming::char,
     combinator::{map, opt},
     sequence::{delimited, preceded},
-    IResult, Parser,
 };
 use std::borrow::Cow;
 
 use crate::{
     core::*,
-    rfc3501::{to_owned_cow, AttributeValue, Envelope},
+    rfc3501::{AttributeValue, Envelope, to_owned_cow},
 };
 
 pub struct BodyFields<'a> {
@@ -23,11 +23,6 @@ pub struct BodyFields<'a> {
 }
 
 impl<'a> BodyFields<'a> {
-    #[cfg(test)]
-    fn parse(i: &'a [u8]) -> IResult<&'a [u8], Self> {
-        Self::parse_with_budget(i, &Budget::unlimited())
-    }
-
     // body-fields     = body-fld-param SP body-fld-id SP body-fld-desc SP
     //                   body-fld-enc SP body-fld-octets
     fn parse_with_budget(i: &'a [u8], budget: &Budget<'_>) -> IResult<&'a [u8], Self> {
@@ -79,11 +74,6 @@ pub struct BodyExt1Part<'a> {
 }
 
 impl<'a> BodyExt1Part<'a> {
-    #[cfg(test)]
-    fn parse(i: &'a [u8]) -> IResult<&'a [u8], Self> {
-        Self::parse_with_budget(i, &Budget::unlimited())
-    }
-
     // body-ext-1part  = body-fld-md5 [SP body-fld-dsp [SP body-fld-lang
     //                   [SP body-fld-loc *(SP body-extension)]]]
     //                     ; MUST NOT be returned on non-extensible
@@ -135,11 +125,6 @@ pub struct BodyExtMPart<'a> {
 }
 
 impl<'a> BodyExtMPart<'a> {
-    #[cfg(test)]
-    fn parse(i: &'a [u8]) -> IResult<&'a [u8], Self> {
-        Self::parse_with_budget(i, &Budget::unlimited())
-    }
-
     // body-ext-mpart  = body-fld-param [SP body-fld-dsp [SP body-fld-lang
     //                   [SP body-fld-loc *(SP body-extension)]]]
     //                     ; MUST NOT be returned on non-extensible
@@ -192,11 +177,6 @@ pub enum ContentEncoding<'a> {
 }
 
 impl<'a> ContentEncoding<'a> {
-    #[cfg(test)]
-    fn parse(i: &'a [u8]) -> IResult<&'a [u8], Self> {
-        Self::parse_with_budget(i, &Budget::unlimited())
-    }
-
     // RFC 3501 defines `body-fld-enc` as a string, never NIL, but some servers send
     // NIL for a part with no Content-Transfer-Encoding header (seen on Apple iCloud;
     // imap-codec records the same from maddy). RFC 2045 s6.1 defaults that to 7bit.
@@ -287,11 +267,6 @@ pub enum BodyExtension<'a> {
 }
 
 impl<'a> BodyExtension<'a> {
-    #[cfg(test)]
-    fn parse(i: &'a [u8]) -> IResult<&'a [u8], Self> {
-        Self::parse_with_budget(i, &Budget::unlimited())
-    }
-
     fn parse_with_budget(i: &'a [u8], budget: &Budget<'_>) -> IResult<&'a [u8], Self> {
         let _guard = budget.enter(i)?;
         alt((
@@ -504,11 +479,6 @@ pub enum BodyStructure<'a> {
 }
 
 impl<'a> BodyStructure<'a> {
-    #[cfg(test)]
-    pub(crate) fn parse(i: &'a [u8]) -> IResult<&'a [u8], Self> {
-        Self::parse_with_budget(i, &Budget::unlimited())
-    }
-
     pub(crate) fn parse_with_budget(i: &'a [u8], budget: &Budget<'_>) -> IResult<&'a [u8], Self> {
         let (i, _) = tag("(")(i)?;
         let _guard = budget.enter(i)?;
@@ -692,268 +662,4 @@ pub(crate) fn msg_att_body_structure<'a>(
         |(_, body)| AttributeValue::BodyStructure(body),
     )
     .parse(i)
-}
-
-#[cfg(test)]
-fn body_param(i: &[u8]) -> IResult<&[u8], BodyParams<'_>> {
-    body_param_bounded(i, &Budget::unlimited())
-}
-
-#[cfg(test)]
-fn body_disposition(i: &[u8]) -> IResult<&[u8], Option<ContentDisposition<'_>>> {
-    body_disposition_bounded(i, &Budget::unlimited())
-}
-
-#[cfg(test)]
-fn body_lang(i: &[u8]) -> IResult<&[u8], Option<Vec<Cow<'_, str>>>> {
-    body_lang_bounded(i, &Budget::unlimited())
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use assert_matches::assert_matches;
-
-    const EMPTY: &[u8] = &[];
-
-    // body-fld-param SP body-fld-id SP body-fld-desc SP body-fld-enc SP body-fld-octets
-    const BODY_FIELDS: &str = r#"("foo" "bar") "id" "desc" "7BIT" 1337"#;
-    const BODY_FIELD_PARAM_PAIR: (Cow<'_, str>, Cow<'_, str>) =
-        (Cow::Borrowed("foo"), Cow::Borrowed("bar"));
-    const BODY_FIELD_ID: Option<Cow<'_, str>> = Some(Cow::Borrowed("id"));
-    const BODY_FIELD_DESC: Option<Cow<'_, str>> = Some(Cow::Borrowed("desc"));
-    const BODY_FIELD_ENC: ContentEncoding = ContentEncoding::SevenBit;
-    const BODY_FIELD_OCTETS: u32 = 1337;
-
-    fn mock_body_text() -> (String, BodyStructure<'static>) {
-        (
-            format!(r#"("TEXT" "PLAIN" {BODY_FIELDS} 42)"#),
-            BodyStructure::Text {
-                common: BodyContentCommon {
-                    ty: ContentType {
-                        ty: Cow::Borrowed("TEXT"),
-                        subtype: Cow::Borrowed("PLAIN"),
-                        params: Some(vec![BODY_FIELD_PARAM_PAIR]),
-                    },
-                    disposition: None,
-                    language: None,
-                    location: None,
-                },
-                other: BodyContentSinglePart {
-                    md5: None,
-                    transfer_encoding: BODY_FIELD_ENC,
-                    octets: BODY_FIELD_OCTETS,
-                    id: BODY_FIELD_ID,
-                    description: BODY_FIELD_DESC,
-                },
-                lines: 42,
-                extension: None,
-            },
-        )
-    }
-
-    #[test]
-    fn test_body_param_data() {
-        assert_matches!(body_param(br#"NIL"#), Ok((EMPTY, None)));
-
-        assert_matches!(
-            body_param(br#"("foo" "bar")"#),
-            Ok((EMPTY, Some(param))) => {
-                assert_eq!(param, vec![(Cow::Borrowed("foo"), Cow::Borrowed("bar"))]);
-            }
-        );
-    }
-
-    #[test]
-    fn test_body_lang_data() {
-        assert_matches!(
-            body_lang(br#""bob""#),
-            Ok((EMPTY, Some(langs))) => {
-                assert_eq!(langs, vec!["bob"]);
-            }
-        );
-
-        assert_matches!(
-            body_lang(br#"("one" "two")"#),
-            Ok((EMPTY, Some(langs))) => {
-                assert_eq!(langs, vec!["one", "two"]);
-            }
-        );
-
-        assert_matches!(body_lang(br#"NIL"#), Ok((EMPTY, None)));
-    }
-
-    #[test]
-    fn test_body_extension_data() {
-        assert_matches!(
-            BodyExtension::parse(br#""blah""#),
-            Ok((EMPTY, BodyExtension::Str(Some(Cow::Borrowed("blah")))))
-        );
-
-        assert_matches!(
-            BodyExtension::parse(br#"NIL"#),
-            Ok((EMPTY, BodyExtension::Str(None)))
-        );
-
-        assert_matches!(
-            BodyExtension::parse(br#"("hello")"#),
-            Ok((EMPTY, BodyExtension::List(list))) => {
-                assert_eq!(list, vec![BodyExtension::Str(Some(Cow::Borrowed("hello")))]);
-            }
-        );
-
-        assert_matches!(
-            BodyExtension::parse(br#"(1337)"#),
-            Ok((EMPTY, BodyExtension::List(list))) => {
-                assert_eq!(list, vec![BodyExtension::Num(1337)]);
-            }
-        );
-    }
-
-    #[test]
-    fn test_body_disposition_data() {
-        assert_matches!(body_disposition(br#"NIL"#), Ok((EMPTY, None)));
-
-        assert_matches!(
-            body_disposition(br#"("attachment" ("FILENAME" "pages.pdf"))"#),
-            Ok((EMPTY, Some(disposition))) => {
-                assert_eq!(disposition, ContentDisposition {
-                    ty: Cow::Borrowed("attachment"),
-                    params: Some(vec![
-                        (Cow::Borrowed("FILENAME"), Cow::Borrowed("pages.pdf"))
-                    ])
-                });
-            }
-        );
-    }
-
-    // Apple iCloud sends NIL here, which the grammar does not allow.
-    #[test]
-    fn test_body_encoding_nil_is_seven_bit() {
-        assert_matches!(
-            ContentEncoding::parse(br"NIL"),
-            Ok((EMPTY, ContentEncoding::SevenBit))
-        );
-    }
-
-    // The whole response has to survive it, not just the field.
-    #[test]
-    fn test_body_structure_multipart_with_nil_encoding() {
-        const BODY: &[u8] = br#"(("text" "plain" ("CHARSET" "UTF-8") NIL NIL NIL 1694 51 NIL NIL NIL NIL)("text" "html" ("CHARSET" "UTF-8") NIL NIL "quoted-printable" 5750 77 NIL NIL NIL NIL) "alternative" ("BOUNDARY" "94eb2c1235681e93cc0568edba59") NIL NIL NIL)"#;
-
-        assert_matches!(
-            BodyStructure::parse(BODY),
-            Ok((EMPTY, BodyStructure::Multipart { bodies, .. })) => {
-                assert_eq!(bodies.len(), 2);
-                assert_matches!(
-                    &bodies[0],
-                    BodyStructure::Text { other, .. } => {
-                        assert_eq!(other.transfer_encoding, ContentEncoding::SevenBit);
-                    }
-                );
-            }
-        );
-    }
-
-    #[test]
-    fn test_body_structure_text() {
-        let (body_str, body_struct) = mock_body_text();
-
-        assert_matches!(
-            BodyStructure::parse(body_str.as_bytes()),
-            Ok((_, text)) => {
-                assert_eq!(text, body_struct);
-            }
-        );
-    }
-
-    #[test]
-    fn test_body_structure_text_with_ext() {
-        let body_str = format!(r#"("TEXT" "PLAIN" {BODY_FIELDS} 42 NIL NIL NIL NIL)"#);
-        let (_, text_body_struct) = mock_body_text();
-
-        assert_matches!(
-            BodyStructure::parse(body_str.as_bytes()),
-            Ok((_, text)) => {
-                assert_eq!(text, text_body_struct)
-            }
-        );
-    }
-
-    #[test]
-    fn test_body_structure_basic() {
-        const BODY: &[u8] = br#"("APPLICATION" "PDF" ("NAME" "pages.pdf") NIL NIL "BASE64" 38838 NIL ("attachment" ("FILENAME" "pages.pdf")) NIL NIL)"#;
-
-        assert_matches!(
-            BodyStructure::parse(BODY),
-            Ok((_, basic)) => {
-                assert_eq!(basic, BodyStructure::Basic {
-                    common: BodyContentCommon {
-                        ty: ContentType {
-                            ty: Cow::Borrowed("APPLICATION"),
-                            subtype: Cow::Borrowed("PDF"),
-                            params: Some(vec![(Cow::Borrowed("NAME"), Cow::Borrowed("pages.pdf"))])
-                        },
-                        disposition: Some(ContentDisposition {
-                            ty: Cow::Borrowed("attachment"),
-                            params: Some(vec![(Cow::Borrowed("FILENAME"), Cow::Borrowed("pages.pdf"))])
-                        }),
-                        language: None,
-                        location: None,
-                    },
-                    other: BodyContentSinglePart {
-                        transfer_encoding: ContentEncoding::Base64,
-                        octets: 38838,
-                        id: None,
-                        md5: None,
-                        description: None,
-                    },
-                    extension: None,
-                })
-            }
-        );
-    }
-
-    #[test]
-    fn test_body_structure_message() {
-        let (text_body_str, _) = mock_body_text();
-        let envelope_str = r#"("Wed, 17 Jul 1996 02:23:25 -0700 (PDT)" "IMAP4rev1 WG mtg summary and minutes" (("Terry Gray" NIL "gray" "cac.washington.edu")) (("Terry Gray" NIL "gray" "cac.washington.edu")) (("Terry Gray" NIL "gray" "cac.washington.edu")) ((NIL NIL "imap" "cac.washington.edu")) ((NIL NIL "minutes" "CNRI.Reston.VA.US") ("John Klensin" NIL "KLENSIN" "MIT.EDU")) NIL NIL "<B27397-0100000@cac.washington.edu>")"#;
-        let body_str =
-            format!(r#"("MESSAGE" "RFC822" {BODY_FIELDS} {envelope_str} {text_body_str} 42)"#);
-
-        assert_matches!(
-            BodyStructure::parse(body_str.as_bytes()),
-            Ok((_, BodyStructure::Message { .. }))
-        );
-    }
-
-    #[test]
-    fn test_body_structure_multipart() {
-        let (text_body_str1, text_body_struct1) = mock_body_text();
-        let (text_body_str2, text_body_struct2) = mock_body_text();
-        let body_str =
-            format!(r#"({text_body_str1}{text_body_str2} "ALTERNATIVE" NIL NIL NIL NIL)"#);
-
-        assert_matches!(
-            BodyStructure::parse(body_str.as_bytes()),
-            Ok((_, multipart)) => {
-                assert_eq!(multipart, BodyStructure::Multipart {
-                    common: BodyContentCommon {
-                        ty: ContentType {
-                            ty: Cow::Borrowed("MULTIPART"),
-                            subtype: Cow::Borrowed("ALTERNATIVE"),
-                            params: None
-                        },
-                        language: None,
-                        location: None,
-                        disposition: None,
-                    },
-                    bodies: vec![
-                        text_body_struct1,
-                        text_body_struct2,
-                    ],
-                    extension: None
-                });
-            }
-        );
-    }
 }

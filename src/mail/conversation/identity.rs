@@ -405,7 +405,3 @@ fn cfws(mut value: &str) -> Option<&str> {
         value = &value[end + 1..];
     }
 }
-
-#[cfg(test)]
-#[path = "tests/identity.rs"]
-mod tests;

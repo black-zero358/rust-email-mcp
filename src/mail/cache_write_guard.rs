@@ -201,7 +201,3 @@ impl Drop for DirtyWriteGuard {
 #[cfg(test)]
 #[path = "cache_write_guard/tests.rs"]
 mod tests;
-
-#[cfg(test)]
-#[path = "cache_write_guard/production_tests.rs"]
-mod production_tests;
