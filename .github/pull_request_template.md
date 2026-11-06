@@ -15,6 +15,6 @@
 - [ ] 已核对 [工程纲领](https://github.com/black-zero358/rust-email-mcp/blob/main/CONTRIBUTING.md)及相关专题约束。
 - [ ] 契约、实现、相关回归和文档一致；仅文档变更已核对链接与事实。
 - [ ] 已说明兼容性、维护影响和验证边界。
-- [ ] 核对与当前 `main` 集成后的最终 diff，确认 `check`、`audit`、`container` 通过。
+- [ ] 核对最终 PR 集成运行。纯文档改动确认 `scope`，其余改动同时确认 `check`、`audit`、`container`。
 
 源码发布、产物发布与生产部署分别执行；未执行的检查或部署保持明确标注。

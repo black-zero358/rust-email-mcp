@@ -2,6 +2,12 @@
 
 本文件保存带版本与环境边界的证据。每次新增记录注明提交/tag、日期与时区、环境、命令、结果、CI 链接及未覆盖项；保留历史结果，不把其测试数量或部署状态当作当前版本的证明。验证要求见 [贡献指南](../CONTRIBUTING.md#验证与完成标准)。
 
+## 2026-11-06 PR #92 缓存验收稳定性
+
+[旧 CI](https://github.com/black-zero358/rust-email-mcp/actions/runs/42166592215) 在准备阶段未等到 UID 8 的缓存正文。另一次运行报告正文仍待写入，以及同步期间的离线核对失败。测试现等待 FIFO 状态查询就绪且无待处理正文，再检查缓存结果。受后台同步影响的列表测试只对 `CACHE_NEEDS_VERIFICATION` 做有期限的重读，保留原结果断言。
+
+WSL Ubuntu、固定 Rust 工具链和合成邮箱下，`cargo fmt --check` 及 `cargo test --locked` 通过，计 560 项单元和 57 项集成测试，4 项显式验收默认忽略。CI 分类用临时 Git 仓库验证 8 个场景，含纯文档、混合差异、跨白名单重命名、手动运行和基线缺失。[PR #92](https://github.com/black-zero358/rust-email-mcp/pull/92) 记录最终提交及 CI。
+
 ## 2026-11-06 离线附件探针依赖升级
 
 在 Windows（Asia/Shanghai）验证 [PR #66](https://github.com/black-zero358/rust-email-mcp/pull/66) 的依赖提交 `6f2bae1` 与 `main` 的 `de4fde9` 集成后的树 `dfc50bf`。pypdf 从 6.12.0 升至 6.21.4，作用域为合成附件探针。PyPI 的 wheel 和 sdist URL、SHA-256 均与锁文件一致。

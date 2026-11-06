@@ -1,9 +1,48 @@
 name: CI
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 permissions:
   contents: read
 jobs:
+  scope:
+    runs-on: ubuntu-latest
+    outputs:
+      full: ${{ steps.diff.outputs.full }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: diff
+        name: Classify changes
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          base="$BEFORE"
+          if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
+            # The first parent of the PR merge commit is the tested base.
+            base="$(git rev-parse --verify HEAD^1 2>/dev/null || true)"
+          fi
+          full=true
+          if [[ -n "$base" ]] && git diff --quiet --no-renames "$base" HEAD -- . \
+            ':(exclude,top)AGENTS.md' ':(exclude,top)CONTRIBUTING.md' \
+            ':(exclude,top)ISSUE_PROGRESS.md' ':(exclude,top)README.md' \
+            ':(exclude,top)SECURITY.md' ':(exclude,top).github/pull_request_template.md' \
+            ':(exclude,top,glob)docs/**/*.md'; then
+            full=false
+            echo 'Documentation only. Skipping Rust, dependency, and container jobs.'
+          fi
+          echo "full=$full" >> "$GITHUB_OUTPUT"
   check:
+    needs: scope
+    if: needs.scope.outputs.full != 'false'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -16,6 +55,8 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo build --locked --release
   audit:
+    needs: scope
+    if: needs.scope.outputs.full != 'false'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -26,6 +67,8 @@ jobs:
       - run: bash scripts/test-audit-dependencies.sh
       - run: bash scripts/audit-dependencies.sh
   container:
+    needs: scope
+    if: needs.scope.outputs.full != 'false'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
