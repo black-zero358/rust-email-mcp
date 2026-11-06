@@ -161,7 +161,7 @@ SMTP 使用 lettre 的低层 connection/command/message API，保留 TLS、AUTH�
 
 SMTPUTF8 需求为信封中非 ASCII 地址或 `mime::requires_smtputf8` 检出的原始国际化头。按 [RFC 6531 §3.2、§3.6](https://www.rfc-editor.org/rfc/rfc6531#section-3.6) 检查所有 MIME 子头，附件子树也不排除；只检查原始字节，RFC 2047 编码词和叶子正文不展开。identity 编码的 message/rfc822、message/global 递归共用结构/头部预算；编码封装的 message/global 保持不透明，符合 [RFC 6532 §3.5](https://www.rfc-editor.org/rfc/rfc6532#section-3.5) 对 7bit 封装的支持。此检查不调用正文选择、HTML 渲染或 transfer/charset 解码；非 ASCII 输入无法在结构/头部预算内确定需求时，连接前返回确定 `rejected`。
 
-缺少 SMTPUTF8 能力通过私有拒绝类型在 MAIL 前返回并持久化为 `rejected`，清理继续有界 QUIT；网络/事务的不确定结果保持 `unknown`，已知接受仍为 `accepted`。8BITMIME 对原始非 ASCII 数据的既有要求、TLS/AUTH 和状态恢复规则不变。
+服务端缺少邮件所需的 SMTPUTF8 或 8BITMIME 时，在 MAIL 前返回类型化拒绝，持久化为 `rejected` 后执行有界 QUIT。SMTP DATA 已提交但最终确认丢失时保持 `unknown`，已知接受仍为 `accepted`。
 
 
 ## Authentication
@@ -201,6 +201,8 @@ full 配置经 `Cache::open_full_with_run` 绑定运行见证。`cache/blob` 保
 `accounts/cache_run` 在每次启动（包括 off）于 Journal 前发布注册库旁的私有运行见证，并持有生命周期锁。full 清洁凭据绑定前驱运行、规范根目录及选定范围。写操作在调度排队前取得准入，关闭时封闭准入并等待既有写入及清理，再写入清洁凭据；异常退出和恢复使旧范围待核对。具体路径、备份和旧程序降级流程见[部署规程](deployment.md#持久缓存备份与恢复)。
 
 `mail/cache_read` 和离线会话先授权，再使用与在线调用相同的 4 槽/20 请求调度；本地 blocking 工作持有共享许可直到实际结束。显式 cache 分支执行本地查询与完整性核对，保持零 IMAP；默认 live 分支继续核对 UIDVALIDITY 和目标存在性。结果报告来源、观察时间和覆盖；FLAGS 缺失保留未知状态。完整正文的文本负载与有界叶元数据分离，维持单文件 32 MiB，渲染与输出裁减在读取时执行；全文索引只接收完整内容。
+
+离线日期搜索按 INTERNALDATE 原时区的日历日处理前台 IMAP 原文和后台已解析的日期。已知系统 FLAGS 在协议读取时按 ASCII 大小写无关规则识别，离线筛选兼容早期已存为自定义拼写的系统标记。显式空 FLAGS 按已知空集合处理，字段缺失仍为未知。对应回归位于 `src/mail/cache_read/query.rs`、`src/mail/sync/tests.rs` 和 `src/mail.rs`。
 
 D2/D3/D4/D5 验证入口为 `src/cache/full_tests.rs`、`src/cache/content_tests.rs`、`src/accounts/cache_run/tests.rs` 和 `src/mail/cache_write_guard/tests.rs`；metadata 和持久游标继续运行 R10 回归。显式离线工具矩阵及故障场景见[实施设计](cache-content-design.md#验收矩阵)。
 
@@ -247,7 +249,7 @@ JSON 日志使用固定事件名和受控字段，记录服务端生成的 reque
 | D1 身份与授权 | `auth::tests::jwt_trust_boundaries`、`failed_refresh_is_shared_and_expired_keys_fail_closed`；`server::output_tests` 的 HTTP 请求鉴权、账户隔离及附件主体检查 |
 | D2 读取与引用 | `mail::tests` 的目标 UID 属性匹配、状态和摘要的 FLAGS 合并、rev1 文件夹往返；`tests/imap_completion.rs` 的完成状态；HTTP 同 UID 双账户与过期 UIDVALIDITY |
 | D3 资源有界 | 六个 `tests/*.rs` 协议集成入口；MIME 头部/解码预算、HTML 分词前属性预算；`server::tests` 的完整 wire 预算与正文前缀；暂存取消与调度配额 |
-| D4 发送与幂等 | `journal::tests` 的重启/主体隔离与并发 claim；`mail::tests` 的 SMTP 未知结果及 accepted 持久化；`smtp::tests` 的 DATA 格式和最终结果 |
+| D4 发送与幂等 | `journal::tests` 的重启/主体隔离与并发 claim；`mail::tests` 的 SMTP 已知结果持久化、MAIL 前能力拒绝和 DATA 确认丢失后的去重；`smtp::tests` 的 DATA 格式和最终结果 |
 | D5 隐私与内容 | `mail::tests::draft_envelope_and_privacy_filter_share_canonical_fields`；MIME 未知编码与完整 alternative 选择；附件精确字节、授权 GET 及私有暂存 |
 | D6 维护与恢复 | `src/accounts`、`src/cache` 的注册库/世代/迁移/回放回归；CI fmt/test/clippy、依赖审计和容器 release 构建；`scripts/check-cache-recovery.py` 的实际候选二进制恢复检查 |
 

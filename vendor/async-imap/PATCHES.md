@@ -249,3 +249,11 @@ the exact UID set or taking its bounded fallback. Run
 ## Test suite reduction (2026-11-06)
 
 The vendored crate-local test modules were removed as part of the repository-wide test maintenance reduction. Runtime source and upstream identity remain the same. Current parser/client verification runs through the root package integration tests in `tests/`; historical test commands above describe the earlier patch acceptance.
+
+## Case-insensitive system flags (issue #84)
+
+Both borrowed and owned flag conversions recognize the system flag names in
+ASCII case-insensitive form. Other flags retain their original text and the
+existing Custom representation. This follows [RFC 3501 section 9](https://www.rfc-editor.org/rfc/rfc3501#section-9).
+The root package's summary FETCH and sync facts regressions cover mixed-case
+wire flags. The upstream identity and dependency versions remain unchanged.

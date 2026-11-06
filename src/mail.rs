@@ -1643,7 +1643,7 @@ mod tests {
             header.len()
         );
         for tool in ["list_emails", "search_emails"] {
-            for update in ["\\Flagged", ""] {
+            for update in ["\\fLaGgEd", ""] {
                 let rows = format!(
                     "* 2 FETCH (UID 99 FLAGS (\\Deleted))\r\n* 3 FETCH (FLAGS (\\Answered))\r\n* 1 FETCH (UID 7 FLAGS (\\Answered))\r\n{full}* 1 FETCH (UID 7 FLAGS ({update}))\r\n* 1 FETCH (UID 7 RFC822.SIZE 101)\r\n* 1 FETCH (UID 7)\r\n"
                 );
@@ -1986,6 +1986,124 @@ mod tests {
     #[tokio::test]
     async fn smtp_accepted_is_persisted_before_unresponsive_quit() {
         smtp_fixture(false).await;
+    }
+
+    #[tokio::test]
+    async fn draft_without_required_8bitmime_is_durably_rejected_before_mail() {
+        use tokio::{
+            io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+            net::TcpListener,
+        };
+        use tokio_rustls::{TlsAcceptor, rustls::pki_types::PrivateKeyDer};
+
+        let imap = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let smtp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = (*crate::config::fixture()).clone();
+        config.imap_host = "localhost".into();
+        config.imap_port = imap.local_addr().unwrap().port();
+        let smtp_port = smtp.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(&dir.path().join("db")).unwrap());
+        let body_fetch = format!(
+            "UID FETCH 7 (UID BODY.PEEK[]<0.{}>)",
+            config.max_message + 1
+        );
+        let mut service = MailService::new(Arc::new(config), journal.clone()).unwrap();
+        service.smtp = Some(SmtpSender::fixture(smtp_port, service.config.timeout));
+
+        let signed = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert = signed.cert.der().clone();
+        let tls = tokio_rustls::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.clone()],
+                PrivateKeyDer::Pkcs8(signed.signing_key.serialize_der().into()),
+            )
+            .unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(cert).unwrap();
+        service.test_imap_roots = Some(roots);
+
+        let imap_task = tokio::spawn(async move {
+            let (socket, _) = imap.accept().await.unwrap();
+            let stream = TlsAcceptor::from(Arc::new(tls))
+                .accept(socket)
+                .await
+                .unwrap();
+            let mut stream = BufReader::new(stream);
+            stream.write_all(b"* OK fixture\r\n").await.unwrap();
+            let raw = concat!(
+                "To: receiver@example.com\r\n",
+                "Content-Type: text/plain; charset=utf-8\r\n",
+                "Content-Transfer-Encoding: 8bit\r\n\r\n",
+                "合成正文\r\n",
+            );
+            for (expected, reply) in [
+                ("LOGIN ", String::new()),
+                (
+                    "EXAMINE \"Drafts\"",
+                    "* 1 EXISTS\r\n* OK [UIDVALIDITY 9] valid\r\n".into(),
+                ),
+                (
+                    "UID FETCH 7 (UID RFC822.SIZE)",
+                    format!("* 1 FETCH (UID 7 RFC822.SIZE {})\r\n", raw.len()),
+                ),
+                (
+                    &body_fetch,
+                    format!("* 1 FETCH (UID 7 BODY[]<0> {{{}}}\r\n{raw})\r\n", raw.len()),
+                ),
+            ] {
+                let mut line = String::new();
+                stream.read_line(&mut line).await.unwrap();
+                let (tag, command) = line.trim_end().split_once(' ').unwrap();
+                assert!(command.starts_with(expected), "{command}");
+                stream
+                    .write_all(format!("{reply}{tag} OK complete\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                stream.flush().await.unwrap();
+            }
+        });
+        let smtp_task = tokio::spawn(async move {
+            let (socket, _) = smtp.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            socket.write_all(b"220 test ESMTP\r\n").await.unwrap();
+            let mut line = String::new();
+            socket.read_line(&mut line).await.unwrap();
+            assert!(line.starts_with("EHLO "));
+            socket.write_all(b"250 test\r\n").await.unwrap();
+            line.clear();
+            socket.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "QUIT\r\n");
+            assert_eq!(
+                journal.get("owner", "test-8bit").unwrap().unwrap().status,
+                "rejected"
+            );
+            socket.write_all(b"221 bye\r\n").await.unwrap();
+            smtp
+        });
+
+        let args = json!({"uid":7,"uid_validity":9,"operation_key":"test-8bit"});
+        let sent = service.execute("send_draft", &args, "owner").await.unwrap();
+        assert_eq!(sent["operation"]["status"], "rejected");
+        assert_eq!(sent["retry_allowed"], false);
+        imap_task.await.unwrap();
+        let smtp = smtp_task.await.unwrap().into_std().unwrap();
+        let lookup = service
+            .execute(
+                "get_operation",
+                &json!({"operation_key":"test-8bit"}),
+                "owner",
+            )
+            .await
+            .unwrap();
+        let repeat = service.execute("send_draft", &args, "owner").await.unwrap();
+        assert_eq!(lookup["operation"], sent["operation"]);
+        assert_eq!(repeat["operation"], sent["operation"]);
+        assert_eq!(
+            smtp.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 
     #[tokio::test]
