@@ -62,7 +62,7 @@
 
 Rust 使用 Cargo 和固定的 Cargo.lock；格式以 rustfmt 为准，Clippy 与构建使用同一工具链。临时 Python 脚本使用 uv，Node 工具使用 pnpm。业务边界沿用现有安全错误模型，不在不可信输入路径依赖 panic；测试或静态不变量中的断言需保持含义明确。存储事务保持短小，不跨越网络等待。
 
-新增依赖必须说明用途、许可证、替代方案和资源影响；升级不能绕过 lockfile 或审计。vendored 代码遵守 [async-imap 补丁记录](vendor/async-imap/PATCHES.md)与 [imap-proto 补丁记录](vendor/imap-proto/PATCHES.md)，同时更新来源、审计脚本和回归。
+新增依赖必须说明用途、许可证、替代方案和资源影响；升级不能绕过 lockfile 或审计。vendored 代码遵守 [async-imap 补丁记录](vendor/async-imap/PATCHES.md)、[imap-proto 补丁记录](vendor/imap-proto/PATCHES.md)与 [lettre 补丁记录](vendor/lettre/PATCHES.md)，同时更新来源、审计脚本和回归。
 
 ## 验证与完成标准
 
