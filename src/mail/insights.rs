@@ -80,17 +80,15 @@ impl MetadataCache {
 
 /// Call only after EXAMINE and validating the caller's UIDVALIDITY in this session.
 impl MailService {
-    pub(super) fn remember_headers(
+    pub(super) fn remember_complete_headers(
         &self,
         mailbox: &str,
         validity: Option<u32>,
         uid: u32,
         bytes: &[u8],
     ) {
-        // Partial HEADER fetches must never masquerade as complete immutable metadata.
-        if bytes.len() >= HEADER_LIMIT
-            || !(bytes.ends_with(b"\r\n\r\n") || bytes.ends_with(b"\n\n"))
-        {
+        // The caller has already proved completeness of the HEADER section.
+        if bytes.len() > HEADER_LIMIT {
             return;
         }
         if let Ok(mut cache) = self.metadata_cache.lock() {
@@ -150,9 +148,8 @@ impl MailService {
                 headers.len(),
             )));
         }
-        if !(headers.ends_with(b"\r\n\r\n") || headers.ends_with(b"\n\n")) {
-            return Err(parts::body::ReadFault::local(MailError::limit()));
-        }
+        // The matching tagged OK and short reply to HEADER_LIMIT + 1
+        // prove exhaustion, including a header-only message without a blank line.
         self.metadata_cache
             .lock()
             .map_err(|_| parts::body::ReadFault::local(MailError::backend()))?
