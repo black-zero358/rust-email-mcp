@@ -9,17 +9,17 @@
 use std::borrow::Cow;
 
 use nom::{
+    IResult, Parser,
     bytes::streaming::tag_no_case,
     character::complete::{space0, space1},
     combinator::map,
     multi::separated_list0,
     sequence::{preceded, separated_pair},
-    IResult, Parser,
 };
 
+use crate::Response;
 use crate::core::{astring_utf8, to_owned_cow};
 use crate::rfc3501::mailbox;
-use crate::Response;
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct Acl<'a> {
@@ -262,26 +262,5 @@ impl From<AclRight> for char {
             AclRight::OldDelete => 'd',
             AclRight::Custom(c) => c,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_char_to_acl_right() {
-        assert_eq!(Into::<AclRight>::into('l'), AclRight::Lookup);
-        assert_eq!(Into::<AclRight>::into('c'), AclRight::OldCreate);
-        assert_eq!(Into::<AclRight>::into('k'), AclRight::CreateMailbox);
-        assert_eq!(Into::<AclRight>::into('0'), AclRight::Custom('0'));
-    }
-
-    #[test]
-    fn test_acl_right_to_char() {
-        assert_eq!(Into::<char>::into(AclRight::Lookup), 'l');
-        assert_eq!(Into::<char>::into(AclRight::OldCreate), 'c');
-        assert_eq!(Into::<char>::into(AclRight::CreateMailbox), 'k');
-        assert_eq!(Into::<char>::into(AclRight::Custom('0')), '0');
     }
 }

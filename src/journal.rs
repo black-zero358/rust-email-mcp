@@ -12,14 +12,6 @@ pub struct Operation {
 
 pub struct Journal(Mutex<Connection>);
 impl Journal {
-    #[cfg(test)]
-    pub(crate) fn fail_writes(&self) {
-        self.0
-            .lock()
-            .unwrap()
-            .execute_batch("PRAGMA query_only=ON")
-            .unwrap();
-    }
     pub fn open(path: &Path) -> Result<Self> {
         let db = Connection::open(path).map_err(|_| MailError::storage())?;
         db.busy_timeout(Duration::from_secs(2))

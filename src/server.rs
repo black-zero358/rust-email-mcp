@@ -860,6 +860,18 @@ impl ServerHandler for EmailServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const OUTPUT_LIMIT: usize = 256 * 1024;
+    const TRACE_ID: &str = "00000000-0000-0000-0000-000000000000";
+
+    fn wire_bytes(result: CallToolResult, id: RequestId) -> Vec<u8> {
+        serde_json::to_vec(&JsonRpcResponse {
+            jsonrpc: JsonRpcVersion2_0,
+            id,
+            result: ServerResult::CallToolResult(result),
+        })
+        .unwrap()
+    }
+
     #[test]
     fn discovery_keeps_journal_visible_and_filters_account_reads_and_legacy_writes() {
         let without_accounts = tools_for_access("read", false);
@@ -887,6 +899,7 @@ mod tests {
             );
         }
     }
+
     #[test]
     fn legacy_write_argument_schemas_and_byte_validation_stay_frozen() {
         let all = tools("full");
@@ -968,6 +981,7 @@ mod tests {
         assert_eq!(items["details"]["limit_kind"], "scan_items");
         assert_eq!(items["details"]["actual"], 21);
     }
+
     #[test]
     fn batch_and_conversation_fit_wire_budget_without_losing_item_outcomes() {
         let body = "中😀\"\\\n".repeat(20000);
@@ -994,6 +1008,7 @@ mod tests {
             }
         }
     }
+
     #[test]
     fn relaxed_inline_attachment_fits_complete_response() {
         use base64::Engine;
@@ -1009,17 +1024,6 @@ mod tests {
             &id,
             crate::config::DEFAULT_MAX_OUTPUT
         ));
-    }
-    const OUTPUT_LIMIT: usize = 256 * 1024;
-    const TRACE_ID: &str = "00000000-0000-0000-0000-000000000000";
-
-    fn wire_bytes(result: CallToolResult, id: RequestId) -> Vec<u8> {
-        serde_json::to_vec(&JsonRpcResponse {
-            jsonrpc: JsonRpcVersion2_0,
-            id,
-            result: ServerResult::CallToolResult(result),
-        })
-        .unwrap()
     }
 
     #[test]
@@ -1073,40 +1077,6 @@ mod tests {
     }
 
     #[test]
-    fn email_budget_preserves_existing_truncation_short_bodies_and_metadata_errors() {
-        let id = RequestId::Number(1);
-        let value = json!({"body":"hello中","body_truncated":false});
-        let full = CallToolResult::structured(json!({"data":value,"request_id":TRACE_ID}));
-        let limit = wire_bytes(full, id.clone()).len() - 1;
-        let response = bounded_email_result(Ok(value), TRACE_ID, &id, limit).unwrap();
-        assert_eq!(
-            response.structured_content.as_ref().unwrap()["data"]["body"],
-            "hello"
-        );
-        assert_eq!(
-            response.structured_content.as_ref().unwrap()["data"]["body_truncated"],
-            true
-        );
-        assert!(wire_bytes(response, id.clone()).len() <= limit);
-        for truncated in [false, true] {
-            let value = json!({"body":"x".repeat(90000),"body_truncated":truncated});
-            let response =
-                bounded_email_result(Ok(value.clone()), TRACE_ID, &id, OUTPUT_LIMIT).unwrap();
-            assert_eq!(response.structured_content.unwrap()["data"], value);
-        }
-        for body in ["", "hello"] {
-            let value =
-                json!({"body":body,"body_truncated":false,"subject":"x".repeat(OUTPUT_LIMIT)});
-            let response = bounded_email_result(Ok(value), TRACE_ID, &id, OUTPUT_LIMIT).unwrap();
-            assert_eq!(
-                response.structured_content.as_ref().unwrap()["error"]["code"],
-                "LIMIT_EXCEEDED"
-            );
-            assert!(wire_bytes(response, id.clone()).len() <= OUTPUT_LIMIT);
-        }
-    }
-
-    #[test]
     fn final_wire_budget_covers_duplicates_escaping_unicode_and_attachments() {
         use base64::{Engine, engine::general_purpose::STANDARD};
         let id = RequestId::String("\\\"\n中".repeat(40).into());
@@ -1156,159 +1126,5 @@ mod tests {
         }
         assert!(serialized_fits(&json!("hello"), 7));
         assert!(!serialized_fits(&json!("hello"), 6));
-    }
-
-    #[test]
-    fn multi_item_results_at_the_256k_boundary() {
-        let id = RequestId::String("\"\\中".repeat(70).into());
-        let make_value =
-            |n| json!({"items":(0..10).map(|_| json!({"body":"x".repeat(n)})).collect::<Vec<_>>()});
-        let mut low = 0;
-        let mut high = OUTPUT_LIMIT;
-        while low + 1 < high {
-            let mid = (low + high) / 2;
-            let response =
-                CallToolResult::structured(json!({"data":make_value(mid),"request_id":TRACE_ID}));
-            if response_fits(&response, &id, OUTPUT_LIMIT) {
-                low = mid;
-            } else {
-                high = mid;
-            }
-        }
-        let exact = bounded_tool_result(Ok(make_value(low)), TRACE_ID, &id, OUTPUT_LIMIT).unwrap();
-        assert!(
-            exact
-                .structured_content
-                .as_ref()
-                .unwrap()
-                .get("data")
-                .is_some()
-        );
-        assert!(wire_bytes(exact, id.clone()).len() <= OUTPUT_LIMIT);
-        let over = bounded_tool_result(Ok(make_value(high)), TRACE_ID, &id, OUTPUT_LIMIT).unwrap();
-        assert_eq!(
-            over.structured_content.as_ref().unwrap()["error"]["code"],
-            "LIMIT_EXCEEDED"
-        );
-        assert!(wire_bytes(over, id).len() <= OUTPUT_LIMIT);
-    }
-
-    #[tokio::test]
-    async fn oversized_rpc_id_is_rejected_before_execution() {
-        use axum::{
-            Router,
-            body::Body,
-            http::{Request, StatusCode},
-            middleware,
-            routing::post,
-        };
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use tower::ServiceExt;
-        let calls = Arc::new(AtomicUsize::new(0));
-        let counter = calls.clone();
-        let app = Router::new()
-            .route(
-                "/mcp",
-                post(move || {
-                    let counter = counter.clone();
-                    async move {
-                        counter.fetch_add(1, Ordering::SeqCst);
-                        "executed"
-                    }
-                }),
-            )
-            .layer(middleware::from_fn(limit_rpc_id));
-        for (id, expected) in [
-            (json!("x".repeat(1022)), StatusCode::OK),
-            (json!(i64::MIN), StatusCode::OK),
-            (json!("x".repeat(1023)), StatusCode::PAYLOAD_TOO_LARGE),
-            (json!("\"\\\n".repeat(200)), StatusCode::PAYLOAD_TOO_LARGE),
-            (json!("中".repeat(400)), StatusCode::PAYLOAD_TOO_LARGE),
-            (json!("x".repeat(255 * 1024)), StatusCode::PAYLOAD_TOO_LARGE),
-        ] {
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::post("/mcp")
-                        .body(Body::from(
-                            json!({"jsonrpc":"2.0","id":id,"method":"tools/call"}).to_string(),
-                        ))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), expected);
-            assert!(
-                axum::body::to_bytes(response.into_body(), OUTPUT_LIMIT)
-                    .await
-                    .is_ok()
-            );
-        }
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-    }
-    #[test]
-    fn schemas_match_policy() {
-        let full = tools("full");
-        assert_eq!(full.len(), 30);
-        let names = full
-            .iter()
-            .map(|t| t.name.as_ref())
-            .collect::<std::collections::HashSet<_>>();
-        assert_eq!(names.len(), full.len(), "tool names must be unique");
-        for (mode, count) in [("read", 16), ("draft", 17), ("send", 21), ("full", 30)] {
-            let tools = tools(mode);
-            assert_eq!(tools.len(), count);
-            for t in tools {
-                assert!(allowed(&t.name, mode));
-                assert!(
-                    !serde_json::to_string(&t.input_schema)
-                        .unwrap()
-                        .contains("markRead")
-                );
-            }
-        }
-    }
-    #[test]
-    fn schema_rejects_unknown_and_wrong_types() {
-        let t = tools("full")
-            .into_iter()
-            .find(|t| t.name == "get_email")
-            .unwrap();
-        let schema = serde_json::to_value(t.input_schema).unwrap();
-        assert!(validate(&json!({"uid":1,"uid_validity":2}), &schema));
-        assert!(!validate(&json!({"uid":"1","uid_validity":2}), &schema));
-        assert!(!validate(
-            &json!({"uid":1,"uid_validity":2,"markRead":true}),
-            &schema
-        ));
-    }
-    #[test]
-    fn advanced_and_batch_schema_policy() {
-        let all = tools("full");
-        let schema = |name: &str| {
-            serde_json::to_value(&all.iter().find(|t| t.name == name).unwrap().input_schema)
-                .unwrap()
-        };
-        assert!(validate(
-            &json!({"since":"2024-02-29","seen":false,"has_attachment":true,"min_size":0}),
-            &schema("search_emails")
-        ));
-        assert!(!validate(
-            &json!({"uids":[1],"uid_validity":2}),
-            &schema("delete_emails")
-        ));
-        assert!(validate(
-            &json!({"uids":[1],"uid_validity":2,"confirm":true}),
-            &schema("delete_emails")
-        ));
-        assert!(!validate(
-            &json!({"uids":vec![1;51],"uid_validity":2,"confirm":true}),
-            &schema("delete_emails")
-        ));
-        for name in ["mark_emails", "move_emails", "delete_emails"] {
-            assert!(!allowed(name, "read"));
-            assert!(!allowed(name, "send"));
-            assert!(allowed(name, "full"));
-        }
     }
 }

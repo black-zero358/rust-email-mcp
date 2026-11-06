@@ -42,25 +42,11 @@ fn root(part: &mime::Part<'_>) -> Section {
     })
 }
 
-#[cfg(test)]
-pub(in crate::mail) fn raw_leaves<'a, 'b>(
-    part: &'a mime::Part<'b>,
-    out: &mut Vec<&'a mime::Part<'b>>,
-    depth: usize,
-) -> Result<()> {
-    let mut index = out.len();
-    visit(part, root(part), depth, &mut index, &mut |_, _, part| {
-        out.push(part)
-    })
-}
-
 pub(in crate::mail) fn from_raw<'a, 'b>(part: &'a mime::Part<'b>) -> Result<RawManifest<'a, 'b>> {
     let mut result = RawManifest {
         manifest: PartManifest {
             parts: vec![],
             body: Default::default(),
-            #[cfg(test)]
-            accounted_bytes: 0,
         },
         entities: vec![],
     };

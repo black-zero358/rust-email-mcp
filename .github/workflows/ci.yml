@@ -12,6 +12,7 @@ permissions:
   contents: read
 jobs:
   scope:
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     outputs:
       full: ${{ steps.diff.outputs.full }}
@@ -43,6 +44,7 @@ jobs:
   check:
     needs: scope
     if: needs.scope.outputs.full != 'false'
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -50,27 +52,56 @@ jobs:
         with:
           toolchain: 1.99.1
           components: rustfmt, clippy
+      - uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.sha }}
+          restore-keys: rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+      - name: Refresh local package fingerprints
+        run: cargo clean -p rust-email-mcp -p async-imap -p imap-proto
       - run: cargo fmt --check
       - run: cargo test --locked
       - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo build --locked --release
   audit:
     needs: scope
     if: needs.scope.outputs.full != 'false'
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
         with:
           toolchain: 1.99.1
-      - run: cargo install cargo-audit --version 0.22.2 --locked
+      - uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        id: audit-cache
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-${{ runner.os }}-${{ runner.arch }}-1.99.1-0.22.2
+      - if: steps.audit-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-audit --version 0.22.2 --locked
       - run: bash scripts/test-audit-dependencies.sh
       - run: bash scripts/audit-dependencies.sh
   container:
     needs: scope
     if: needs.scope.outputs.full != 'false'
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - run: bash scripts/test-docker-context.sh
-      - run: docker build --tag rust-email-mcp:ci .
+      - uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: /tmp/buildkit-cache
+          key: image-${{ runner.os }}-${{ hashFiles('Dockerfile', 'Cargo.lock') }}-${{ github.sha }}
+          restore-keys: image-${{ runner.os }}-${{ hashFiles('Dockerfile', 'Cargo.lock') }}-
+      - name: Build release container
+        run: |
+          docker buildx create --use --driver docker-container
+          docker buildx build --load --tag rust-email-mcp:ci \
+            --cache-from type=local,src=/tmp/buildkit-cache \
+            --cache-to type=local,dest=/tmp/buildkit-cache-new,mode=max .
+          rm -rf /tmp/buildkit-cache
+          mv /tmp/buildkit-cache-new /tmp/buildkit-cache

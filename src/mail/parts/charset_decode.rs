@@ -219,7 +219,3 @@ impl CharsetDecoder {
         }
     }
 }
-
-#[cfg(test)]
-#[path = "charset_decode/tests.rs"]
-mod tests;

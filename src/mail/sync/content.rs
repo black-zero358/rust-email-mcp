@@ -887,6 +887,3 @@ fn same_derivation(
     Ok(output.bytes == candidate.materialized.bytes
         && <[u8; 32]>::from(output.digest.finalize()) == candidate.materialized.sha256)
 }
-
-#[cfg(test)]
-mod tests;

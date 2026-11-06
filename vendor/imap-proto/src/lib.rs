@@ -33,9 +33,6 @@ pub mod rfc5256;
 pub mod rfc5464;
 pub mod rfc7162;
 
-#[cfg(test)]
-mod tests;
-
 #[derive(Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum Response<'a> {

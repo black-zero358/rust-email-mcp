@@ -90,7 +90,7 @@ if (caps?.updateModelContext?.resourceLink) {
 
 [验证证据与公开资料摘要](../scripts/attachment-client-adapter/evidence/local-prototype-2026-11-02.json) 记录命令、版本、测试计数及公开下载文件 SHA-256。上述 7 组测试的 HTTP 侧使用本地合成 fixture 服务。
 
-真实 Rust 服务也已完成跨运行时验收：[独立联调记录](../scripts/attachment-client-adapter/evidence/rust-integration-2026-11-02.json)，测试入口 [attachments.rs](../src/server/output_tests/attachments.rs) 的 `standalone_node_adapter_consumes_real_rust_mcp_and_authorized_get`。它启动隔离 TLS IMAP 与真实 JWT MCP/GET router，经 Node CLI 逐个准备、认证下载并落盘全部 8 组 R00 fixture，再由 Rust 从私有报告路径读回文件，独立核对原始长度与 SHA-256；XLSX/PDF/两份同名 CSV/524,289 B CSV 均通过。结果为 1 passed、0 failed，5.42 秒。
+真实 Rust 服务也已完成跨运行时验收：[独立联调记录](../scripts/attachment-client-adapter/evidence/rust-integration-2026-11-02.json)，测试入口 [attachments.rs](https://github.com/black-zero358/rust-email-mcp/blob/42873c0f2ea9f8ff284fa044c4111d7cb97f8dc9/src/server/output_tests/attachments.rs) 的 `standalone_node_adapter_consumes_real_rust_mcp_and_authorized_get`。它启动隔离 TLS IMAP 与真实 JWT MCP/GET router，经 Node CLI 逐个准备、认证下载并落盘全部 8 组 R00 fixture，再由 Rust 从私有报告路径读回文件，独立核对原始长度与 SHA-256；XLSX/PDF/两份同名 CSV/524,289 B CSV 均通过。结果为 1 passed、0 failed，5.42 秒。
 
 该测试为显式 ignored 开发验收，不给默认 Cargo 测试添加 Node 依赖。成功执行命令：
 
