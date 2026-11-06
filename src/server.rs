@@ -650,8 +650,8 @@ fn authenticated_parts(
     }
     Ok(parts)
 }
-/// Legacy write validation is frozen in bytes; read validation lives in input.
-fn validate(a: &Value, schema: &Value) -> bool {
+/// Legacy write lengths use bytes; only the selected top-level text body permits CRLF.
+fn validate(a: &Value, schema: &Value, allow_body_crlf: bool) -> bool {
     if let Some(c) = schema.get("const")
         && a != c
     {
@@ -670,10 +670,11 @@ fn validate(a: &Value, schema: &Value) -> bool {
             let Some(props) = schema["properties"].as_object() else {
                 return false;
             };
-            if obj
-                .iter()
-                .any(|(k, v)| props.get(k).is_none_or(|s| !validate(v, s)))
-            {
+            if obj.iter().any(|(key, value)| {
+                props
+                    .get(key)
+                    .is_none_or(|field| !validate(value, field, allow_body_crlf && key == "body"))
+            }) {
                 return false;
             }
             if let Some(required) = schema["required"].as_array()
@@ -686,9 +687,15 @@ fn validate(a: &Value, schema: &Value) -> bool {
             true
         }
         Some("string") => a.as_str().is_some_and(|s| {
-            !s.contains(['\0', '\r'])
-                && s.len() >= schema["minLength"].as_u64().unwrap_or(0) as usize
+            s.len() >= schema["minLength"].as_u64().unwrap_or(0) as usize
                 && s.len() <= schema["maxLength"].as_u64().unwrap_or(65536) as usize
+                && !s.contains('\0')
+                && if allow_body_crlf {
+                    s.match_indices('\r')
+                        .all(|(index, _)| s.as_bytes().get(index + 1) == Some(&b'\n'))
+                } else {
+                    !s.contains('\r')
+                }
         }),
         Some("integer") => a.as_u64().is_some_and(|n| {
             n >= schema["minimum"].as_u64().unwrap_or(0)
@@ -698,7 +705,7 @@ fn validate(a: &Value, schema: &Value) -> bool {
         Some("array") => a.as_array().is_some_and(|v| {
             v.len() >= schema["minItems"].as_u64().unwrap_or(0) as usize
                 && v.len() <= schema["maxItems"].as_u64().unwrap_or(100) as usize
-                && v.iter().all(|i| validate(i, &schema["items"]))
+                && v.iter().all(|i| validate(i, &schema["items"], false))
         }),
         _ => true,
     }
@@ -766,7 +773,14 @@ impl ServerHandler for EmailServer {
             .map_err(|_| ErrorData::internal_error("Tool schema unavailable", None))?;
         let validation = if is_read(&name) {
             input::validate(&name, &args, &schema)
-        } else if validate(&args, &schema) {
+        } else if validate(
+            &args,
+            &schema,
+            matches!(
+                name.as_str(),
+                "save_draft" | "send_email" | "reply_email" | "forward_email"
+            ),
+        ) {
             Ok(())
         } else {
             Err(MailError::input())
@@ -912,23 +926,30 @@ mod tests {
                 if !schema["properties"][key].is_null() {
                     let field = &schema["properties"][key];
                     assert_eq!(field["maxLength"], 512);
-                    assert!(validate(&json!("中".repeat(170)), field));
-                    assert!(!validate(&json!("中".repeat(171)), field));
-                    assert!(validate(&json!("😀".repeat(128)), field));
-                    assert!(!validate(&json!("😀".repeat(129)), field));
+                    assert!(validate(&json!("中".repeat(170)), field, false));
+                    assert!(!validate(&json!("中".repeat(171)), field, false));
+                    assert!(validate(&json!("😀".repeat(128)), field, false));
+                    assert!(!validate(&json!("😀".repeat(129)), field, false));
                 }
             }
             if !schema["properties"]["operation_key"].is_null() {
                 let field = &schema["properties"]["operation_key"];
-                assert!(validate(&json!("中".repeat(42)), field));
-                assert!(!validate(&json!("中".repeat(43)), field));
+                assert!(validate(&json!("中".repeat(42)), field, false));
+                assert!(!validate(&json!("中".repeat(43)), field, false));
             }
             if !schema["properties"]["body"].is_null() {
                 let field = &schema["properties"]["body"];
-                assert!(validate(&json!("a\nb"), field));
-                assert!(!validate(&json!("a\rb"), field));
-                assert!(validate(&json!("😀".repeat(16384)), field));
-                assert!(!validate(&json!("😀".repeat(16385)), field));
+                assert!(validate(&json!("a\nb"), field, true));
+                assert!(validate(&json!("a\r\nb"), field, true));
+                assert!(!validate(&json!("a\rb"), field, true));
+                assert!(validate(&json!("😀".repeat(16384)), field, true));
+                assert!(!validate(&json!("😀".repeat(16385)), field, true));
+                for (bytes, allowed) in [(65534, true), (65535, false)] {
+                    assert_eq!(
+                        validate(&json!(format!("{}\r\n", "a".repeat(bytes))), field, true),
+                        allowed
+                    );
+                }
             }
         }
     }
