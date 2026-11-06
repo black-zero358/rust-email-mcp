@@ -181,7 +181,7 @@ impl Backend {
                         let (tag, command) = line.trim_end().split_once(' ').unwrap();
                         let mut reply = match command {
                             "CAPABILITY" => b"* CAPABILITY IMAP4rev1\r\n".to_vec(),
-                            "SELECT \"INBOX\"" | "EXAMINE INBOX" | "EXAMINE \"INBOX\"" | "EXAMINE \"Drafts\"" => b"* 1 EXISTS\r\n* OK [UIDVALIDITY 9] valid\r\n* OK [UIDNEXT 8] next\r\n".to_vec(),
+                            command if command == "SELECT \"INBOX\"" || command == "EXAMINE \"Drafts\"" || command.strip_prefix("EXAMINE ").is_some_and(|name| name.trim_matches('"').eq_ignore_ascii_case("INBOX")) => b"* 1 EXISTS\r\n* OK [UIDVALIDITY 9] valid\r\n* OK [UIDNEXT 8] next\r\n".to_vec(),
                             "UID STORE 7 +FLAGS (\\Seen)" => b"* 1 FETCH (UID 7 FLAGS (\\Seen))\r\n".to_vec(),
                             "UID STORE 7 -FLAGS (\\Seen)" => Vec::new(),
                             command if command.starts_with("LOGIN ") => Vec::new(),
@@ -652,7 +652,7 @@ async fn http_auth_and_rpc_id_gate_each_request_before_mail() {
 
 #[tokio::test]
 async fn signed_target_attachment_get_rechecks_subject_and_returns_exact_binary() {
-    let h = Harness::new(false).await;
+    let h = Harness::with_cache(Some("full")).await;
     let listed = h
         .call(
             "owner",
@@ -666,11 +666,25 @@ async fn signed_target_attachment_get_rechecks_subject_and_returns_exact_binary(
     );
     let descriptor = &listed["data"]["attachments"][0];
     assert_eq!(descriptor["filename"], "part.bin", "{listed}");
+    let attachment_id = &descriptor["attachment_id"];
+    for mailbox in ["INBOX", "Inbox", "inbox"] {
+        let listed = h
+            .call(
+                "owner",
+                "list_attachments",
+                json!({"mailbox":mailbox,"uid":7,"uid_validity":9}),
+            )
+            .await;
+        assert_eq!(
+            listed["data"]["attachments"][0]["attachment_id"], *attachment_id,
+            "{listed}"
+        );
+    }
     let prepared = h
         .call(
             "owner",
             "prepare_attachment_download",
-            json!({"uid":7,"uid_validity":9,"attachment_id":descriptor["attachment_id"]}),
+            json!({"mailbox":"Inbox","uid":7,"uid_validity":9,"attachment_id":attachment_id}),
         )
         .await;
     let url = prepared["data"]["download_url"]
@@ -735,6 +749,29 @@ async fn signed_target_attachment_get_rechecks_subject_and_returns_exact_binary(
             ATTACHMENT
         );
     }
+
+    let inline = h.call("owner", "download_attachment", json!({"mailbox":"inbox","uid":7,"uid_validity":9,"attachment_id":attachment_id,"attachment_index":descriptor["attachment_index"]})).await;
+    assert_eq!(
+        inline["data"]["base64"],
+        STANDARD.encode(ATTACHMENT),
+        "{inline}"
+    );
+    let before = h.connections();
+    let cached = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let result = h.call("owner", "download_attachment", json!({"read_source":"cache","mailbox":"Inbox","uid":7,"uid_validity":9,"attachment_id":attachment_id})).await;
+            if result["error"]["code"] != "CACHE_MISS" {
+                break result;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.unwrap();
+    assert_eq!(cached["data"]["read_source"], "cache", "{cached}");
+    assert_eq!(cached["data"]["attachment_id"], *attachment_id, "{cached}");
+    assert_eq!(cached["data"]["base64"], STANDARD.encode(ATTACHMENT));
+    assert_eq!(h.connections(), before);
+    drop(h.app);
+    h.cache.finish().await;
 }
 
 #[tokio::test]
