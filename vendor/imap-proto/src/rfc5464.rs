@@ -5,18 +5,18 @@
 //!
 
 use nom::{
+    IResult, Parser,
     branch::alt,
     bytes::streaming::{tag, tag_no_case},
     combinator::map,
     multi::separated_list0,
-    IResult, Parser,
 };
 use std::borrow::Cow;
 
 use crate::{
+    Response,
     core::*,
     rfc3501::{MailboxDatum, ResponseCode},
-    Response,
 };
 
 fn is_entry_component_char(c: u8) -> bool {
@@ -225,200 +225,4 @@ pub(crate) fn resp_text_code_metadata_too_many(i: &[u8]) -> IResult<&[u8], Respo
 pub(crate) fn resp_text_code_metadata_no_private(i: &[u8]) -> IResult<&[u8], ResponseCode<'_>> {
     let (i, _) = tag_no_case("METADATA NOPRIVATE")(i)?;
     Ok((i, ResponseCode::MetadataNoPrivate))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{metadata_solicited, metadata_unsolicited, MailboxDatum, Response, ResponseCode};
-    use crate::rfc3501::{Outcome, Status};
-    use std::borrow::Cow;
-
-    #[test]
-    fn test_solicited_fail_1() {
-        match metadata_solicited(b"METADATA \"\" (/asdfg \"asdf\")\r\n") {
-            Err(_) => {}
-            _ => panic!("Error required when entry name is not starting with /private or /shared"),
-        }
-    }
-
-    #[test]
-    fn test_solicited_fail_2() {
-        match metadata_solicited(b"METADATA \"\" (/shared/asdfg \"asdf\")\r\n") {
-            Err(_) => {}
-            _ => panic!(
-                "Error required when in entry name /shared \
-                 is not continued with /admin, /comment or /vendor"
-            ),
-        }
-    }
-
-    #[test]
-    fn test_solicited_fail_3() {
-        match metadata_solicited(b"METADATA \"\" (/private/admin \"asdf\")\r\n") {
-            Err(_) => {}
-            _ => panic!(
-                "Error required when in entry name /private \
-                 is not continued with /comment or /vendor"
-            ),
-        }
-    }
-
-    #[test]
-    fn test_solicited_fail_4() {
-        match metadata_solicited(b"METADATA \"\" (/shared/vendor \"asdf\")\r\n") {
-            Err(_) => {}
-            _ => panic!("Error required when vendor name is not provided."),
-        }
-    }
-
-    #[test]
-    fn test_solicited_success() {
-        match metadata_solicited(
-            b"METADATA \"mbox\" (/shared/vendor/vendorname \"asdf\" \
-              /private/comment/a \"bbb\")\r\n",
-        ) {
-            Ok((i, Response::MailboxData(MailboxDatum::MetadataSolicited { mailbox, values }))) => {
-                assert_eq!(mailbox, "mbox");
-                assert_eq!(i, b"\r\n");
-                assert_eq!(values.len(), 2);
-                assert_eq!(values[0].entry, "/shared/vendor/vendorname");
-                assert_eq!(
-                    values[0]
-                        .value
-                        .as_ref()
-                        .expect("None value is not expected"),
-                    "asdf"
-                );
-                assert_eq!(values[1].entry, "/private/comment/a");
-                assert_eq!(
-                    values[1]
-                        .value
-                        .as_ref()
-                        .expect("None value is not expected"),
-                    "bbb"
-                );
-            }
-            _ => panic!("Correct METADATA response is not parsed properly."),
-        }
-    }
-
-    #[test]
-    fn test_literal_success() {
-        // match metadata_solicited(b"METADATA \"\" (/shared/vendor/vendor.coi/a \"AAA\")\r\n")
-        match metadata_solicited(b"METADATA \"\" (/shared/vendor/vendor.coi/a {3}\r\nAAA)\r\n") {
-            Ok((i, Response::MailboxData(MailboxDatum::MetadataSolicited { mailbox, values }))) => {
-                assert_eq!(mailbox, "");
-                assert_eq!(i, b"\r\n");
-                assert_eq!(values.len(), 1);
-                assert_eq!(values[0].entry, "/shared/vendor/vendor.coi/a");
-                assert_eq!(
-                    values[0]
-                        .value
-                        .as_ref()
-                        .expect("None value is not expected"),
-                    "AAA"
-                );
-            }
-            Err(e) => panic!("ERR: {e:?}"),
-            _ => panic!("Strange failure"),
-        }
-    }
-
-    #[test]
-    fn test_nil_success() {
-        match metadata_solicited(b"METADATA \"\" (/shared/comment NIL /shared/admin NIL)\r\n") {
-            Ok((i, Response::MailboxData(MailboxDatum::MetadataSolicited { mailbox, values }))) => {
-                assert_eq!(mailbox, "");
-                assert_eq!(i, b"\r\n");
-                assert_eq!(values.len(), 2);
-                assert_eq!(values[0].entry, "/shared/comment");
-                assert_eq!(values[0].value, None);
-                assert_eq!(values[1].entry, "/shared/admin");
-                assert_eq!(values[1].value, None);
-            }
-            Err(e) => panic!("ERR: {e:?}"),
-            _ => panic!("Strange failure"),
-        }
-    }
-
-    #[test]
-    fn test_unsolicited_success() {
-        match metadata_unsolicited(b"METADATA \"theBox\" /shared/admin/qwe /private/comment/a\r\n")
-        {
-            Ok((
-                i,
-                Response::MailboxData(MailboxDatum::MetadataUnsolicited { mailbox, values }),
-            )) => {
-                assert_eq!(i, b"\r\n");
-                assert_eq!(mailbox, "theBox");
-                assert_eq!(values.len(), 2);
-                assert_eq!(values[0], "/shared/admin/qwe");
-                assert_eq!(values[1], "/private/comment/a");
-            }
-            _ => panic!("Correct METADATA response is not parsed properly."),
-        }
-    }
-
-    #[test]
-    fn test_response_codes() {
-        match Response::parse(b"* OK [METADATA LONGENTRIES 123] Some entries omitted.\r\n") {
-            Ok((
-                _,
-                Response::Data {
-                    status: Status::Ok,
-                    outcome:
-                        Outcome {
-                            code: Some(ResponseCode::MetadataLongEntries(123)),
-                            information: Some(Cow::Borrowed("Some entries omitted.")),
-                        },
-                },
-            )) => {}
-            rsp => panic!("unexpected response {rsp:?}"),
-        }
-
-        match Response::parse(b"* NO [METADATA MAXSIZE 123] Annotation too large.\r\n") {
-            Ok((
-                _,
-                Response::Data {
-                    status: Status::No,
-                    outcome:
-                        Outcome {
-                            code: Some(ResponseCode::MetadataMaxSize(123)),
-                            information: Some(Cow::Borrowed("Annotation too large.")),
-                        },
-                },
-            )) => {}
-            rsp => panic!("unexpected response {rsp:?}"),
-        }
-
-        match Response::parse(b"* NO [METADATA TOOMANY] Too many annotations.\r\n") {
-            Ok((
-                _,
-                Response::Data {
-                    status: Status::No,
-                    outcome:
-                        Outcome {
-                            code: Some(ResponseCode::MetadataTooMany),
-                            information: Some(Cow::Borrowed("Too many annotations.")),
-                        },
-                },
-            )) => {}
-            rsp => panic!("unexpected response {rsp:?}"),
-        }
-
-        match Response::parse(b"* NO [METADATA NOPRIVATE] Private annotations not supported.\r\n") {
-            Ok((
-                _,
-                Response::Data {
-                    status: Status::No,
-                    outcome:
-                        Outcome {
-                            code: Some(ResponseCode::MetadataNoPrivate),
-                            information: Some(Cow::Borrowed("Private annotations not supported.")),
-                        },
-                },
-            )) => {}
-            rsp => panic!("unexpected response {rsp:?}"),
-        }
-    }
 }

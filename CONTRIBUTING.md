@@ -72,8 +72,9 @@ Rust 行为变更使用与 [CI](.github/workflows/ci.yml)一致的命令：
 cargo fmt --check
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
-cargo build --locked --release
 ```
+
+Release 编译由 `container` job 的生产 Dockerfile 执行。Rust job 缓存依赖构建，恢复缓存后清理本包与两个 vendored 包，保证当前源码重新编译。审计工具和 Docker 构建层分别缓存。
 
 依赖审计使用专用脚本覆盖 vendored 上游版本；`cargo-audit` 版本与 CI 一致：
 

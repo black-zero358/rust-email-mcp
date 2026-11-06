@@ -58,34 +58,3 @@ fn transfer_and_charset_cross_chunk_pipeline_matches_the_raw_oracle() {
         }
     }
 }
-
-#[test]
-fn html_rendering_context_stays_shared_across_selected_leaves() {
-    let mut context = DisplayContext::new(HtmlDisplay::Readable);
-    let mut body = String::new();
-    for number in 0..2 {
-        let input = format!("<a href='https://example.test/{number}'>link</a>");
-        let mut transfer =
-            transfer_decode::Decoder::new(transfer_decode::Encoding::Identity, input.len() * 4);
-        let mut charset =
-            charset_decode::CharsetDecoder::new(b"utf-8", true, input.len() * 4).unwrap();
-        let mut text = String::new();
-        decode_transfer(
-            &mut transfer,
-            &mut charset,
-            input.as_bytes(),
-            false,
-            &mut text,
-        )
-        .unwrap();
-        decode_transfer(&mut transfer, &mut charset, &[], true, &mut text).unwrap();
-        decode_charset(&mut charset, &[], true, &mut text).unwrap();
-        body.push_str(&crate::html::render_selected(&text, &mut context).unwrap());
-    }
-    assert!(body.contains("https://example.test/0"));
-    assert!(body.contains("https://example.test/1"));
-    assert_eq!(
-        serde_json::to_value(context.into_metadata()).unwrap()["html_parts"],
-        2
-    );
-}

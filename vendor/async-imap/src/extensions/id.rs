@@ -58,31 +58,3 @@ pub(crate) async fn parse_id<T: Stream<Item = io::Result<ResponseData>> + Unpin 
 
     Ok(id)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_format_identification() {
-        assert_eq!(
-            format_identification([("name", Some("MyClient"))]),
-            r#""name" "MyClient""#
-        );
-
-        assert_eq!(
-            format_identification([("name", Some(r#""MyClient"\"#))]),
-            r#""name" "\"MyClient\"\\""#
-        );
-
-        assert_eq!(
-            format_identification([("name", Some("MyClient")), ("version", Some("2.0"))]),
-            r#""name" "MyClient" "version" "2.0""#
-        );
-
-        assert_eq!(
-            format_identification([("name", None), ("version", Some("2.0"))]),
-            r#""name" NIL "version" "2.0""#
-        );
-    }
-}

@@ -216,7 +216,7 @@ impl StagingRoot {
         root.recovery = root.recover()?;
         Ok(Arc::new(root))
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub fn recovery_report(&self) -> RecoveryReport {
         self.recovery
     }

@@ -2,6 +2,25 @@
 
 本文件保存带版本与环境边界的证据。每次新增记录注明提交/tag、日期与时区、环境、命令、结果、CI 链接及未覆盖项；保留历史结果，不把其测试数量或部署状态当作当前版本的证明。验证要求见 [贡献指南](../CONTRIBUTING.md#验证与完成标准)。
 
+## 2026-11-06 测试与 CI 精简
+
+基线为 `42873c0`。使用 `uv run scripts/test-inventory.py --revision 42873c0` 与工作树统计，按 UTF-8/LF 归一化后的测试源码测量，包含内嵌测试/辅助模块、专项脚本、恢复烟测和统计脚本。保留历史证据、数据夹具和文档，源码计数覆盖可执行测试代码。
+
+| 范围 | 原行数 → 当前 | 原字节数 → 当前 | 原 Rust 用例 → 当前 |
+| --- | --- | --- | --- |
+| 第一方测试与验收 | 38,328 → 5,576（14.55%） | 1,444,147 → 210,324（14.56%） | 626 → 83（13.26%） |
+| 加上 vendored 测试 | 42,847 → 5,576（13.01%） | 1,603,903 → 210,324（13.11%） | 736 → 83（11.28%） |
+
+专项用例另计 Node 7 项、Python 8 组样例与 12 项负例、审计脚本 20 项、Docker/恢复/长跑/Journal 各一个命令入口。精简后保留审计 20 项、Docker/恢复/Journal 及新增规模统计各一个入口。连同 Rust 用例，第一方总量为 677 → 107（15.81%），包含 vendored 为 787 → 107（13.60%）。该指标按具名用例和验收入口统计，内部参数组合不单独扩展。
+
+默认 Rust 测试保留 75 个库测试和 8 个协议集成测试，首次整合全部通过，库测试 3.06 秒。审计脚本 20 项回归及 340 包依赖审计通过，保留 `pin-utils` 的 unmaintained 提示。最终格式、Clippy 和生产 Docker release 构建通过。恢复检查和最终提交 CI 结果归档在 [PR #94](https://github.com/black-zero358/rust-email-mcp/pull/94)。
+
+生产 HTTP 回归使用实际 router、签名 JWT 和双账户 TLS IMAP。保留正文读取、UIDVALIDITY、账户授权、附件主体隔离和精确二进制下载。邮件、缓存及存储测试保留代表性预算、提交、取消和恢复路径。独立审阅核对运行时代码及 fixtures，SMTP 回归补上必须观察 QUIT 和同键重试零新增连接的断言。
+
+移除细粒度故障排列、独立 Node/Python 附件原型和 R13 长跑设施。原 30 分钟负载、真实客户端文件解析和广泛协议边界矩阵留作历史证据；当前发布流程使用默认回归、容器 release 构建及二进制恢复烟测。以下旧记录对应其注明的提交和工具版本。
+
+CI 复用 Rust 依赖、cargo-audit 二进制和 BuildKit 层缓存，恢复 Cargo 缓存后清理三个本地包。release 编译集中到容器 job，保留 PR 合并引用测试、过期 PR 运行取消及文档范围分类。缓存依据 [GitHub 官方说明](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching) 和 [Docker local cache](https://docs.docker.com/build/cache/backends/local/)。
+
 ## 2026-11-06 PR #92 缓存验收稳定性
 
 [旧 CI](https://github.com/black-zero358/rust-email-mcp/actions/runs/42166592215) 在准备阶段未等到 UID 8 的缓存正文。另一次运行报告正文仍待写入，以及同步期间的离线核对失败。测试现等待 FIFO 状态查询就绪且无待处理正文，再检查缓存结果。受后台同步影响的列表测试只对 `CACHE_NEEDS_VERIFICATION` 做有期限的重读，保留原结果断言。

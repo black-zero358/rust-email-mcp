@@ -137,10 +137,6 @@ impl ErrorSnapshot {
     pub(super) fn entries(&self) -> impl Iterator<Item = CheckpointError> + '_ {
         self.entries.iter().copied().flatten()
     }
-    #[cfg(test)]
-    pub(super) fn count(&self) -> usize {
-        self.count
-    }
     pub(super) fn omitted(&self) -> usize {
         self.count.saturating_sub(MAX_ERROR_DETAILS)
     }

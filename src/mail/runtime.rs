@@ -96,16 +96,6 @@ impl MailRuntime {
         &self.config
     }
 
-    #[cfg(test)]
-    pub(crate) fn admission_counts_for_test(&self) -> (usize, usize) {
-        self.scheduler.admission_counts_for_test()
-    }
-
-    #[cfg(all(test, target_os = "linux"))]
-    pub(crate) fn scheduler_sample_for_test(&self) -> Value {
-        self.scheduler.sample_for_test()
-    }
-
     pub async fn finish_cache(&self, cache: PreparedCache) {
         let sync_finished = self.sync.finish().await;
         let writes_finished = self

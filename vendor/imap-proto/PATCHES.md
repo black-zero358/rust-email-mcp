@@ -178,3 +178,7 @@ When upgrading, update the upstream archive, commit, version, checksum and
 licenses together with both audit mappings and regressions. Replace the local
 patch only after the bounded parser, protocol completion and application
 regressions pass against the replacement.
+
+## Test suite reduction (2026-11-06)
+
+The vendored crate-local test modules were removed as part of the repository-wide test maintenance reduction. Runtime source and upstream identity remain the same. Current parser/client verification runs through the root package integration tests in `tests/`; historical test commands above describe the earlier patch acceptance.
