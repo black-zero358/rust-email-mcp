@@ -123,7 +123,7 @@ docker build --tag rust-email-mcp:local .
 | 主分支门禁 | 2026-11-06 复核，`main` 未受保护，规则集为空 | 启用 PR 门禁及 GitHub Actions 必需检查 `scope`、`check`、`audit`、`container`，验证并记录配置 |
 | 字符与字节契约 | R01/R02 已完成读取码点、UTF-8/modified UTF-7 字节预算与输出 Schema，旧写输入规则保留；测试、独立审阅和最终 CI 通过 | 具体提交和质量检查见[读取规划状态](docs/read-capabilities-plan.md#实施状态)及[验证记录](docs/validation.md)；契约变更继续按上述兼容性与验证要求维护 |
 | 持续审计 | 审计暂无定时触发 | 维护者每周执行并留存结果，继续覆盖本地补丁 |
-| 发布产物可复现 | [Release 工作流](.github/workflows/release.yml)在推送新版本 tag 后运行 `scripts/package-release.sh` 并上传归档及校验文件 | 首次版本发布时核对工作流、恢复验收结果和 Release 附件 SHA-256 |
+| 提交绑定发布与产物复验 | `v0.3.0` 首次通过标签触发的工作流自动发布。独立下载核对归档和二进制 SHA-256、静态链接及 V6 隔离恢复。[发布验收](docs/validation.md#2026-11-06-v030-发布验收) | 后续版本沿用[发布检查](docs/maintenance.md#发布检查)，记录标签提交、工作流及下载产物验收 |
 
 发布与安全维护责任由仓库维护者承担；PR 作者负责本次变更的实现和证据，部署操作者负责具体环境的验收与恢复。角色可由同一人担任，记录中应明确执行结果。
 

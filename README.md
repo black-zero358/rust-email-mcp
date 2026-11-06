@@ -91,7 +91,7 @@
 
 ## 构建与版本
 
-本页对应 `main` 的 0.3.0 源码。从已发布版本安装时，使用该版本的 Linux amd64 二进制、`SHA256SUMS` 和发行说明。[下载 v0.2.2](https://github.com/black-zero358/rust-email-mcp/releases/tag/v0.2.2)
+本页对应 `main` 的 0.3.0 源码。安装已发布版本时，按标签页的发行说明获取 Linux amd64 静态二进制和 `SHA256SUMS`。[下载 v0.3.0](https://github.com/black-zero358/rust-email-mcp/releases/tag/v0.3.0)
 
 从 0.2.2 升级到 0.3.0 前，核对整理结果中的 `accepted`、离线正文索引重建及停止宽限。[0.3.0 升级与回退](docs/maintenance.md#030-升级要点)
 

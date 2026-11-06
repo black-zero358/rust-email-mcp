@@ -2,6 +2,22 @@
 
 本文件保存带版本与环境边界的证据。每次新增记录注明提交/tag、日期与时区、环境、命令、结果、CI 链接及未覆盖项；保留历史结果，不把其测试数量或部署状态当作当前版本的证明。验证要求见 [贡献指南](../CONTRIBUTING.md#验证与完成标准)。
 
+## 2026-11-06 v0.3.0 发布验收
+
+注解标签 `v0.3.0` 的 Git 对象为 `57f01440b1446a685be0c29c67e0ad6f3183114a`，于 2026-11-06 16:54:47（Asia/Shanghai）创建，指向源码提交 `3e3ebc5b280813df6cb65cf63d6a1c6a762e614c`。该提交的 `scope`、`check`、`audit`、`container` 均通过。[源码提交](https://github.com/black-zero358/rust-email-mcp/commit/3e3ebc5b280813df6cb65cf63d6a1c6a762e614c) · [主干 CI](https://github.com/black-zero358/rust-email-mcp/actions/runs/42188935189)
+
+Release 工作流在 Ubuntu 24.04 runner 使用 Rust 1.99.1 和 `musl-gcc` 从标签提交构建 `x86_64-unknown-linux-musl`。`package` 和 `publish` 均通过，工作流于 2026-11-06 16:58:16（Asia/Shanghai）发布以下附件。[发布工作流](https://github.com/black-zero358/rust-email-mcp/actions/runs/42191094237) · [发行页](https://github.com/black-zero358/rust-email-mcp/releases/tag/v0.3.0)
+
+| 文件 | 字节数 | SHA-256 |
+| --- | ---: | --- |
+| `rust-email-mcp-0.3.0-x86_64-unknown-linux-musl.tar.gz` | 9,243,240 | `869fd933efc24538640dd96fab5f0de3ae3f19d5d405b48a0eb11675980a5055` |
+| `SHA256SUMS` | 120 | `b9ba7bd1595b15103f53c157fcbb1b6de3657f4e3a944612f34ba57418c11bf1` |
+| 解包后的 `rust-email-mcp` | 21,824,560 | `1bde603ad4b20bef30b2140721eaa487095bb490ad276423cb9e37954b76bd18` |
+
+独立复验从发行页下载两个附件，核对 GitHub 资产摘要与下载字节，并核对 `SHA256SUMS` 记录的归档摘要。解包与程序核验使用 WSL Ubuntu amd64。归档含程序、`SOURCE.txt`、README 和 LICENSE 四个普通文件。README、LICENSE 与标签内容一致，`SOURCE.txt` 的版本、目标、工具链、提交及二进制摘要均已核对。使用 `file` 和 `readelf` 确认二进制为 ELF64、little-endian、x86-64、已剥离符号的静态 PIE，程序头无 `INTERP`，动态表无 `NEEDED`。
+
+使用标签内的 `scripts/check-cache-recovery.py`，通过 uv 离线运行 Python 3.12.3，对实际下载的程序执行 `--schema-version 6` 恢复烟测。独立用户和网络命名空间内验证了恢复代次 1、2、3，缓存关闭时失败启动仍推进运行见证，损坏见证在打开 Journal 前被拒绝，操作库哨兵保持原字节，缓存目录和文件分别为 0700 和 0600。该版本的客户端兼容事项见[升级与回退](maintenance.md#030-升级要点)。
+
 ## 0.3.0 兼容性验证入口
 
 下表用于在最终候选提交上复验升级契约。测试使用合成邮件、隔离缓存及测试身份，运行 `cargo test --locked <测试名>` 可单独复验。验收结果按[发布检查](maintenance.md#发布检查)记录到对应提交和 CI 运行。
