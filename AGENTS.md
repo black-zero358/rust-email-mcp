@@ -4,6 +4,7 @@
 
 ## Working rules
 
+- Keep the root README oriented to setup and first use. Link detailed tool contracts, operations and dated validation from their owning documents, and distinguish the default branch from tagged downloads.
 - Rust: Cargo with the pinned toolchain and Cargo.lock; temporary Python scripts: uv; Node tooling: pnpm. Python and Node are not runtime dependencies.
 - For exact-source archive validation, use a snapshot-specific Cargo target directory or clean this package and both vendored path packages in each validated profile before reusing a shared target across snapshots; release cleaning requires `cargo clean --release`. Cargo freshness uses source mtimes; check the resulting release digest and retain it with the source identity.
 - Keep secrets and deployment identities out of Git and logs. Use synthetic data for regressions. Never send or modify real email for tests without explicit user authorization.
