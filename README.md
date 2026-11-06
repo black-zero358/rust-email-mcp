@@ -70,6 +70,8 @@
 
 持久缓存默认关闭，启用后仍默认在线读取。支持离线的工具可传 `read_source:"cache"`，搜索和 Message-ID 定位使用 `search_source:"cache"`。后台同步需在 full 缓存中单独启用。[缓存配置与同步](docs/deployment.md#持久缓存配置)
 
+离线全文搜索返回正文索引覆盖；`search_index.rebuild_pending` 为 true 时，初始搜索会继续从本地正文重建旧索引。升级后请重新开始先前的搜索分页。[离线查询契约](docs/capabilities.md#诊断统计和缓存)
+
 ## 权限与使用限制
 
 | `MAIL_MODE` | 默认邮箱可用操作 |

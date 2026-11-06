@@ -8,10 +8,11 @@ use super::{
 };
 use crate::{
     error::{LimitKind, MailError},
-    html::{self, DisplayContext, HtmlDisplay},
+    html::{self, DisplayContext, HtmlDisplay, RenderWork},
     mime::{self, selection},
 };
 use mailparse::MailHeaderMap;
+use std::collections::HashSet;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 pub(in crate::mail) const PAGE_ENCODED_BYTES: usize = 128 * 1024;
@@ -119,17 +120,21 @@ impl PreviewText {
         is_html: bool,
         complete: bool,
         display: &mut DisplayContext,
+        work: &mut RenderWork,
     ) -> Result<bool, ReadFault> {
         let rendered = if is_html {
             if complete {
-                html::render_selected(&text, display)
+                html::render_selected(&text, display, work)
             } else {
-                html::render_selected_prefix(&text, display)
+                html::render_selected_prefix(&text, display, work)
             }
             .map_err(ReadFault::local)?
         } else {
             text
         };
+        if !rendered.is_empty() && self.points != 0 {
+            self.pending_space = true;
+        }
         Ok(self.append(&rendered) || !complete)
     }
 
@@ -211,7 +216,9 @@ where
         .await
         .map_err(|fault| manifest_fault(fault, &observe))?;
     let command_fault = |error| ReadFault::command(observe(error));
-    let selected = loop {
+    let mut rejected = HashSet::new();
+    let mut work = RenderWork::default();
+    'candidate: loop {
         let mut selected = Vec::new();
         match selection::select(
             Node {
@@ -220,14 +227,10 @@ where
             },
             &mut selected,
             true,
+            &|node| rejected.contains(&node.index),
         ) {
             Ok(true) => return Err(ReadFault::local(html::unsupported())),
-            Ok(false) => {
-                break selected
-                    .into_iter()
-                    .map(|node| node.index)
-                    .collect::<Vec<_>>();
-            }
+            Ok(false) => {}
             Err(node) => {
                 if budget.claim(1) == 0 {
                     return Ok(Preview::BudgetSkipped);
@@ -241,56 +244,67 @@ where
                     .await
                     .map_err(command_fault)?;
                 manifest.body.nodes[index].nonempty = Some(!bytes.is_empty());
+                continue;
             }
         }
-    };
-    let mut output = PreviewText::default();
-    let mut display = DisplayContext::new(HtmlDisplay::Readable);
-    for node in selected {
-        let BodyKind::Leaf(index) = manifest.body.nodes[node].kind else {
-            return Err(ReadFault::local(MailError::backend()));
-        };
-        let part = &manifest.parts[index];
-        let encoded = part
-            .encoded_size
-            .ok_or_else(|| ReadFault::local(MailError::backend()))? as usize;
-        let sample = budget.available(encoded);
-        if sample == 0 && encoded != 0 {
-            return Ok(output.finish(true));
-        }
-        let (leaf, complete) = if encoded == 0 {
-            if budget.claim(1) == 0 {
+        let mut output = PreviewText::default();
+        let mut display = DisplayContext::new(HtmlDisplay::Readable);
+        for node in selected {
+            let BodyKind::Leaf(index) = manifest.body.nodes[node.index].kind else {
+                return Err(ReadFault::local(MailError::backend()));
+            };
+            let part = &manifest.parts[index];
+            let encoded = part
+                .encoded_size
+                .ok_or_else(|| ReadFault::local(MailError::backend()))?
+                as usize;
+            let sample = budget.available(encoded);
+            if sample == 0 && encoded != 0 {
                 return Ok(output.finish(true));
             }
-            fetch::section_chunk(session, uid, &part.section, 0, 1, Some(0))
-                .await
-                .map_err(command_fault)?;
-            (String::new(), true)
-        } else {
-            let mut decoder = SampleDecoder::new(&part.charset, &part.transfer_encoding, sample)?;
-            budget.claim(sample);
-            let bytes = fetch::section_chunk(session, uid, &part.section, 0, sample, Some(sample))
-                .await
-                .map_err(command_fault)?;
-            decoder.feed(&bytes)?;
-            let complete = sample == encoded && budget.claim(1) != 0;
-            if complete {
-                fetch::section_chunk(session, uid, &part.section, encoded, 1, Some(0))
+            let (leaf, complete) = if encoded == 0 {
+                if budget.claim(1) == 0 {
+                    return Ok(output.finish(true));
+                }
+                fetch::section_chunk(session, uid, &part.section, 0, 1, Some(0))
                     .await
                     .map_err(command_fault)?;
+                (String::new(), true)
+            } else {
+                let mut decoder =
+                    SampleDecoder::new(&part.charset, &part.transfer_encoding, sample)?;
+                budget.claim(sample);
+                let bytes =
+                    fetch::section_chunk(session, uid, &part.section, 0, sample, Some(sample))
+                        .await
+                        .map_err(command_fault)?;
+                decoder.feed(&bytes)?;
+                let complete = sample == encoded && budget.claim(1) != 0;
+                if complete {
+                    fetch::section_chunk(session, uid, &part.section, encoded, 1, Some(0))
+                        .await
+                        .map_err(command_fault)?;
+                }
+                (decoder.finish(complete)?, complete)
+            };
+            match output.append_leaf(
+                leaf,
+                part.content_type == "text/html",
+                complete,
+                &mut display,
+                &mut work,
+            ) {
+                Ok(true) => return Ok(output.finish(true)),
+                Ok(false) => {}
+                Err(fault) if fault.error.code == "UNSUPPORTED_BODY" => {
+                    rejected.insert(node.index);
+                    continue 'candidate;
+                }
+                Err(fault) => return Err(fault),
             }
-            (decoder.finish(complete)?, complete)
-        };
-        if output.append_leaf(
-            leaf,
-            part.content_type == "text/html",
-            complete,
-            &mut display,
-        )? {
-            return Ok(output.finish(true));
         }
+        return Ok(output.finish(false));
     }
-    Ok(output.finish(false))
 }
 
 /// Sample an already validated raw fetch from attachment filtering. The MIME
@@ -303,46 +317,59 @@ pub(in crate::mail) fn from_raw(
         return Ok(Preview::BudgetSkipped);
     }
     let message = mime::parse(raw).map_err(ReadFault::local)?;
-    let mut selected = Vec::new();
-    if selection::select(&message, &mut selected, true)
-        .map_err(|_| ReadFault::local(MailError::backend()))?
-    {
-        return Err(ReadFault::local(html::unsupported()));
-    }
     let mut budget = SampleBudget {
         message: MESSAGE_ENCODED_BYTES,
         page: page_remaining,
     };
-    let mut output = PreviewText::default();
-    let mut display = DisplayContext::new(HtmlDisplay::Readable);
-    for part in selected {
-        let encoded = part.encoded_body();
-        if encoded.is_empty() {
-            continue;
+    let mut rejected = HashSet::new();
+    let mut work = RenderWork::default();
+    'candidate: loop {
+        let mut selected = Vec::new();
+        if selection::select(&message, &mut selected, true, &|part| {
+            rejected.contains(&std::ptr::from_ref(part))
+        })
+        .map_err(|_| ReadFault::local(MailError::backend()))?
+        {
+            return Err(ReadFault::local(html::unsupported()));
         }
-        let sample = budget.available(encoded.len());
-        if sample == 0 {
-            return Ok(output.finish(true));
+        let mut output = PreviewText::default();
+        let mut display = DisplayContext::new(HtmlDisplay::Readable);
+        for part in selected {
+            let encoded = part.encoded_body();
+            if encoded.is_empty() {
+                continue;
+            }
+            let sample = budget.available(encoded.len());
+            if sample == 0 {
+                return Ok(output.finish(true));
+            }
+            let encoding = part
+                .headers
+                .get_first_value("Content-Transfer-Encoding")
+                .map_or_else(|| "7bit".into(), |value| value.trim().to_ascii_lowercase());
+            let mut decoder = SampleDecoder::new(&part.ctype.charset, &encoding, sample)?;
+            budget.claim(sample);
+            decoder.feed(&encoded[..sample])?;
+            let complete = sample == encoded.len();
+            let leaf = decoder.finish(complete)?;
+            match output.append_leaf(
+                leaf,
+                part.ctype.mimetype == "text/html",
+                complete,
+                &mut display,
+                &mut work,
+            ) {
+                Ok(true) => return Ok(output.finish(true)),
+                Ok(false) => {}
+                Err(fault) if fault.error.code == "UNSUPPORTED_BODY" => {
+                    rejected.insert(std::ptr::from_ref(part));
+                    continue 'candidate;
+                }
+                Err(fault) => return Err(fault),
+            }
         }
-        let encoding = part
-            .headers
-            .get_first_value("Content-Transfer-Encoding")
-            .map_or_else(|| "7bit".into(), |value| value.trim().to_ascii_lowercase());
-        let mut decoder = SampleDecoder::new(&part.ctype.charset, &encoding, sample)?;
-        budget.claim(sample);
-        decoder.feed(&encoded[..sample])?;
-        let complete = sample == encoded.len();
-        let leaf = decoder.finish(complete)?;
-        if output.append_leaf(
-            leaf,
-            part.ctype.mimetype == "text/html",
-            complete,
-            &mut display,
-        )? {
-            return Ok(output.finish(true));
-        }
+        return Ok(output.finish(false));
     }
-    Ok(output.finish(false))
 }
 
 #[cfg(test)]

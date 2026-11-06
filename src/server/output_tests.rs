@@ -240,6 +240,10 @@ struct Harness {
 
 impl Harness {
     async fn new(metadata_cache: bool) -> Self {
+        Self::with_cache(metadata_cache.then_some("metadata")).await
+    }
+
+    async fn with_cache(cache_mode: Option<&str>) -> Self {
         let signed = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let cert = signed.cert.der().clone();
         let tls = tokio_rustls::rustls::ServerConfig::builder()
@@ -281,12 +285,27 @@ impl Harness {
             is_legacy: false,
         });
         let catalog = AccountCatalog::from_test_accounts(settings.clone()).unwrap();
-        let cache_settings = metadata_cache.then(|| {
+        let cache_settings = cache_mode.map(|mode| {
             let path = staging.path().join("cache.json");
-            std::fs::write(&path, br#"{"version":1,"mode":"metadata","directory":"metadata","max_bytes":33554432,"accounts":[{"account_id":"default","mailboxes":["INBOX"],"max_bytes":8388608}]}"#).unwrap();
+            std::fs::write(
+                &path,
+                json!({"version":1,"mode":mode,"directory":"cache","max_bytes":33554432,
+                "accounts":[{"account_id":"default","mailboxes":["INBOX"],"max_bytes":8388608}]})
+                .to_string(),
+            )
+            .unwrap();
             config::load_cache_file(&path, &settings).unwrap().unwrap()
         });
-        let cache = MailRuntime::prepare_cache(&catalog, cache_settings).unwrap();
+        let cache = if cache_mode == Some("full") {
+            let run = crate::accounts::CacheRunIdentity {
+                instance: uuid::Uuid::new_v4(),
+                previous: None,
+                current: uuid::Uuid::new_v4(),
+            };
+            MailRuntime::prepare_cache_for_run(&catalog, cache_settings, Some(run)).unwrap()
+        } else {
+            MailRuntime::prepare_cache(&catalog, cache_settings).unwrap()
+        };
         let journal = Arc::new(Journal::open(Path::new(":memory:")).unwrap());
         let mail = Arc::new(
             MailRuntime::with_cache(catalog, journal, cache.clone())
@@ -516,6 +535,40 @@ async fn metadata_cache_status_reports_live_evidence_without_an_imap_read() {
     })
     .await
     .unwrap();
+    assert_eq!(h.connections(), before);
+    drop(h.app);
+    h.cache.finish().await;
+}
+
+#[tokio::test]
+async fn offline_body_search_publishes_projection_coverage_through_its_schema() {
+    let h = Harness::with_cache(Some("full")).await;
+    let live = h
+        .call("owner", "get_email", json!({"uid":7,"uid_validity":9}))
+        .await;
+    assert_eq!(live["data"]["body"], "第一个邮箱");
+    let before = h.connections();
+    let searched = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let page = h
+                .call(
+                    "owner",
+                    "search_emails",
+                    json!({"query":"第一个","search_source":"cache","uid_validity":9}),
+                )
+                .await;
+            if page["data"]["emails"][0]["cache_match"]["body"] == true {
+                break page;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let index = &searched["data"]["cache"]["scopes"][0]["coverage"]["search_index"];
+    assert_eq!(index["indexed_body"], 1);
+    assert_eq!(index["version"], 2);
+    assert_eq!(index["rebuild_pending"], false);
     assert_eq!(h.connections(), before);
     drop(h.app);
     h.cache.finish().await;

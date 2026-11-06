@@ -53,7 +53,8 @@ mod tests {
 
     fn render(html: &str) -> DisplayBody {
         let mut context = DisplayContext::new(HtmlDisplay::Readable);
-        let text = super::super::render_selected(html, &mut context).unwrap();
+        let text =
+            super::super::render_selected(html, &mut context, &mut Default::default()).unwrap();
         DisplayBody {
             text,
             metadata: context.into_metadata(),
@@ -83,17 +84,25 @@ mod tests {
         for foreign in ["<svg><![CDATA[secret]]></svg>", "<math>secret</math>"] {
             let mut context = DisplayContext::new(HtmlDisplay::Readable);
             assert_eq!(
-                super::super::render_selected(&format!("visible{foreign}"), &mut context)
-                    .unwrap_err()
-                    .code,
+                super::super::render_selected(
+                    &format!("visible{foreign}"),
+                    &mut context,
+                    &mut Default::default()
+                )
+                .unwrap_err()
+                .code,
                 "UNSUPPORTED_BODY"
             );
         }
         let mut context = DisplayContext::new(HtmlDisplay::Readable);
         assert_eq!(
-            super::super::render_selected(&"<b></b>".repeat(32768), &mut context)
-                .unwrap_err()
-                .code,
+            super::super::render_selected(
+                &"<b></b>".repeat(32768),
+                &mut context,
+                &mut Default::default()
+            )
+            .unwrap_err()
+            .code,
             "LIMIT_EXCEEDED"
         );
         let mut context = DisplayContext::new(HtmlDisplay::Readable);
@@ -104,7 +113,7 @@ mod tests {
             "</blockquote>".repeat(16)
         );
         assert_eq!(
-            super::super::render_selected(&amplified, &mut context)
+            super::super::render_selected(&amplified, &mut context, &mut Default::default())
                 .unwrap_err()
                 .code,
             "LIMIT_EXCEEDED"
@@ -116,7 +125,6 @@ mod tests {
 pub(crate) struct DisplayContext {
     format: HtmlDisplay,
     html_parts: u32,
-    tokens: usize,
     output_bytes: usize,
     links: usize,
     // At most 256 pairs, with <=2048-byte labels and addresses. Longer labels
@@ -137,9 +145,6 @@ impl DisplayContext {
     }
     pub fn html_part(&mut self) {
         self.html_parts = self.html_parts.saturating_add(1);
-    }
-    pub fn tokens(&self) -> usize {
-        self.tokens
     }
     fn omit(&mut self, reason: usize) {
         self.omissions[reason] = self.omissions[reason].saturating_add(1);
@@ -537,7 +542,6 @@ impl Readable {
     }
     pub fn finish(
         mut self,
-        tokens: usize,
         parse_error: bool,
         html: &str,
         complete: bool,
@@ -565,7 +569,6 @@ impl Readable {
         while !self.preserve_tail && self.out.ends_with('\n') {
             self.out.pop();
         }
-        self.context.tokens = tokens;
         Ok((self.out, Some(self.context)))
     }
 }

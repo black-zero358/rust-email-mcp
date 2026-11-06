@@ -17,6 +17,15 @@ const SEGMENT_STRIDE: i64 = 4096;
 const MAX_CANDIDATES: usize = 200;
 const MAX_HITS: usize = 50;
 
+pub(crate) const BODY_INDEX_VERSION: u16 = 2;
+pub(crate) const BODY_INDEX_REBUILD_BATCH: u32 = 4;
+
+// Version 1 used the artifact's HTML version directly. Keep the artifact key
+// and leaf metadata readable, and give the projected index its own namespace.
+pub(super) const fn index_html_version(html_version: u16) -> i64 {
+    (html_version as i64) << 16 | BODY_INDEX_VERSION as i64
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SearchPosition {
@@ -47,7 +56,126 @@ enum Build {
     Append(i64),
 }
 
+struct StoredIndex {
+    id: i64,
+    blob: [u8; 16],
+    digest: [u8; 32],
+    complete: bool,
+    version: i64,
+}
+
 impl Cache {
+    /// Pick old or interrupted body indexes to rebuild from their existing
+    /// local body blob. Search results only expose the current projection.
+    pub(crate) fn pending_body_index_rebuild(
+        &self,
+        account: &AccountKey,
+        scope: &ScopeSnapshot,
+        (mime, html): (u16, u16),
+    ) -> Result<Vec<(u32, BlobId, u64)>, CacheError> {
+        let namespace = self.scope(account, &scope.mailbox)?;
+        if !self.full || namespace != scope.account_namespace {
+            return Err(CacheError::OutOfScope);
+        }
+        let databases = self.lock()?;
+        let db = &databases
+            .get(&namespace)
+            .ok_or(CacheError::OutOfScope)?
+            .connection;
+        let mut statement = db.prepare_cached(
+            "SELECT m.uid,a.blob_id,d.bytes FROM messages m
+             JOIN artifacts a ON a.message_id=m.id AND a.kind=1 AND a.part=0
+                AND a.mime_version=?4 AND a.html_version=?5 AND a.state=1
+             JOIN blobs d ON d.id=a.blob_id
+             WHERE m.mailbox=?1 AND m.uid_validity=?2 AND m.uid<=?3 AND NOT m.tombstone
+                AND EXISTS(SELECT 1 FROM body_indexes b WHERE b.message_id=m.id AND b.mime_version=?4
+                    AND b.blob_id=a.blob_id AND (b.html_version=?5 OR (b.html_version=?6 AND NOT b.complete)))
+                AND NOT EXISTS(SELECT 1 FROM body_indexes b WHERE b.message_id=m.id AND b.mime_version=?4
+                    AND b.html_version=?6 AND b.blob_id=a.blob_id AND b.complete)
+             ORDER BY m.uid DESC LIMIT ?7",
+        )?;
+        Ok(statement
+            .query_map(
+                params![
+                    scope.mailbox,
+                    scope.uid_validity,
+                    scope.high_uid,
+                    mime,
+                    html,
+                    index_html_version(html),
+                    BODY_INDEX_REBUILD_BATCH
+                ],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        BlobId::from_bytes(row.get(1)?),
+                        u64::from(row.get::<_, u32>(2)?),
+                    ))
+                },
+            )?
+            .collect::<Result<_, _>>()?)
+    }
+
+    pub(crate) fn discard_old_body_index(
+        &self,
+        reference: Ref<'_>,
+        kind: ArtifactKey,
+        blob: BlobId,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), CacheError> {
+        let ArtifactKey::FullBody {
+            mime_version,
+            html_version,
+        } = kind
+        else {
+            return Err(CacheError::OutOfScope);
+        };
+        let namespace = self.scope(reference.account, reference.mailbox)?;
+        let epoch = self.disk.restore_epoch();
+        let check = || {
+            if cancelled() || epoch != self.disk.restore_epoch() {
+                Err(CacheError::NeedsVerification)
+            } else {
+                Ok(())
+            }
+        };
+        loop {
+            check()?;
+            let mut databases = self.lock()?;
+            let database = databases
+                .get_mut(&namespace)
+                .ok_or(CacheError::OutOfScope)?;
+            let more =
+                self.write_checked(
+                    namespace,
+                    database,
+                    |tx| {
+                        verify_body(tx, reference, kind, blob)?;
+                        let id = tx.query_row(
+                    "SELECT b.id FROM body_indexes b JOIN messages m ON b.message_id=m.id
+                     WHERE m.mailbox=?1 AND m.uid_validity=?2 AND m.uid=?3 AND b.mime_version=?4
+                     AND (b.html_version=?5 OR (b.html_version=?6 AND NOT b.complete))
+                     AND b.blob_id=?7 ORDER BY b.html_version LIMIT 1",
+                    params![reference.mailbox, reference.uid_validity, reference.uid, mime_version,
+                        html_version, index_html_version(html_version), blob.bytes()],
+                    |row| row.get(0),
+                ).optional()?;
+                        match id {
+                            Some(id) => {
+                                sweep_index(tx, id)?;
+                                Ok(true)
+                            }
+                            None => Ok(false),
+                        }
+                    },
+                    check,
+                )?;
+            if !more {
+                return Ok(());
+            }
+        }
+    }
+
     /// Search cursors freeze search visibility independently of the thread index.
     pub fn search_revision(
         &self,
@@ -105,6 +233,7 @@ impl Cache {
             }
         };
         let digest: [u8; 32] = Sha256::digest(text.as_bytes()).into();
+        let index_version = index_html_version(html_version);
         let id = loop {
             check()?;
             let mut databases = self.lock()?;
@@ -117,41 +246,49 @@ impl Cache {
                 |tx| {
                     verify_body(tx, reference, kind, blob)?;
                     let message = present_message(tx, reference)?;
-                    let prior: Option<(i64, [u8; 16], [u8; 32], bool)> = tx
+                    let prior = tx
                         .query_row(
-                            "SELECT id,blob_id,digest,complete FROM body_indexes
-                     WHERE message_id=?1 AND mime_version=?2 AND html_version=?3",
-                            params![message, mime_version, html_version],
-                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                            "SELECT id,blob_id,digest,complete,html_version FROM body_indexes
+                     WHERE message_id=?1 AND mime_version=?2 AND html_version IN (?3,?4)
+                     ORDER BY html_version LIMIT 1",
+                            params![message, mime_version, html_version, index_version],
+                            |row| {
+                                Ok(StoredIndex {
+                                    id: row.get(0)?,
+                                    blob: row.get(1)?,
+                                    digest: row.get(2)?,
+                                    complete: row.get(3)?,
+                                    version: row.get(4)?,
+                                })
+                            },
                         )
                         .optional()?;
-                    if let Some((id, old_blob, old_digest, complete)) = prior {
-                        if old_blob == blob.bytes() {
-                            if old_digest != digest {
+                    if let Some(prior) = prior {
+                        if prior.version == index_version && prior.blob == blob.bytes() {
+                            if prior.digest != digest {
                                 return Err(CacheError::Corrupt);
                             }
-                            return Ok(if complete {
+                            return Ok(if prior.complete {
                                 Build::Done
                             } else {
-                                Build::Append(id)
+                                Build::Append(prior.id)
                             });
                         }
-                        tx.execute("UPDATE body_indexes SET complete=0 WHERE id=?1", [id])?;
-                        if tx.execute(
-                            "DELETE FROM body_segments WHERE id IN (
-                           SELECT id FROM body_segments WHERE index_id=?1 LIMIT 16
-                         )",
-                            [id],
-                        )? != 0
+                        if sweep_index(tx, prior.id)?
+                            || tx.query_row(
+                                "SELECT EXISTS(SELECT 1 FROM body_indexes
+                                 WHERE message_id=?1 AND mime_version=?2 AND html_version=?3)",
+                                params![message, mime_version, index_version],
+                                |row| row.get::<_, bool>(0),
+                            )?
                         {
                             return Ok(Build::Sweep);
                         }
-                        tx.execute("DELETE FROM body_indexes WHERE id=?1", [id])?;
                     }
                     tx.execute(
                     "INSERT INTO body_indexes(message_id,mime_version,html_version,blob_id,digest)
                      VALUES(?1,?2,?3,?4,?5)",
-                    params![message,mime_version,html_version,blob.bytes(),digest],
+                    params![message,mime_version,index_version,blob.bytes(),digest],
                 )?;
                     Ok(Build::Append(tx.last_insert_rowid()))
                 },
@@ -251,6 +388,7 @@ impl Cache {
         }
         let phrase = (!short).then(|| format!("\"{}\"", query.replace('"', "\"\"")));
         let (mime, html) = body.unwrap_or_default();
+        let index_version = index_html_version(html);
         let namespace = self.scope(account, mailbox)?;
         let databases = self.lock()?;
         let db = &databases
@@ -265,7 +403,7 @@ impl Cache {
                 AND b.uid_validity=f.uid_validity AND b.mime_version=?3 AND b.html_version=?4
              ),0)
              FROM mailboxes f WHERE f.mailbox=?1 AND f.uid_validity=?2",
-            params![mailbox, scope.uid_validity, mime, html],
+            params![mailbox, scope.uid_validity, mime, index_version],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         let before = position.map_or(i64::from(u32::MAX) + 1, |value| {
@@ -275,7 +413,7 @@ impl Cache {
             "SELECT m.id,m.uid,m.index_text,b.id FROM messages m
              LEFT JOIN artifacts a ON a.message_id=m.id AND a.kind=1 AND a.part=0
                  AND a.mime_version=?3 AND a.html_version=?4 AND a.state=1
-             LEFT JOIN body_indexes b ON b.message_id=m.id AND b.mime_version=?3 AND b.html_version=?4
+             LEFT JOIN body_indexes b ON b.message_id=m.id AND b.mime_version=?3 AND b.html_version=?7
                  AND b.blob_id=a.blob_id AND b.complete
              WHERE m.mailbox=?1 AND m.uid_validity=?2 AND NOT m.tombstone AND m.uid<=?5 AND m.uid<?6
              ORDER BY m.uid DESC LIMIT 201",
@@ -286,7 +424,8 @@ impl Cache {
             mime,
             html,
             scope.high_uid,
-            before
+            before,
+            index_version,
         ])?;
         let mut items = Vec::with_capacity(limit);
         let mut last = None;
@@ -365,6 +504,22 @@ impl Cache {
             indexed_body: indexed_body as u64,
         })
     }
+}
+
+/// Returns true while the parent may still have segments to sweep.
+fn sweep_index(tx: &rusqlite::Transaction<'_>, id: i64) -> Result<bool, CacheError> {
+    tx.execute("UPDATE body_indexes SET complete=0 WHERE id=?1", [id])?;
+    if tx.execute(
+        "DELETE FROM body_segments WHERE id IN (
+            SELECT id FROM body_segments WHERE index_id=?1 LIMIT 16
+         )",
+        [id],
+    )? != 0
+    {
+        return Ok(true);
+    }
+    tx.execute("DELETE FROM body_indexes WHERE id=?1", [id])?;
+    Ok(false)
 }
 
 fn search_revision(db: &Connection, scope: &ScopeSnapshot) -> Result<u64, CacheError> {

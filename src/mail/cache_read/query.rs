@@ -1,7 +1,7 @@
 //! Bounded local metadata, full-text and exact-ID queries.
 use super::*;
 use crate::{
-    cache::{SearchPosition, ThreadRole},
+    cache::{BODY_INDEX_VERSION, SearchPosition, ThreadRole},
     mail::{
         classification::{self, Coverage},
         parts::preview,
@@ -11,6 +11,7 @@ use base64::Engine;
 
 const EXACT_WINDOW: u32 = 200;
 const PREVIEW_BYTES: usize = preview::PAGE_ENCODED_BYTES;
+const SEARCH_BODY: (u16, u16) = (1, 1);
 
 impl CachedReader {
     pub(super) fn cached_query(&self, name: &str, args: &Value) -> Result<Value> {
@@ -30,6 +31,9 @@ impl CachedReader {
         let (rows, next_before_uid, next_cache_cursor, index_coverage) = if let Some(query) =
             args["query"].as_str()
         {
+            if args.get("cache_cursor").is_none() && before.is_none() {
+                self.rebuild_body_indexes(&scope)?;
+            }
             let revision = self
                 .cache
                 .search_revision(&self.account, &scope)
@@ -46,7 +50,14 @@ impl CachedReader {
                 cursor.or_else(|| before.map(|uid| SearchPosition { uid, segment: None }));
             let page = self
                 .cache
-                .search_cached(&self.account, mailbox, query, position, limit, Some((1, 1)))
+                .search_cached(
+                    &self.account,
+                    mailbox,
+                    query,
+                    position,
+                    limit,
+                    Some(SEARCH_BODY),
+                )
                 .map_err(cache_error)?;
             if page.search_revision != revision
                 || page.scope.uid_validity != scope.uid_validity
@@ -76,11 +87,17 @@ impl CachedReader {
                 .filter(|cursor| cursor.segment.is_none())
                 .map(|cursor| cursor.uid);
             let next_cursor = page.next.map(|next| encode_cursor(next, key));
+            let rebuild_pending = !self
+                .cache
+                .pending_body_index_rebuild(&self.account, &scope, SEARCH_BODY)
+                .map_err(cache_error)?
+                .is_empty();
             (
                 rows,
                 next_uid,
                 next_cursor,
-                json!({"indexed_metadata":page.indexed_metadata,"indexed_body":page.indexed_body,"version":1}),
+                json!({"indexed_metadata":page.indexed_metadata,"indexed_body":page.indexed_body,
+                    "version":BODY_INDEX_VERSION,"rebuild_pending":rebuild_pending}),
             )
         } else {
             if args.get("cache_cursor").is_some() {
@@ -157,6 +174,87 @@ impl CachedReader {
             result["next_cache_cursor"] = json!(next_cache_cursor);
         }
         Ok(result)
+    }
+
+    fn rebuild_body_indexes(&self, scope: &ScopeSnapshot) -> Result<()> {
+        let mut remaining = cached_body::LIMIT as u64;
+        for (uid, blob, bytes) in self
+            .cache
+            .pending_body_index_rebuild(&self.account, scope, SEARCH_BODY)
+            .map_err(cache_error)?
+        {
+            let Some(left) = remaining.checked_sub(bytes.max(1)) else {
+                continue;
+            };
+            remaining = left;
+            self.rebuild_body_index(scope, uid, blob)?;
+        }
+        self.verify(scope, None)
+    }
+
+    fn rebuild_body_index(
+        &self,
+        scope: &ScopeSnapshot,
+        uid: u32,
+        blob: crate::cache::BlobId,
+    ) -> Result<()> {
+        let reference = self.reference(&scope.mailbox, scope.uid_validity, uid);
+        let result = (|| {
+            let mut lease = self
+                .cache
+                .open_blob(reference, cached_body::KEY, Access::Offline, Some(blob))
+                .map_err(cache_error)?;
+            let cancelled = || {
+                !self.persistent.offline_current(
+                    &self.account,
+                    &scope.mailbox,
+                    scope.uid_validity,
+                    Some(uid),
+                )
+            };
+            let record = match cached_body::Record::decode(&mut lease) {
+                Err(CacheError::Corrupt) => {
+                    return self
+                        .cache
+                        .discard_old_body_index(reference, cached_body::KEY, blob, &cancelled)
+                        .map_err(cache_error);
+                }
+                result => result.map_err(cache_error)?,
+            };
+            let displayed = match record.display(crate::html::HtmlDisplay::Legacy) {
+                Err(error) if matches!(error.code, "LIMIT_EXCEEDED" | "UNSUPPORTED_BODY") => {
+                    return self
+                        .cache
+                        .discard_old_body_index(reference, cached_body::KEY, blob, &cancelled)
+                        .map_err(cache_error);
+                }
+                result => result?,
+            };
+            lease.revalidate().map_err(cache_error)?;
+            self.cache
+                .remember_full_body_index(
+                    reference,
+                    cached_body::KEY,
+                    blob,
+                    &displayed.text,
+                    &cancelled,
+                )
+                .map_err(cache_error)
+        })();
+        match result {
+            Ok(()) => Ok(()),
+            // A cache with limited disk or an unreadable body still serves its
+            // metadata and already indexed bodies with truthful coverage.
+            Err(error)
+                if matches!(
+                    error.code,
+                    "LIMIT_EXCEEDED" | "CACHE_MISS" | "CACHE_UNAVAILABLE" | "STORAGE_UNAVAILABLE"
+                ) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn matches_filters(
@@ -242,50 +340,58 @@ impl CachedReader {
                 .cache
                 .artifact_state(reference, cached_body::KEY)
                 .map_err(cache_error)?;
-            let (key, info) = match state {
-                ArtifactState::Materialized(info) => (cached_body::KEY, info),
-                ArtifactState::Derivable { raw } => {
-                    match self
-                        .cache
-                        .artifact_state(reference, ArtifactKey::Raw)
-                        .map_err(cache_error)?
-                    {
-                        ArtifactState::Materialized(info) if raw == info.id => {
-                            (ArtifactKey::Raw, info)
-                        }
-                        _ => return Err(cache_miss()),
-                    }
+            let raw_source = |expected: Option<crate::cache::BlobId>| match self
+                .cache
+                .artifact_state(reference, ArtifactKey::Raw)
+                .map_err(cache_error)?
+            {
+                ArtifactState::Materialized(info) if expected.is_none_or(|id| id == info.id) => {
+                    Ok((ArtifactKey::Raw, info))
                 }
+                _ => Err(cache_miss()),
+            };
+            let (mut key, mut info) = match state {
+                ArtifactState::Materialized(info) => (cached_body::KEY, info),
+                ArtifactState::Derivable { raw } => raw_source(Some(raw))?,
+                ArtifactState::Unsupported(_) => raw_source(None)?,
                 _ => return Err(cache_miss()),
             };
-            let size = usize::try_from(info.bytes).map_err(|_| MailError::limit())?;
-            if size > 8 * 1024 || size.max(1) > *remaining {
-                return Ok(None);
+            loop {
+                let size = usize::try_from(info.bytes).map_err(|_| MailError::limit())?;
+                if size > 8 * 1024 || size.max(1) > *remaining {
+                    return Ok(None);
+                }
+                *remaining -= size.max(1);
+                let mut lease = self
+                    .cache
+                    .open_blob(reference, key, Access::Offline, Some(info.id))
+                    .map_err(cache_error)?;
+                let value = if key == ArtifactKey::Raw {
+                    let raw = blob_bytes(&mut lease, 8 * 1024)?;
+                    preview::from_raw(&raw, &mut (8 * 1024)).map_err(|fault| fault.error)?
+                } else {
+                    let record = cached_body::Record::decode(&mut lease).map_err(cache_error)?;
+                    match record.display(crate::html::HtmlDisplay::Legacy) {
+                        Err(error) if error.code == "UNSUPPORTED_BODY" => {
+                            (key, info) = raw_source(None).map_err(|_| error)?;
+                            continue;
+                        }
+                        result => preview::from_displayed(&result?.text),
+                    }
+                };
+                lease.revalidate().map_err(cache_error)?;
+                lease.touch();
+                lease.revalidate().map_err(cache_error)?;
+                if !self.persistent.offline_current(
+                    reference.account,
+                    reference.mailbox,
+                    reference.uid_validity,
+                    Some(reference.uid),
+                ) {
+                    return Err(cache_error(CacheError::NeedsVerification));
+                }
+                return Ok(Some(value));
             }
-            *remaining -= size.max(1);
-            let mut lease = self
-                .cache
-                .open_blob(reference, key, Access::Offline, Some(info.id))
-                .map_err(cache_error)?;
-            let value = if key == ArtifactKey::Raw {
-                let raw = blob_bytes(&mut lease, 8 * 1024)?;
-                preview::from_raw(&raw, &mut (8 * 1024)).map_err(|fault| fault.error)?
-            } else {
-                let record = cached_body::Record::decode(&mut lease).map_err(cache_error)?;
-                preview::from_displayed(&record.display(crate::html::HtmlDisplay::Legacy)?.text)
-            };
-            lease.revalidate().map_err(cache_error)?;
-            lease.touch();
-            lease.revalidate().map_err(cache_error)?;
-            if !self.persistent.offline_current(
-                reference.account,
-                reference.mailbox,
-                reference.uid_validity,
-                Some(reference.uid),
-            ) {
-                return Err(cache_error(CacheError::NeedsVerification));
-            }
-            Ok(Some(value))
         })();
         item["preview_status"] = json!(match result {
             Ok(Some(preview::Preview::Text { text, truncated })) => {
@@ -422,7 +528,8 @@ fn server_day(date: &str) -> Option<String> {
 
 fn search_key(scope: &ScopeSnapshot, revision: u64, args: &Value) -> [u8; 32] {
     let mut hash = Sha256::new();
-    hash.update(b"r11-cache-search-v1\0");
+    hash.update(b"r11-cache-search\0");
+    hash.update(BODY_INDEX_VERSION.to_be_bytes());
     hash.update(scope.account_namespace);
     hash.update(scope.uid_validity.to_be_bytes());
     hash.update(scope.high_uid.to_be_bytes());

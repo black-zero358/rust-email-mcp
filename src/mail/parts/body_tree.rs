@@ -62,6 +62,14 @@ impl crate::mime::selection::Node for Node<'_> {
             ),
         }
     }
+    fn charset_supported(self) -> bool {
+        match &self.node().kind {
+            BodyKind::Leaf(index) => {
+                crate::mime::selection::charset_supported(&self.manifest.parts[*index].charset)
+            }
+            BodyKind::Container { .. } => true,
+        }
+    }
     fn nonempty(self) -> Option<bool> {
         match &self.node().kind {
             BodyKind::Leaf(index) => self.manifest.parts[*index]

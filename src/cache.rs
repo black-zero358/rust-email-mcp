@@ -32,6 +32,7 @@ pub use blob::{
     Access, ArtifactKey, ArtifactLayer, ArtifactState, BlobId, BlobInfo, BlobLease, BlobStage,
     LayerCoverage, Omission,
 };
+pub(crate) use body_index::BODY_INDEX_VERSION;
 pub use body_index::{CachedSearchHit, CachedSearchPage, SearchPosition};
 pub use dirty::{DirtyStamp, DirtyTicket};
 pub use evidence::{

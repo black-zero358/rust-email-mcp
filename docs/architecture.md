@@ -147,6 +147,8 @@ HTTP 内容固定为 octet-stream，带 no-store/nosniff、`X-Content-SHA256` �
 
 HTML 回退只用有界 tokenizer sink，不引入 DOM/layout 引擎、不执行脚本或加载资源。tokenizer 前检查输入和属性复杂度，处理时继续限制 token 与输出；属性复杂度必须覆盖无空白的相邻 quoted attributes 和 slash recovery。tokenizer-only sink 无法解释 SVG/MathML 外来内容及其 CDATA，出现时即使已有可见文字也拒绝整段正文。其他非空但无法完整解释的内联内容同样显式失败，转发必须在发送 claim 前拒绝不完整原文。所有新构建纯文本邮件显式声明 UTF-8，保持转发中的 Unicode 内容。
 
+正文候选探测在解码前核对非空文本叶的字符集。某个候选的 HTML 无法完整渲染时，舍弃本轮全部展示、HTML 统计和缓存叶，重新选择完整表示；尝试已用的解码、分词、预览取样及 IMAP 字节预算继续计入。协议失败和资源限额沿原错误传播。投影按选中叶顺序展示，相邻非空叶之间没有换行时补一个 LF，计入正文预算；预览把独立叶边界折叠为一个空格。回归覆盖 raw/转发、结构化分块、缓存叶重放和预览。
+
 读取可显式选择 `html_display:readable`；默认和转发继续使用 `legacy`。两种格式复用同一 MIME 候选选择器，读取解析一次 MIME 后分别提取元数据及所选格式正文。`html/readable` 维护有界格式状态：16 层列表/引用/表格、256 个链接、每链接 2048 UTF-8 字节；实体解码后验证 http/https/mailto 协议、控制字符和长度。多个所选 HTML 叶子共用 token、输出和链接预算。输出含 `legacy-v1` / `readable-v1` 及固定原因省略计数，保持外来内容拒绝和原有输入/标记复杂度约束。
 
 ## Send lifecycle
@@ -201,6 +203,8 @@ full 配置经 `Cache::open_full_with_run` 绑定运行见证。`cache/blob` 保
 `accounts/cache_run` 在每次启动（包括 off）于 Journal 前发布注册库旁的私有运行见证，并持有生命周期锁。full 清洁凭据绑定前驱运行、规范根目录及选定范围。写操作在调度排队前取得准入，关闭时封闭准入并等待既有写入及清理，再写入清洁凭据；异常退出和恢复使旧范围待核对。具体路径、备份和旧程序降级流程见[部署规程](deployment.md#持久缓存备份与恢复)。
 
 `mail/cache_read` 和离线会话先授权，再使用与在线调用相同的 4 槽/20 请求调度；本地 blocking 工作持有共享许可直到实际结束。显式 cache 分支执行本地查询与完整性核对，保持零 IMAP；默认 live 分支继续核对 UIDVALIDITY 和目标存在性。结果报告来源、观察时间和覆盖；FLAGS 缺失保留未知状态。完整正文的文本负载与有界叶元数据分离，维持单文件 32 MiB，渲染与输出裁减在读取时执行；全文索引只接收完整内容。
+
+正文全文索引 v2 使用新的投影身份，已保存的 R11B 正文叶和 SQLite V6 继续可读。离线搜索只计入 v2 完整索引，`rebuild_pending` 表示本地还有旧索引或未完成的替换；初始搜索从已有正文 blob 最多重建四封、合计最多 32 MiB 负载，分页延续同一索引视图。旧游标需重新搜索。旧正文的候选无法渲染但缓存有完整原件时，从原件重新选叶，默认展示可物化恢复后的正文。实际回归覆盖旧粘连词隐藏、同 blob 重建、版本覆盖和回收。
 
 D2/D3/D4/D5 验证入口为 `src/cache/full_tests.rs`、`src/cache/content_tests.rs`、`src/accounts/cache_run/tests.rs` 和 `src/mail/cache_write_guard/tests.rs`；metadata 和持久游标继续运行 R10 回归。显式离线工具矩阵及故障场景见[实施设计](cache-content-design.md#验收矩阵)。
 
