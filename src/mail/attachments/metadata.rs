@@ -1,6 +1,7 @@
 //! Stable attachment references and bounded display metadata; IDs grant no access.
 use super::*;
-use crate::error::InputViolation;
+use crate::{error::InputViolation, mail::persistence::canonical_mailbox};
+use sha2::digest::Output;
 
 pub(super) struct AttachmentReference<'a> {
     pub alias: &'a str,
@@ -11,17 +12,53 @@ pub(super) struct AttachmentReference<'a> {
 }
 impl AttachmentReference<'_> {
     pub fn id(&self, index: usize) -> String {
+        let mailbox = canonical_mailbox(self.mailbox);
+        format!("att_v1_{:x}", self.digest(index, mailbox.as_bytes()))
+    }
+
+    fn digest(&self, index: usize, mailbox: &[u8]) -> Output<Sha256> {
         let mut hash = Sha256::new();
         hash.update(b"email-mcp-attachment-reference-v1\0");
         hash.update(self.account.reference_namespace());
-        hash.update((self.mailbox.len() as u64).to_be_bytes());
-        hash.update(self.mailbox.as_bytes());
+        hash.update((mailbox.len() as u64).to_be_bytes());
+        hash.update(mailbox);
         hash.update(self.validity.to_be_bytes());
         hash.update(self.uid.to_be_bytes());
         hash.update((index as u32).to_be_bytes());
         hash.update(MIME_REFERENCE_VERSION.to_be_bytes());
-        format!("att_v1_{:x}", hash.finalize())
+        hash.finalize()
     }
+
+    fn matches_legacy_inbox(&self, index: usize, id: &[u8; 32]) -> bool {
+        // Earlier att_v1 references hashed the exact requested spelling of INBOX.
+        (1..32).any(|mask| {
+            let mut mailbox = *b"INBOX";
+            for (bit, letter) in mailbox.iter_mut().enumerate() {
+                if mask & (1 << bit) != 0 {
+                    letter.make_ascii_lowercase();
+                }
+            }
+            self.digest(index, &mailbox)[..] == id[..]
+        })
+    }
+}
+
+fn parse_id(value: &Value) -> Option<[u8; 32]> {
+    let digits = value.as_str()?.strip_prefix("att_v1_")?.as_bytes();
+    let mut id = [0; 32];
+    if digits.len() != id.len() * 2 {
+        return None;
+    }
+    let nibble = |digit| match digit {
+        b'0'..=b'9' => Some(digit - b'0'),
+        b'a'..=b'f' => Some(digit - b'a' + 10),
+        _ => None,
+    };
+    let (pairs, _) = digits.as_chunks::<2>();
+    for (byte, &[high, low]) in id.iter_mut().zip(pairs) {
+        *byte = (nibble(high)? << 4) | nibble(low)?;
+    }
+    Some(id)
 }
 
 pub(super) fn ensure_account(args: &Value, alias: &str) -> Result<()> {
@@ -37,41 +74,30 @@ pub(super) fn select_part(
     reference: &AttachmentReference<'_>,
 ) -> Result<usize> {
     ensure_account(args, reference.alias)?;
-    let id = match args.get("attachment_id") {
-        None => None,
-        Some(Value::String(id))
-            if id.strip_prefix("att_v1_").is_some_and(|suffix| {
-                suffix.len() == 64
-                    && suffix
-                        .bytes()
-                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            }) =>
-        {
-            Some(id.as_str())
-        }
-        _ => {
-            return Err(MailError::input_field(InputViolation::new(
-                "/attachment_id",
-                "invalid_attachment_id",
-                "relist_attachments",
-            )));
-        }
-    };
+    let id = args
+        .get("attachment_id")
+        .map(|value| {
+            parse_id(value).ok_or_else(|| {
+                MailError::input_field(InputViolation::new(
+                    "/attachment_id",
+                    "invalid_attachment_id",
+                    "relist_attachments",
+                ))
+            })
+        })
+        .transpose()?;
     let index = args
         .get("attachment_index")
         .map(|_| number(args, "attachment_index", 0, 0, MAX_ATTACHMENT_INDEX as u64))
         .transpose()?
         .map(|index| index as usize);
-    if index.is_none() && id.is_none() {
-        return Err(MailError::input_field(InputViolation::new(
-            "",
-            "attachment_reference_required",
-            "provide_attachment_reference",
-        )));
-    }
+    let mailbox = canonical_mailbox(reference.mailbox).as_bytes();
+    let matches_legacy =
+        |index, id| mailbox == b"INBOX" && reference.matches_legacy_inbox(index, id);
     if let Some(index) = index {
-        if let Some(id) = id
-            && reference.id(index) != id
+        if let Some(ref id) = id
+            && reference.digest(index, mailbox)[..] != id[..]
+            && !matches_legacy(index, id)
         {
             return Err(MailError::input_field(InputViolation::new(
                 "/attachment_id",
@@ -84,9 +110,17 @@ pub(super) fn select_part(
             .map(|_| index)
             .ok_or_else(attachment_missing);
     }
+    let id = id.as_ref().ok_or_else(|| {
+        MailError::input_field(InputViolation::new(
+            "",
+            "attachment_reference_required",
+            "provide_attachment_reference",
+        ))
+    })?;
     parts
         .iter()
-        .find(|part| Some(reference.id(part.index).as_str()) == id)
+        .find(|part| reference.digest(part.index, mailbox)[..] == id[..])
+        .or_else(|| parts.iter().find(|part| matches_legacy(part.index, id)))
         .map(|part| part.index)
         .ok_or_else(attachment_missing)
 }
