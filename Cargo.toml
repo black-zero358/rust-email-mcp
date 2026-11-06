@@ -45,6 +45,7 @@ jsonschema = { version = "=0.60.2", default-features = false }
 [patch.crates-io]
 async-imap = { path = "vendor/async-imap" }
 imap-proto = { path = "vendor/imap-proto" }
+lettre = { path = "vendor/lettre" }
 
 [profile.release]
 lto = "thin"

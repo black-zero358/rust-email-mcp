@@ -60,18 +60,21 @@ impl Capabilities {
     }
 
     /// Check if the server has the given capability via str.
+    /// Extension atom names are matched without regard to ASCII case.
     pub fn has_str<S: AsRef<str>>(&self, cap: S) -> bool {
         let s = cap.as_ref();
         if s.eq_ignore_ascii_case(IMAP4REV1_CAPABILITY) {
             return self.has(&Capability::Imap4rev1);
         }
-        if s.len() > AUTH_CAPABILITY_PREFIX.len() {
-            let (pre, val) = s.split_at(AUTH_CAPABILITY_PREFIX.len());
-            if pre.eq_ignore_ascii_case(AUTH_CAPABILITY_PREFIX) {
-                return self.has(&Capability::Auth(val.into())); // TODO: avoid clone
-            }
+        if let Some((prefix, mechanism)) = s.split_at_checked(AUTH_CAPABILITY_PREFIX.len())
+            && prefix.eq_ignore_ascii_case(AUTH_CAPABILITY_PREFIX)
+            && !mechanism.is_empty()
+        {
+            return self.has(&Capability::Auth(mechanism.into()));
         }
-        self.has(&Capability::Atom(s.into())) // TODO: avoid clone
+        self.0
+            .iter()
+            .any(|capability| matches!(capability, Capability::Atom(atom) if atom.eq_ignore_ascii_case(s)))
     }
 
     /// Iterate over all the server's capabilities

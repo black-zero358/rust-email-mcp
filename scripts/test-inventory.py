@@ -30,7 +30,7 @@ rust = tree_sitter.Parser(tree_sitter.Language(tree_sitter_rust.language()))
 other_cases = {
     "scripts/attachment-client-adapter/adapter.test.mjs": 7,
     "scripts/attachment-delivery-probe/probe.py": 20,
-    "scripts/test-audit-dependencies.sh": 20,
+    "scripts/test-audit-dependencies.sh": 28 if "vendor/lettre/UPSTREAM.sha256" in sources else 20,
     "scripts/test-docker-context.sh": 1,
     "scripts/check-cache-recovery.py": 1,
     "scripts/run-r13-acceptance.py": 1,

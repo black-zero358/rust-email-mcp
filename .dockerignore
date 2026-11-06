@@ -9,3 +9,5 @@ vendor/**
 !vendor/async-imap/**
 !vendor/imap-proto/
 !vendor/imap-proto/**
+!vendor/lettre/
+!vendor/lettre/**
