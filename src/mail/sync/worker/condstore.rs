@@ -3,7 +3,7 @@ use super::{super::delta, *};
 
 enum Selection {
     Plain(Session, scan::Selected),
-    Extended(Session, scan::Selected, delta::ModSeq),
+    Extended(Session, scan::Selected, delta::ModSeq, delta::Capabilities),
 }
 
 pub(super) struct ScopeFloors {
@@ -124,10 +124,10 @@ impl Batch<'_> {
     async fn select_condstore(
         &self,
         mut session: Session,
-        capability: crate::error::Result<bool>,
+        capabilities: crate::error::Result<delta::Capabilities>,
     ) -> Result<Selection> {
-        let failure = match capability {
-            Ok(false) => {
+        let failure = match capabilities {
+            Ok(caps) if !caps.condstore => {
                 self.report_protocol(
                     ActiveProtocol::Rev1,
                     Some(ProtocolFallback::CapabilityUnavailable),
@@ -135,10 +135,10 @@ impl Batch<'_> {
                 let (session, selected) = self.select_plain(session).await?;
                 return Ok(Selection::Plain(session, selected));
             }
-            Ok(true) => match delta::examine(&mut session, &self.lease.key, &self.mailbox).await {
+            Ok(caps) => match delta::examine(&mut session, &self.lease.key, &self.mailbox).await {
                 Ok((selected, modseq)) => {
                     self.observe_selected(&selected)?;
-                    return Ok(Selection::Extended(session, selected, modseq));
+                    return Ok(Selection::Extended(session, selected, modseq, caps));
                 }
                 Err(error) => error,
             },
@@ -188,9 +188,7 @@ impl Batch<'_> {
         let missing_enable = capabilities
             .as_ref()
             .is_ok_and(|caps| caps.qresync && !caps.enable);
-        let selected = self
-            .select_condstore(session, capabilities.map(|caps| caps.condstore))
-            .await?;
+        let selected = self.select_condstore(session, capabilities).await?;
         let result = self.condstore_selected(true, fence, floors, selected).await;
         if missing_enable {
             self.record_qresync_fallback(ProtocolFallback::QresyncEnableFailed);
@@ -202,7 +200,7 @@ impl Batch<'_> {
         let fence = self.reconciliation_fence().await?;
         let floors = self.local(|scope| ScopeFloors::read(&scope)).await?;
         let mut session = self.login().await?;
-        let capabilities = delta::supports_condstore(&mut session).await;
+        let capabilities = delta::capabilities(&mut session).await;
         let selected = self.select_condstore(session, capabilities).await?;
         self.condstore_selected(advance, fence, floors, selected)
             .await
@@ -216,7 +214,7 @@ impl Batch<'_> {
     ) -> Result<Turn> {
         self.report_protocol(ActiveProtocol::Rev1, Some(reason));
         let mut session = self.login().await?;
-        let capabilities = delta::supports_condstore(&mut session).await;
+        let capabilities = delta::capabilities(&mut session).await;
         let selected = self.select_condstore(session, capabilities).await?;
         let result = self.condstore_selected(true, fence, floors, selected).await;
         self.record_qresync_fallback(reason);
@@ -239,13 +237,13 @@ impl Batch<'_> {
         floors: ScopeFloors,
         selected: Selection,
     ) -> Result<Turn> {
-        let (mut session, selected, highest_modseq) = match selected {
+        let (mut session, selected, highest_modseq, capabilities) = match selected {
             Selection::Plain(session, selected) => {
                 return self
                     .reconcile_selected(session, selected, fence, None)
                     .await;
             }
-            Selection::Extended(session, selected, delta::ModSeq::Unavailable) => {
+            Selection::Extended(session, selected, delta::ModSeq::Unavailable, _) => {
                 self.fence_protocol_fallback(
                     &selected,
                     ProtocolFallback::Nomodseq,
@@ -255,8 +253,8 @@ impl Batch<'_> {
                     .reconcile_selected(session, selected, fence, None)
                     .await;
             }
-            Selection::Extended(session, selected, delta::ModSeq::Highest(highest)) => {
-                (session, selected, highest)
+            Selection::Extended(session, selected, delta::ModSeq::Highest(highest), caps) => {
+                (session, selected, highest, caps)
             }
         };
         self.report_protocol(ActiveProtocol::Condstore, None);
@@ -350,6 +348,7 @@ impl Batch<'_> {
                 &selected,
                 &page.uids,
                 round.base_modseq,
+                capabilities,
             ))
             .await
             {
