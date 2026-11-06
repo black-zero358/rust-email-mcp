@@ -2,6 +2,12 @@
 
 本文件保存带版本与环境边界的证据。每次新增记录注明提交/tag、日期与时区、环境、命令、结果、CI 链接及未覆盖项；保留历史结果，不把其测试数量或部署状态当作当前版本的证明。验证要求见 [贡献指南](../CONTRIBUTING.md#验证与完成标准)。
 
+## 2026-11-06 离线附件探针依赖升级
+
+在 Windows（Asia/Shanghai）验证 [PR #66](https://github.com/black-zero358/rust-email-mcp/pull/66) 的依赖提交 `6f2bae1` 与 `main` 的 `de4fde9` 集成后的树 `dfc50bf`。pypdf 从 6.12.0 升至 6.21.4，作用域为合成附件探针。PyPI 的 wheel 和 sdist URL、SHA-256 均与锁文件一致。
+
+使用 uv 0.11.14 执行探针的 `uv lock --check`、`uv audit --locked` 和 `uv run --locked probe.py selftest`。审计未发现已知漏洞。CPython 3.12.11 和 3.13.13 各通过 8 组样例和 12 项负例，文件摘要、解析内容和负例结果与 [R00 历史报告](../scripts/attachment-delivery-probe/evidence/selftest-2026-11-02.json) 一致。[最终 CI](https://github.com/black-zero358/rust-email-mcp/pull/66/checks)
+
 ## 2026-11-05 R13 整体验收与 0.2.2 候选
 
 源码提交 `706cbdc4fc6f8d60cb71cf109cfce2356d3879f0`，父提交为 R12D 合并 `c4bdfc293123bd648068c4ce6dd426dfd86d9a4b`。本次增加独立进程的 Linux release 验收、实际 musl 打包与恢复脚本，并将版本提升至兼容新增的 0.2.2。服务与验收共用 `server::http_router`，认证客户端共用生产发现逻辑；根证书注入及资源观测仅在 Linux 测试构建中启用。

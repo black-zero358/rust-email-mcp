@@ -17,7 +17,7 @@ uv run --project scripts/attachment-delivery-probe --locked scripts/attachment-d
 | --- | --- | --- |
 | openpyxl | 3.1.5 / MIT | 独立打开 XLSX 并按工作表取数；标准库 ZIP/XML 仅能核对封装与 XML，选择 openpyxl 补实际文件解析 |
 | et-xmlfile | 2.0.0 / MIT | openpyxl 的传递依赖，随独立 uv.lock 固定 |
-| pypdf | 6.12.0 / BSD-3-Clause | 独立打开 PDF 并提取验证段落；标准库逐字节匹配只核对生成格式，选择 pypdf 补常规阅读器解析 |
+| pypdf | 6.21.4 / BSD-3-Clause | 独立打开 PDF 并提取验证段落；标准库逐字节匹配只核对生成格式，选择 pypdf 补常规阅读器解析 |
 
 这些包只进入此独立 uv 环境，不加入 Cargo、镜像或线上依赖。fixture 无公式、宏、外部链接或第三方文档内容。
 
