@@ -34,7 +34,7 @@ pub use blob::{
 };
 pub(crate) use body_index::{BODY_INDEX_REBUILD_BATCH, BODY_INDEX_VERSION};
 pub use body_index::{CachedSearchHit, CachedSearchPage, SearchPosition};
-pub use dirty::{DirtyStamp, DirtyTicket};
+pub use dirty::{DirtyStamp, DirtyTicket, ListingStamp};
 pub use evidence::{
     CachedListingPage, CachedMailbox, CachedMessage, ListingEvidence, MailboxEvidence,
 };

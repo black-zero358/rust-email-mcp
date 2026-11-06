@@ -1,5 +1,5 @@
 //! Durable mutation claims and compare-and-swap online reconciliation.
-use super::{Cache, CacheError, MAX_FOLDERS_PER_ACCOUNT, Namespace};
+use super::{Cache, CacheError, MAX_FOLDERS_PER_ACCOUNT, Namespace, Ref};
 use crate::accounts::AccountKey;
 use rusqlite::{Connection, params};
 use std::sync::atomic::Ordering;
@@ -22,6 +22,12 @@ pub struct DirtyStamp {
     revision: i64,
     validity: Option<u32>,
     restore_epoch: u64,
+}
+
+/// Write-through proof from before the UID FETCH that observed mutable FLAGS.
+pub struct ListingStamp {
+    scope: DirtyStamp,
+    uid_validity: u32,
 }
 
 impl Cache {
@@ -143,6 +149,24 @@ impl Cache {
         })
     }
 
+    /// Capture the mutation revision before a live summary FETCH. Its selected
+    /// generation can be newer than the asynchronously persisted EXAMINE.
+    pub fn listing_stamp(
+        &self,
+        account: &AccountKey,
+        mailbox: &str,
+        uid_validity: u32,
+    ) -> Result<ListingStamp, CacheError> {
+        let scope = self.dirty_stamp(account, mailbox)?;
+        if uid_validity == 0 || scope.validity.is_some_and(|current| current > uid_validity) {
+            return Err(CacheError::NeedsVerification);
+        }
+        Ok(ListingStamp {
+            scope,
+            uid_validity,
+        })
+    }
+
     /// Clear only after the caller has fully verified the affected scope
     /// online against the stamp. An EXAMINE alone supplies no such evidence.
     pub fn clear_dirty_if_verified(
@@ -220,6 +244,33 @@ impl Cache {
 impl DirtyStamp {
     pub(super) fn revision(&self) -> u64 {
         self.revision as u64
+    }
+}
+
+impl ListingStamp {
+    pub(super) fn verify(
+        &self,
+        cache: &Cache,
+        db: &Connection,
+        reference: Ref<'_>,
+    ) -> Result<(), CacheError> {
+        let scope = &self.scope;
+        if scope.namespace != reference.account.reference_namespace()
+            || scope.mailbox != reference.mailbox
+            || self.uid_validity != reference.uid_validity
+            || scope.instance != cache.instance
+            || scope.restore_epoch != cache.disk.restore_epoch()
+        {
+            return Err(CacheError::NeedsVerification);
+        }
+        let (validity, revision, _) = observation(db, reference.mailbox)?;
+        if validity != Some(self.uid_validity)
+            || revision != scope.revision
+            || inflight(db, reference.mailbox)?
+        {
+            return Err(CacheError::NeedsVerification);
+        }
+        Ok(())
     }
 }
 

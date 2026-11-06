@@ -655,6 +655,10 @@ mod tests {
     async fn offline_search_matches_both_internal_date_formats_and_legacy_flags() {
         let directory = tempfile::tempdir().unwrap();
         let reader = reader_fixture(directory.path(), 5);
+        let stamp = reader
+            .cache
+            .listing_stamp(&reader.account, "INBOX", 9)
+            .unwrap();
         let canonical = ["Seen", "Answered", "Flagged"];
         let legacy = [
             r#"Custom("\\sEeN")"#,
@@ -699,6 +703,7 @@ mod tests {
                         size: None,
                         observed_at_ms: 1,
                     },
+                    Some(&stamp),
                 )
                 .unwrap();
         }

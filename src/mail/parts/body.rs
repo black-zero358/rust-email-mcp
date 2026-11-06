@@ -270,6 +270,7 @@ impl<'a> BodyReadSession<'a> {
                     internal_date: None,
                     size: u32::try_from(size).ok(),
                 }],
+                None,
             );
         }
         if let Some(value) = self
