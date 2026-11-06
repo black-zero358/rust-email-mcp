@@ -51,51 +51,46 @@ fn full_configuration(root: &Path, accounts: &[(&str, &[&str])]) -> PathBuf {
 }
 
 const CACHE_OBSERVATION_WAIT: Duration = Duration::from_secs(2);
+const CACHE_WRITE_WAIT: Duration = Duration::from_secs(15);
 
 async fn wait_cached_body(h: &CacheHarness, app: &axum::Router, uid: u32, expected: &str) {
-    let mut last = Value::Null;
-    tokio::time::timeout(CACHE_OBSERVATION_WAIT, async {
-        loop {
-            last = h
-                .call_tool(
-                    Some(app),
-                    "alice",
-                    "get_email",
-                    json!({"uid":uid,"uid_validity":9,"read_source":"cache"}),
-                )
-                .await;
-            if !matches!(
-                last["error"]["code"].as_str(),
-                Some("CACHE_MISS" | "CACHE_NEEDS_VERIFICATION")
-            ) {
-                assert_eq!(last["data"]["read_source"], "cache", "{last}");
-                assert_eq!(last["data"]["uid"], uid, "{last}");
-                assert_eq!(last["data"]["body"], expected, "{last}");
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("UID {uid} did not become readable from cache: {last}"));
+    let status = wait_cache_barrier(h, app).await;
+    let body = h
+        .call_tool(
+            Some(app),
+            "alice",
+            "get_email",
+            json!({"uid":uid,"uid_validity":9,"read_source":"cache"}),
+        )
+        .await;
+    assert_eq!(
+        body["data"]["read_source"], "cache",
+        "UID {uid}: {body}, {status}"
+    );
+    assert_eq!(body["data"]["uid"], uid, "{body}");
+    assert_eq!(body["data"]["body"], expected, "{body}");
 }
 
-async fn wait_cache_barrier(h: &CacheHarness, app: &axum::Router) {
+async fn wait_cache_barrier(h: &CacheHarness, app: &axum::Router) -> Value {
     let mut last = Value::Null;
-    tokio::time::timeout(CACHE_OBSERVATION_WAIT, async {
+    tokio::time::timeout(CACHE_WRITE_WAIT, async {
         loop {
             last = h
                 .call_tool(Some(app), "alice", "get_cache_status", json!({}))
                 .await;
+            assert_eq!(last["data"]["write_health"]["failed_writes"], 0, "{last}");
             match last["data"]["status"].as_str() {
-                Some("ready") => break,
-                Some("unavailable") => tokio::time::sleep(Duration::from_millis(10)).await,
+                Some("ready") if last["data"]["content_pending"] == 0 => break,
+                Some("ready" | "unavailable") => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
                 _ => panic!("unexpected cache status: {last}"),
             }
         }
     })
     .await
     .unwrap_or_else(|_| panic!("cache queue did not confirm readiness: {last}"));
+    last
 }
 
 #[tokio::test]
@@ -262,7 +257,7 @@ async fn full_signed_body_listing_search_and_exact_locate_survive_clean_restart_
             .contains("中文正文"),
         "{warm}"
     );
-    let status = read("get_cache_status", json!({})).await;
+    let status = wait_cache_barrier(&h, &app).await;
     assert_eq!(status["data"]["content_pending"], 0, "{status}");
     assert_eq!(
         status["data"]["storage"]["folders"][0]["layers"]["full_body"]["materialized"], 1,
