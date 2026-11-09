@@ -1,5 +1,7 @@
 # Issue #29 — FETCH 属性归并验证
 
+> 历史归档：保留对应日期和提交的设计、实施与验收记录。现行文档见[文档导航](../../README.md)。
+
 - 日期：2026-10-29，Asia/Shanghai。问题：[issue #29](https://github.com/black-zero358/rust-email-mcp/issues/29)。
 - 修复代码：`223f263`；整合 main `717a302e3ca955a084c3a0cca78d38dcb0fc141a` 后代码提交：`c86654b4dda067565aa4cd6f953b93e443704a3f`。后续文档提交不改变运行代码。
 - 环境：Windows 独立工作树、WSL Ubuntu、固定 Rust/Cargo 1.99.1。独立 `CARGO_TARGET_DIR=/home/oeic_fe/issue-29-target`，复制缓存后清除本项目及 vendored async-imap 产物并实际重编。只使用小型合成协议响应及 duplex 后端；没有真实邮箱操作或部署。
@@ -15,7 +17,7 @@
 - FLAGS-only 不创建摘要，真实空 HEADER 可创建摘要；分拆属性保持唯一 UID、降序及请求 limit，其他 UID 和无 UID 的 HEADER 不进入结果。
 - SIZE、BODY 和列表的匹配 tagged OK；已有数据后 NO/BAD/EOF/错误 tag 均失败。
 
-依据：[RFC 3501 §5.2](https://www.rfc-editor.org/rfc/rfc3501#section-5.2) 允许非请求更新；[§7.4.2](https://www.rfc-editor.org/rfc/rfc3501#section-7.4.2) 定义 FETCH 属性。vendored `Fetch::has_flags()` 只暴露属性存在性，解析及既有 iterator 行为不变，来源与范围记录于 [PATCHES.md](../../vendor/async-imap/PATCHES.md)。
+依据：[RFC 3501 §5.2](https://www.rfc-editor.org/rfc/rfc3501#section-5.2) 允许非请求更新；[§7.4.2](https://www.rfc-editor.org/rfc/rfc3501#section-7.4.2) 定义 FETCH 属性。vendored `Fetch::has_flags()` 只暴露属性存在性，解析及既有 iterator 行为不变，来源与范围记录于 [PATCHES.md](../../../vendor/async-imap/PATCHES.md)。
 
 ## 检查与边界
 

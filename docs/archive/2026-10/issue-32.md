@@ -1,5 +1,7 @@
 # 2026-10-29 SMTPUTF8 原始头需求（issue #32）
 
+> 历史归档：保留对应日期和提交的设计、实施与验收记录。现行文档见[文档导航](../../README.md)。
+
 - 环境/日期：Windows 独立工作树、WSL Ubuntu、固定 Rust/Cargo 1.99.1；2026-10-29，Asia/Shanghai。独立 target `/home/oeic_fe/issue-smtputf8-target`，复制依赖缓存后清除项目及 vendored async-imap 产物并重编，新增线路回归命名执行 1 项。
 - 代码：`12856ccc4bf9ced347cb9cc57bb4c16cbb556490`；整合 `aca17fc390cfe7cd284b2e43d5846f119e4cfa94` 合入 main `ca9eeac23f9dfe3c3d0f3a95680ee896a7829ec1`。唯一冲突为 MIME 测试插入位置，保留 SMTPUTF8 与 disposition 两项测试；运行时代码自动合并。后续文档提交不改变已测源码。
 

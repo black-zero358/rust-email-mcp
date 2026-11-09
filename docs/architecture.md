@@ -1,6 +1,6 @@
 # 架构与设计约束
 
-[CONTRIBUTING.md](../CONTRIBUTING.md) 是工程总入口，定义设计原则 D1–D6、变更流程和完成标准。本文件记录这些原则在当前实现中的细则、模块边界和设计决策。用户能力与配置见 [README](../README.md)，维护要求见 [maintenance](maintenance.md)，部署操作见 [deployment](deployment.md)。验收结果和基准测量属于带版本依据的 [validation](validation.md)，不能替代当前规范。
+[CONTRIBUTING.md](../CONTRIBUTING.md) 是工程总入口，定义设计原则 D1–D6、变更流程和完成标准。本文件记录这些原则在当前实现中的细则、模块边界和设计决策。用户能力与配置见 [README](../README.md)，维护要求见 [maintenance](maintenance.md)，部署操作见 [deployment](deployment.md)。验收结果和基准测量按提交记录在 [validation](validation.md)。
 
 ## Module boundaries
 
@@ -85,7 +85,7 @@ IMAP 文本模式固定为 rev1：所有邮箱参数编码为 modified UTF-7，L
 
 async-imap 0.12 的 APPEND flags 原样序列化，必须传入 `(\Draft)` 这样的带括号列表。合成 duplex 回归覆盖 literal continuation 及 OK/NO/BAD。vendored completion-status 补丁只允许匹配 tag 的 OK 成功；NO/BAD、缺失终结响应和错误 tag 均失败。SELECT/EXAMINE（含 CONDSTORE）和 STATUS 共用这一完成边界；无响应或只有 `0 EXISTS`/部分元数据的断连不能解释成成功空邮箱，列表/搜索不得在未完成 EXAMINE 时返回空页。来源、退出条件与审计方式见 [PATCHES.md](../vendor/async-imap/PATCHES.md)。
 
-IMAP TCP 连接在 TLS 握手前启用 `TCP_NODELAY`。命令编码器按 tag、空格、命令和 CRLF 分次写入，小包应及时发出，避免 Nagle 与对端延迟 ACK 在连续分块读取中累积等待；连接期限、传输预算和 tagged completion 规则保持一致。设置失败沿用固定 Backend 错误。真实 TLS 登录后的客户端 socket 选项由 `mail::tests::production_imap_login_enables_tcp_nodelay` 验证，依据 [RFC 9293 §3.7.4](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.7.4)。
+IMAP TCP 连接在 TLS 握手前启用 `TCP_NODELAY`。命令编码器按 tag、空格、命令和 CRLF 分次写入，小包应及时发出，避免 Nagle 与对端延迟 ACK 在连续分块读取中累积等待；连接期限、传输预算和 tagged completion 规则保持一致。设置失败沿用固定 Backend 错误。连接设置见 `src/mail.rs` 的 `connect`，协议依据 [RFC 9293 §3.7.4](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.7.4)。
 
 APPEND 等待同步 literal continuation 时，先将合法 untagged 通知交给现有有界 unsolicited 队列，再继续读取；只有 `Continue` 才发送正文。continuation 前任何 tagged 结果（包括提前 OK 和错误 tag）、BYE、EOF 或读取错误均失败且不发送 literal，拒绝后排队的 continuation 不能恢复命令。完整 literal 后仍等待匹配 tag 的 OK。`save_draft_waits_for_continuation_after_notifications` 和 `save_draft_append_protocol` 覆盖这一 D2 协议边界；不改变草稿 flags/MIME 或发送策略。
 
@@ -105,6 +105,8 @@ HTTP 内容固定为 octet-stream，带 no-store/nosniff、`X-Content-SHA256` �
 
 `mail/insights.rs` 提供有界标识符图会话、精确 Message-ID 定位、严格 STATUS 统计、脱敏诊断与正文展示。头部缓存最多 256 项/16 MiB、60 秒，只保存不可变头部并以新 UIDVALIDITY 失效；正文共用 `mime`/`html` 选择器。统计用 `imap_text::status_counts` 验证完整字段和命令完成。批量修改使用明确 UID、总体期限和逐项结果，失败项保守为 unknown、后续 unprocessed；没有持久化修改日志，重试前必须检查邮箱。范围与限制见 [能力说明](capabilities.md)。
 
+单目录会话的候选完整头上限为 128 KiB。匹配 tagged OK 后的局部头错误进入 `skipped_candidates`，所选邮件的局部正文错误进入 `message_errors`；传输、目标属性或命令失败终止读取。种子头失败中止关联，完整性字段包含跳过的候选。
+
 ## Cross-mailbox conversations
 
 `read_conversation` 通过 `mailboxes`、`scope` 或 `cursor` 显式进入跨文件夹模式，旧单文件夹参数与输出保留。账户 ACL 在排队、游标访问和连接之前验证，游标绑定 principal 与 AccountKey 命名空间。standard 范围只采用协议 INBOX、服务端 Sent 与管理员 archive 配置，排除 All/Junk/Trash/Drafts/NoSelect；名称候选不授予范围。首次固定每目录 UIDVALIDITY 和 UIDNEXT−1，初始不可用目录保留错误，需重启查询才能重新冻结。
@@ -117,7 +119,7 @@ HTTP 内容固定为 octet-stream，带 no-store/nosniff、`X-Content-SHA256` �
 
 同 token 重放固定最近已交付的位置、覆盖、错误快照及原响应裁减标记；续查和重放均复核冻结目录的 UIDVALIDITY，任一变化使整个游标失效。复核轮转顺序并分摊期限；正常推进只交付本页已核对目录的来源，副本代表可改选为同变体的健康位置。同页某完整引用的头读取失败后，其他关联搜索命中该引用也保持阻断，下一页再处理。重放目录复核失败返回可重试错误并保留 token，避免交付旧的完整性状态。正文覆盖通过 body_requested/body_returned 和 omitted_refs 单独报告。
 
-对应 D1/D2/D3/D5 的验证入口为 `src/mail/conversation/tests`、`src/server/output_tests/conversation.rs` 与 `tests/thread_search_budget.rs`：覆盖身份碰撞、配额及取消、跨目录关联和固定水位、窗口失败、主体/账户边界、UIDVALIDITY、响应预算、重放和虚拟时间过期。真实 handler 结果用声明的 outputSchema 核验，所有邮件与 IMAP 服务均为本地合成数据。
+代表性回归见 `src/mail/conversation/tests/state.rs`、`store.rs`、`persist.rs` 与 `tests/thread_search_budget.rs`，分别核对副本/冲突、世代失效、持久编解码和协议预算。签名 HTTP 的账户读取与 Schema 检查见 `src/server/output_tests.rs`；原跨目录完整 HTTP 矩阵见[历史验证](archive/2026-11/validation.md#2026-11-05-r09-跨文件夹会话)。
 
 ## MIME and HTML
 
@@ -182,7 +184,7 @@ JWKS 的硬缓存期限为 300 秒，不因刷新失败延长。刷新 I/O 使�
 
 静态 OAuth 客户端明确回调 allowlist，生产与测试分离用户和客户端。Rauthy 允许提前 refresh，保留轮换和五秒宽限。单节点 Hiqlite 使用 immediate durable Raft log sync、一个读连接、一个 HTTP worker 和一次并发 Argon2id 哈希（32 MiB、三次迭代、两通道）。多会话互不干扰、提前刷新、重启恢复及资源观测是认证/部署变更的验收内容。
 
-部署时保留 WebAuthn origin 的显式 `:443`，ChatGPT callback 精确复制客户端当前设置界面值。Rauthy 0.37.2 的 discovery 遗漏其支持的 public-client `none`，按 [deployment](deployment.md) 修正；升级或变更域名、端点、scope 时重新导出核对。登录限流不覆盖静态 asset/theme；验收全部登录页脚本/样式及突发加载，HTML 200 本身不代表登录页可用。
+部署时保留 WebAuthn origin 的显式 `:443`，ChatGPT callback 精确复制客户端当前设置界面值。Rauthy 0.37.2 的 discovery 遗漏其支持的 public-client `none`，按 [deployment](deployment.md) 修正；升级或变更域名、端点、scope 时重新导出核对。登录限流与静态 asset/theme 路径分开配置；验收时检查全部脚本、样式、突发加载及页面实际渲染。
 
 ## Persistent metadata cache
 
@@ -196,7 +198,7 @@ JWKS 的硬缓存期限为 300 秒，不因刷新失败延长。刷新 I/O 使�
 
 `cursor_storage` 反映实际 memory/persistent 模式。仅整个冻结范围都被管理员配置选中时使用持久模式；选中但不可用的范围明确失败，已存在持久 token 不转入内存。`get_cache_status` 先授权，只返回当前账户的配置、覆盖、配额及故障；本地读屏障最多等待 2 秒，不连接邮箱。备份恢复命令 `--cache-restored` 在 Journal 前执行，原子提升根恢复世代、清除游标、标记 dirty，未启用分区以后打开时也应用该世代。单次 EXAMINE 更新目录世代，完整存在性核对负责清除 dirty。
 
-metadata 提供持久元数据、部件证据和在线会话续查；full 增加原始邮件/派生内容、显式离线读取及写操作 dirty 范围通知。R12 接入全量扫描和受影响范围的只读收敛。D1/D2/D3/D5 验证位置为 `src/cache/tests.rs`、`src/config/cache_config.rs`、`src/mail/conversation/tests/durable.rs` / `persist.rs` 和 `src/server/output_tests/cache.rs`；配置/运维入口见[缓存设计](cache-design.md)。
+metadata 提供持久元数据、部件证据和在线会话续查；full 增加原始邮件/派生内容、显式离线读取及写操作 dirty 范围通知。R12 接入全量扫描和受影响范围的只读收敛。D1/D2/D3/D5 验证位置为 `src/cache/tests.rs`、`src/config/cache_config.rs`、`src/mail/conversation/tests/persist.rs` 和 `src/server/output_tests.rs`；配置/运维入口见[缓存设计](cache-design.md)。
 
 ### Full-cache storage foundation
 
@@ -220,7 +222,7 @@ full 配置经 `Cache::open_full_with_run` 绑定运行见证。`cache/blob` 保
 
 D2/D3/D4/D5 验证入口为 `src/cache/full_tests.rs`、`src/cache/content_tests.rs`、`src/accounts/cache_run/tests.rs` 和 `src/mail/cache_write_guard/tests.rs`；metadata 和持久游标继续运行 R10 回归。显式离线工具矩阵及故障场景见[实施设计](cache-content-design.md#验收矩阵)。
 
-已完成 FETCH 的删除观察绑定原会话 UIDVALIDITY 与 UIDNEXT 上界；范围内未知 UID 留下持久墓碑以封存迟到证据，未来 UID 保持可分配。`fetch_miss_tombstones_only_uids_below_the_observed_uidnext` 和 `live_missing_future_uid_does_not_disable_cache_or_tombstone_later_arrival` 验证持久层和签名 HTTP 路径；单封与批量整理共用同一 SELECT 会话的 UIDVALIDITY 校验和完整 UID FETCH，在首个远端写命令前登记 dirty。标记只用匹配目标 UID 的 FLAGS 确认，移动只用成功命令内映射该 UID 的 COPYUID 确认。永久删除的 EXPUNGE 序号可包含并发移除，成功完成归入 `accepted`。合成协议回归 `single_writes_distinguish_missing_targets_and_confirmed_updates` 与签名 HTTP 回归 `message_write_outcomes_validate_through_signed_mcp` 覆盖证据、完成标签、缺失和逐项结果。协议失败及缺必要属性沿用原错误和停止规则。
+已完成 FETCH 的删除观察绑定原会话 UIDVALIDITY 与 UIDNEXT 上界；范围内未知 UID 留下持久墓碑以封存迟到证据，未来 UID 保持可分配。墓碑与旧租约隔离的代表性回归见 `src/cache/full_tests.rs`；单封与批量整理共用同一 SELECT 会话的 UIDVALIDITY 校验和完整 UID FETCH，在首个远端写命令前登记 dirty。标记只用匹配目标 UID 的 FLAGS 确认，移动只用成功命令内映射该 UID 的 COPYUID 确认。永久删除的 EXPUNGE 序号可包含并发移除，成功完成归入 `accepted`。合成协议回归 `single_writes_distinguish_missing_targets_and_confirmed_updates` 与签名 HTTP 回归 `message_write_outcomes_validate_through_signed_mcp` 覆盖证据、完成标签、缺失和逐项结果。协议失败及缺必要属性沿用原错误和停止规则。
 
 ### Synchronization foundation
 
@@ -230,15 +232,15 @@ R12A 的 `cache/sync_state` 使用 V4 保存独立历史、新 UID 与存在性/
 
 R12B 的 `mail/sync/worker` 接入 full 配置的可选后台循环，省略 sync 保持暂停。每步重新核对当前账户、有效读取授权与管理员范围；历史、tail、FLAGS/存在性、内容和清理交错执行，任务提交使用真实收据。关闭先取消并等待后台实际工作，阻塞 SQLite/文件操作及暂存清理继续持有共享许可；未完成清理或尚未持久化的世代/删除观察保留未清洁状态。
 
-V5 独立保存派生文件的访问顺序，前台成功读取更新顺序，后台验证保持原值；压力回收复核同版本原件、产物和访问序号，保留租约。GC 按有界候选 keyset 推进，过滤后空批仍保留继续位置。范围发现与存在性核对分别报告，数据层完成还核对对应内容及索引证据。D1/D2/D3/D5 对应 `src/cache/sync_state/tests.rs`、`src/mail/sync/tests.rs`、`src/mail/sync/content/tests.rs`、`src/server/output_tests/sync_acceptance.rs` 与 `tests/thread_search_budget.rs`。完整分期、恢复及验收条件见[同步设计](cache-sync-design.md)。
+V5 独立保存派生文件的访问顺序，前台成功读取更新顺序，后台验证保持原值；压力回收复核同版本原件、产物和访问序号，保留租约。GC 按有界候选 keyset 推进，过滤后空批仍保留继续位置。范围发现与存在性核对分别报告，数据层完成还核对对应内容及索引证据。D1/D2/D3/D5 对应 `src/cache/sync_state/tests.rs`、`src/mail/sync/tests.rs` 与 `tests/thread_search_budget.rs`。完整分期、恢复及验收条件见[同步设计](cache-sync-design.md)。
 
 R12C 通过可选 `sync.protocol:"auto"` 接入 CONDSTORE，默认 rev1。`mail/sync/delta` 在认证连接上执行有界 CAPABILITY、只读 EXAMINE 和 CHANGEDSINCE，每命令共用 128 KiB 线路预算，parser 独立约束 token、节点和 owned allocation；只接纳正 63 位 MODSEQ、完整选中证据与匹配 tagged OK，EXAMINE 必须确认 READ-ONLY。语义或解析失败关闭当前命令流，回退最多使用一个新连接并保留原期限及累计字节预算。普通前台协议接口保持原有语法。
 
-V6 独立持久化扩展水位与修订。基线只能来自同一完整 rev1 核对首个页面之前的 EXAMINE；FLAGS 与 FLAGS/删除分别使用独立水位。每轮冻结 base、target、UID 上界及恢复/dirty/事实修订，每页至多 200 个已知 UID，事实与下一位置原子提交，末页才将 committed 提升至 target。并发范围内成员或 FLAGS 变化使旧页失效；范围外新增 UID 留给后续覆盖。遗漏的 CHANGEDSINCE UID 保留原存在性，周期 rev1 核对负责删除和 dirty 收敛。明确 NOMODSEQ 或 committed 回退先撤销进程内水位可见性，再持久化；存储失败保留撤销标记并阻止 clean receipt。D1/D2/D3 对应 `src/cache/sync_state/delta/tests.rs`、`src/mail/sync/delta/tests.rs`、`src/server/output_tests/condstore_acceptance.rs` 和 `tests/sync_delta_budget.rs`。
+V6 独立持久化扩展水位与修订。基线只能来自同一完整 rev1 核对首个页面之前的 EXAMINE；FLAGS 与 FLAGS/删除分别使用独立水位。每轮冻结 base、target、UID 上界及恢复/dirty/事实修订，每页至多 200 个已知 UID，事实与下一位置原子提交，末页才将 committed 提升至 target。并发范围内成员或 FLAGS 变化使旧页失效；范围外新增 UID 留给后续覆盖。遗漏的 CHANGEDSINCE UID 保留原存在性，周期 rev1 核对负责删除和 dirty 收敛。明确 NOMODSEQ 或 committed 回退先撤销进程内水位可见性，再持久化；存储失败保留撤销标记并阻止 clean receipt。D1/D2/D3 对应 `src/cache/sync_state/delta/tests.rs`、`src/mail/sync/delta/tests.rs` 和 `tests/sync_delta_budget.rs`。
 
 R12D 的 `mail/sync/qresync` 在 auto 策略中优先协商 QRESYNC，严格要求同连接 CAPABILITY、ENABLED QRESYNC 和匹配 tagged OK。完整非空已知集合至多 200 UID 时使用只读 EXAMINE QRESYNC，较大范围先 EXAMINE CONDSTORE 再按精确 UID 页 FETCH CHANGEDSINCE VANISHED；空集合跳过 FETCH。预览与实际页面通过范围修订和 UID 序列 CAS 复核，生成命令完整长度最多 8192 字节。parser 采用独立有界入口，完整命令预算 128 KiB，VANISHED 区间在分配前限数并保持压缩；EARLIER 必须属于请求集合，实时删除核对 UIDNEXT 与事件顺序。各协议回退共享每步骤至多两条实际连接、原期限和累计传输预算。
 
-已确认删除先建立进程内范围围栏。已选择目录的 UID FETCH 逐帧处理实时 VANISHED，失败或取消保留围栏，EARLIER、FLAGS 与水位继续等待匹配 tagged OK。小量删除与 FLAGS/分页原子提交；超出有界提交额度时推进持久 dirty 修订并开启新的完整 rev1 核对，完成前暂停离线交付和 clean receipt。前台读写入口在网络之前捕获证据修订，正向缓存写入在入队和执行时核对；核对结束保留范围修订，拒绝旧网络结果的迟到写回。已开始的 FIFO 写入通过队列屏障结清后才冻结新的审计，使先前未知 UID 也纳入存在性核对。失败保留围栏，正常关闭仍等待队列与许可释放。该机制沿用 V6，D1/D2/D3 的验证位置为 `src/cache/sync_state/delta/tests.rs`、`src/mail/sync/qresync/tests.rs`、`src/server/output_tests/qresync_acceptance.rs` 和 `tests/sync_qresync_budget.rs`。
+已确认删除先建立进程内范围围栏。已选择目录的 UID FETCH 逐帧处理实时 VANISHED，失败或取消保留围栏，EARLIER、FLAGS 与水位继续等待匹配 tagged OK。小量删除与 FLAGS/分页原子提交；超出有界提交额度时推进持久 dirty 修订并开启新的完整 rev1 核对，完成前暂停离线交付和 clean receipt。前台读写入口在网络之前捕获证据修订，正向缓存写入在入队和执行时核对；核对结束保留范围修订，拒绝旧网络结果的迟到写回。已开始的 FIFO 写入通过队列屏障结清后才冻结新的审计，使先前未知 UID 也纳入存在性核对。失败保留围栏，正常关闭仍等待队列与许可释放。该机制沿用 V6，D1/D2/D3 的验证位置为 `src/cache/sync_state/delta/tests.rs`、`src/mail/sync/qresync/tests.rs` 和 `tests/sync_qresync_budget.rs`。
 
 ## Local operation store
 
@@ -267,31 +269,11 @@ JSON 日志使用固定事件名和受控字段，记录服务端生成的 reque
 | D5 隐私与内容 | `mail::tests::draft_envelope_and_privacy_filter_share_canonical_fields`；MIME 未知编码与完整 alternative 选择；附件精确字节、授权 GET 及私有暂存 |
 | D6 维护与恢复 | `src/accounts`、`src/cache` 的注册库/世代/迁移/回放回归；CI fmt/test/clippy、依赖审计和容器 release 构建；`scripts/check-cache-recovery.py` 的实际候选二进制恢复检查 |
 
-测试精简移除了大量故障排列、细粒度边界组合、独立客户端原型和 R13 持续负载设施。开发者针对新缺陷增加最小回归，并同步替换重叠用例，保持总体量预算。历史长跑和完整矩阵记录位于 [validation](validation.md)，下方设计记录中的旧测试名称随对应历史工作包保留。
+测试精简移除了大量故障排列、细粒度边界组合、独立客户端原型和 R13 持续负载设施。开发者针对新缺陷增加最小回归，并同步替换重叠用例，保持总体量预算。历史长跑和完整矩阵见[历史验证](archive/2026-11/validation.md)，现行测试以上表为入口。
 
 Vendored 包的协议回归集中在根包 `tests/`。`tests/imap_completion.rs` 通过原始 CAPABILITY 响应核对 MOVE、UIDPLUS 等扩展能力的 ASCII 大小写匹配，覆盖写入能力检查和诊断共用的查询接口。各上游身份继续由 `scripts/audit-dependencies.sh` 检查，Docker 上下文由 `scripts/test-docker-context.sh` 以合成哨兵和实际构建器核验。
 
 ## Decision records
-
-R06 parser 基础对应 D2/D3/D5：`tests/body_structure_budget.rs` 在默认根测试中覆盖结构预算、分配记账、正常响应分段、typed 错误及 Client 终止；`scripts/test-audit-dependencies.sh` 核对两个 path 包的上游审计视图与失败清理，`scripts/test-docker-context.sh` 核对两个允许的 vendor 目录。原完成状态、字节预算和邮件回归继续执行。解析器的预算限制与流式附件/PartManifest 功能分工作包交付。
-
-R09 搜索基础的 D2/D3/D5 入口为 `tests/thread_search_budget.rs`：覆盖 199/200/201 个结果、合法前缀分片、显式空 SEARCH 与缺失响应、完整命令字节阈值、密集 FLAGS 的分配预算、通知消费后释放、错 tag/断连/失败闭锁，以及命令前数据隔离和完成后尾部恢复。普通 SEARCH 超过 200 个结果及既有 BODYSTRUCTURE/部件 FETCH 测试继续检查兼容性。
-
-R06 附件映射对应 D2/D3/D5：`mail::parts` 的 mapping/raw 差分与 reader 回归核对原 DFS 索引、每节点头证据、特殊 multipart 和头预算；`server::output_tests::structure` 使用本地 TLS IMAP 与认证 HTTP MCP 核对实际命令、一次新连接回退、世代变化和协议失败。账户测试继续检查同 UID 的引用隔离；`imap_text` 回归覆盖 ASCII/Unicode 搜索及 STATUS 的结构预算错误分类。
-
-R07 附件部件读取对应 D2/D3/D5：`tests/part_fetch_budget.rs` 验证命令期 literal 预算、完整 section 语法和每个合法前缀、quoted 逻辑字节、typed 错误隐私及完成后的默认解析恢复；`mail::parts::transfer_decode` 与原整段解码做跨块差分；`mail::attachments::staging` 验证私密文件、四份额度、跨进程锁、重启清理及真实阻塞任务取消。`server::output_tests::parts` 通过认证 HTTP 核对大邮件中的小附件、64 KiB 边界、末端探针、坏编码、协议失败、权限重查及慢消费清理。`download_begin_timeout_keeps_transfer_permit_until_blocking_io_finishes` 覆盖下载入口的暂存超时与实际资源释放。
-
-R05 的 D1/D3/D4/D5 回归入口：`accounts/catalog/tests` 与 `config/account_config/tests` 覆盖显式 ACL、默认账户、世代、秘密引用、v1/v2 迁移、发布失败恢复和原 Journal 字节保留；`mail/scheduler/tests` 覆盖全局额度、公平借槽、取消和超时。`server/output_tests/accounts` 通过真实 HTTP/JWT 与双模拟邮箱核对同 UID 隔离、按主体发现、默认读取与旧写目标、历史发送查询、附件撤权、账户独立退避及完整响应预算。`cancelled_http_reads_release_admission_backend_slots_and_connections` 验证 4 个运行/16 个排队读取的取消释放，`in_flight_attachment_gets_stop_on_disconnect_revocation_and_account_removal` 验证下载断连及账户取消释放。
-
-R01 的字符与错误回归入口：`read_lengths_count_unicode_code_points_and_publish_byte_limits`、`read_structure_errors_are_bounded_private_and_point_to_array_items`、`read_mailbox_unicode_and_wire_budgets_keep_legacy_writes_frozen`、`read_search_transmits_full_unicode_literal_at_character_boundary`、`legacy_write_argument_schemas_and_byte_validation_stay_frozen`、`legacy_write_mailbox_inputs_and_configured_directories_stay_at_512_bytes`、`recorded_send_status_remains_available_after_legacy_directory_change`、`input_detail_budget_preserves_original_error_and_measures_real_wire`、`budget_errors_identify_header_structure_attachment_and_body_resources`。分别覆盖 D2/D3/D4/D5 的输入、协议、幂等与错误预算边界。
-
-R04 的 D1/D2/D3/D5 回归入口为 `opaque_ids_bind_every_reference_dimension_and_preserve_all_mime_indices`、`attachment_fetch_reports_absence_only_after_successful_tagged_completion`、`http_failure_classes_are_small_private_and_release_transfer_permits`、`four_slow_consumers_cancel_and_timeout_without_losing_capacity`、`expired_wrong_principal_or_account_handles_return_private_reprepare_errors`，以及真实 JWT MCP/GET 的 `server::output_tests::attachments`。它们核对稳定引用、认证隐私、命令完成、失败分类、许可释放、8 组文件完整字节和输出 Schema。`signed_target_attachment_get_rechecks_subject_and_returns_exact_binary` 核对 `INBOX` 拼写等价的在线和缓存入口，`legacy_inbox_attachment_ids_still_bind_all_reference_dimensions` 核对旧 ID 与其绑定范围。跨运行时的 Node 适配验收作为显式 ignored 测试执行，默认 Cargo 测试仅需 Rust。
-
-R02/R03 的新增验证入口：`accounts/tests.rs` 覆盖 D1/D4 的身份绑定、并发初始化、损坏与恢复；`every_read_output_schema_validates_real_handler_success_and_empty_results` 和其余 `server/output_tests` 覆盖 D3/D5 的正常、局部失败、诊断超时和完整 wire 压缩结果；`readable_reads_use_one_display_policy_while_forward_keeps_legacy_body`、`readable_html_expansion_uses_display_budget_after_bounded_charset_decode` 及 `html/readable` 回归覆盖 MIME 候选、旧转发、显示膨胀与跨部件预算。
-
-R07 正文的 D2/D3/D5 验证入口为 `server::output_tests::body_parts`：14 组认证 HTTP 场景对照 raw 与 parts 的三种正文工具，覆盖 40 MiB 邮件的小正文、隐式 charset、alternative/related、拆块字符、HTML 共享预算、完整 wire 前缀、重复 UID、UTF-7 和 UIDVALIDITY、局部错误继续，以及 raw/HEADER/部件协议失败停止。`mail::parts::charset_decode` 覆盖编码/BOM/输出边界，`mail::parts::body` 对照传输与字符解码，`mail::parts::mapping::body_selection_tests` 核对完整候选、默认字符集和全树头部预算，`mail::parts::reader::tests` 核对 tagged completion 与预算失败阶段。
-
-R08 的 D2/D3/D5 验证入口为 `server::output_tests::listing`，覆盖默认关闭的预览、完整/部分头分类、严格摘要协议、非首正文部件、FLAGS 更新、HTML 与字符截断、页取样额度、逐项错误和摘要保留、完整 wire 预算及附件筛选游标。`preview_reuses_the_single_validated_attachment_filter_fallback` 核对筛选回退与预览组合只读一次；`replacement_stream_spends_only_the_page_budget_left_by_the_first` 核对替换连接共用传输余额。`mail::classification` 与 `mail::parts::preview` 的合成回归分别覆盖固定头规则、URI 与字段截断，以及网络/本地 raw 共用的前缀解码和字符数限制。
 
 以下为当前选择的简短追溯记录，状态均为“采用”。新决策记录背景、决定、代价及重审条件；被替代的决策保留并指向后继记录，不以部署状态覆盖设计历史。
 
@@ -317,11 +299,3 @@ R08 的 D2/D3/D5 验证入口为 `server::output_tests::listing`，覆盖默认�
 - [Rauthy refresh configuration](https://sebadob.github.io/rauthy/config/config.html)
 - [lettre BCC handling](https://docs.rs/lettre/latest/lettre/message/struct.MessageBuilder.html#method.keep_bcc)
 - [async-imap session operations](https://docs.rs/async-imap/latest/async_imap/struct.Session.html)
-
-### 0.2.1 容量与局部失败
-
-会话完整头预算128 KiB与MIME单头预算一致。候选HEADER命令已完整消费后，局部超限/头解析错误加入skipped_candidates并继续；所选消息在完整FETCH后的内容错误加入message_errors。原始FETCH的LIMIT_EXCEEDED仅由已完成SIZE检查或完整BODY检查产生，可以跳过；传输/协议错误立即终止连接。种子头是关联起点，失败仍中止。完整性字段同时考虑跳过的候选。
-
-默认32 MiB单封、128 MiB累计连接预算、2 MiB完整输出；parser与BudgetStream共用同一累计上限参数。mail默认4槽，20个工具请求准入与10秒等待共同约束排队。二进制下载另有4个传输槽，取邮件共用邮箱槽，读取阶段60秒期限含等待。
-
-新增回归：conversation_large_headers_skip_local_failures_but_stop_protocol_errors；batch_and_conversation_fit_wire_budget_without_losing_item_outcomes；relaxed_inline_attachment_fits_complete_response；relaxed_parallel_attachment_decode_accepts_large_payloads。

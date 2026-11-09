@@ -66,7 +66,7 @@
 | 读取离线副本 | 管理员可按账户和文件夹启用 full 缓存，客户端显式选择本地读取，结果带观察时间和覆盖范围。用 `get_cache_status` 查看缓存及同步进度。 |
 | 处理草稿、发送与整理 | `save_draft` 保存草稿，`send_email`、`send_draft`、`reply_email`、`forward_email` 提交发送。full 模式提供标记、移动、删除及文件夹管理。 |
 
-附件的 HTTP GET 需要**同一 OAuth 主体**的有效 Bearer 令牌，文件提供 SHA-256 校验。客户端取得文件后交给文件解析工具。[标准适配器](scripts/attachment-client-adapter/README.md)支持下载、校验和落盘。当前附件下载与内容读取使用合成文件离线验收，ChatGPT 文件接收待实测。
+附件的 HTTP GET 需要**同一 OAuth 主体**的有效 Bearer 令牌，文件提供 SHA-256 校验。客户端取得文件后交给文件解析工具。下载、校验和落盘由客户端实现；原型的[离线实验记录](scripts/attachment-client-adapter/README.md)供接入时参考。当前附件下载与内容读取使用合成文件离线验收，ChatGPT 文件接收待实测。
 
 持久缓存默认关闭，启用后仍默认在线读取。支持离线的工具可传 `read_source:"cache"`，搜索和 Message-ID 定位使用 `search_source:"cache"`。后台同步需在 full 缓存中单独启用。[缓存配置与同步](docs/deployment.md#持久缓存配置)
 
@@ -91,7 +91,7 @@
 
 ## 构建与版本
 
-本页对应 `main` 的 0.3.0 源码。安装已发布版本时，按标签页的发行说明获取 Linux amd64 静态二进制和 `SHA256SUMS`。[下载 v0.3.0](https://github.com/black-zero358/rust-email-mcp/releases/tag/v0.3.0)
+本页对应 `main` 的 0.3.0 源码。当前安装教程使用上方的 Docker Compose 流程。发行页另提供 Linux amd64 静态二进制归档和 `SHA256SUMS`，下载后在同一目录执行 `sha256sum --check SHA256SUMS` 核验归档。[下载 v0.3.0](https://github.com/black-zero358/rust-email-mcp/releases/tag/v0.3.0)
 
 从 0.2.2 升级到 0.3.0 前，核对整理结果中的 `accepted`、离线正文索引重建及停止宽限。[0.3.0 升级与回退](docs/maintenance.md#030-升级要点)
 
@@ -111,5 +111,6 @@ cargo test --locked
 | OAuth、登录和连接问题 | [排障手册](docs/troubleshooting.md) |
 | 设计、兼容性、发布与依赖审计 | [架构](docs/architecture.md) · [维护规程](docs/maintenance.md) |
 | 开发规范、测试和 PR 流程 | [贡献指南](CONTRIBUTING.md) |
+| 全部文档、待实施方案和历史记录 | [文档导航](docs/README.md) |
 
 反馈问题时，请提供版本、`request_id`、错误码及使用合成数据的复现步骤。漏洞请按[安全策略](SECURITY.md)私下报告。项目采用 [MIT 许可证](LICENSE)。

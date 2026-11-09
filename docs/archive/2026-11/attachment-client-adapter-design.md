@@ -1,10 +1,12 @@
 # R04 附件离线下载与直接读取
 
+> 历史归档：保留对应日期和提交的设计、实施与验收记录。现行文档见[文档导航](../../README.md)。 Python/Node 原型及其运行命令已于 2026-11-06 退出主线，源码可在[精简前提交](https://github.com/black-zero358/rust-email-mcp/tree/42873c0f2ea9f8ff284fa044c4111d7cb97f8dc9/scripts)查阅；当前下载契约见[能力说明](../../capabilities.md#附件与兼容性)。
+
 验证日期：2026-11-02。本阶段只用本地模拟邮箱和合成文件，完成下载与内容读取。全部 8 组合成附件已通过 Rust 服务与标准客户端的联调，7 组本地测试通过。
 
 本阶段完成条件是：文件完整下载、名称正确、同名文件分别保留、长度与 SHA-256 一致，并能直接读取合成表格和 PDF 的已知内容。外部连接测试后移，本阶段不连接真实 ChatGPT、不登录、不部署。
 
-下载测试使用 [标准客户端](../scripts/attachment-client-adapter/README.md)。表格验证金额 194、数量 6，两份同名 CSV 分别为 11/29，PDF 验证段落为 CEDAR-729。详细联调证据见下方“离线验证结果”；接口研究仅作后续参考。
+下载测试使用 [标准客户端](../../../scripts/attachment-client-adapter/README.md)。表格验证金额 194、数量 6，两份同名 CSV 分别为 11/29，PDF 验证段落为 CEDAR-729。详细联调证据见下方“离线验证结果”；接口研究仅作后续参考。
 
 ## 后续研究附录：已核对的接口（本阶段不实施）
 
@@ -76,7 +78,7 @@ if (caps?.updateModelContext?.resourceLink) {
 
 ## 离线验证结果
 
-[可运行原型](../scripts/attachment-client-adapter/README.md) 分为标准客户端和 UI mock 候选。标准客户端使用当前 R04 的完整 descriptor：prepare 的 `checksum` 可为 null，Base64 的 decoded_size 可为 estimate，QP 可为 unknown；下载后读取 `X-Content-SHA256` 和 `Content-Digest`，与客户端边读边计算的 SHA-256 一起核对。只有 size_accuracy 为 exact 才把准备阶段长度作为精确比较值。成功结果保留实际 decoded_size、sha256 和核验来源。
+[可运行原型](../../../scripts/attachment-client-adapter/README.md) 分为标准客户端和 UI mock 候选。标准客户端使用当前 R04 的完整 descriptor：prepare 的 `checksum` 可为 null，Base64 的 decoded_size 可为 estimate，QP 可为 unknown；下载后读取 `X-Content-SHA256` 和 `Content-Digest`，与客户端边读边计算的 SHA-256 一起核对。只有 size_accuracy 为 exact 才把准备阶段长度作为精确比较值。成功结果保留实际 decoded_size、sha256 和核验来源。
 
 本地 Node 24.15.0 / pnpm 12.15.0 的 7 组受控测试通过，覆盖：
 
@@ -88,15 +90,13 @@ if (caps?.updateModelContext?.resourceLink) {
 - 后续接口研究中的程序生成 File 通过 mock 接口读取，返回模拟引用；这项 mock 测试与本阶段的下载验收分别记录。
 - ext-apps 2.0.4 的实际生成 schema 接受 `ui/message` 和 `ui/update-model-context` 的 resource_link 形状；宿主未声明 resourceLink capability 时返回 client_delivery_required。
 
-[验证证据与公开资料摘要](../scripts/attachment-client-adapter/evidence/local-prototype-2026-11-02.json) 记录命令、版本、测试计数及公开下载文件 SHA-256。上述 7 组测试的 HTTP 侧使用本地合成 fixture 服务。
+[验证证据与公开资料摘要](../../../scripts/attachment-client-adapter/evidence/local-prototype-2026-11-02.json) 记录命令、版本、测试计数及公开下载文件 SHA-256。上述 7 组测试的 HTTP 侧使用本地合成 fixture 服务。
 
-真实 Rust 服务也已完成跨运行时验收：[独立联调记录](../scripts/attachment-client-adapter/evidence/rust-integration-2026-11-02.json)，测试入口 [attachments.rs](https://github.com/black-zero358/rust-email-mcp/blob/42873c0f2ea9f8ff284fa044c4111d7cb97f8dc9/src/server/output_tests/attachments.rs) 的 `standalone_node_adapter_consumes_real_rust_mcp_and_authorized_get`。它启动隔离 TLS IMAP 与真实 JWT MCP/GET router，经 Node CLI 逐个准备、认证下载并落盘全部 8 组 R00 fixture，再由 Rust 从私有报告路径读回文件，独立核对原始长度与 SHA-256；XLSX/PDF/两份同名 CSV/524,289 B CSV 均通过。结果为 1 passed、0 failed，5.42 秒。
+真实 Rust 服务也已完成跨运行时验收：[独立联调记录](../../../scripts/attachment-client-adapter/evidence/rust-integration-2026-11-02.json)，测试入口 [attachments.rs](https://github.com/black-zero358/rust-email-mcp/blob/42873c0f2ea9f8ff284fa044c4111d7cb97f8dc9/src/server/output_tests/attachments.rs) 的 `standalone_node_adapter_consumes_real_rust_mcp_and_authorized_get`。它启动隔离 TLS IMAP 与真实 JWT MCP/GET router，经 Node CLI 逐个准备、认证下载并落盘全部 8 组 R00 fixture，再由 Rust 从私有报告路径读回文件，独立核对原始长度与 SHA-256；XLSX/PDF/两份同名 CSV/524,289 B CSV 均通过。结果为 1 passed、0 failed，5.42 秒。
 
 该测试为显式 ignored 开发验收，不给默认 Cargo 测试添加 Node 依赖。成功执行命令：
 
-```powershell
-wsl -d Ubuntu -- bash -lc 'cd "/mnt/d/UserData/Documents/ChatGPT/server MCP/rust-email-mcp" && ADAPTER_NODE_BINARY="/mnt/d/UserData/Documents/ChatGPT/server MCP/rust-email-mcp/scripts/attachment-client-adapter/generated/node-v24.15.0-linux-x64/bin/node" CARGO_TARGET_DIR=/home/oeic_fe/.cache/rust-email-mcp-target /home/oeic_fe/.cargo/bin/cargo +1.99.1 test --locked --lib server::output_tests::attachments::standalone_node_adapter_consumes_real_rust_mcp_and_authorized_get -- --ignored --exact'
-```
+历史联调命令见[精简前文档](https://github.com/black-zero358/rust-email-mcp/blob/42873c0f2ea9f8ff284fa044c4111d7cb97f8dc9/docs/attachment-client-adapter-design.md)。
 
 Linux Node 24.15.0 只解压在忽略的 generated 目录，官方 SHASUMS256 校验通过；也可由 ADAPTER_NODE_BINARY 指定已有兼容 Node。临时 fixture 和下载文件由测试生命周期清理，输出仅保留合成断言摘要。
 

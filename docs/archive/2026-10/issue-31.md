@@ -1,5 +1,7 @@
 # Issue #31 — 批量读取本地错误隔离
 
+> 历史归档：保留对应日期和提交的设计、实施与验收记录。现行文档见[文档导航](../../README.md)。
+
 - 日期：2026-10-29，Asia/Shanghai。[Issue #31](https://github.com/black-zero358/rust-email-mcp/issues/31)。
 - 修复代码：`324aecf`；整合 main `9bb9721e86e14ca24bd471fb82bc94aa27a1c888` 的提交 `7725f4fc429219c1544b496eaa8b2a42177132cd`；最终工具说明/契约提交 `a07ba54635e101936ba611fb18f511b4d5e90a6f`。后续文档提交不改变运行代码。
 - 环境：Windows 独立工作树、WSL Ubuntu、固定 Rust/Cargo 1.99.1。历史 `issue-status-target` 在本轮专属使用，先清理本项目与 vendored async-imap 构建产物，确认重编当前工作树。只使用合成小邮件与本地 duplex；没有真实邮箱或部署。
