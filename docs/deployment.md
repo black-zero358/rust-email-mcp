@@ -2,7 +2,7 @@
 
 以下示例使用 Linux amd64、Docker Compose、已有 HTTPS Nginx，域名为 `mail.example.com`，MCP 地址为 `https://mail.example.com/email/mcp`。替换为自己的域名。Rauthy 的固定镜像摘要对应 amd64。
 
-部署前按 [维护与发布规范](maintenance.md) 确认目标版本、commit、产物校验和、兼容性与验收证据。源码发布与生产部署分别执行；本指南不授予真实邮件写入测试权限。
+部署前按 [维护与发布规范](maintenance.md) 确认目标版本、commit、产物校验和、兼容性与验收证据。部署及真实邮件写入按单独约定的环境与操作范围执行。
 
 ## 准备目录与配置
 

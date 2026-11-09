@@ -1,5 +1,7 @@
 # 2026-10-29 SELECT/EXAMINE 与 STATUS 完成边界（issue #28）
 
+> 历史归档：保留对应日期和提交的设计、实施与验收记录。现行文档见[文档导航](../../README.md)。
+
 - 日期与环境：2026-10-29，Asia/Shanghai；Windows 隔离工作树、WSL Ubuntu、固定 Rust 1.99.1。全程为本地 duplex 与合成数据，没有真实邮箱、发送、部署或压力实验。
 - 修复代码：`331da70cc37c34ab547a8c90ee015ad21e512c8d`，原基线 `36177076aae667cd72ba3ca81556b94575ab0fc6`；随后合入已完成的 main issue #25，合并提交 `f998b576c2e34164a836879baaa1e9118bfb4729`。
 

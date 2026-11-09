@@ -1,5 +1,7 @@
 # 2026-10-29 未知 transfer encoding 处理（issue #34）
 
+> 历史归档：保留对应日期和提交的设计、实施与验收记录。现行文档见[文档导航](../../README.md)。
+
 - 日期/环境：2026-10-29，Asia/Shanghai；Windows 独立工作树、WSL Ubuntu，固定 Rust/Cargo 1.99.1。独立 target `/home/oeic_fe/issue-cte-target`；复制依赖缓存后清除本项目及 vendored async-imap 构建产物并重编，明确执行新增测试 1 项。
 - 修复代码：`08ff18477f2b32f993e26681daff014d89caedde`，基线 main `18b26ddc8a365ecdabb7a38b50a476b8f9155679`；整合提交 `949686f1e28fb9d1ec8fdd5080f2b27705be742f` 合入 main `717a302`，无冲突、无额外运行时手改。
 

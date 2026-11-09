@@ -1,18 +1,20 @@
 # R00 附件交付选型与隔离探针
 
+> 历史归档：保留对应日期和提交的设计、实施与验收记录。现行文档见[文档导航](../../README.md)。 Python/Node 原型及其运行命令已于 2026-11-06 退出主线，源码可在[精简前提交](https://github.com/black-zero358/rust-email-mcp/tree/42873c0f2ea9f8ff284fa044c4111d7cb97f8dc9/scripts)查阅；当前下载契约见[能力说明](../../capabilities.md#附件与兼容性)。
+
 日期：2026-11-02。产品源码基线：`e58090129eda40a47e593a8b89928291559bf1bd`（0.2.1）。对应 [R00/R04 实施方案](read-capabilities-plan.md#r00-与-r04-附件交付)。本次交付确定合成验证方法、能力矩阵及客户端适配归属。按用户随后确认的范围，R04 只做本地离线测试，完成 Rust 下载集成及 CSV/XLSX/PDF 内容读取；ChatGPT 实际连接测试后移。
 
 选型：产品保留同主体 Bearer GET 作为原始字节通道，标准客户端负责下载、核对摘要及本地保存，再由文件解析器读取内容。标准 MCP 资源及 ChatGPT 文件接口保留为后续接入候选；本阶段使用本地模拟邮箱和合成文件验收。
 
 ## 已交付的可复现证据
 
-- [探针与运行说明](../scripts/attachment-delivery-probe/README.md)：独立 uv 项目、锁定解析器、确定性 CSV/XLSX/PDF 生成器、loopback MCP/Bearer HTTP 服务及客户端。
-- [自测结果](../scripts/attachment-delivery-probe/evidence/selftest-2026-11-02.json)：8 组 fixture 的原始长度、SHA-256、GET/资源/Base64 结果与解析内容。
-- [现场工具清单](../scripts/attachment-delivery-probe/evidence/tool-surface-2026-11-02.json)：本任务可见的 QQ 邮箱工具及宿主文件接口范围，未调用真实邮箱。
+- [探针与运行说明](../../../scripts/attachment-delivery-probe/README.md)：独立 uv 项目、锁定解析器、确定性 CSV/XLSX/PDF 生成器、loopback MCP/Bearer HTTP 服务及客户端。
+- [自测结果](../../../scripts/attachment-delivery-probe/evidence/selftest-2026-11-02.json)：8 组 fixture 的原始长度、SHA-256、GET/资源/Base64 结果与解析内容。
+- [现场工具清单](../../../scripts/attachment-delivery-probe/evidence/tool-surface-2026-11-02.json)：本任务可见的 QQ 邮箱工具及宿主文件接口范围，未调用真实邮箱。
 
 验收环境为 Windows、CPython 3.13.13、Python 标准库 HTTP 客户端、loopback JSON Streamable HTTP。依赖锁定为 openpyxl 3.1.5、et-xmlfile 2.0.0、pypdf 6.12.0，均只用于开发解析。探针服务使用隔离的一次性凭据，无 IMAP/SMTP、生产 OAuth、部署或邮件写入。
 
-探针自测覆盖的是本目录的合成 HTTP 服务与客户端。现有 Rust handler 的实现和回归入口分别为 [mail/attachments.rs](../src/mail/attachments.rs) 的 `download_with`、`http_download_authorization_binary_headers_and_transfer_capacity`；本次没有通过该 handler 运行 fixture。R04 将同一组 fixture 接入 Rust 的隔离 IMAP/HTTP 测试，补产品错误映射、UIDVALIDITY、取消及并发覆盖。
+探针自测覆盖的是本目录的合成 HTTP 服务与客户端。现有 Rust handler 的实现和回归入口分别为 [mail/attachments.rs](../../../src/mail/attachments.rs) 的 `download_with`、`http_download_authorization_binary_headers_and_transfer_capacity`；本次没有通过该 handler 运行 fixture。R04 将同一组 fixture 接入 Rust 的隔离 IMAP/HTTP 测试，补产品错误映射、UIDVALIDITY、取消及并发覆盖。
 
 ## 能力矩阵
 

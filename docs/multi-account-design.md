@@ -1,6 +1,6 @@
-# R05 多邮箱只读配置与身份设计
+# 多邮箱只读配置与身份设计
 
-日期：2026-11-02。沿用 [读取方案 R05](read-capabilities-plan.md#r05-多账户读取) 和统一身份契约；本文件记录本轮实现接口、配置及离线验证安排。新增邮箱固定只读，旧写工具继续使用原邮箱及原发送记录库。
+本文记录当前多账户配置、授权、注册库与共享调度。追加邮箱固定只读，旧写工具继续使用原邮箱及原发送记录库。配置操作见[部署指南](deployment.md#多账户配置)，交付历史见[读取能力记录](read-capabilities-plan.md)。
 
 ## 配置与旧调用
 
@@ -103,32 +103,9 @@ v2 保留原 legacy_default 表与其 UUID、generation=1、身份摘要和原�
 
 已有 v2 注册库时，移除 ACCOUNT_CONFIG_PATH 会拒绝启动；恢复明确的账户配置后再启动。旧二进制回退需要恢复 v1 注册副本，操作记录库保留最新内容；持久缓存与注册表恢复联动按[缓存恢复规程](deployment.md#持久缓存备份与恢复)执行。
 
-## 固定跨工作者接口
+## 运行期接口
 
-```rust
-config::load_runtime() -> anyhow::Result<ValidatedAccountSet>
-accounts::open_catalog(ValidatedAccountSet) -> anyhow::Result<Arc<AccountCatalog>>
-
-ValidatedAccountSet { service_config: Arc<Config>, default_read_account: String,
-                      accounts: Vec<ValidatedAccountConfig>, source: AccountConfigSource }
-AccountLease { key: AccountKey, alias: String, display_name: String,
-               config: Arc<Config>, is_legacy: bool, cancellation: CancellationToken }
-
-AccountCatalog::config() -> &Arc<Config>
-AccountCatalog::default_read_account_id() -> &str
-AccountCatalog::read_account(principal, Option<&str>) -> Result<AccountLease>
-AccountCatalog::read_key(principal, &AccountKey) -> Result<AccountLease>
-AccountCatalog::write_account(principal) -> Result<AccountLease>
-AccountCatalog::visible_accounts(principal) -> Vec<AccountLease>
-AccountCatalog::registered_accounts() -> Vec<AccountLease>
-
-MailRuntime::new(Arc<AccountCatalog>, Arc<Journal>) -> anyhow::Result<Self>
-MailRuntime::config() -> &Arc<Config>
-MailRuntime::execute(name, args, principal) -> Result<Value>
-MailRuntime::has_read_access(principal) -> bool
-MailRuntime::legacy_mode_for(principal) -> Option<String>
-MailRuntime::list_accounts(principal) -> Value
-```
+配置加载、账户授权与任务路由分别由 [`config`](../src/config.rs)、[`AccountCatalog`](../src/accounts/catalog.rs) 和 [`MailRuntime`](../src/mail/runtime.rs) 负责。账户租约携带持久身份、配置世代、权限及取消状态；读取和写入均经目录授权后进入调度。
 
 Config 保留解析后的原字段兼容视图：service_config 对应固定 legacy default；每个追加邮箱持有覆盖其 IMAP/凭据/目录、mode=read 的独立视图。追加邮箱不构造 SMTP sender；file_only 原邮箱 read + smtp:null 也不构造 SMTP。AccountKey 派生 Hash，继续提供现有 reference_namespace，附件/调度/缓存均用内部键，不用别名当身份。
 
@@ -144,22 +121,8 @@ Config 保留解析后的原字段兼容视图：service_config 对应固定 leg
 
 附件句柄 64 个、传输槽 4 个保持全局共享，避免账户数放大额度。后端 FETCH 结束后释放后端槽；二进制传输许可保留至消费或取消。每次 GET 用当前 Principal + 句柄 AccountKey 再授权，并保留 UIDVALIDITY、摘要和响应预算。
 
-## 文件职责与离线验证
+## 验证入口
 
-| 执行者 | 文件所有权 | 交付 |
-| --- | --- | --- |
-| 配置/登记 | src/config.rs、config/**、accounts.rs、accounts/**、本文件；账户错误 helper 按协调修改 error.rs | 严格 JSON、秘密引用、ACL、身份/世代、原子迁移、故障恢复测试 |
-| 邮件运行时 | mail.rs、mail/** | MailRuntime、共享 Scheduler、账户读路由、固定原写路由、附件/缓存隔离 |
-| 协议接线 | server.rs、server/**、main.rs、auth.rs 的必要接线 | 14 个读取工具 account_id、按主体发现、Schema、启动次序、双账户 HTTP/JWT 验收 |
-| 主执行者 | 共享 README/架构/维护/AGENTS/.env/部署文档 | 集成审阅、完整验证、发布记录 |
+账户注册与迁移见 `src/accounts/tests.rs`、`src/accounts/catalog/tests.rs`，配置见 `src/config/account_config/tests.rs`，共享调度见 `src/mail/scheduler.rs`。`src/server/output_tests.rs` 使用签名 JWT、双账户 TLS IMAP 和实际 HTTP 路由核对授权、同 UID 隔离及附件交付。
 
-测试继续只用本地模拟邮箱与合成邮件：旧环境启动；旧环境追加只读；file_only；默认读取换邮箱但旧写目标固定；空 ACL 与历史记录；同文件夹/UID/UIDVALIDITY 在双邮箱的正文、头缓存、附件 id 与下载不混用；无权限时后端连接计数为零；身份变化和删除重加的旧引用失败；全局 4/20 与公平借槽；配置/迁移失败原 Journal 字节不变。真实连接、登录和部署不在本阶段执行。
-
-2026-11-02 模块验证：在 `/home/oeic_fe/.cache/rust-email-mcp-r05-accounts-check` 建立临时同源 harness，Cargo.toml/Cargo.lock 取自项目（仅 vendored 路径改为项目绝对路径），`#[path]` 直接载入实际 config/accounts/error/journal 源文件。命令：
-
-```sh
-CARGO_TARGET_DIR=/home/oeic_fe/.cache/rust-email-mcp-target \
-  /home/oeic_fe/.cargo/bin/cargo +1.99.1 test --offline --locked --lib
-```
-
-通过 26 项：config 7、accounts 17、journal 2；包含发布示例严格解析、v1/v2 发布前故障、previous 副本发布失败与完整重试、有界核验已有备份、中断临时文件清理、原记录库字节不变。Linux 执行了文件权限/symlink/目录/字节上限测试；Windows 的拒绝文件引用分支提供 cfg 专用回归，待 Windows Rust 环境执行。跨模块完整 crate 与 HTTP/JWT 验证由集成轮运行。
+现行原则与回归对应关系见[架构验证表](architecture.md#invariants-and-verification)，R05 的原始实验见[历史记录](archive/2026-11/validation.md#2026-11-02-r05-多账户离线验证)。

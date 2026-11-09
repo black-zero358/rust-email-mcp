@@ -1,4 +1,4 @@
-# 邮件能力扩展
+# 邮件能力与工具契约
 
 当前验证证据见 [验证记录](validation.md)，待闭环验收见 [贡献指南](../CONTRIBUTING.md#待闭环事项)。所有测试使用合成邮件或本地组件；生产部署、真实邮件修改、ChatGPT 客户端附件接收另行验收。
 
@@ -10,13 +10,13 @@
 
 `search_emails` 支持组合 `query`、`from`、`to`、`subject`、`since`、`before`、`seen`、`flagged`、`answered`、`has_attachment`、`min_size`、`max_size`。日期采用 `YYYY-MM-DD`，`since` 包含当日、`before` 不包含当日，按 IMAP INTERNALDATE 的日历日匹配。大小为整封邮件编码后的字节数，最小值和最大值均包含边界。
 
-例如查询本周未读邮件：
+例如查询指定日期区间的未读邮件：
 
 ```json
 {"mailbox":"INBOX","since":"2026-10-26","before":"2026-11-02","seen":false,"limit":20}
 ```
 
-未回复筛选使用 `answered:false`，含义是服务器未设置 `\\Answered` 标记；不能据此断定所有客户端都没有回复过。收件人 `to` 对应 To 头，不包含隐式 BCC 投递关系。
+使用 `answered:false` 筛选服务器尚未设置 `\\Answered` 标记的邮件；回复状态取决于客户端对该标记的维护。收件人 `to` 对应 To 头，不包含隐式 BCC 投递关系。
 
 服务先使用 UID SEARCH 过滤日期、文本、地址、大小和标记。`has_attachment` 在有限候选中核对 BODYSTRUCTURE 和必要 MIME 头，按已验证清单判断附件；需要完整 MIME 时，每页最多一次有界整封回退。回退后可提前返回短页，`next_before_uid` 保留最后一个已检查 UID；新连接复查 UIDVALIDITY 和大小，两条连接共用原传输预算和期限。持续传入游标及返回的 `uid_validity`，直到游标为空，空页同样可以带后续游标。
 
@@ -32,7 +32,7 @@
 
 ## 附件与兼容性
 
-全部 16 个读取工具声明 `outputSchema`，覆盖实际 `{data, request_id}`、`{error, request_id}`、逐项失败和完整响应预算降级。写工具沿用原契约。常用顺序为 `list_accounts → list_mailboxes → search_emails → get_emails`，再按需调用 `read_conversation` 或 `list_attachments → prepare_attachment_download`。附件当前仅做本地离线测试，核对完整下载和文件内容读取；ChatGPT 实际连接测试后移。
+16 个读取工具及 6 个单封/批量整理工具声明 `outputSchema`，覆盖 `{data, request_id}`、`{error, request_id}` 与各工具的逐项结果。读取工具同时覆盖完整响应预算降级，整理工具区分 `updated` 和 `accepted`。常用顺序为 `list_accounts → list_mailboxes → search_emails → get_emails`，再按需调用 `read_conversation` 或 `list_attachments → prepare_attachment_download`。附件当前仅做本地离线测试，核对完整下载和文件内容读取；ChatGPT 实际连接测试后移。
 
 `list_accounts` 的 `default_account_id` 与账户的 `default` 指示默认项；`capabilities` 和 `limits` 给出当前实现及配置值。`list_mailboxes` 保留 `attributes`，增加 `attribute_flags`、`delimiter`、`selectable`、`special_use`、`role_source` 和 `role_candidates`。服务器用途、管理员配置和 INBOX 协议角色分别标记 `server`、`configuration`、`protocol`；只有名称候选时 `special_use` 为空、`role_source` 为 null。
 
@@ -48,7 +48,7 @@
 
 返回的 `download_url` 需要同一用户的有效 OAuth Bearer 令牌。句柄有效期 600 秒，每实例最多保存 64 个描述符，不缓存附件字节；重启后失效。它不能作为公共分享链接。最多四个二进制下载并发，响应被消费或丢弃后释放传输名额；IMAP 读取还使用共享邮箱槽位。附件列表使用 `next_attachment_offset` 分页。
 
-公开路由为 `MCP_RESOURCE/attachments/{token}`，需转发至内部 `/mcp/attachments/{token}` 并关闭包含句柄的访问日志。响应使用 `application/octet-stream`、`no-store`、`nosniff` 和安全文件名的 attachment disposition，`X-Content-SHA256` 与 `Content-Digest` 校验最终交付字节。客户端负责安全解析文件内容；[标准适配器](../scripts/attachment-client-adapter/README.md)使用独立授权会话完成下载、校验和落盘。[ChatGPT 适配设计](attachment-client-adapter-design.md)记录宿主文件接口及待验收步骤，分析请求由用户发起。
+公开路由为 `MCP_RESOURCE/attachments/{token}`，需转发至内部 `/mcp/attachments/{token}` 并关闭包含句柄的访问日志。响应使用 `application/octet-stream`、`no-store`、`nosniff` 和安全文件名的 attachment disposition，`X-Content-SHA256` 与 `Content-Digest` 校验最终交付字节。客户端使用自己的授权会话完成下载，核对长度和摘要，再交给文件解析工具。原 Node 适配器的[离线证据](../scripts/attachment-client-adapter/README.md)和[历史接口研究](archive/2026-11/attachment-client-adapter-design.md)供后续接入参考；ChatGPT 文件接收按待闭环事项验收。
 
 附件 GET 的失败响应为带 `request_id`、固定 `phase` 和 `action` 的小型 JSON：401 重新认证；认证服务暂不可用时返回 503；未知、过期或其他主体的句柄统一 404 并提示重新准备；UIDVALIDITY 变化返回 409；消息或部件删除返回 404；未知编码返回 422；资源超限返回 413 及限制类别；下载满额返回 429 和 `Retry-After`；后端失败/坏编码返回 502，超时返回 504。`connection_bytes` 指连接累计读取预算，`part_fetch_bytes` 指单次部件 FETCH 的编码 literal 预算，`decoded_attachment_bytes` 指最终解码内容预算。确认 IMAP tagged OK 后才判定消息缺失；缺必需属性、NO 或断连按后端失败处理。
 
